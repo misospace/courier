@@ -9,7 +9,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -18,7 +17,6 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -27,6 +25,7 @@ import (
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/bootstrap"
+	"github.com/misospace/courier/internal/cacheopts"
 	"github.com/misospace/courier/internal/connector"
 	"github.com/misospace/courier/internal/controller"
 	"github.com/misospace/courier/internal/executor"
@@ -222,8 +221,8 @@ func main() {
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
-		Cache:                  controllerCacheOptions(watchedNamespaces),
-		Client:                 client.Options{Cache: &client.CacheOptions{DisableFor: uncachedReadObjects()}},
+		Cache:                  cacheopts.Options(watchedNamespaces),
+		Client:                 client.Options{Cache: &client.CacheOptions{DisableFor: cacheopts.UncachedReadObjects()}},
 		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
@@ -863,57 +862,6 @@ func containsNamespace(namespaces []string, namespace string) bool {
 		}
 	}
 	return false
-}
-
-// controllerCacheOptions scopes the manager's informers to the watched
-// namespaces (#632): CoderRun, LaneProfile and Pod are listed and watched
-// only there, so a side-by-side release neither observes nor can be woken
-// by another deployment's runs, lanes, and run pods. These three are the
-// only kinds the informer cache ever holds, because they are the only kinds
-// the shipped chart RBAC grants watch on; every other kind the operator
-// reads is excluded from the cache by uncachedReadObjects and read directly
-// from the API server. An empty watched set leaves the three run kinds
-// cluster-wide — the single-controller default.
-func controllerCacheOptions(watched []string) cache.Options {
-	if len(watched) == 0 {
-		return cache.Options{}
-	}
-	namespaces := make(map[string]cache.Config, len(watched))
-	for _, namespace := range watched {
-		namespaces[namespace] = cache.Config{}
-	}
-	byNamespace := cache.ByObject{Namespaces: namespaces}
-	return cache.Options{
-		ByObject: map[client.Object]cache.ByObject{
-			&courierv1alpha1.CoderRun{}:    byNamespace,
-			&courierv1alpha1.LaneProfile{}: byNamespace,
-			&corev1.Pod{}:                  byNamespace,
-		},
-	}
-}
-
-// uncachedReadObjects lists the kinds the manager's client must read directly
-// from the API server rather than through the informer cache. The chart
-// grants the operator watch only on CoderRun, LaneProfile and Pod; every
-// kind below is point-read by secure admission, preflight or provisioning —
-// a Get by name, or a single List — and the chart grants it get/list only.
-// Reading such a kind through the cache would lazily start a cluster-scoped
-// informer needing list+watch that authorization refuses, so the first
-// credential or preflight read wedges on a sync that can never complete
-// (#641). Disabling the cache for a kind aligns the client's read path with
-// the least-privilege grant the chart actually ships: the read needs only the
-// verb that is already granted, and no cluster-wide watch is added. A kind
-// the operator newly reads by name must join this set (or the watchable
-// cache); otherwise a future provisioning step re-opens the same wedge.
-func uncachedReadObjects() []client.Object {
-	return []client.Object{
-		&corev1.Secret{},
-		&corev1.Service{},
-		&corev1.ServiceAccount{},
-		&corev1.Namespace{},
-		&corev1.Node{},
-		&rbacv1.Role{},
-	}
 }
 
 // cronLane pairs one LaneProfile with the schedules targeting it.

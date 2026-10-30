@@ -2384,12 +2384,48 @@ terminalized, while a legacy controller with no configured list owns every
 namespace. The manager's informers, the capacity and retention gauges (which
 for a secure controller therefore report only the run namespace), and the
 discovery-namespace startup check follow the same boundary; preflight reads of
-Nodes, Namespaces, and cluster Services, and the uncached API reader,
-deliberately do not. The evidence intake applies the same boundary to inbound
+Nodes, Namespaces, and cluster Services go through the uncached API reader,
+which is not namespace-restricted. The evidence intake applies the same boundary to inbound
 captures: with the ownership set configured, an authenticated capture naming a
 run outside it is refused before anything is persisted, so a key shared
 across releases cannot turn one release's intake into a writer in another's
 namespaces.
+
+The manager's cache informer-caches only CoderRun, LaneProfile, and Pod,
+namespaced to the watched namespaces wherever an ownership set is configured
+— with no ownership set the cache is unrestricted, the single-controller
+default. Every other kind — Secrets, Services, ServiceAccounts,
+NetworkPolicies, RBAC objects, Namespaces, Nodes — is read point-wise
+through the uncached API reader (`SecureControl.reader`), never through the
+cached client. The chart's grants are what make that boundary load-bearing:
+list and watch for the three cached kinds, list without watch for Secrets,
+Services, ServiceAccounts, NetworkPolicies, and the RBAC objects, get and
+list for Nodes, and get alone for Namespaces. A read of any other kind
+through the cached client would therefore lazily start an informer that can
+never watch — its initial list pulls every object it listed into the
+operator's memory, and it relists forever. The manager's client excludes the
+get/list-only kinds from cached reads (`cacheopts.UncachedReadObjects`,
+#647), so such a read is served straight from the API server even without
+the routing; routing the secure path through the uncached reader keeps it
+correct independently of that exclusion, and each is pinned by its own test.
+`DefaultNamespaces` bounds such
+an accidental informer for a namespaced kind to the watched namespaces; a
+cluster-scoped kind (Node, Namespace) stays cluster-wide, which is why the
+live-probe Node List goes through the uncached reader. Writes stay on the
+cached client, because creates, patches, and deletes never start informers.
+
+Operator sizing follows from that boundary: the operator itself needs only
+small memory — the prior v1 operator measured ~22Mi point-in-time (#642) —
+and the chart's 128Mi default remains the sizing anchor. The boundary is
+measured, not assumed: against a real API server holding a Secret
+population, repeated secure provisioning passes and the preflight reads they
+reroute start no informer — no watch is issued for a kind the cache does not
+inform — and leave the operator's live heap below half that population
+(the measured delta was zero), while one cached Secret read starts the
+informer that pulls the whole population into memory. The residual limits
+are API-server load rather than memory: uncached point reads issue per-pass
+Gets against the API server, and the live-probe preflight issues one
+legitimate cluster-wide Node List per launch pass.
 
 - **Pending** — created by a source. The operator checks the lane's `concurrency`
   against admitted (`Claimed` + `Running`) runs on that lane. Over capacity → stays Pending (this is the

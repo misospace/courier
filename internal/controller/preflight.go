@@ -109,7 +109,7 @@ func (s *SecureControl) checkDeploymentPreconditions(ctx context.Context) error 
 // restricted admission on the run namespace cannot run secure mode.
 func (s *SecureControl) checkNamespaceBoundary(ctx context.Context) error {
 	namespace := &corev1.Namespace{}
-	if err := s.Client.Get(ctx, types.NamespacedName{Name: s.Config.RunNamespace}, namespace); err != nil {
+	if err := s.reader().Get(ctx, types.NamespacedName{Name: s.Config.RunNamespace}, namespace); err != nil {
 		return fmt.Errorf("secure preflight: read run namespace: %w", err)
 	}
 	labels := namespace.Labels
@@ -214,7 +214,7 @@ func operatorAccessReviews() []accessReview {
 func (s *SecureControl) checkBrokerRBAC(ctx context.Context, run *courier.CoderRun) error {
 	role := topology.BrokerRole(run)
 	live := role.DeepCopy()
-	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: role.Name}, live); err != nil {
+	if err := s.reader().Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: role.Name}, live); err != nil {
 		return fmt.Errorf("secure preflight: read broker Role: %w", err)
 	}
 	if !reflect.DeepEqual(live.Rules, role.Rules) {
@@ -470,7 +470,7 @@ func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun,
 // incarnation would provision, for dry-run rendering only.
 func (s *SecureControl) renderedWorkerPublicKey(ctx context.Context, run *courier.CoderRun) ([]byte, error) {
 	secret := &corev1.Secret{}
-	err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.SigningSecretName(run.Name)}, secret)
+	err := s.reader().Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.SigningSecretName(run.Name)}, secret)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			// No incarnation yet: render with a placeholder key; the dry-run
@@ -492,7 +492,7 @@ func (s *SecureControl) renderedWorkerPublicKey(ctx context.Context, run *courie
 // lane-following, so no lane sizing is resolved or passed in here.
 func (s *SecureControl) runLiveProbes(ctx context.Context, run *courier.CoderRun, cache *topology.CachePin) error {
 	nodes := &corev1.NodeList{}
-	if err := s.Client.List(ctx, nodes); err != nil {
+	if err := s.reader().List(ctx, nodes); err != nil {
 		return fmt.Errorf("secure preflight: list nodes: %w", err)
 	}
 	eligible := eligibleNodes(nodes)
@@ -669,7 +669,7 @@ func (s *SecureControl) collectProbeResults(ctx context.Context, run *courier.Co
 
 func (s *SecureControl) serviceClusterIP(ctx context.Context, namespace, name string) (string, error) {
 	service := &corev1.Service{}
-	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, service); err != nil {
+	if err := s.reader().Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, service); err != nil {
 		return "", err
 	}
 	if service.Spec.ClusterIP == "" || service.Spec.ClusterIP == "None" {

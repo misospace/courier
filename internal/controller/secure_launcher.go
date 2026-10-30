@@ -339,7 +339,7 @@ func (s *SecureControl) gatewayConfig(ctx context.Context, run *courier.CoderRun
 // and are never logged or exposed.
 func (s *SecureControl) ensureGatewayKeyCopy(ctx context.Context, run *courier.CoderRun) error {
 	existing := &corev1.Secret{}
-	err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.GatewaySecretName(run.Name)}, existing)
+	err := s.reader().Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.GatewaySecretName(run.Name)}, existing)
 	if err == nil {
 		return nil
 	}
@@ -355,7 +355,7 @@ func (s *SecureControl) ensureGatewayKeyCopy(ctx context.Context, run *courier.C
 		keyName = "key"
 	}
 	source := &corev1.Secret{}
-	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: parts[0], Name: parts[1]}, source); err != nil {
+	if err := s.reader().Get(ctx, types.NamespacedName{Namespace: parts[0], Name: parts[1]}, source); err != nil {
 		return fmt.Errorf("secure topology: read gateway key Secret %s: %w", s.Config.GatewayKeySecret, err)
 	}
 	value, ok := source.Data[keyName]
@@ -665,7 +665,7 @@ func (s *SecureControl) Revoke(ctx context.Context, run *courier.CoderRun) (bool
 	// broker pod survives — a partial pass must never report done with broker
 	// ingress still routed.
 	service := &corev1.Service{}
-	err = s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, service)
+	err = s.reader().Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, service)
 	serviceDeleted := false
 	switch {
 	case err == nil:
@@ -800,7 +800,7 @@ func (s *SecureControl) gatewayPointer() *topology.GatewayPin {
 
 func (s *SecureControl) ensureBrokerTLS(ctx context.Context, run *courier.CoderRun) error {
 	existing := &corev1.Secret{}
-	err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerTLSSecretName(run.Name)}, existing)
+	err := s.reader().Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerTLSSecretName(run.Name)}, existing)
 	if err == nil {
 		return nil
 	}
@@ -832,7 +832,7 @@ func (s *SecureControl) ensureBrokerTLS(ctx context.Context, run *courier.CoderR
 // values only to copy them between Secrets and never logs or exposes them.
 func (s *SecureControl) ensureCredentialsCopy(ctx context.Context, run *courier.CoderRun) error {
 	existing := &corev1.Secret{}
-	err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.CredentialsSecretName(run.Name)}, existing)
+	err := s.reader().Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.CredentialsSecretName(run.Name)}, existing)
 	if err == nil {
 		return nil
 	}
@@ -875,7 +875,7 @@ func (s *SecureControl) copyCredentials(ctx context.Context, registration *forge
 		}
 		secret := &corev1.Secret{}
 		key := types.NamespacedName{Namespace: s.Config.OperatorNamespace, Name: ref.SecretName}
-		if err := s.Client.Get(ctx, key, secret); err != nil {
+		if err := s.reader().Get(ctx, key, secret); err != nil {
 			return "", fmt.Errorf("read credential Secret %s for provider %q: %w", ref.SecretName, registration.Name, err)
 		}
 		value, ok := secret.Data[ref.Key]
@@ -905,7 +905,7 @@ func (s *SecureControl) ensurePolicySecret(ctx context.Context, run *courier.Cod
 		return err
 	}
 	existing := &corev1.Secret{}
-	err = s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: rendered.Name}, existing)
+	err = s.reader().Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: rendered.Name}, existing)
 	if err == nil {
 		if string(existing.Data["policy.json"]) != string(rendered.Data["policy.json"]) {
 			return secureNeedsHuman("PolicyConflict",
@@ -949,7 +949,7 @@ func (s *SecureControl) rotateSigningKey(ctx context.Context, run *courier.Coder
 
 func (s *SecureControl) signingPublicKey(ctx context.Context, run *courier.CoderRun) ([]byte, error) {
 	secret := &corev1.Secret{}
-	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.SigningSecretName(run.Name)}, secret); err != nil {
+	if err := s.reader().Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.SigningSecretName(run.Name)}, secret); err != nil {
 		return nil, fmt.Errorf("secure topology: read signing key: %w", err)
 	}
 	raw, ok := secret.Data["signing.key"]
@@ -1046,7 +1046,7 @@ func (s *SecureControl) topologyPodsExist(ctx context.Context, run *courier.Code
 
 func (s *SecureControl) serviceAccount(ctx context.Context, run *courier.CoderRun, name string) (*corev1.ServiceAccount, error) {
 	sa := &corev1.ServiceAccount{}
-	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: name}, sa); err != nil {
+	if err := s.reader().Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: name}, sa); err != nil {
 		return nil, fmt.Errorf("secure topology: read service account %s: %w", name, err)
 	}
 	return sa, nil
