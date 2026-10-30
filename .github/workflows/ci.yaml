@@ -52,8 +52,25 @@ jobs:
       - name: Build
         run: go build ./...
 
-  test:
+  test-shard:
+    name: test / ${{ matrix.name }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: executor
+            packages: ./cmd/courier-executor
+            envtest: false
+          - name: harness
+            packages: ./internal/harness
+            envtest: false
+          - name: controller
+            packages: ./internal/controller
+            envtest: true
+          - name: rest
+            packages: __rest__
+            envtest: true
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -63,9 +80,11 @@ jobs:
           cache: true
 
       - name: Install setup-envtest
+        if: ${{ matrix.envtest }}
         run: make setup-envtest
 
       - name: Resolve envtest asset version
+        if: ${{ matrix.envtest }}
         id: envtest-version
         run: |
           k8s=$(sed -n 's/^ENVTEST_K8S_VERSION ?= //p' Makefile)
@@ -73,18 +92,52 @@ jobs:
           echo "k8s=$k8s" >> "$GITHUB_OUTPUT"
 
       - name: Cache envtest assets
+        if: ${{ matrix.envtest }}
         uses: actions/cache@v6.1.0
         with:
           path: ~/.local/share/kubebuilder-envtest
           key: envtest-k8s-${{ steps.envtest-version.outputs.k8s }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Provision envtest assets
+        if: ${{ matrix.envtest }}
         run: |
           k8s=$(sed -n 's/^ENVTEST_K8S_VERSION ?= //p' Makefile)
           echo "KUBEBUILDER_ASSETS=$(bin/setup-envtest use -p path "$k8s")" >> "$GITHUB_ENV"
 
-      - name: Test
-        run: go test -race ./... -coverprofile cover.out
+      - name: Test shard
+        env:
+          PACKAGES: ${{ matrix.packages }}
+          SHARD: ${{ matrix.name }}
+        shell: bash
+        run: |
+          if [ "$PACKAGES" = "__rest__" ]; then
+            mapfile -t packages < <(
+              go list ./... |
+                grep -v -E '/cmd/courier-executor$|/internal/harness$|/internal/controller$'
+            )
+          else
+            packages=("$PACKAGES")
+          fi
+          test "${#packages[@]}" -gt 0
+          printf 'race-test shard %s: %s\n' "$SHARD" "${packages[*]}"
+          go test -race "${packages[@]}" -coverprofile "cover-${SHARD}.out"
+
+  # Keep the required branch-protection context stable while the expensive
+  # race suite fans out onto independent runners. A failed or cancelled matrix
+  # child makes the matrix job non-success, and therefore this aggregator fail.
+  test:
+    runs-on: ubuntu-latest
+    needs: test-shard
+    if: ${{ !cancelled() }}
+    steps:
+      - name: Require race-test shards
+        env:
+          SHARD_RESULT: ${{ needs.test-shard.result }}
+        run: |
+          if [ "$SHARD_RESULT" != "success" ]; then
+            echo "race-test shards finished with: $SHARD_RESULT"
+            exit 1
+          fi
 
   images-classify:
     runs-on: ubuntu-latest
