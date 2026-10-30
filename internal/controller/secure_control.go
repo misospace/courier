@@ -81,6 +81,13 @@ func terminalPreflightVerdict(err error) *SecureNeedsHumanError {
 // is created.
 const laneConfigReason = "LaneConfig"
 
+// contributionContextReason marks a contribute run whose admitted execution
+// context cannot be decoded — missing, foreign, or malformed — raised by the
+// launch paths before any coordinator starts (#624). The spec and its context
+// are immutable, so this is permanent: the run terminalizes NeedsHuman instead
+// of relaunching without an objective.
+const contributionContextReason = "ContributionContext"
+
 // laneConfigRejection returns the permanent lane-profile misconfiguration the
 // lane's author must fix, and nil for every other launch failure. Like a
 // pod-admission rejection this is permanent: requeueing cannot change a lane
@@ -191,6 +198,12 @@ type SecureControl struct {
 	// observed UID as a precondition. Nil falls back to Client, which serves
 	// only direct-construction tests.
 	APIReader client.Reader
+	// Sources resolves the adapter owning a run by its persisted source name.
+	// A contribute-mode run's objective lives in that source's own context, so
+	// the launch asks the owning adapter to translate it into the
+	// source-neutral goal input (#624). Nil means no contribute run can launch,
+	// which its launch fails closed.
+	Sources *SourceRegistry
 }
 
 func (s *SecureControl) now() time.Time {

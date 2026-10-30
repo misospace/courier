@@ -234,12 +234,23 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 // immutable spec, the current status, and the lane's roles and framing. The
 // trusted criterion envelope (#280) travels with it exactly as the legacy
 // executor receives it: the identical pinned set, operator-authored.
+//
+// A contribute-mode run carries its admitted objective in its source's own
+// context rather than the spec, so the run's owning adapter translates it into
+// the source-neutral input the goal renderer needs (#624). That decode is pure
+// durable state, so it is resolved before any API read and a run whose context
+// cannot be decoded terminalizes instead of launching a coordinator with no
+// objective.
 func (s *SecureControl) controlInvocation(ctx context.Context, run *courier.CoderRun) (executor.Invocation, error) {
+	contribution, err := launchContribution(s.Sources, run)
+	if err != nil {
+		return executor.Invocation{}, err
+	}
 	lane := &courier.LaneProfile{}
 	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Lane}, lane); err != nil {
 		return executor.Invocation{}, fmt.Errorf("secure topology: read lane profile %q: %w", run.Spec.Lane, err)
 	}
-	invocation, err := executor.NewInvocation(run, lane, topology.ControlWorkspacePath)
+	invocation, err := executor.NewInvocationWithContribution(run, lane, topology.ControlWorkspacePath, contribution)
 	if err != nil {
 		return executor.Invocation{}, err
 	}

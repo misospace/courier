@@ -404,6 +404,11 @@ func main() {
 		"manual": manual.New(diagnostics),
 		"adhoc":  adhoc.New(mgr.GetClient(), mgr.GetAPIReader()),
 	})
+	// A contribute run's objective is its source's own context, so each launch
+	// path resolves the owning adapter through this registry rather than
+	// decoding the context itself (#624). The registry is shared by pointer, so
+	// adapters registered below are visible to every consumer.
+	launcher.Sources = sources
 	if dispatchEnabled {
 		if strings.TrimSpace(dispatchBaseURL) == "" || strings.TrimSpace(dispatchAgentName) == "" {
 			setupLog.Error(fmt.Errorf("dispatch requires base URL and agent name"), "unable to configure Dispatch source")
@@ -643,6 +648,7 @@ func main() {
 		secure.Patcher = reconciler
 		secure.MaxRestarts = reconciler.MaxRestarts
 		secure.APIReader = mgr.GetAPIReader()
+		secure.Sources = sources
 		reconciler.Secure = secure
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
