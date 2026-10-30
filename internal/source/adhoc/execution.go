@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/executor"
@@ -102,6 +103,15 @@ func (a Adapter) ContributionExecution(run *courierv1alpha1.CoderRun) (executor.
 		return executor.ContributionExecution{}, fmt.Errorf(
 			"%w: source context goal is missing or blank", ErrInvalidExecutionContext)
 	}
+	// The goal travels verbatim into the coordinator's prompt and its
+	// container environment, so a control character there is malformed input
+	// rather than objective text: it would corrupt the goal's framing or break
+	// the coordinator's container at start, and no retry can repair it. Tab and
+	// newline stay legal — objectives are legitimately multi-line.
+	if containsUnsafeControl(payload.Goal) {
+		return executor.ContributionExecution{}, fmt.Errorf(
+			"%w: source context goal must not contain control characters or invalid utf-8", ErrInvalidExecutionContext)
+	}
 	baseRef := payload.BaseRef
 	if strings.TrimSpace(baseRef) == "" {
 		return executor.ContributionExecution{}, fmt.Errorf(
@@ -121,9 +131,32 @@ func (a Adapter) ContributionExecution(run *courierv1alpha1.CoderRun) (executor.
 		return executor.ContributionExecution{}, fmt.Errorf(
 			"%w: source context base ref must not start or end with /", ErrInvalidExecutionContext)
 	}
+	if containsUnsafeControl(baseRef) {
+		return executor.ContributionExecution{}, fmt.Errorf(
+			"%w: source context base ref must not contain control characters or invalid utf-8", ErrInvalidExecutionContext)
+	}
 
 	// The goal is returned byte-for-byte as stored: admission already
 	// trimmed it once, and the renderer must see exactly what was
 	// admitted so every relaunch renders the same goal.
 	return executor.ContributionExecution{Goal: payload.Goal, BaseRef: baseRef}, nil
+}
+
+// containsUnsafeControl reports text that cannot safely travel into a
+// coordinator prompt or a container environment: invalid UTF-8, or an ASCII
+// control character other than the tab and newline an objective may legitimately
+// contain.
+func containsUnsafeControl(s string) bool {
+	if !utf8.ValidString(s) {
+		return true
+	}
+	for _, r := range s {
+		if r == '\t' || r == '\n' {
+			continue
+		}
+		if r < 0x20 || r == 0x7f {
+			return true
+		}
+	}
+	return false
 }

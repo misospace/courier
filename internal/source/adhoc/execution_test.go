@@ -228,6 +228,16 @@ func TestContributionExecutionFailClosed(t *testing.T) {
 			wantReason: "goal is missing or blank",
 		},
 		{
+			name:       "goal-nul",
+			run:        contributeRun(t, fmt.Sprintf(`{"%s":{"goal":"a\u0000b","baseRef":"main"}}`, contextKey)),
+			wantReason: "goal must not contain control characters or invalid utf-8",
+		},
+		{
+			name:       "goal-control",
+			run:        contributeRun(t, fmt.Sprintf(`{"%s":{"goal":"a\u0001b","baseRef":"main"}}`, contextKey)),
+			wantReason: "goal must not contain control characters or invalid utf-8",
+		},
+		{
 			name:       "missing-base-ref",
 			run:        contributeRun(t, testContextJSON(t, contextPayload{Goal: "g"})),
 			wantReason: "base ref is missing or blank",
@@ -257,6 +267,11 @@ func TestContributionExecutionFailClosed(t *testing.T) {
 			run:        contributeRun(t, testContextJSON(t, contextPayload{Goal: "g", BaseRef: "main/"})),
 			wantReason: "must not start or end with /",
 		},
+		{
+			name:       "base-ref-control",
+			run:        contributeRun(t, fmt.Sprintf(`{"%s":{"goal":"g","baseRef":"main\u0001"}}`, contextKey)),
+			wantReason: "base ref must not contain control characters or invalid utf-8",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -269,6 +284,48 @@ func TestContributionExecutionFailClosed(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tc.wantReason) {
 				t.Fatalf("err = %q; want a reason containing %q", err, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestContributionExecutionAcceptsTabAndNewline pins the other side of the
+// control-character gate: tab and newline stay legal bytes in the goal, so a
+// legitimately multi-line objective decodes byte-for-byte instead of being
+// refused or silently rewritten. The JSON carries the characters as \n and
+// \t escapes, so the decode receives real control bytes.
+func TestContributionExecutionAcceptsTabAndNewline(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+		goal string
+	}{
+		{
+			name: "newline",
+			raw:  fmt.Sprintf(`{"%s":{"goal":"first line\nsecond line","baseRef":"main"}}`, contextKey),
+			goal: "first line\nsecond line",
+		},
+		{
+			name: "tab",
+			raw:  fmt.Sprintf(`{"%s":{"goal":"column one\tcolumn two","baseRef":"main"}}`, contextKey),
+			goal: "column one\tcolumn two",
+		},
+		{
+			name: "newline and tab",
+			raw:  fmt.Sprintf(`{"%s":{"goal":"first line\nindented\tsecond line","baseRef":"main"}}`, contextKey),
+			goal: "first line\nindented\tsecond line",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := newAdapter(nil).ContributionExecution(contributeRun(t, tc.raw))
+			if err != nil {
+				t.Fatalf("ContributionExecution = %v; want the %s goal accepted", err, tc.name)
+			}
+			if got.Goal != tc.goal {
+				t.Fatalf("Goal = %q; want the stored goal byte-for-byte %q", got.Goal, tc.goal)
+			}
+			if got.BaseRef != "main" {
+				t.Fatalf("BaseRef = %q; want %q", got.BaseRef, "main")
 			}
 		})
 	}

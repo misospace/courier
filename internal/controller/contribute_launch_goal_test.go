@@ -196,23 +196,29 @@ func TestSecureControlInvocationCarriesAdmittedGoal(t *testing.T) {
 }
 
 // TestContributeLaunchFailsClosedWithoutAdmittedContext pins that a contribute
-// run never launches a coordinator it cannot give an objective to: a durable
-// context the owning source cannot decode is permanent (the spec is immutable),
-// so it terminalizes NeedsHuman with the decode's own reason, and the generic
-// renderer refuses to invent one.
+// run never launches a coordinator it cannot give an objective to, and pins
+// which failures the reconciler treats as permanent: a context the owning
+// source refuses is immutable spec data, so it must be classified as a
+// human-fixable launch rejection (which terminalizes NeedsHuman and fences any
+// provisioned topology) rather than churned through claim and release forever.
+// A failure to reach an owning adapter at all stays retryable, because a later
+// deployment can wire it.
 func TestContributeLaunchFailsClosedWithoutAdmittedContext(t *testing.T) {
 	tests := []struct {
-		name     string
-		source   string
-		context  string
-		registry func(c client.Client) *SourceRegistry
+		name      string
+		source    string
+		context   string
+		permanent bool
+		registry  func(c client.Client) *SourceRegistry
 	}{
-		{name: "empty context", source: "adhoc", context: "", registry: contributeRegistry},
-		{name: "malformed context", source: "adhoc", context: `{"adhoc.courier.misospace.dev/v1":`, registry: contributeRegistry},
-		{name: "foreign context key", source: "adhoc", context: `{"other.example/v1":{"goal":"x","baseRef":"main"}}`, registry: contributeRegistry},
-		{name: "context without goal", source: "adhoc", context: `{"adhoc.courier.misospace.dev/v1":{"baseRef":"main"}}`, registry: contributeRegistry},
+		{name: "empty context", source: "adhoc", context: "", permanent: true, registry: contributeRegistry},
+		{name: "malformed context", source: "adhoc", context: `{"adhoc.courier.misospace.dev/v1":`, permanent: true, registry: contributeRegistry},
+		{name: "foreign context key", source: "adhoc", context: `{"other.example/v1":{"goal":"x","baseRef":"main"}}`, permanent: true, registry: contributeRegistry},
+		{name: "context without goal", source: "adhoc", context: `{"adhoc.courier.misospace.dev/v1":{"baseRef":"main"}}`, permanent: true, registry: contributeRegistry},
+		{name: "context with a control character", source: "adhoc", context: `{"adhoc.courier.misospace.dev/v1":{"goal":"x\u0001y","baseRef":"main"}}`, permanent: true, registry: contributeRegistry},
 		{name: "source without the surface", source: "manual", context: `{"goal":"x"}`, registry: contributeRegistry},
-		{name: "unwired source", source: "adhoc", context: `{"adhoc.courier.misospace.dev/v1":{"goal":"x","baseRef":"main"}}`, registry: func(client.Client) *SourceRegistry { return NewSourceRegistry(nil) }},
+		{name: "unregistered source", source: "cron", context: `{"goal":"x"}`, registry: contributeRegistry},
+		{name: "unwired registry", source: "adhoc", context: `{"adhoc.courier.misospace.dev/v1":{"goal":"x","baseRef":"main"}}`, registry: func(client.Client) *SourceRegistry { return NewSourceRegistry(nil) }},
 	}
 
 	for _, tc := range tests {
@@ -230,15 +236,26 @@ func TestContributeLaunchFailsClosedWithoutAdmittedContext(t *testing.T) {
 					Lane:          "local",
 				},
 			}
-			if _, err := launchContribution(tc.registry(c), run); err == nil {
+			_, err := launchContribution(tc.registry(c), run)
+			if err == nil {
 				t.Fatalf("launch accepted a contribute run with %s", tc.name)
-			} else {
-				var needsHuman *SecureNeedsHumanError
-				if !errors.As(err, &needsHuman) {
-					t.Fatalf("error = %v, want a permanent NeedsHuman rejection", err)
+			}
+			var needsHuman *SecureNeedsHumanError
+			if tc.permanent {
+				if !errors.As(err, &needsHuman) || needsHuman.Reason != contributionContextReason {
+					t.Fatalf("error = %v, want a permanent rejection with reason %q", err, contributionContextReason)
 				}
-				if needsHuman.Reason != contributionContextReason {
-					t.Fatalf("reason = %q, want %q", needsHuman.Reason, contributionContextReason)
+				// This is the reconciler's own gate: without it the run would
+				// release its claim and re-launch on every pass.
+				if classified := launchRejection(err); classified == nil || classified.Reason != contributionContextReason {
+					t.Fatalf("launchRejection(%v) = %+v, want the contribution-context verdict", err, classified)
+				}
+			} else {
+				if errors.As(err, &needsHuman) {
+					t.Fatalf("error = %v, want a retryable failure, not a permanent NeedsHuman verdict", err)
+				}
+				if classified := launchRejection(err); classified != nil {
+					t.Fatalf("launchRejection(%v) = %+v, want nil so the launch stays retryable", err, classified)
 				}
 			}
 			// The renderer cannot substitute a goal of its own.

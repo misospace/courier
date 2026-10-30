@@ -101,19 +101,27 @@ func (r *SourceRegistry) ContributionExecution(run *courierv1alpha1.CoderRun) (e
 
 // launchContribution resolves the contribution execution input one launch
 // renders into the coordinator goal, and is empty for every run that carries
-// its whole goal in the spec. A contribute run whose own source cannot supply
-// the input is permanent — the spec and its context are immutable — so it
-// terminalizes NeedsHuman with the decode's own reason rather than requeueing a
-// launch that can never succeed.
+// its whole goal in the spec.
+//
+// A refusal from the adapter owning the run is permanent: the context it
+// refused lives in the immutable spec, so the run terminalizes NeedsHuman with
+// that reason rather than relaunching without an objective. A failure to reach
+// an owning adapter at all — no registry wired, no adapter registered under the
+// run's source, a source that supplies no contribution surface — is reported as
+// an ordinary error, exactly as every other unresolved source is, because a
+// later deployment can wire it.
 func launchContribution(registry *SourceRegistry, run *courierv1alpha1.CoderRun) (executor.ContributionExecution, error) {
 	if run.Spec.Mode != courierv1alpha1.ModeContribute {
 		return executor.ContributionExecution{}, nil
 	}
 	contribution, err := registry.ContributionExecution(run)
-	if err != nil {
-		return executor.ContributionExecution{}, secureNeedsHuman(contributionContextReason, "%v", err)
+	if err == nil {
+		return contribution, nil
 	}
-	return contribution, nil
+	if errors.Is(err, ErrSourceRegistryRequired) || errors.Is(err, ErrUnknownSource) || errors.Is(err, ErrContributionContextUnsupported) {
+		return executor.ContributionExecution{}, err
+	}
+	return executor.ContributionExecution{}, secureNeedsHuman(contributionContextReason, "%v", err)
 }
 
 // HeadRef identifies the exact head of a pull request: the repository that

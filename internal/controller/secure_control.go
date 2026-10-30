@@ -102,12 +102,31 @@ func laneConfigRejection(err error) *SecureNeedsHumanError {
 }
 
 // launchRejection returns the permanent, human-fixable launch failure — a
-// terminal preflight verdict or a misconfigured lane — and nil otherwise.
+// terminal preflight verdict, a misconfigured lane, or a contribute run whose
+// own source refuses the admitted execution context — and nil otherwise.
 func launchRejection(err error) *SecureNeedsHumanError {
 	if permanent := terminalPreflightVerdict(err); permanent != nil {
 		return permanent
 	}
-	return laneConfigRejection(err)
+	if permanent := laneConfigRejection(err); permanent != nil {
+		return permanent
+	}
+	return contributionContextRejection(err)
+}
+
+// contributionContextRejection returns the permanent contribute-launch
+// rejection — the adapter owning the run decoded its own durable context and
+// refused it — and nil for every other launch failure. The context the decode
+// refused lives in the immutable spec, so requeueing cannot change it: the run
+// terminalizes NeedsHuman naming the decode failure rather than cycling claim
+// and release, and the secure path fences any topology it already provisioned
+// before terminalizing.
+func contributionContextRejection(err error) *SecureNeedsHumanError {
+	var permanent *SecureNeedsHumanError
+	if !errors.As(err, &permanent) || permanent.Reason != contributionContextReason {
+		return nil
+	}
+	return permanent
 }
 
 // ProviderFactory constructs the forge provider facets for one selected
