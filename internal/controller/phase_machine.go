@@ -24,11 +24,10 @@ var (
 	// so callers terminate NeedsHuman instead of cycling claim and release.
 	ErrHeadRepositoryGone = errors.New("coderun controller: pull request head repository is missing")
 	// ErrContributionContextUnsupported reports that the source owning a run
-	// cannot supply the execution input a contribute-mode run needs, either
-	// because the deployment wired no adapter for it or because that adapter
-	// does not decode contribution context. The condition is permanent for the
-	// run's immutable spec, so callers terminate NeedsHuman instead of
-	// relaunching a coordinator that can never be given an objective.
+	// supplies no contribution execution surface at all. It is reported as an
+	// ordinary error, like any other unresolved source, because a later
+	// deployment can wire an adapter that does; see launchContribution for what
+	// a contribute run treats as permanent.
 	ErrContributionContextUnsupported = errors.New("coderun controller: source does not supply a contribution execution context")
 )
 

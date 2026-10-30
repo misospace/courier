@@ -2567,14 +2567,20 @@ state alone — no source or forge contact — so resume and relaunch regenerate
 identical goal. The admitted goal is untrusted task data: it is pasted verbatim
 inside framing that names it data, never instructions, and it grants no
 repository authority, mutates no policy, selects no credential, and moves no
-publication target. The rendered goal is the only channel — `Invocation` →
+publication target. The source decode refuses ASCII control characters other
+than tab and newline, which would corrupt that framing or break the coordinator
+container at start. The rendered goal is the only channel — `Invocation` →
 `COURIER_GOAL` → coordinator — with no second prompt or environment field, and
 `InvocationFromEnv` accepts `contribute` with `COURIER_REF` exactly `0` where
 every other mode still requires a positive reference. A contribute run whose
-context its own source cannot decode is permanent, because the spec and its
-context are immutable, so the launch terminalizes `NeedsHuman` (reason
-`ContributionContext`) before any coordinator starts rather than launching one
-with no objective. A contribution pins no acceptance criteria, so its goal
+*owning adapter* refuses its durable context is permanent — that context lives in
+the immutable spec — so the launch terminalizes `NeedsHuman` (reason
+`ContributionContext`), fencing any topology the secure path already
+provisioned, rather than launching a coordinator with no objective. Reaching no
+owning adapter at all (no registry wired, no adapter registered under the run's
+source, a source that supplies no contribution surface) stays an ordinary
+retryable launch failure, because a later deployment can wire it. A contribution
+pins no acceptance criteria, so its goal
 carries no criterion-evidence grammar, and the base ref it states is task
 context only: publication stays bound to the base the broker's persisted policy
 pins (`PolicyFromRun`), which no model output can move.

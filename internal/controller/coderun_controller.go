@@ -996,16 +996,19 @@ func (r *CoderRunReconciler) terminateMissingHead(ctx context.Context, run *cour
 	return r.terminateNeedsHuman(ctx, run, adapter, item, &SecureNeedsHumanError{Reason: "HeadRepositoryGone", Detail: cause.Error()})
 }
 
-// secureLaunchFailure handles an error from LaunchSecure. The terminal
-// verdict classes — a rendered pod spec the API server refuses outright, and
-// a probe pod pinned to a node its name does not name — terminalize the run,
-// and fence the round first: a resumed launch reaches the launcher with a
-// live worker and a credentialed broker already provisioned, and a
-// NeedsHuman run is no longer observed and is reaped only after its retention
-// window, so a fence deferred past this reconcile would leave the untrusted
-// executor running and the broker holding credentials for all of it. A
-// ProbeIdentity verdict can only arise on a first pass, before any topology
-// pod exists, so its fence is a no-op riding the same branch. A fence
+// secureLaunchFailure handles an error from LaunchSecure. The permanent classes
+// launchRejection selects — a rendered pod spec the API server refuses outright,
+// a probe pod pinned to a node whose name it does not name, a lane whose sizing
+// could never launch, and a contribute run whose own source refuses the
+// execution context it stored — terminalize the run, and fence the round first:
+// a resumed launch reaches the launcher with a live worker and a credentialed
+// broker already provisioned, and a NeedsHuman run is no longer observed and is
+// reaped only after its retention window, so a fence deferred past this
+// reconcile would leave the untrusted executor running and the broker holding
+// credentials for all of it. A ProbeIdentity verdict can only arise on a first
+// pass, before any topology pod exists, so its fence is a no-op riding the same
+// branch, while a refused contribution context is raised after the worker and
+// broker exist and its fence is the real one. A fence
 // that fails does not terminalize: the claim is released and the next pass
 // retries the fence. Every other error keeps the launch path's transient
 // behaviour — the claim is released back to Pending — because a signal that
