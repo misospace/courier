@@ -345,6 +345,10 @@ func TestCheckWaiterOnFailedLaunchSeesNoReceipt(t *testing.T) {
 	// prepareSnapshot and must complete for the waiter to reach its claim.
 	// Both callers unpack, so both need a scripted tip echo.
 	worker.hangKinds = []string{"check"}
+	// The gated cancel holds the dispatcher's failed launch in flight: the
+	// waiter must reach its claim on the same active entry before the
+	// registry replaces the failed one, or it would dispatch fresh.
+	worker.cancelGate = make(chan struct{})
 	worker.ordinaryResults = []protocol.Result{
 		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "snap-tip"},
 		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "snap-tip"},
@@ -363,11 +367,18 @@ func TestCheckWaiterOnFailedLaunchSeesNoReceipt(t *testing.T) {
 	go func() {
 		resultB <- coordinator.runCheck(context.Background(), checkCall("go test ./..."), "", ToolResult{ToolCallID: "c-b", Name: toolCheck})
 	}()
+	// The waiter's unpack is its last I/O before its claim; once its
+	// dispatch is recorded, only local computation separates it from the
+	// claim, so a short margin makes the ordering deterministic while the
+	// gated cancel keeps the entry active.
+	awaitDispatchCount(t, worker, isWorkerUnpackTask, 2)
+	time.Sleep(100 * time.Millisecond)
 
 	// Cancelling the dispatching caller leaves its entry without a receipt:
 	// the waiter wakes to the fixed failed-launch notice, never a second
 	// dispatch, and the key stays rerunnable afterwards.
 	cancelA()
+	close(worker.cancelGate)
 	select {
 	case got := <-resultA:
 		if !got.IsError {
