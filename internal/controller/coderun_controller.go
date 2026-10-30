@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -201,6 +202,15 @@ type CoderRunReconciler struct {
 	// strict no-op ahead of any read or write. Empty means the
 	// backward-compatible single-controller default resolved by owns.
 	OwnedNamespaces []string
+
+	// obsMu guards obsLast, obsRetry, and obsDegraded, the process-local
+	// execution-observation memory of publishExecutionObservation (#633). All
+	// maps are lazily initialized: the reconciler is built as a struct literal,
+	// so they start nil and are created on first write.
+	obsMu       sync.Mutex
+	obsLast     map[string]observationMarker
+	obsRetry    map[string]observationRetry
+	obsDegraded map[string]bool
 }
 
 // metrics returns the run recorder to use, defaulting to the process-wide
@@ -259,6 +269,9 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	var run courierv1alpha1.CoderRun
 	if err := r.Get(ctx, req.NamespacedName, &run); err != nil {
+		if apierrors.IsNotFound(err) {
+			r.forgetExecutionObservation(req.NamespacedName)
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -280,6 +293,8 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	if !run.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil
 	}
+
+	r.publishExecutionObservation(ctx, &run)
 
 	// Evidence lifecycle runs for every non-deleting run ahead of the phase
 	// dispatch, so a terminal run the dispatch leaves untouched still has its

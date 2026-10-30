@@ -2964,6 +2964,55 @@ annotation re-publishes it once Dispatch accepts the signal. The contract
 change is tracked alongside #267; the source-neutral `blocked-external` lifecycle result and
 `BlockedExternal` phase in the operator are unchanged.
 
+### Execution observations
+
+Courier reports optional, source-neutral execution observations so a source can
+display live work without fabricating its own session, claim, or heartbeat rows
+(misospace/courier#633, companion misospace/dispatch#1495; neither release
+blocks the other). `source.ExecutionObserver` carries the contract:
+current-state upserts with the run's durable identity (UID), the source's work
+identity, mode, adapter name, observed state, and timestamp. States map the
+run's own phases only — running, verifying, awaiting-review, and the terminal
+family — so an observation never infers model progress from pod or process
+existence, and a stale or absent observation is unknown coverage at the source,
+never proof no execution exists.
+
+Reporting is non-authoritative best-effort observability: absence, rejection,
+or failure must not gate discovery, claim/admission, launch, status updates,
+publication, lifecycle settlement, recovery, capacity release, or retention,
+and the optional report joins no existing success or settlement gate. The
+controller publishes on state change (and re-publishes the current state after
+an operator restart, which converges because the source keys current state by
+run identity — the report is an upsert, and the wire's idempotency key only
+deduplicates byte-identical deliveries), under a per-attempt deadline and a
+per-run failure cooldown, with no queue, timer, or storage beyond a
+process-local last-reported marker bounded by the live-run set. A transient
+failure re-attempts on a later reconcile once the cooldown passes; it never
+requeues on its own, so a wedged observations endpoint can cost at most one
+bounded attempt per run per cooldown instead of one per reconcile. A terminal
+run that settles quietly may therefore miss a retry of a failed terminal
+observation — accepted under best-effort semantics; the source ages the last
+accepted state rather than treating absence as false.
+
+Mixed versions are negotiated, not lockstepped. A bare 404/405/501 on the
+observations route is proven version skew: the client latches the feature
+unsupported for the process, flips the `execution-observations` capability
+gauge, and short-circuits further reports without an HTTP round trip —
+re-probed by the next operator process after a peer upgrade. This latch trusts
+a companion-contract obligation: the route never reserves 404/405/501 for
+per-item reasons. 401/403, 429, and 5xx are never "unsupported": they stay
+distinct retryable classes and never trigger a fallback to weaker auth or
+another endpoint. An adapter without the seam reports the unsupported posture
+rather than imitating the observation through an ordinary lifecycle call. Old
+clients are unaffected: the route and its fields are additive, and an old
+Courier simply never sends, which a new Dispatch displays as unavailable
+coverage rather than an empty execution set. Sources fence primarily by state
+kind — terminal observations are never replaced by non-terminal ones — with
+`observedAt` ordering non-terminal changes and driving staleness display.
+Observations never carry claim receipts, fence tokens, lease data, secrets,
+prompts, or work output: telemetry must not claim source ownership, and the
+report travels under the existing authenticated agent identity.
+
 ## MCP surface
 
 The legacy coordinator pod currently receives forge access through MCP, alongside

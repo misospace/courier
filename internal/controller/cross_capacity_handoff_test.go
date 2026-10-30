@@ -130,6 +130,11 @@ func TestCrossCapacityHandoffCoolsExhaustedProfileOnly(t *testing.T) {
 					}
 					handoutAcks++
 					_ = json.NewEncoder(w).Encode(map[string]any{"acknowledged": true})
+				case r.Method == http.MethodPost && r.URL.Path == "/api/agent-work/observations":
+					// This fake predates the optional execution-observation
+					// route (#633): the 404 is negotiated absence, which must
+					// degrade only telemetry, never the handoff under test.
+					http.NotFound(w, r)
 				default:
 					t.Errorf("unexpected Dispatch request %s %s", r.Method, r.URL)
 					http.NotFound(w, r)
