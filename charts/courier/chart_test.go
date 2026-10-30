@@ -751,6 +751,90 @@ func TestChartRendersSecureTopologyConfiguration(t *testing.T) {
 	}
 }
 
+// TestChartRendersSecureBrokerBindingAuthority covers #640: the secure operator
+// must be able to create its per-run broker TokenReview ClusterRoleBinding under
+// API-server anti-escalation enforcement, which requires `bind` on the effective
+// broker ClusterRole. The grant is resourceNames-scoped to exactly that role —
+// never `*`, never `escalate` — and rendered only in secure mode, so a
+// legacy-only release gains no new authority.
+func TestChartRendersSecureBrokerBindingAuthority(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+	chartDir := copyChart(t)
+	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
+		t.Fatalf("configure chart repository: %v", err)
+	}
+	runHelm(t, chartDir, "dependency", "build")
+
+	secureArgs := func(extra ...string) []string {
+		args := []string{"template", "courier", ".",
+			"--namespace", "courier-native",
+			"--set", "secure.enabled=true",
+			"--set", "secure.runNamespace=courier-runs",
+			"--set", "secure.providers[0].name=github",
+			"--set", "secure.providers[0].type=github",
+			"--set", "secure.providers[0].endpoint=https://api.github.com/",
+			"--set", "secure.providers[0].serves[0]=misospace/*",
+			"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+			"--set", "secure.providers[0].credentials.forge-api.key=token",
+		}
+		return append(args, extra...)
+	}
+
+	const binderRole = "name: courier-broker-tokenreview-binder"
+
+	enabled := runHelm(t, chartDir, secureArgs()...)
+	role := findDocument(t, enabled, "kind: ClusterRole", binderRole)
+	for _, want := range []string{
+		"resources: [clusterroles]",
+		"verbs: [bind]",
+		"resourceNames: [courier-broker-tokenreview]",
+	} {
+		if !strings.Contains(role, want) {
+			t.Fatalf("secure broker binder ClusterRole is missing %q:\n%s", want, role)
+		}
+	}
+	// Anti-escalation must stay scoped: only the bind verb, no escalate, no
+	// wildcard resourceNames, and the grant must not widen the operator's
+	// existing clusterrolebindings rule.
+	if strings.Contains(role, "escalate") || strings.Contains(role, "[*]") {
+		t.Fatalf("secure broker binder must be scoped to bind on one role:\n%s", role)
+	}
+	binding := findDocument(t, enabled, "kind: ClusterRoleBinding", binderRole)
+	if !strings.Contains(binding, "kind: ServiceAccount") ||
+		!strings.Contains(binding, "name: courier\n") ||
+		!strings.Contains(binding, "namespace: courier-native") {
+		t.Fatalf("secure broker binder ClusterRoleBinding must bind the operator service account:\n%s", binding)
+	}
+
+	// A custom broker TokenReview ClusterRole name (#632) must re-scope the bind
+	// grant to that name and leave no reference to the historical default.
+	custom := runHelm(t, chartDir, secureArgs(
+		"--set", "secure.brokerTokenReviewClusterRole=courier-native-broker-tokenreview",
+	)...)
+	customRole := findDocument(t, custom, "kind: ClusterRole", binderRole)
+	if !strings.Contains(customRole, "resourceNames: [courier-native-broker-tokenreview]") {
+		t.Fatalf("custom broker role must re-scope the bind grant:\n%s", customRole)
+	}
+	if strings.Contains(customRole, "resourceNames: [courier-broker-tokenreview]") {
+		t.Fatalf("custom broker role must not keep a bind grant on the historical name:\n%s", customRole)
+	}
+
+	// Legacy-only mode renders neither the broker role nor its binder grant.
+	disabled := runHelm(t, chartDir, "template", "courier", ".")
+	for _, unwanted := range []string{
+		"broker-tokenreview-binder",
+		"verbs: [bind]",
+		"resources: [clusterroles]",
+		"courier-broker-tokenreview",
+	} {
+		if strings.Contains(disabled, unwanted) {
+			t.Fatalf("secure-disabled chart output unexpectedly contains %q", unwanted)
+		}
+	}
+}
+
 // TestChartRendersBootstrapLaneProfiles checks the #74 laneProfiles values
 // transport: the values serialize into a release ConfigMap that the manager
 // reads through the --bootstrap-lane-profiles-file seam, the rendered output
