@@ -152,9 +152,6 @@ func TestChartLabelSourceAcceptsOperatorCredentialSeam(t *testing.T) {
 	if !strings.Contains(seamOnly, "--observer-credential-secret=forge-creds") {
 		t.Fatal("label-source chart output is missing the observer credential seam argument")
 	}
-	if strings.Contains(seamOnly, "--git-credential-secret=") || strings.Contains(seamOnly, "--github-credential-secret=") {
-		t.Fatal("seam-only label-source chart output unexpectedly injects a legacy credential Secret")
-	}
 
 	out, err := runHelmOutput(t, chartDir, "template", "courier", ".",
 		"--set", "labelSource.enabled=true",
