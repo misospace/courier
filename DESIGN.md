@@ -486,6 +486,28 @@ through the same crashloop-bounded path pod loss uses, handing the run to a
 human at the ceiling with the terminated pod preserved as the ending's
 evidence.
 
+### Tracked check receipts
+
+Coordinator validation runs through a dedicated `check` tool on the same
+trusted execution surface as `shell`: the command dispatches over the signed
+protocol to the untrusted worker, and the result is the worker's own exit
+status and bounded output tails — never a summary grep, a shell pipeline
+masking the test exit, or a process-name observation. Each check is tracked
+by a receipt whose identity is the normalized command plus the workspace
+state it ran against: the snapshot tip and the applied bootstrap environment
+digest. A repeat request against unchanged state is served from the saved
+receipt — pass or fail — instead of re-executing; any state change, a lost
+receipt, or a concrete concern reruns. A cancelled or worker-failed dispatch
+is never reusable as evidence.
+
+While an equivalent check is in flight, a duplicate request waits on that
+dispatch instead of launching a second one. Receipts are bounded (evicted
+least-recently tracked first) and live only in the coordinator incarnation: a harness
+restart loses them and simply reruns, while the durable operation evidence
+stays in the existing status operations. The tool is coordinator-only —
+sub-agents keep plain shell — and plain `shell` remains the bypass for a
+deliberate fresh run.
+
 ### Coordinator pod process lifetime
 
 The legacy pod runs the executor directly as PID 1 — the pod sets `Command`,

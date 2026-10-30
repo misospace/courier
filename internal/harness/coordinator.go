@@ -30,6 +30,7 @@ type ForgeOps interface {
 // no publish and no merge tool: publication is not model-influenced.
 const (
 	toolShell       = "shell"
+	toolCheck       = "check"
 	toolDelegate    = "delegate"
 	toolCancelBrief = "cancel_brief"
 	toolForge       = "forge"
@@ -53,6 +54,7 @@ type Coordinator struct {
 	publisher Publisher
 	activity  ActivitySink
 	briefs    *BriefRegistry
+	checks    *checkRegistry
 	status    *StatusReporter
 	control   *ControlWatcher
 	// budgets is the context policy resolved per role at startup; a role
@@ -270,6 +272,7 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 		compactions:             config.Compactions,
 		bootstrapReceipts:       config.BootstrapReceipts,
 		briefs:                  NewBriefRegistry(),
+		checks:                  newCheckRegistry(),
 		status:                  config.Status,
 		control:                 config.Control,
 		workRefBeyondAnchor:     config.WorkRefBeyondAnchor,
@@ -704,6 +707,20 @@ func shellTool() ToolDef {
 	}
 }
 
+func checkTool() ToolDef {
+	return ToolDef{
+		Name:        toolCheck,
+		Description: "Run one shell command on the sandbox worker as a tracked check. When an identical command runs against an unchanged workspace state (snapshot tip and bootstrap environment), the saved receipt is returned instead of rerunning; state changes invalidate receipts automatically. Use the plain shell tool to bypass receipt reuse.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"command": map[string]any{"type": "string", "description": "The shell command to run as a tracked check."},
+			},
+			"required": []string{"command"},
+		},
+	}
+}
+
 func forgeTool() ToolDef {
 	return ToolDef{
 		Name:        toolForge,
@@ -723,7 +740,7 @@ func forgeTool() ToolDef {
 // offered: worker shell, delegation, cancellation, and — when the forge seam
 // is wired — broker forge reads. Publication is never a tool.
 func (c *Coordinator) coordinatorTools() []ToolDef {
-	tools := []ToolDef{shellTool()}
+	tools := []ToolDef{shellTool(), checkTool()}
 	tools = append(tools,
 		ToolDef{
 			Name:        toolDelegate,
@@ -780,6 +797,13 @@ func (c *Coordinator) runTool(ctx context.Context, call ToolCall, briefID string
 	switch call.Name {
 	case toolShell:
 		return c.runShell(ctx, call, briefID, result)
+	case toolCheck:
+		if subagent {
+			result.IsError = true
+			result.Content = "tracked checks are not available to sub-agents"
+			return result
+		}
+		return c.runCheck(ctx, call, briefID, result)
 	case toolDelegate:
 		if subagent {
 			result.IsError = true
