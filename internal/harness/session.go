@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 )
 
 // RoleCoordinator is the one role a lane must bind: the coordinator owns the
@@ -97,19 +99,35 @@ func (p ContextPolicy) forRole(role string) ContextBudgetInput {
 	}
 }
 
-// declaresRole answers whether the lane declared a usable context policy for
-// this role — the predicate that makes a role required at the capability gate:
-// a global fraction or reservation, a positive per-role ceiling, or a nonzero
-// per-role override of either. It is deliberately broader than "the lane named
-// this role": a global fraction covers every bound role without naming it, and
-// an override is a declaration because forRole honors it. An all-zero
-// per-role entry declares nothing — a config-shaped `roles: {coder: {}}` must
-// not read as a declared budget — so an undeclared lane is merely degraded and
-// never gated by a policy it never opted into.
-func (p ContextPolicy) declaresRole(role string) bool {
+// DeclaresRole answers whether the lane declared a usable context policy for
+// this role — the predicate that makes a role required at the capability gate
+// and that decides whether a role's resolution input may reach the
+// coordinator (#636): a global fraction or reservation, a positive per-role
+// ceiling, or a nonzero per-role override of either. It is deliberately
+// broader than "the lane named this role": a global fraction covers every
+// bound role without naming it, and an override is a declaration because
+// forRole honors it. An all-zero per-role entry declares nothing — a
+// config-shaped `roles: {coder: {}}` must not read as a declared budget — so
+// an undeclared lane is merely degraded and never gated by a policy it never
+// opted into.
+func (p ContextPolicy) DeclaresRole(role string) bool {
 	declared := p.Roles[role]
 	return p.CompactAtPercent != 0 || p.OutputReservation != 0 ||
 		declared.MaxInputTokens > 0 || declared.CompactAtPercent != 0 || declared.OutputReservation != 0
+}
+
+// BudgetInput builds one role's resolution input: the lane's declared policy
+// for the role with the gateway-verified input limit filled in. It is the
+// shared input (#636) the capability probe records and
+// CoordinatorConfig.ContextBudgets carries, so the same declared-plus-
+// verified values that decided capability health resolve the session's
+// budget — never a second gateway read that could disagree with the one the
+// gate decided on. The verified limit comes from the gateway, never from the
+// declaration.
+func (p ContextPolicy) BudgetInput(role string, probedMaxInputTokens int) ContextBudgetInput {
+	input := p.forRole(role)
+	input.ProbedMaxInputTokens = probedMaxInputTokens
+	return input
 }
 
 // RoleBudget resolves one role's context budget from the lane's declaration
@@ -124,16 +142,40 @@ func (p ContextPolicy) declaresRole(role string) bool {
 // the run cannot establish and an invalid declaration, is returned fail
 // closed.
 func (p ContextPolicy) RoleBudget(role string, probedMaxInputTokens int) (ContextBudget, error) {
-	input := p.forRole(role)
-	input.ProbedMaxInputTokens = probedMaxInputTokens
-	budget, err := ResolveContextBudget(input)
+	budget, err := ResolveContextBudget(p.BudgetInput(role, probedMaxInputTokens))
 	if err != nil {
-		if errors.Is(err, ErrNoContextCapacity) && !p.declaresRole(role) {
+		if errors.Is(err, ErrNoContextCapacity) && !p.DeclaresRole(role) {
 			return ContextBudget{}, nil
 		}
 		return ContextBudget{}, err
 	}
 	return budget, nil
+}
+
+// ContextPolicyFromLane converts the LaneProfile CRD's declared context
+// policy into the harness policy (#636). A nil CRD policy converts to the
+// zero harness policy: the lane declares nothing, no role is gated, and no
+// session compacts — the documented unbudgeted legacy behavior. Conversion
+// only, no validation: the CRD schema and the bootstrap normalizer bound the
+// declared values, and ResolveContextBudget fails closed on anything the
+// resolver cannot honor.
+func ContextPolicyFromLane(policy *courierv1alpha1.ContextPolicy) ContextPolicy {
+	if policy == nil {
+		return ContextPolicy{}
+	}
+	out := ContextPolicy{
+		CompactAtPercent:  policy.CompactAtPercent,
+		OutputReservation: policy.OutputReservation,
+		Roles:             make(map[string]RoleContextPolicy, len(policy.Roles)),
+	}
+	for role, declared := range policy.Roles {
+		out.Roles[role] = RoleContextPolicy{
+			MaxInputTokens:    declared.MaxInputTokens,
+			CompactAtPercent:  declared.CompactAtPercent,
+			OutputReservation: declared.OutputReservation,
+		}
+	}
+	return out
 }
 
 // ActivitySink receives earned-activity signals (HARNESS.md §6). A stream

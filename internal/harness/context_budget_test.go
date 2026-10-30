@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
+
+	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 )
 
 // The wiring proof for #296 (implementation child of #243): the gateway read
@@ -882,8 +885,17 @@ func TestContextBudgetOneReadPerModel(t *testing.T) {
 	}
 	for _, role := range []string{"coordinator", "coder"} {
 		capability, ok := findCapability(caps, "context-budget:"+role)
-		if !ok || capability.State != StateHealthy {
-			t.Fatalf("context-budget:%s = %+v, want healthy from the shared read", role, capability)
+		if !ok {
+			t.Fatalf("capability table = %+v", caps)
+		}
+		// #636: neither role is declared, so no budget is enforced for either
+		// — the shared read verified a window, and the table names it without
+		// claiming a healthy budget no session will carry.
+		if capability.State != StateUnavailable || capability.Required {
+			t.Fatalf("context-budget:%s = %+v, want unavailable and never required", role, capability)
+		}
+		if !strings.Contains(capability.Detail, "no budget is enforced") {
+			t.Fatalf("context-budget:%s detail = %q, want the not-enforced reason", role, capability.Detail)
 		}
 	}
 }
@@ -955,4 +967,287 @@ func TestContextBudgetUnboundDeclaredRoleIsNamed(t *testing.T) {
 		t.Fatalf("an unbound declared role must not fail the gate: %v", err)
 	}
 	assertShortBudgetDetails(t, caps)
+}
+
+// TestContextPolicyFromLane pins the CRD-to-harness conversion (#636): nil
+// converts to the zero policy (the unbudgeted legacy behavior), declared
+// values convert field for field, and the conversion copies — mutating the
+// result must never reach back into the CRD object the operator pinned.
+func TestContextPolicyFromLane(t *testing.T) {
+	if got := ContextPolicyFromLane(nil); got.CompactAtPercent != 0 || got.OutputReservation != 0 || len(got.Roles) != 0 {
+		t.Fatalf("nil CRD policy converted to %+v, want the zero policy", got)
+	}
+	declared := &courierv1alpha1.ContextPolicy{
+		CompactAtPercent:  60,
+		OutputReservation: 4096,
+		Roles: map[string]courierv1alpha1.ContextBudget{
+			"coordinator": {MaxInputTokens: 128000},
+			"coder":       {MaxInputTokens: 32000, CompactAtPercent: 50, OutputReservation: 2048},
+		},
+	}
+	got := ContextPolicyFromLane(declared)
+	want := ContextPolicy{
+		CompactAtPercent:  60,
+		OutputReservation: 4096,
+		Roles: map[string]RoleContextPolicy{
+			"coordinator": {MaxInputTokens: 128000},
+			"coder":       {MaxInputTokens: 32000, CompactAtPercent: 50, OutputReservation: 2048},
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("converted policy = %+v, want %+v", got, want)
+	}
+	got.Roles["coder"] = RoleContextPolicy{MaxInputTokens: 1}
+	if declared.Roles["coder"].MaxInputTokens != 32000 {
+		t.Fatalf("conversion aliases the CRD policy: %+v", declared.Roles)
+	}
+}
+
+// TestBudgetInputCarriesDeclaredAndVerified pins the shared resolution input
+// (#636): the lane's declared policy for the role with the gateway-verified
+// limit filled in — the exact input the probe records and
+// CoordinatorConfig.ContextBudgets carries.
+func TestBudgetInputCarriesDeclaredAndVerified(t *testing.T) {
+	policy := ContextPolicy{
+		CompactAtPercent:  60,
+		OutputReservation: 4096,
+		Roles:             map[string]RoleContextPolicy{"coder": {MaxInputTokens: 32000, CompactAtPercent: 50}},
+	}
+	input := policy.BudgetInput("coder", 64000)
+	want := ContextBudgetInput{
+		Role:                   "coder",
+		DeclaredMaxInputTokens: 32000,
+		ProbedMaxInputTokens:   64000,
+		CompactAtPercent:       50,
+		OutputReservation:      4096,
+	}
+	if !reflect.DeepEqual(input, want) {
+		t.Fatalf("BudgetInput = %+v, want %+v", input, want)
+	}
+	// An undeclared role still composes — the probe records bound roles the
+	// lane did not declare for, and the caller decides what to keep.
+	bare := policy.BudgetInput("reviewer", 0)
+	if bare.Role != "reviewer" || bare.CompactAtPercent != 60 || bare.OutputReservation != 4096 {
+		t.Fatalf("undeclared role input = %+v, want the lane defaults with a zero ceiling", bare)
+	}
+}
+
+// TestProbeRecordsBudgetInputsForTheCoordinator pins the gate-to-coordinator
+// coherence seam (#636): the probe hands every DECLARED bound role's
+// resolution input to OnContextBudget — declared policy plus the verified
+// limit — so the coordinator executes under exactly the limits the gate
+// verified, and an undeclared bound role is never recorded, so the caller
+// cannot gain a policy the lane never opted into.
+func TestProbeRecordsBudgetInputsForTheCoordinator(t *testing.T) {
+	gateway, _, cleanup := modelInfoGateway(t, servingModelInfo(
+		`{"data":[{"model_name":"test/coordinator","model_info":{"max_input_tokens":128000}}]}`))
+	defer cleanup()
+	deps := budgetProbeDeps(gateway)
+	deps.Context = ContextPolicy{Roles: map[string]RoleContextPolicy{"coordinator": {MaxInputTokens: 96000}}}
+	recorded := map[string]ContextBudgetInput{}
+	deps.OnContextBudget = func(role string, input ContextBudgetInput) {
+		recorded[role] = input
+	}
+
+	caps := ProbeCapabilities(context.Background(), deps)
+	if _, ok := recorded["coordinator"]; !ok {
+		t.Fatalf("the probe recorded no input for the declared coordinator role: %+v", recorded)
+	}
+	input := recorded["coordinator"]
+	if input.DeclaredMaxInputTokens != 96000 || input.ProbedMaxInputTokens != 128000 {
+		t.Fatalf("recorded input = %+v, want declared 96000 with the verified 128000", input)
+	}
+	// The recorded input resolves to the same budget the capability table
+	// reported: healthy at min(declared, verified).
+	budget, err := ResolveContextBudget(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if budget.State != StateHealthy || budget.EffectiveLimit != 96000 {
+		t.Fatalf("resolved budget = %+v, want healthy at 96000", budget)
+	}
+	capability, ok := findCapability(caps, "context-budget:coordinator")
+	if !ok || capability.State != StateHealthy {
+		t.Fatalf("capability = %+v, want healthy", capability)
+	}
+
+	// A nil callback records nothing and changes no probe behavior.
+	deps2 := budgetProbeDeps(gateway)
+	deps2.Context = deps.Context
+	caps2 := ProbeCapabilities(context.Background(), deps2)
+	if _, ok := findCapability(caps2, "context-budget:coordinator"); !ok {
+		t.Fatalf("capability table = %+v", caps2)
+	}
+}
+
+// TestProbeDeclinesAnUndeclaredRoleRecordsNothingAndNamesIt pins the
+// undeclared-role contract end to end (#636): a bound role the lane declares
+// nothing for is recorded by no budget even when the gateway verified a
+// window for its model, and the capability table reports the truth — no
+// budget is enforced, naming the verified window — so a healthy capability
+// is never paired with an unbounded session.
+func TestProbeDeclinesAnUndeclaredRoleRecordsNothingAndNamesIt(t *testing.T) {
+	gateway, _, cleanup := modelInfoGateway(t, servingModelInfo(
+		`{"data":[{"model_name":"test/coordinator","model_info":{"max_input_tokens":128000}}]}`))
+	defer cleanup()
+	deps := budgetProbeDeps(gateway)
+	recorded := map[string]ContextBudgetInput{}
+	deps.OnContextBudget = func(role string, input ContextBudgetInput) {
+		recorded[role] = input
+	}
+
+	caps := ProbeCapabilities(context.Background(), deps)
+	if len(recorded) != 0 {
+		t.Fatalf("undeclared roles recorded = %+v, want none", recorded)
+	}
+	capability, ok := findCapability(caps, "context-budget:coordinator")
+	if !ok {
+		t.Fatalf("capability table = %+v", caps)
+	}
+	if capability.State != StateUnavailable || capability.Required {
+		t.Fatalf("undeclared verified role = %+v, want unavailable and never required", capability)
+	}
+	if !strings.Contains(capability.Detail, "128000") || !strings.Contains(capability.Detail, "no budget is enforced") {
+		t.Fatalf("detail = %q, want it to name the verified window and the absent enforcement", capability.Detail)
+	}
+	if _, err := Gate(caps); err != nil {
+		t.Fatalf("an undeclared role must not gate the run: %v", err)
+	}
+	assertShortBudgetDetails(t, caps)
+}
+
+// TestProbeRecordsOverwriteAcrossRetryRounds pins the retry contract the
+// coordinator wiring relies on (#636): every probe round re-records every
+// declared role, so after a failed round followed by a passing one the
+// recorded inputs are the passing round's — a stale unverified input from a
+// failed round can never reach the coordinator.
+func TestProbeRecordsOverwriteAcrossRetryRounds(t *testing.T) {
+	deps := budgetProbeDeps(nil)
+	deps.Context = ContextPolicy{Roles: map[string]RoleContextPolicy{"coordinator": {MaxInputTokens: 96000}}}
+	recorded := map[string]ContextBudgetInput{}
+	deps.OnContextBudget = func(role string, input ContextBudgetInput) {
+		recorded[role] = input
+	}
+
+	// Round one: the gateway read fails, so the verified limit is zero.
+	deps.Gateway = nil
+	ProbeCapabilities(context.Background(), deps)
+	if recorded["coordinator"].ProbedMaxInputTokens != 0 {
+		t.Fatalf("round one recorded %+v, want an unverified input", recorded["coordinator"])
+	}
+	// Round two: the gateway answers, and the record must carry its read.
+	gateway, _, cleanup := modelInfoGateway(t, servingModelInfo(
+		`{"data":[{"model_name":"test/coordinator","model_info":{"max_input_tokens":128000}}]}`))
+	defer cleanup()
+	deps.Gateway = gateway
+	ProbeCapabilities(context.Background(), deps)
+	if recorded["coordinator"].ProbedMaxInputTokens != 128000 {
+		t.Fatalf("round two recorded %+v, want the passing round's verified limit", recorded["coordinator"])
+	}
+}
+
+// TestContextBudgetDefaultedLaneGatesEveryBoundRole pins the production
+// policy shape (#636): the CRD defaults compactAtPercent to 75 whenever a
+// context block exists, so a lane that declares only a coder ceiling
+// declares a usable policy for EVERY bound role — the coordinator runs
+// budgeted at the gateway-verified window, and its model-info read becomes a
+// required capability. An operator who caps one role has opted every role
+// into budget enforcement, and this test keeps that consequence visible.
+func TestContextBudgetDefaultedLaneGatesEveryBoundRole(t *testing.T) {
+	// The policy exactly as the API server stores it after defaulting.
+	stored := ContextPolicy{
+		CompactAtPercent: 75,
+		Roles:            map[string]RoleContextPolicy{"coder": {MaxInputTokens: 32000}},
+	}
+	gateway, _, cleanup := modelInfoGateway(t, servingModelInfo(
+		`{"data":[{"model_name":"test/coordinator","model_info":{"max_input_tokens":128000}},`+
+			`{"model_name":"test/coder","model_info":{"max_input_tokens":64000}}]}`))
+	defer cleanup()
+	deps := budgetProbeDeps(gateway)
+	deps.Context = stored
+	recorded := map[string]ContextBudgetInput{}
+	deps.OnContextBudget = func(role string, input ContextBudgetInput) {
+		recorded[role] = input
+	}
+
+	caps := ProbeCapabilities(context.Background(), deps)
+	for role, wantRequired := range map[string]bool{"coordinator": true, "coder": true} {
+		capability, ok := findCapability(caps, "context-budget:"+role)
+		if !ok {
+			t.Fatalf("capability table = %+v", caps)
+		}
+		if capability.State != StateHealthy || capability.Required != wantRequired {
+			t.Fatalf("context-budget:%s = %+v, want healthy and required=%v", role, capability, wantRequired)
+		}
+	}
+	// Both roles are budgeted: the coordinator at its verified window (no
+	// declared ceiling, global fraction applies), the coder at its declared
+	// ceiling.
+	coordinatorBudget, err := ResolveContextBudget(recorded["coordinator"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if coordinatorBudget.EffectiveLimit != 128000 || coordinatorBudget.CompactPoint != 128000*75/100 {
+		t.Fatalf("coordinator budget = %+v, want the verified window at the defaulted fraction", coordinatorBudget)
+	}
+	coderBudget, err := ResolveContextBudget(recorded["coder"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if coderBudget.EffectiveLimit != 32000 {
+		t.Fatalf("coder budget = %+v, want the declared ceiling", coderBudget)
+	}
+
+	// The same lane with a gateway that cannot verify the coordinator's
+	// model fails the gate closed: the defaulted fraction made the
+	// coordinator's model-info read a required capability.
+	broken, _, cleanupBroken := modelInfoGateway(t, servingModelInfo(
+		`{"data":[{"model_name":"test/coder","model_info":{"max_input_tokens":64000}}]}`))
+	defer cleanupBroken()
+	deps.Gateway = broken
+	recorded = map[string]ContextBudgetInput{}
+	deps.OnContextBudget = func(role string, input ContextBudgetInput) {
+		recorded[role] = input
+	}
+	brokenCaps := ProbeCapabilities(context.Background(), deps)
+	if _, err := Gate(brokenCaps); err == nil {
+		t.Fatal("a defaulted lane whose coordinator model cannot be verified must fail the gate closed")
+	}
+	assertShortBudgetDetails(t, brokenCaps)
+}
+
+// TestProbeRecordsUnverifiedDeclaredInput pins the declared-only path
+// (#636): when the gateway read fails, the recorded input still carries the
+// declared ceiling with a zero verified limit, so the coordinator resolves
+// configured — in use, never healthy — exactly as the capability table
+// reports.
+func TestProbeRecordsUnverifiedDeclaredInput(t *testing.T) {
+	gateway, _, cleanup := modelInfoGateway(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"message":"boom"}}`))
+	})
+	defer cleanup()
+	deps := budgetProbeDeps(gateway)
+	deps.Context = ContextPolicy{Roles: map[string]RoleContextPolicy{"coordinator": {MaxInputTokens: 128000}}}
+	recorded := map[string]ContextBudgetInput{}
+	deps.OnContextBudget = func(role string, input ContextBudgetInput) {
+		recorded[role] = input
+	}
+
+	caps := ProbeCapabilities(context.Background(), deps)
+	input := recorded["coordinator"]
+	if input.DeclaredMaxInputTokens != 128000 || input.ProbedMaxInputTokens != 0 {
+		t.Fatalf("recorded input = %+v, want the declared ceiling with no verified limit", input)
+	}
+	budget, err := ResolveContextBudget(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if budget.State != StateConfigured || budget.EffectiveLimit != 128000 {
+		t.Fatalf("resolved budget = %+v, want configured at the declared 128000", budget)
+	}
+	capability, _ := findCapability(caps, "context-budget:coordinator")
+	if capability.State != StateConfigured {
+		t.Fatalf("capability = %+v, want configured", capability)
+	}
 }

@@ -67,6 +67,21 @@ type Invocation struct {
 	// publication policy. The value is operator-authored from the persisted
 	// policy; a coordinator may read it but can never author it.
 	Criteria string
+	// Context carries the lane's declared context policy (#636): the
+	// per-role ceilings and overrides the LaneProfile pinned at admission.
+	// It is declarations only — internal/harness resolves the effective
+	// budget against the gateway-verified model input limit; nothing here
+	// is resolution. Nil when the lane declares no policy, which keeps the
+	// documented unbudgeted legacy behavior. The value travels in the
+	// run-context environment (COURIER_CONTEXT_JSON): within one control
+	// incarnation the pod env is fixed, so a restarted pod reconstructs the
+	// identical declared policy rather than re-reading the live
+	// LaneProfile. The pin is per incarnation, not per run: the operator
+	// renders a relaunch's pod env from the live LaneProfile, so an edit to
+	// the lane's context policy takes effect at the next control
+	// incarnation and never mid-incarnation. A coordinator may read the
+	// policy but can never author it.
+	Context *courierv1alpha1.ContextPolicy
 }
 
 // Command is a process command with no shell interpolation.
@@ -173,6 +188,7 @@ var (
 	ErrMissingRunName             = errors.New("executor: run name is required")
 	ErrMissingNamespace           = errors.New("executor: run namespace is required")
 	ErrMissingWorkspace           = errors.New("executor: workspace path is required")
+	ErrInvalidContextPolicy       = errors.New("executor: COURIER_CONTEXT_JSON is not a valid context policy")
 	ErrMissingCommandName         = errors.New("executor: command name is required")
 )
 
@@ -546,6 +562,7 @@ func NewInvocationWithContribution(run *courierv1alpha1.CoderRun, lane *courierv
 		Framing:   lane.Spec.Framing,
 		Workspace: workspace,
 		Debug:     run.Spec.Debug,
+		Context:   lane.Spec.Context.DeepCopy(),
 	}, nil
 }
 
@@ -578,6 +595,21 @@ func RunContextEnvironment(inv Invocation) []EnvVar {
 		{Name: "COURIER_WORKSPACE", Value: inv.Workspace},
 		{Name: "COURIER_LOG_LEVEL", Value: level},
 	}
+	// The lane's declared context policy travels beside the roles it
+	// budgets (#636), and only when a policy is pinned: absence is
+	// meaningful to the reconstruction boundary — an old invocation or a
+	// lane with no context keeps the documented unbudgeted behavior rather
+	// than an empty stand-in. As with the roles above, a marshal failure
+	// (unreachable for this declared-only shape) degrades to a value that
+	// reconstructs as "the lane declares nothing", never to a partially
+	// written policy.
+	if inv.Context != nil {
+		contextJSON, err := json.Marshal(inv.Context)
+		if err != nil {
+			contextJSON = []byte("{}")
+		}
+		values = append(values, EnvVar{Name: EnvContextPolicy, Value: string(contextJSON)})
+	}
 	// The pinned criterion envelope travels beside the run context it
 	// belongs to, but only when a set is pinned: fix-pr runs and
 	// pre-contract policies carry no envelope, so its absence is meaningful
@@ -597,6 +629,16 @@ func RunContextEnvironment(inv Invocation) []EnvVar {
 // operator's pod rendering (RunContextEnvironment) and the standalone
 // executor's config read name the same variable and cannot drift.
 const EnvCriteria = "COURIER_CRITERIA"
+
+// EnvContextPolicy is the trusted environment key carrying the lane's
+// declared context policy to a coordinator (#636): the LaneProfile's
+// spec.context declarations as operator-authored pod-env JSON. Exported so
+// the operator's pod rendering (RunContextEnvironment) and the native
+// control's reconstruction (InvocationFromEnv) name the same variable and
+// cannot drift. The value is declarations only; internal/harness resolves
+// them against gateway-verified limits, and a worker or model can never set
+// it.
+const EnvContextPolicy = "COURIER_CONTEXT_JSON"
 
 // Default git identity names used when a deployment configures none. A fresh
 // clone has no git identity, so the coordinator environment must always carry
@@ -804,6 +846,19 @@ func InvocationFromEnv(get func(string) string) (Invocation, error) {
 		if err := json.Unmarshal([]byte(rolesJSON), &inv.Roles); err != nil {
 			return Invocation{}, fmt.Errorf("executor: decode COURIER_ROLES_JSON: %w", err)
 		}
+	}
+	// The lane's declared context policy reconstructs like the roles it
+	// budgets (#636): present means parse-or-fail — a malformed policy is a
+	// configuration failure the control pod must fail closed on, never a
+	// session that silently runs unbudgeted — and absent means the lane
+	// declares no policy.
+	contextJSON := get(EnvContextPolicy)
+	if strings.TrimSpace(contextJSON) != "" {
+		var policy courierv1alpha1.ContextPolicy
+		if err := json.Unmarshal([]byte(contextJSON), &policy); err != nil {
+			return Invocation{}, fmt.Errorf("%w: %v", ErrInvalidContextPolicy, err)
+		}
+		inv.Context = &policy
 	}
 	switch {
 	case inv.RunName == "":
