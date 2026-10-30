@@ -497,14 +497,17 @@ func (c *cacheGrowthCluster) newCacheWith(t *testing.T, ctx context.Context, cfg
 	return cacheObj
 }
 
-// cachedClient builds the delegating client the manager hands out: reads of
-// structured objects go through the cache, writes go straight to the API
-// server.
-func (c *cacheGrowthCluster) cachedClient(t *testing.T, cfg *rest.Config, cacheObj cache.Cache) client.Client {
+// cachedClient builds a client over the given cache. With no disableFor it
+// reads every structured object through the cache — the pre-#647 manager
+// client, which the contrast test uses to reproduce the informer mechanism.
+// Passing cacheopts.UncachedReadObjects() reproduces the shipped manager
+// client, whose DisableFor reads the restricted kinds straight from the API
+// server so no informer can start for them even through this client.
+func (c *cacheGrowthCluster) cachedClient(t *testing.T, cfg *rest.Config, cacheObj cache.Cache, disableFor ...client.Object) client.Client {
 	t.Helper()
 	cached, err := client.New(cfg, client.Options{
 		Scheme: c.scheme,
-		Cache:  &client.CacheOptions{Reader: cacheObj},
+		Cache:  &client.CacheOptions{Reader: cacheObj, DisableFor: disableFor},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -541,7 +544,10 @@ func (c *cacheGrowthCluster) secureControl(t *testing.T, cfg *rest.Config, cache
 // secure provisioning path against a real API server: the passes must read
 // the kinds the chart denies watch as point reads, must start no informer
 // for them, and must leave the operator's memory flat while the cluster
-// holds a Secret population an informer would pull into it.
+// holds a Secret population an informer would pull into it. It runs against
+// the shipped manager client and, to keep the no-watch assertion sensitive
+// to routing rather than only to the DisableFor exclusion, against the same
+// cache without it.
 func TestSecureProvisioningKeepsRestrictedKindsOutOfTheCache(t *testing.T) {
 	if envtestClient == nil {
 		t.Skip("KUBEBUILDER_ASSETS is not set")
@@ -549,82 +555,106 @@ func TestSecureProvisioningKeepsRestrictedKindsOutOfTheCache(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cluster := newCacheGrowthCluster(t, ctx)
-	cacheObj := cluster.newCache(t, ctx, cacheopts.Options([]string{cacheGrowthRunNamespace}))
-	cached := cluster.cachedClient(t, cluster.config(cluster.recorder), cacheObj)
-	control := cluster.secureControl(t, cluster.config(cluster.recorder), cached)
 
-	_, policy, err := control.ResolveAdmission(ctx, cluster.run)
-	if err != nil {
-		t.Fatalf("ResolveAdmission: %v", err)
-	}
-	// The persisted policy is what the secure path re-selects the
-	// registration from.
-	cluster.run.Status.PublicationPolicy = policy
+	// The passes run against two client shapes. The shipped manager client
+	// (cacheopts.Options plus the DisableFor exclusion) measures the wiring
+	// as deployed. The same cache without the exclusion keeps the no-watch
+	// assertion sensitive to routing: DisableFor absorbs a read that drifts
+	// back onto the cached client, but without it such a regression starts
+	// an informer and its watch fails the assertion below. Together the
+	// shapes prove both the production client and the routing itself hold.
+	for _, shape := range []struct {
+		name       string
+		disableFor []client.Object
+	}{
+		{name: "shipped-manager-client", disableFor: cacheopts.UncachedReadObjects()},
+		{name: "cache-without-exclusion", disableFor: nil},
+	} {
+		t.Run(shape.name, func(t *testing.T) {
+			recorder := &requestRecorder{}
+			cfg := cluster.config(recorder)
+			// The cache shares the shape's recorder: a lazily started
+			// informer watches on the cache's transport, so the watch
+			// assertion below can only see it there.
+			cacheObj := cluster.newCacheWith(t, ctx, cfg, cacheopts.Options([]string{cacheGrowthRunNamespace}))
+			cached := cluster.cachedClient(t, cfg, cacheObj, shape.disableFor...)
+			control := cluster.secureControl(t, cfg, cached)
 
-	// Warm the transport so the measurement covers the provisioning passes
-	// and not the client's first connection.
-	warm := &corev1.Namespace{}
-	if err := control.reader().Get(ctx, types.NamespacedName{Name: cacheGrowthRunNamespace}, warm); err != nil {
-		t.Fatalf("warm-up read: %v", err)
-	}
+			_, policy, err := control.ResolveAdmission(ctx, cluster.run)
+			if err != nil {
+				t.Fatalf("ResolveAdmission: %v", err)
+			}
+			// The persisted policy is what the secure path re-selects the
+			// registration from.
+			cluster.run.Status.PublicationPolicy = policy
 
-	baseline := liveHeapBytes()
-	for pass := 0; pass < 3; pass++ {
-		if err := control.provisionStatic(ctx, cluster.run, policy); err != nil {
-			t.Fatalf("provisioning pass %d: %v", pass, err)
-		}
-		// The preflight read sites this change rerouted: a Namespace, a
-		// Service, a Secret, and a ServiceAccount, each read point-wise
-		// through the uncached reader.
-		if err := control.checkNamespaceBoundary(ctx); err != nil {
-			t.Fatalf("namespace boundary check, pass %d: %v", pass, err)
-		}
-		if _, err := control.cachePin(ctx); err != nil {
-			t.Fatalf("cache pin, pass %d: %v", pass, err)
-		}
-		if _, err := control.renderedWorkerPublicKey(ctx, cluster.run); err != nil {
-			t.Fatalf("worker public key, pass %d: %v", pass, err)
-		}
-		if _, err := control.serviceAccount(ctx, cluster.run, topology.ControlSAName(cluster.run.Name)); err != nil {
-			t.Fatalf("service account read, pass %d: %v", pass, err)
-		}
-		// A legitimate uncached collection read, like the live probe's
-		// cluster-wide Node List. It must not be reported as an informer:
-		// only a watch means the cache started holding the kind.
-		nodes := &corev1.NodeList{}
-		if err := control.reader().List(ctx, nodes); err != nil {
-			t.Fatalf("node list, pass %d: %v", pass, err)
-		}
-	}
-	after := liveHeapBytes()
-	growth := heapGrowth(baseline, after)
-	t.Logf("three provisioning passes changed the live heap by %d bytes (bounded growth %d) and issued %d Secret reads; the cluster holds %d bytes of Secrets",
-		int64(after)-int64(baseline), growth, cluster.recorder.counted("get", "secrets"), cacheGrowthSecretsBytes)
+			// Warm the transport so the measurement covers the provisioning
+			// passes and not the client's first connection.
+			warm := &corev1.Namespace{}
+			if err := control.reader().Get(ctx, types.NamespacedName{Name: cacheGrowthRunNamespace}, warm); err != nil {
+				t.Fatalf("warm-up read: %v", err)
+			}
 
-	// A watch is the informer's signature: an informer watches the kind it
-	// caches, and nothing else does — the uncached API reader never
-	// watches, so a collection read it issues is not an informer. A watch
-	// on a kind the cache does not inform therefore means an informer
-	// started for that kind and now holds every object of it in the
-	// operator's memory.
-	for _, call := range cluster.recorder.snapshot() {
-		if call.verb != "watch" {
-			continue
-		}
-		if cacheGrowthInformedKinds[call.resource] && call.namespace != "" {
-			// The production cache informs the watched namespaces only.
-			continue
-		}
-		t.Fatalf("provisioning issued a watch on %s: an informer for that kind started and holds every object of it in the operator's memory", call.resource)
-	}
-	// The passes must actually have read the restricted kinds, or the
-	// assertion above would pass vacuously.
-	if got := cluster.recorder.counted("get", "secrets"); got < 3 {
-		t.Fatalf("the provisioning passes read %d Secrets, want one per pass: the informer assertion would pass vacuously", got)
-	}
-	if growth > cacheGrowthHeapBound {
-		t.Fatalf("three provisioning passes grew the operator's live heap by %d bytes (bound %d) while the cluster holds %d bytes of Secrets: the passes must not cache them",
-			growth, cacheGrowthHeapBound, cacheGrowthSecretsBytes)
+			baseline := liveHeapBytes()
+			for pass := 0; pass < 3; pass++ {
+				if err := control.provisionStatic(ctx, cluster.run, policy); err != nil {
+					t.Fatalf("provisioning pass %d: %v", pass, err)
+				}
+				// The preflight read sites this change rerouted: a
+				// Namespace, a Service, a Secret, and a ServiceAccount,
+				// each read point-wise through the uncached reader.
+				if err := control.checkNamespaceBoundary(ctx); err != nil {
+					t.Fatalf("namespace boundary check, pass %d: %v", pass, err)
+				}
+				if _, err := control.cachePin(ctx); err != nil {
+					t.Fatalf("cache pin, pass %d: %v", pass, err)
+				}
+				if _, err := control.renderedWorkerPublicKey(ctx, cluster.run); err != nil {
+					t.Fatalf("worker public key, pass %d: %v", pass, err)
+				}
+				if _, err := control.serviceAccount(ctx, cluster.run, topology.ControlSAName(cluster.run.Name)); err != nil {
+					t.Fatalf("service account read, pass %d: %v", pass, err)
+				}
+				// A legitimate uncached collection read, like the live
+				// probe's cluster-wide Node List. It must not be reported
+				// as an informer: only a watch means the cache started
+				// holding the kind.
+				nodes := &corev1.NodeList{}
+				if err := control.reader().List(ctx, nodes); err != nil {
+					t.Fatalf("node list, pass %d: %v", pass, err)
+				}
+			}
+			after := liveHeapBytes()
+			growth := heapGrowth(baseline, after)
+			t.Logf("three provisioning passes changed the live heap by %d bytes (bounded growth %d) and issued %d Secret reads; the cluster holds %d bytes of Secrets",
+				int64(after)-int64(baseline), growth, recorder.counted("get", "secrets"), cacheGrowthSecretsBytes)
+
+			// A watch is the informer's signature: an informer watches the
+			// kind it caches, and nothing else does — the uncached API
+			// reader never watches, so a collection read it issues is not
+			// an informer. A watch on a kind the cache does not inform
+			// therefore means an informer started for that kind and now
+			// holds every object of it in the operator's memory.
+			for _, call := range recorder.snapshot() {
+				if call.verb != "watch" {
+					continue
+				}
+				if cacheGrowthInformedKinds[call.resource] && call.namespace != "" {
+					// The production cache informs the watched namespaces only.
+					continue
+				}
+				t.Fatalf("provisioning issued a watch on %s: an informer for that kind started and holds every object of it in the operator's memory", call.resource)
+			}
+			// The passes must actually have read the restricted kinds, or
+			// the assertion above would pass vacuously.
+			if got := recorder.counted("get", "secrets"); got < 3 {
+				t.Fatalf("the provisioning passes read %d Secrets, want one per pass: the informer assertion would pass vacuously", got)
+			}
+			if growth > cacheGrowthHeapBound {
+				t.Fatalf("three provisioning passes grew the operator's live heap by %d bytes (bound %d) while the cluster holds %d bytes of Secrets: the passes must not cache them",
+					growth, cacheGrowthHeapBound, cacheGrowthSecretsBytes)
+			}
+		})
 	}
 }
 
@@ -644,8 +674,11 @@ func TestCachedRestrictedKindReadPullsSecretsIntoTheCache(t *testing.T) {
 	defer cancel()
 	cluster := newCacheGrowthCluster(t, ctx)
 
-	// The pre-change cache configuration: no namespace bound, so an
-	// accidental Secret informer lists the whole cluster.
+	// The pre-change client and cache: no DisableFor for the restricted
+	// kinds, and no namespace bound, so a cached read of a restricted kind
+	// starts an informer that lists the whole cluster. This is the wiring
+	// the production client no longer has; the contrast exists to show the
+	// mechanism the routing and DisableFor together remove.
 	unboundedRecorder := &requestRecorder{}
 	unboundedCfg := cluster.config(unboundedRecorder)
 	unbounded := cluster.newCacheWith(t, ctx, unboundedCfg, cache.Options{})

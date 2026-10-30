@@ -109,7 +109,7 @@ func (s *SecureControl) checkDeploymentPreconditions(ctx context.Context) error 
 // restricted admission on the run namespace cannot run secure mode.
 func (s *SecureControl) checkNamespaceBoundary(ctx context.Context) error {
 	namespace := &corev1.Namespace{}
-	if err := s.Client.Get(ctx, types.NamespacedName{Name: s.Config.RunNamespace}, namespace); err != nil {
+	if err := s.reader().Get(ctx, types.NamespacedName{Name: s.Config.RunNamespace}, namespace); err != nil {
 		return fmt.Errorf("secure preflight: read run namespace: %w", err)
 	}
 	labels := namespace.Labels
@@ -214,7 +214,7 @@ func operatorAccessReviews() []accessReview {
 func (s *SecureControl) checkBrokerRBAC(ctx context.Context, run *courier.CoderRun) error {
 	role := topology.BrokerRole(run)
 	live := role.DeepCopy()
-	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: role.Name}, live); err != nil {
+	if err := s.reader().Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: role.Name}, live); err != nil {
 		return fmt.Errorf("secure preflight: read broker Role: %w", err)
 	}
 	if !reflect.DeepEqual(live.Rules, role.Rules) {

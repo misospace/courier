@@ -2397,7 +2397,12 @@ Services, ServiceAccounts, NetworkPolicies, and the RBAC objects, get and
 list for Nodes, and get alone for Namespaces. A read of any other kind
 through the cached client would therefore lazily start an informer that can
 never watch — its initial list pulls every object it listed into the
-operator's memory, and it relists forever. `DefaultNamespaces` bounds such
+operator's memory, and it relists forever. The manager's client excludes the
+get/list-only kinds from cached reads (`cacheopts.UncachedReadObjects`,
+#647), so such a read is served straight from the API server even without
+the routing; routing the secure path through the uncached reader keeps it
+correct independently of that exclusion, and each is pinned by its own test.
+`DefaultNamespaces` bounds such
 an accidental informer for a namespaced kind to the watched namespaces; a
 cluster-scoped kind (Node, Namespace) stays cluster-wide, which is why the
 live-probe Node List goes through the uncached reader. Writes stay on the

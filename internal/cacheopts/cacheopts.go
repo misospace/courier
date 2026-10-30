@@ -1,4 +1,5 @@
-// Package cacheopts builds the manager's informer-cache configuration.
+// Package cacheopts builds the manager's informer-cache and client read
+// configuration.
 //
 // The configuration lives here rather than in the manager's entrypoint so
 // the controller tests can exercise the same cache the manager runs: the
@@ -9,6 +10,7 @@ package cacheopts
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -51,5 +53,29 @@ func Options(watched []string) cache.Options {
 			&courierv1alpha1.LaneProfile{}: byNamespace,
 			&corev1.Pod{}:                  byNamespace,
 		},
+	}
+}
+
+// UncachedReadObjects lists the kinds the manager's client must read directly
+// from the API server rather than through the informer cache. The chart
+// grants the operator watch only on CoderRun, LaneProfile and Pod; every
+// kind below is point-read by secure admission, preflight or provisioning —
+// a Get by name, or a single List — and the chart grants it get/list only.
+// Reading such a kind through the cache would lazily start a cluster-scoped
+// informer needing list+watch that authorization refuses, so the first
+// credential or preflight read wedges on a sync that can never complete
+// (#641). Disabling the cache for a kind aligns the client's read path with
+// the least-privilege grant the chart actually ships: the read needs only the
+// verb that is already granted, and no cluster-wide watch is added. A kind
+// the operator newly reads by name must join this set (or the watchable
+// cache); otherwise a future provisioning step re-opens the same wedge.
+func UncachedReadObjects() []client.Object {
+	return []client.Object{
+		&corev1.Secret{},
+		&corev1.Service{},
+		&corev1.ServiceAccount{},
+		&corev1.Namespace{},
+		&corev1.Node{},
+		&rbacv1.Role{},
 	}
 }

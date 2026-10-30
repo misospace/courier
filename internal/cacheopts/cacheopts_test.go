@@ -44,3 +44,42 @@ func TestOptionsScopeRunKinds(t *testing.T) {
 		}
 	}
 }
+
+// TestUncachedReadObjectsCoverNoWatchKinds guards the invariant that aligns
+// the manager client's reads with the shipped chart RBAC (#641): every kind
+// read by-name during secure admission, preflight or provisioning must be
+// excluded from the informer cache (the chart grants those kinds get/list but
+// not watch), while the three kinds the chart does grant watch on must stay
+// cached and out of the uncached set.
+func TestUncachedReadObjectsCoverNoWatchKinds(t *testing.T) {
+	// Kinds the chart grants get/list but never watch, all point-read by the
+	// secure path. A read of any of these through the cache starts a forbidden
+	// cluster-wide informer and wedges, so each must appear here.
+	wantUncached := map[string]bool{
+		"Secret":         false,
+		"Service":        false,
+		"ServiceAccount": false,
+		"Namespace":      false,
+		"Node":           false,
+		"Role":           false,
+	}
+	// Kinds the chart grants watch on and the cache legitimately holds. They
+	// must never be forced uncached: doing so would drop the watch-driven
+	// reconciliation that wake-on-event correctness depends on.
+	watched := map[string]bool{"CoderRun": true, "LaneProfile": true, "Pod": true}
+	for _, object := range UncachedReadObjects() {
+		kind := reflect.TypeOf(object).Elem().Name()
+		if watched[kind] {
+			t.Fatalf("%s is watched and cached but also listed uncached; the cache and uncached-read sets must stay disjoint", kind)
+		}
+		if _, ok := wantUncached[kind]; !ok {
+			t.Fatalf("unexpected uncached kind %s; only chart get/list-only kinds read by the secure path belong here", kind)
+		}
+		wantUncached[kind] = true
+	}
+	for kind, seen := range wantUncached {
+		if !seen {
+			t.Fatalf("kind %s is read by-name on the secure path but is not disabled from the cache; its first read would wedge a forbidden informer", kind)
+		}
+	}
+}
