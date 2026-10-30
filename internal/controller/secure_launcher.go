@@ -79,7 +79,7 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := s.Preflight(ctx, run, policy, relaunch, spec.resources, spec.workerImage); err != nil {
+	if err := s.preflight(ctx, run, policy, relaunch, spec.resources, spec.workerImage); err != nil {
 		return ctrl.Result{}, err
 	}
 

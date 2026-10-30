@@ -43,24 +43,26 @@ type probeOutcome struct {
 	Got  string `json:"got"`
 }
 
-// Preflight runs the secure-mode preflight for one run. It assumes the static
+// preflight runs the secure-mode preflight for one run. It assumes the static
 // topology objects (SAs, RBAC, secrets, services, policies) are already
 // provisioned, and that the deployment-level facts that do not depend on them —
 // the operator's own grants and the dedicated run namespace's restricted Pod
 // Security label — were already proven by the launch path before it created
-// anything (checkDeploymentPreconditions). relaunch abbreviates the check:
-// replacement launches re-verify the static guarantees but do not repeat the
-// multi-node live probes, which ran before the first workload exposure.
-// resources and workerImage are the lane-resolved values the caller already
-// holds for this launch pass, so the dry-run proof and the pods created
-// afterwards are the same artifacts. The proof carries the probe pod only on a
-// pass that will create probes live, so a deployment with no probe image never
-// proves — and is never failed by — a spec it will not create.
+// anything (checkDeploymentPreconditions). The method is unexported so that
+// proof cannot be skipped: the only caller is the launch path, which proves
+// those facts first. relaunch abbreviates the check: replacement launches
+// re-verify the static guarantees but do not repeat the multi-node live
+// probes, which ran before the first workload exposure. resources and
+// workerImage are the lane-resolved values the caller already holds for this
+// launch pass, so the dry-run proof and the pods created afterwards are the
+// same artifacts. The proof carries the probe pod only on a pass that will
+// create probes live, so a deployment with no probe image never proves — and
+// is never failed by — a spec it will not create.
 //
 // Permanent deployment misconfiguration returns a *SecureNeedsHumanError;
 // transient API or probe failures return an ordinary error so the run requeues
 // without launching.
-func (s *SecureControl) Preflight(ctx context.Context, run *courier.CoderRun, policy *courier.PublicationPolicy, relaunch bool, resources corev1.ResourceRequirements, workerImage string) error {
+func (s *SecureControl) preflight(ctx context.Context, run *courier.CoderRun, policy *courier.PublicationPolicy, relaunch bool, resources corev1.ResourceRequirements, workerImage string) error {
 	if err := s.checkBrokerRBAC(ctx, run); err != nil {
 		return err
 	}
@@ -244,9 +246,22 @@ func (s *SecureControl) selfSubjectAccessReview(ctx context.Context, review acce
 		},
 	}, metav1.CreateOptions{})
 	if err != nil {
-		return false, err
+		return false, s.accessReviewError(err, "self subject access reviews")
 	}
 	return sar.Status.Allowed && !sar.Status.Denied, nil
+}
+
+// accessReviewError classifies a failure to ask the API server an access
+// question. A refusal is a deployment misconfiguration the operator must fix —
+// the operator cannot even ask — so it is a verdict the retry gate can bound,
+// not an ordinary transient error the design retries as fast as the API server
+// allowed.
+func (s *SecureControl) accessReviewError(err error, resource string) error {
+	if apierrors.IsForbidden(err) {
+		return secureNeedsHuman("OperatorRBAC",
+			"the operator cannot create %s: %v", resource, err)
+	}
+	return err
 }
 
 func (s *SecureControl) subjectAccessReviewAs(ctx context.Context, serviceAccount string, review accessReview) (bool, error) {
@@ -266,7 +281,7 @@ func (s *SecureControl) subjectAccessReviewAs(ctx context.Context, serviceAccoun
 		},
 	}, metav1.CreateOptions{})
 	if err != nil {
-		return false, err
+		return false, s.accessReviewError(err, "subject access reviews")
 	}
 	return sar.Status.Allowed && !sar.Status.Denied, nil
 }

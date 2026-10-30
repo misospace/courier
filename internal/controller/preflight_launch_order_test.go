@@ -7,8 +7,10 @@ import (
 
 	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	fakek8s "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -86,5 +88,29 @@ func TestLaunchSecureProvesOperatorGrantsBeforeProvisioning(t *testing.T) {
 	}
 	if len(serviceAccounts.Items) != 0 {
 		t.Fatalf("service accounts = %#v, want the topology left unprovisioned", serviceAccounts.Items)
+	}
+}
+
+// TestCheckOperatorAccessForbiddenIsAVerdict pins the last hole in the
+// operator-grant proof: the operator needs a grant to ask the access-review
+// question at all, and a deployment that lacks it cannot be told apart from a
+// transient failure by the error alone. A refusal is a deployment
+// misconfiguration the operator must fix, so it must arrive as the verdict the
+// retry gate bounds rather than as an ordinary error the design retries as fast
+// as the API server allowed.
+func TestCheckOperatorAccessForbiddenIsAVerdict(t *testing.T) {
+	control, _ := secureControl(t)
+	forbidden := fakek8s.NewSimpleClientset()
+	forbidden.Fake.PrependReactor("create", "selfsubjectaccessreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(
+			schema.GroupResource{Group: "authorization.k8s.io", Resource: "selfsubjectaccessreviews"},
+			"", errors.New("no grant"))
+	})
+	control.Config.Kubernetes = forbidden
+
+	err := control.checkOperatorAccess(context.Background())
+	var permanent *SecureNeedsHumanError
+	if !errors.As(err, &permanent) || permanent.Reason != "OperatorRBAC" {
+		t.Fatalf("checkOperatorAccess error = %v, want an OperatorRBAC verdict", err)
 	}
 }
