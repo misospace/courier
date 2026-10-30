@@ -254,8 +254,9 @@ controllers:
         #                               --github-credential-secret for operator
         #                               observation and is never injected into
         #                               coordinator pods (#638)
-        #   --observer-credential-key   Optional key within it; empty falls
-        #                               back to --github-token-key,
+        #   --observer-credential-key   Optional key within it; requires
+        #                               --observer-credential-secret; empty
+        #                               falls back to --github-token-key,
         #                               --git-token-key, or token
         #   --executor-environment-secret
         #                               Secret exposed to coordinator pods for

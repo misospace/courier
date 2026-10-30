@@ -324,6 +324,7 @@ func TestResolveOperatorForgeCredential(t *testing.T) {
 		gitKey         string
 		wantSecret     string
 		wantKey        string
+		wantErr        bool
 	}{
 		{
 			name:           "observer seam wins over legacy flags",
@@ -360,6 +361,14 @@ func TestResolveOperatorForgeCredential(t *testing.T) {
 			name: "nothing configured stays empty",
 		},
 		{
+			name:         "observer key without observer secret is rejected",
+			observerKey:  "api",
+			githubSecret: "courier-github-api",
+			githubKey:    "token",
+			gitSecret:    "courier-github",
+			wantErr:      true,
+		},
+		{
 			name:           "whitespace-only seam falls through",
 			observerSecret: "  ",
 			gitSecret:      "courier-github",
@@ -368,7 +377,16 @@ func TestResolveOperatorForgeCredential(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			secret, key := resolveOperatorForgeCredential(test.observerSecret, test.observerKey, test.githubSecret, test.githubKey, test.gitSecret, test.gitKey)
+			secret, key, err := resolveOperatorForgeCredential(test.observerSecret, test.observerKey, test.githubSecret, test.githubKey, test.gitSecret, test.gitKey)
+			if test.wantErr {
+				if err == nil {
+					t.Fatal("an observer key without an observer secret must fail startup")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveOperatorForgeCredential: %v", err)
+			}
 			if secret != test.wantSecret || key != test.wantKey {
 				t.Fatalf("resolveOperatorForgeCredential() = (%q, %q), want (%q, %q)", secret, key, test.wantSecret, test.wantKey)
 			}
@@ -397,7 +415,10 @@ func TestOperatorCredentialSeamResolvesSecureObserver(t *testing.T) {
 	).Build()
 	ctx := context.Background()
 
-	secret, key := resolveOperatorForgeCredential("forge-creds", "", "", "", "", "")
+	secret, key, err := resolveOperatorForgeCredential("forge-creds", "", "", "", "", "")
+	if err != nil {
+		t.Fatalf("resolveOperatorForgeCredential: %v", err)
+	}
 	token, err := loadGitHubToken(ctx, reader, "courier-system", secret, key)
 	if err != nil {
 		t.Fatalf("loadGitHubToken: %v", err)
@@ -413,7 +434,10 @@ func TestOperatorCredentialSeamResolvesSecureObserver(t *testing.T) {
 		t.Fatal("clearing the legacy credential flags left secure mode without an observer credential")
 	}
 
-	secret, key = resolveOperatorForgeCredential("", "", "", "", "courier-github", "")
+	secret, key, err = resolveOperatorForgeCredential("", "", "", "", "courier-github", "")
+	if err != nil {
+		t.Fatalf("resolveOperatorForgeCredential legacy fallback: %v", err)
+	}
 	token, err = loadGitHubToken(ctx, reader, "courier-system", secret, key)
 	if err != nil {
 		t.Fatalf("loadGitHubToken legacy fallback: %v", err)

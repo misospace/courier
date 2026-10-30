@@ -131,7 +131,7 @@ func main() {
 	flag.StringVar(&githubCredentialSecret, "github-credential-secret", "", "Optional Secret containing the GitHub API token; empty falls back to --git-credential-secret.")
 	flag.StringVar(&githubTokenKey, "github-token-key", "", "Optional key in the GitHub API credential Secret; empty falls back to --git-token-key or token.")
 	flag.StringVar(&observerCredentialSecret, "observer-credential-secret", "", "Optional Secret carrying the trusted operator's own forge credential; when set it wins over --github-credential-secret for operator observation and is never injected into coordinator pods (#638).")
-	flag.StringVar(&observerCredentialKey, "observer-credential-key", "", "Optional key in the observer credential Secret; empty falls back to --github-token-key, --git-token-key, or token.")
+	flag.StringVar(&observerCredentialKey, "observer-credential-key", "", "Optional key in the observer credential Secret; requires --observer-credential-secret; empty falls back to --github-token-key, --git-token-key, or token.")
 	flag.StringVar(&executorEnvironmentSecret, "executor-environment-secret", "", "Optional Secret exposed as coordinator environment variables for model/provider configuration.")
 	flag.StringVar(&gitAuthorName, "git-author-name", defaults.Git.AuthorName, "Git author name rendered into operator-created coordinator pods; empty falls back to the explicit default. Separate from any forge authentication identity (#317).")
 	flag.StringVar(&gitAuthorEmail, "git-author-email", defaults.Git.AuthorEmail, "Git author email rendered into operator-created coordinator pods; empty falls back to the explicit default. Forge attribution requires an account-associated email (#317).")
@@ -376,10 +376,14 @@ func main() {
 	// observer-only seam wins over the legacy flags, so a secure deployment
 	// can bind one Secret to one upstream credential without that Secret
 	// being the legacy pod-injection Secret (#638).
-	operatorCredentialSecret, operatorCredentialKey := resolveOperatorForgeCredential(
+	operatorCredentialSecret, operatorCredentialKey, err := resolveOperatorForgeCredential(
 		observerCredentialSecret, observerCredentialKey,
 		githubCredentialSecret, githubTokenKey,
 		gitCredentialSecret, gitTokenKey)
+	if err != nil {
+		setupLog.Error(err, "unable to configure the operator forge credential")
+		os.Exit(1)
+	}
 
 	githubObserver, err := githubObserver(startupCtx, mgr.GetAPIReader(), os.Getenv("POD_NAMESPACE"), operatorCredentialSecret, operatorCredentialKey, forgeRegistry)
 	if err != nil {
@@ -969,10 +973,14 @@ func githubObserver(ctx context.Context, reader client.Reader, namespace, creden
 // operator reads its own forge credential from. The observer-only seam wins
 // over the legacy flags; the legacy pair-fallback chain
 // (--github-credential-secret then --git-credential-secret, and the matching
-// token-key chain) is unchanged. The seam is never carried onto
-// executor.PodConfig, so a Secret named only there is structurally absent
-// from legacy and model-controlled pod injection (#638).
-func resolveOperatorForgeCredential(observerSecret, observerKey, githubSecret, githubKey, gitSecret, gitKey string) (secret, key string) {
+// token-key chain) is unchanged. The seam is atomic: a key without a seam
+// Secret would silently re-key a legacy Secret, so it is rejected. The seam
+// is never carried onto executor.PodConfig, so a Secret named only there is
+// structurally absent from legacy and model-controlled pod injection (#638).
+func resolveOperatorForgeCredential(observerSecret, observerKey, githubSecret, githubKey, gitSecret, gitKey string) (secret, key string, err error) {
+	if strings.TrimSpace(observerKey) != "" && strings.TrimSpace(observerSecret) == "" {
+		return "", "", fmt.Errorf("--observer-credential-key requires --observer-credential-secret")
+	}
 	secret = strings.TrimSpace(observerSecret)
 	if secret == "" {
 		secret = strings.TrimSpace(githubSecret)
@@ -987,7 +995,7 @@ func resolveOperatorForgeCredential(observerSecret, observerKey, githubSecret, g
 	if key == "" {
 		key = strings.TrimSpace(gitKey)
 	}
-	return secret, key
+	return secret, key, nil
 }
 
 // loadGitHubToken reads the resolved operator forge credential from the named
