@@ -279,50 +279,75 @@ func TestResolveDispatchBindingsBoundsTheBareConnectorIdentity(t *testing.T) {
 	}
 }
 
-func TestBuildSecureControlRejectsTaintedLegacyCredential(t *testing.T) {
-	registryFile := filepath.Join(t.TempDir(), "providers.json")
-	providers := `{"providers":[{"name":"github","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"courier-github","key":"token"}},"serves":["*"]}]}`
-	if err := os.WriteFile(registryFile, []byte(providers), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	_, err := buildSecureControl(secureConfig{
-		providersFile:   registryFile,
-		runNamespace:    "runs",
-		harnessImage:    "harness:test",
-		probeImage:      "busybox:test",
-		legacyGitSecret: "courier-github",
-		observer:        observerWithHeadResolver{},
-		operatorNS:      "courier-system",
-	})
-	if err == nil || !strings.Contains(err.Error(), "tainted") {
-		t.Fatalf("a registration referencing a legacy-exposed Secret must fail startup, got %v", err)
-	}
-}
-
-// TestBuildSecureControlRejectsCredentialExposedAsExecutorEnvironmentSecret
-// pins that the executor environment Secret is pod-exposed through envFrom
-// like the legacy credential Secrets: a Secret configured there is wholesale
-// visible to coordinator pods and must not back a secure registration (#638).
-func TestBuildSecureControlRejectsCredentialExposedAsExecutorEnvironmentSecret(t *testing.T) {
-	registryFile := filepath.Join(t.TempDir(), "providers.json")
-	providers := `{"providers":[{"name":"github","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"courier-model-env","key":"token"}},"serves":["*"]}]}`
-	if err := os.WriteFile(registryFile, []byte(providers), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	_, err := buildSecureControl(secureConfig{
-		providersFile:     registryFile,
-		runNamespace:      "runs",
-		harnessImage:      "harness:test",
-		probeImage:        "busybox:test",
-		executorEnvSecret: "courier-model-env",
-		observer:          observerWithHeadResolver{},
-		operatorNS:        "courier-system",
-	})
-	if err == nil || !strings.Contains(err.Error(), "tainted") {
-		t.Fatalf("a registration referencing the executor environment Secret must fail startup, got %v", err)
-	}
-	if err != nil && !strings.Contains(err.Error(), "--executor-environment-secret") {
-		t.Fatalf("the taint error must name the exposing flag, got %v", err)
+// TestBuildSecureControlRejectsTaintedCredential covers the whole
+// pod-exposed Secret set: every flag that injects a Secret into a
+// model-controlled coordinator pod taints a registration that references it,
+// and the comparison trims both sides so a padded name cannot slip past
+// (#638).
+func TestBuildSecureControlRejectsTaintedCredential(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		registration string
+		legacyGit    string
+		legacyAPI    string
+		executorEnv  string
+		wantFlag     string
+	}{
+		{
+			name:         "legacy git credential Secret",
+			registration: "courier-github",
+			legacyGit:    "courier-github",
+			wantFlag:     "--git-credential-secret",
+		},
+		{
+			name:         "legacy GitHub API credential Secret",
+			registration: "courier-github-api",
+			legacyAPI:    "courier-github-api",
+			wantFlag:     "--github-credential-secret",
+		},
+		{
+			name:         "executor environment Secret",
+			registration: "courier-model-env",
+			executorEnv:  "courier-model-env",
+			wantFlag:     "--executor-environment-secret",
+		},
+		{
+			name:         "padded registration Secret name",
+			registration: "  courier-github  ",
+			legacyGit:    "courier-github",
+			wantFlag:     "--git-credential-secret",
+		},
+		{
+			name:         "padded flag value",
+			registration: "courier-github",
+			legacyGit:    "courier-github ",
+			wantFlag:     "--git-credential-secret",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			registryFile := filepath.Join(t.TempDir(), "providers.json")
+			providers := fmt.Sprintf(`{"providers":[{"name":"github","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":%q,"key":"token"}},"serves":["*"]}]}`, test.registration)
+			if err := os.WriteFile(registryFile, []byte(providers), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := buildSecureControl(secureConfig{
+				providersFile:     registryFile,
+				runNamespace:      "runs",
+				harnessImage:      "harness:test",
+				probeImage:        "busybox:test",
+				legacyGitSecret:   test.legacyGit,
+				legacyAPISecret:   test.legacyAPI,
+				executorEnvSecret: test.executorEnv,
+				observer:          observerWithHeadResolver{},
+				operatorNS:        "courier-system",
+			})
+			if err == nil || !strings.Contains(err.Error(), "tainted") {
+				t.Fatalf("a registration referencing a pod-exposed Secret must fail startup, got %v", err)
+			}
+			if !strings.Contains(err.Error(), test.wantFlag) {
+				t.Fatalf("the taint error must name the exposing flag %q, got %v", test.wantFlag, err)
+			}
+		})
 	}
 }
 
@@ -500,7 +525,8 @@ func TestBuildSecureControlAcceptsObserverSeamOnSecureSecret(t *testing.T) {
 
 // TestBuildSecureControlRejectsObserverSeamNamedAsPodExposedSecret rejects an
 // observer seam Secret that any pod-injection flag exposes: either legacy
-// credential Secret or the executor environment Secret (#638).
+// credential Secret or the executor environment Secret (#638). The comparison
+// trims both sides, so a padded name cannot slip past it.
 func TestBuildSecureControlRejectsObserverSeamNamedAsPodExposedSecret(t *testing.T) {
 	registryFile := filepath.Join(t.TempDir(), "providers.json")
 	providers := `{"providers":[{"name":"github","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"forge-creds","key":"token"}},"serves":["*"]}]}`
@@ -511,25 +537,52 @@ func TestBuildSecureControlRejectsObserverSeamNamedAsPodExposedSecret(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, podExposedField := range []string{"git", "api", "env"} {
-		t.Run(podExposedField, func(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		observerSecret string
+		expose         func(config *secureConfig)
+		wantFlag       string
+	}{
+		{
+			name:           "git",
+			observerSecret: "shared-secret",
+			expose:         func(config *secureConfig) { config.legacyGitSecret = "shared-secret" },
+			wantFlag:       "--git-credential-secret",
+		},
+		{
+			name:           "api",
+			observerSecret: "shared-secret",
+			expose:         func(config *secureConfig) { config.legacyAPISecret = "shared-secret" },
+			wantFlag:       "--github-credential-secret",
+		},
+		{
+			name:           "env",
+			observerSecret: "shared-secret",
+			expose:         func(config *secureConfig) { config.executorEnvSecret = "shared-secret" },
+			wantFlag:       "--executor-environment-secret",
+		},
+		{
+			name:           "padded seam name",
+			observerSecret: "  shared-secret  ",
+			expose:         func(config *secureConfig) { config.executorEnvSecret = "shared-secret" },
+			wantFlag:       "--executor-environment-secret",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
 			config := secureConfig{
 				providersFile:  registryFile,
 				runNamespace:   "runs",
 				observer:       couriergithub.Observer{Client: client},
-				observerSecret: "shared-secret",
+				observerSecret: test.observerSecret,
 				restConfig:     &rest.Config{Host: "https://127.0.0.1:1"},
 			}
-			switch podExposedField {
-			case "git":
-				config.legacyGitSecret = "shared-secret"
-			case "api":
-				config.legacyAPISecret = "shared-secret"
-			case "env":
-				config.executorEnvSecret = "shared-secret"
-			}
-			if _, err := buildSecureControl(config); err == nil || !strings.Contains(err.Error(), "observer credential Secret") {
+			test.expose(&config)
+			_, err := buildSecureControl(config)
+			if err == nil || !strings.Contains(err.Error(), "observer credential Secret") {
 				t.Fatalf("an observer seam that is also pod-injected must fail startup, got %v", err)
+			}
+			if !strings.Contains(err.Error(), test.wantFlag) {
+				t.Fatalf("the overlap error must name the exposing flag %q, got %v", test.wantFlag, err)
 			}
 		})
 	}
