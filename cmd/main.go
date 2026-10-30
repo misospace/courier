@@ -1134,7 +1134,7 @@ func buildSecureControl(config secureConfig) (*controller.SecureControl, error) 
 	}
 	for _, registration := range registry.Registrations() {
 		for purpose, ref := range registration.Credentials {
-			if exposure, ok := tainted[ref.SecretName]; ok {
+			if exposure, ok := tainted[strings.TrimSpace(ref.SecretName)]; ok {
 				return nil, fmt.Errorf(
 					"provider %q credential purpose %q references Secret %q, which is exposed to coordinator pods through %s: a credential exposed to any model-controlled pod is tainted and must not back a secure registration",
 					registration.Name, purpose, ref.SecretName, exposure)

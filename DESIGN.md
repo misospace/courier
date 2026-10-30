@@ -3257,8 +3257,8 @@ only informs.
    re-key of a legacy Secret. The seam is never rendered into
    `executor.PodConfig`, so a Secret named only there is structurally absent
    from legacy and model-controlled pod injection, while the legacy credential
-   flags and `--executor-environment-secret` remain the only writers of pod
-   Secret injection. Secure mode rejects a seam Secret that is also exposed to
+   flags and `--executor-environment-secret` remain the only writers of Secret
+   injection into coordinator pods. Secure mode rejects a seam Secret that is also exposed to
    coordinator pods through any of those flags, and the
    [HARNESS.md](./HARNESS.md) §9 taint rejects any registration referencing a
    Secret any of them exposes — a credential injected into a
