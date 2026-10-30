@@ -2549,6 +2549,42 @@ criterion pin, and any PR number or head anchor, fails the binding: the broker's
 discovery-based PR idempotency owns PR identity at publication. The work tip is
 either absent or a recorded adoption tip, never both.
 
+### Contribution execution bridge
+A `contribute` run carries no issue or pull-request number: its admitted
+objective and base ref exist only inside the source's own opaque
+`spec.sourceContext`, so rendering its coordinator goal needs a source-neutral
+execution input rather than a spec reference. `GoalWithContribution`
+(`internal/executor/executor.go`) takes that input — `executor.ContributionExecution`,
+an admitted goal plus a base ref — and is the only renderer a contribute run
+reaches; `Goal` and `NewInvocation` keep their shapes and fail closed for it.
+Translating durable source context into the input is the source's job: an
+adapter that materializes contribute runs implements the optional
+`executor.ContributionContext` surface, and each launch path resolves it through
+the source registry (`SourceRegistry.ContributionExecution` and
+`launchContribution`, `internal/controller`). Core never parses source-owned
+context and never learns a source's context key. Decoding reads durable run
+state alone — no source or forge contact — so resume and relaunch regenerate the
+identical goal. The admitted goal is untrusted task data: it is pasted verbatim
+inside framing that names it data, never instructions, and it grants no
+repository authority, mutates no policy, selects no credential, and moves no
+publication target. The source decode refuses ASCII control characters other
+than tab and newline, which would corrupt that framing or break the coordinator
+container at start. The rendered goal is the only channel — `Invocation` →
+`COURIER_GOAL` → coordinator — with no second prompt or environment field, and
+`InvocationFromEnv` accepts `contribute` with `COURIER_REF` exactly `0` where
+every other mode still requires a positive reference. A contribute run whose
+*owning adapter* refuses its durable context is permanent — that context lives in
+the immutable spec — so the launch terminalizes `NeedsHuman` (reason
+`ContributionContext`), fencing any topology the secure path already
+provisioned, rather than launching a coordinator with no objective. Reaching no
+owning adapter at all (no registry wired, no adapter registered under the run's
+source, a source that supplies no contribution surface) stays an ordinary
+retryable launch failure, because a later deployment can wire it. A contribution
+pins no acceptance criteria, so its goal
+carries no criterion-evidence grammar, and the base ref it states is task
+context only: publication stays bound to the base the broker's persisted policy
+pins (`PolicyFromRun`), which no model output can move.
+
 ## Terminal retention and closed-unmerged PRs
 
 **The leak:** `reapDone` (`internal/controller/reap.go`) deletes only resolved `Done` runs after a default five minutes. `HandedOff`, `NeedsHuman`, and `Failed` are never reaped: `Reconcile` (`internal/controller/coderun_controller.go`) revisits a terminal phase only to retry a pending lifecycle report and otherwise returns without a timer. `AwaitingReview` was part of the same gap — the controller never re-observed a PR after a run settled — until #250 added the slow, bounded read of the recorded pull request that turns a confirmed merge into `Done`; a PR closed without merge still keeps its run indefinitely, which this design fixes below. The #179 dogfood deployment left 26 `AwaitingReview`, 6 `NeedsHuman`, 1 `Failed`, and 17 retained coordinator pods. `source.Runner.Poll` (`internal/source/runner.go`) lists every CoderRun on every poll to build its dedupe set, so the list grows without bound.
