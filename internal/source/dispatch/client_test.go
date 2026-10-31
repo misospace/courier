@@ -1491,12 +1491,10 @@ func TestHTTPClientClassifiesPermanentRefusal(t *testing.T) {
 		})
 	}
 	t.Run("transport failure stays transient", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
-		client, err := NewClient(server.URL, "worker", "secret-token", time.Second)
+		client, err := NewClient("http://127.0.0.1:1", "worker", "secret-token", time.Second, failingDoer{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		server.Close()
 		if err := client.SetStatus(context.Background(), workID, "in-review"); err == nil {
 			t.Fatal("SetStatus() error = nil, want the transport failure")
 		} else if errors.Is(err, source.ErrPermanentRefusal) {
