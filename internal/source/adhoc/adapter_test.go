@@ -340,7 +340,7 @@ func TestAdmitCreateRaceResumes(t *testing.T) {
 	ctx := context.Background()
 	in := validAdmission()
 	key := mintKey(in.BaseRepo, in.BaseRef, in.Goal, in.WorkRepo)
-	name := runName(key)
+	name := source.RunName(SourceName, key)
 	resource := schema.GroupResource{Group: "courier.misospace.dev", Resource: "coderruns"}
 
 	raceCluster := func(t *testing.T, winner *courierv1alpha1.CoderRun, hideFirstGet bool) client.Client {
@@ -426,7 +426,7 @@ func TestAdmitForeignRunFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	in := validAdmission()
 	key := mintKey(in.BaseRepo, in.BaseRef, in.Goal, in.WorkRepo)
-	name := runName(key)
+	name := source.RunName(SourceName, key)
 
 	for _, tc := range []struct {
 		name   string

@@ -486,7 +486,7 @@ func (r *Runner) Poll(ctx context.Context) error {
 				Debug:             spec.Debug,
 			},
 		}
-		name := runName(r.Config.Source, itemIdentity)
+		name := RunName(r.Config.Source, itemIdentity)
 		if predecessor := settledPredecessor(runs.Items, r.Config.Source, itemIdentity, r); predecessor != nil {
 			name = successorRunName(r.Config.Source, itemIdentity, predecessor.UID)
 		}
@@ -747,7 +747,12 @@ func workKey(sourceName, workItemID string) string {
 	return sourceName + "\x00" + workItemID
 }
 
-func runName(sourceName, workItemID string) string {
+// RunName derives the CoderRun object name for a source work item:
+// "courier-" plus the first 32 hex characters of the sha256 digest over
+// (source name, NUL, work item ID). One naming scheme for every
+// key-derived run name, including push-based adapters that create
+// CoderRuns directly.
+func RunName(sourceName, workItemID string) string {
 	digest := sha256.Sum256([]byte(workKey(sourceName, workItemID)))
 	return "courier-" + hex.EncodeToString(digest[:])[:32]
 }

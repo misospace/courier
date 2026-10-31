@@ -77,7 +77,7 @@ func (s *recordingSink) lines() []recordedLine {
 // offering, in the given phase with no pull request.
 func dedupeRetainedRun(phase courierv1alpha1.Phase) *courierv1alpha1.CoderRun {
 	return &courierv1alpha1.CoderRun{
-		ObjectMeta: metav1.ObjectMeta{Name: runName("test", "opaque-a"), Namespace: "courier"},
+		ObjectMeta: metav1.ObjectMeta{Name: RunName("test", "opaque-a"), Namespace: "courier"},
 		Spec: courierv1alpha1.CoderRunSpec{
 			Mode:       courierv1alpha1.ModeResolveIssue,
 			Source:     "test",
@@ -156,8 +156,8 @@ func TestRunnerPollReOfferIsVisibleAtDefaultVerbosity(t *testing.T) {
 	if !strings.HasPrefix(lines[0].msg, "work item was offered again") {
 		t.Fatalf("line message = %q, want prefix %q", lines[0].msg, "work item was offered again")
 	}
-	if got, _ := lines[0].field("retainedRun"); got != runName("test", "opaque-a") {
-		t.Fatalf("retainedRun = %v, want %q", got, runName("test", "opaque-a"))
+	if got, _ := lines[0].field("retainedRun"); got != RunName("test", "opaque-a") {
+		t.Fatalf("retainedRun = %v, want %q", got, RunName("test", "opaque-a"))
 	}
 	if got, _ := lines[0].field("retainedPhase"); got != "AwaitingReview" {
 		t.Fatalf("retainedPhase = %v, want AwaitingReview", got)

@@ -262,7 +262,7 @@ func TestRunnerRetryCorrelatesPredecessorByNormalizedAttemptID(t *testing.T) {
 	if !containsName(runs.Items, wantName) {
 		t.Fatalf("successor under the normalized identity %q not materialized; runs = %v", wantName, runNames(runs.Items))
 	}
-	if containsName(runs.Items, runName("test", "issue-7@gen2")) {
+	if containsName(runs.Items, RunName("test", "issue-7@gen2")) {
 		t.Fatalf("offer took the ordinary name; normalization-based correlation did not fire; runs = %v", runNames(runs.Items))
 	}
 }
@@ -296,7 +296,7 @@ func TestRunnerNonRequeueRecordsKeepTheBarrierAndNeverNameSuccessor(t *testing.T
 			}
 			// fresh-9 materializes under the ordinary deterministic name: the
 			// non-requeue record claims no predecessor link.
-			ordinary := runName("test", "fresh-9")
+			ordinary := RunName("test", "fresh-9")
 			if successorRunName("test", "fresh-9", types.UID("pred-uid")) == ordinary {
 				t.Fatal("test fixture collision between ordinary and successor names")
 			}
