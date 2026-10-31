@@ -254,12 +254,16 @@ func TestCheckConcurrentRequestsShareOneDispatch(t *testing.T) {
 	}
 }
 
+// TestCheckPreservesFailedExitOnReuse pins the production shape of a
+// failing check: the worker reports a nonzero exit as ResultFailed
+// (protocol runTask), and such a completed run is real evidence — reused
+// without rerunning, never presented as passing.
 func TestCheckPreservesFailedExitOnReuse(t *testing.T) {
 	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
 	defer cleanupWorker()
 	worker.snapshotTip = "snap-tip"
 	worker.ordinaryResults = []protocol.Result{
-		{Status: protocol.ResultCompleted, ExitCode: 1, StdoutTail: "--- FAIL\n", StderrTail: "boom\n"},
+		{Status: protocol.ResultFailed, ExitCode: 1, StdoutTail: "--- FAIL\n", StderrTail: "boom\n"},
 	}
 	coordinator := newCheckCoordinator(t, delegator, snapshotProvider("snap-tip"))
 
@@ -276,9 +280,65 @@ func TestCheckPreservesFailedExitOnReuse(t *testing.T) {
 		if !strings.Contains(result.Content, "exit=1") || !strings.Contains(result.Content, "--- FAIL\n") {
 			t.Fatalf("check %d content = %q, want exit=1 with the failing output", i, result.Content)
 		}
+		if !strings.Contains(result.Content, "status: failed") {
+			t.Fatalf("check %d content = %q, want the failed status reported, never a pass", i, result.Content)
+		}
 	}
 	if !strings.Contains(second.Content, "check receipt: reused") {
 		t.Fatalf("second check content = %q, want the reused failing receipt", second.Content)
+	}
+}
+
+// TestCheckUnstartedFailedStatusIsNotReusable pins the other side of the
+// ResultFailed classification: exit code -1 is the worker's sentinel for a
+// task that never started or died to a signal — the run produced no exit
+// status of its own, so it is not reusable evidence and the repeat reruns.
+func TestCheckUnstartedFailedStatusIsNotReusable(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.snapshotTip = "snap-tip"
+	worker.ordinaryResults = []protocol.Result{
+		{Status: protocol.ResultFailed, ExitCode: -1, StderrTail: "task rejected before execution\n"},
+		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "rerun ok\n"},
+	}
+	coordinator := newCheckCoordinator(t, delegator, snapshotProvider("snap-tip"))
+
+	first := coordinator.runCheck(context.Background(), checkCall("go test ./..."), "", ToolResult{ToolCallID: "c1", Name: toolCheck})
+	second := coordinator.runCheck(context.Background(), checkCall("go test ./..."), "", ToolResult{ToolCallID: "c2", Name: toolCheck})
+
+	if got := taskDispatchCount(worker, notUnpackTask); got != 2 {
+		t.Fatalf("check dispatches = %d, want the sentinel-failed receipt to be rerun on repeat", got)
+	}
+	if !first.IsError {
+		t.Fatalf("first check = %+v, want the unstarted run reported as an error", first)
+	}
+	if second.IsError || !strings.Contains(second.Content, "check receipt: fresh") || !strings.Contains(second.Content, "rerun ok\n") {
+		t.Fatalf("second check = %+v, want a fresh passing receipt after the rerun", second)
+	}
+}
+
+// TestCheckCompletedRunClassification pins the evidence boundary directly:
+// a status/exit pair counts as a completed run exactly when the invocation
+// produced its own exit status.
+func TestCheckCompletedRunClassification(t *testing.T) {
+	for _, tc := range []struct {
+		status   string
+		exitCode int
+		want     bool
+	}{
+		{status: protocol.ResultCompleted, exitCode: 0, want: true},
+		{status: protocol.ResultCompleted, exitCode: 1, want: true},
+		{status: protocol.ResultFailed, exitCode: 1, want: true},
+		{status: protocol.ResultFailed, exitCode: 2, want: true},
+		{status: protocol.ResultFailed, exitCode: 127, want: true},
+		{status: protocol.ResultFailed, exitCode: 0, want: false},
+		{status: protocol.ResultFailed, exitCode: -1, want: false},
+		{status: protocol.ResultCancelled, exitCode: -1, want: false},
+		{status: "running", exitCode: 0, want: false},
+	} {
+		if got := completedRun(tc.status, tc.exitCode); got != tc.want {
+			t.Errorf("completedRun(%q, %d) = %v, want %v", tc.status, tc.exitCode, got, tc.want)
+		}
 	}
 }
 
@@ -331,63 +391,74 @@ func TestCheckFailedLaunchLeavesNoReceipt(t *testing.T) {
 	}
 }
 
-func TestCheckNormalizesWhitespaceInIdentity(t *testing.T) {
+// TestCheckDistinctSpellingsDoNotShareReceipt pins the exact-bytes identity
+// end to end: commands sh tokenizes alike but executes differently — and
+// commands differing only in formatting whitespace — each keep their own
+// receipt, because only identical bytes guarantee an identical program.
+func TestCheckDistinctSpellingsDoNotShareReceipt(t *testing.T) {
 	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
 	defer cleanupWorker()
 	worker.snapshotTip = "snap-tip"
 	worker.ordinaryResults = []protocol.Result{
-		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "ok\n"},
+		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "double-quoted\n"},
+		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "single-quoted\n"},
+		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "bare\n"},
+		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "spaced\n"},
 	}
 	coordinator := newCheckCoordinator(t, delegator, snapshotProvider("snap-tip"))
 
-	first := coordinator.runCheck(context.Background(), checkCall("go test   \t ./..."), "", ToolResult{ToolCallID: "c1", Name: toolCheck})
-	second := coordinator.runCheck(context.Background(), checkCall("go test ./..."), "", ToolResult{ToolCallID: "c2", Name: toolCheck})
-
-	if got := taskDispatchCount(worker, notUnpackTask); got != 1 {
-		t.Fatalf("check dispatches = %d, want commands differing only in whitespace to share one receipt", got)
+	commands := []string{`echo "$HOME"`, `echo '$HOME'`, `echo $HOME`, "go test   \t ./..."}
+	for i, command := range commands {
+		result := coordinator.runCheck(context.Background(), checkCall(command), "", ToolResult{ToolCallID: fmt.Sprintf("c%d", i), Name: toolCheck})
+		if result.IsError || !strings.Contains(result.Content, "check receipt: fresh") {
+			t.Fatalf("check %d (%q) = %+v, want a fresh dispatch for each distinct spelling", i, command, result)
+		}
 	}
-	if !strings.Contains(second.Content, "check receipt: reused") {
-		t.Fatalf("second check content = %q, want the whitespace variant to reuse the receipt", second.Content)
+	if got := taskDispatchCount(worker, notUnpackTask); got != len(commands) {
+		t.Fatalf("check dispatches = %d, want one per distinct spelling", got)
 	}
-	if first.IsError || second.IsError {
-		t.Fatalf("checks = %+v / %+v, want passing receipts", first, second)
+	// Only the exact same bytes reuse.
+	repeat := coordinator.runCheck(context.Background(), checkCall(`echo "$HOME"`), "", ToolResult{ToolCallID: "c-repeat", Name: toolCheck})
+	if !strings.Contains(repeat.Content, "check receipt: reused") || !strings.Contains(repeat.Content, "double-quoted\n") {
+		t.Fatalf("repeat check content = %q, want the exact-bytes repeat served from its own receipt", repeat.Content)
+	}
+	if got := taskDispatchCount(worker, notUnpackTask); got != len(commands) {
+		t.Fatalf("check dispatches = %d, want the exact-bytes repeat to launch nothing", got)
 	}
 }
 
-// TestCheckNormalizesWhitespaceOutsideQuotesOnly pins the normalization
-// contract: commands sh tokenizes into the same argv share one receipt,
-// while different argv — quoted whitespace, escaped spaces, literal
-// backslashes — never merge.
-func TestCheckNormalizesWhitespaceOutsideQuotesOnly(t *testing.T) {
+// TestCheckIdentityIsExactCommandBytes pins the key-level contract: two
+// commands share a state key exactly when their bytes are equal, and the
+// state halves (tip, environment digest) are part of the key.
+func TestCheckIdentityIsExactCommandBytes(t *testing.T) {
+	const tip = "tip"
+	const env = "envdigest"
 	cases := []struct {
 		name      string
 		a, b      string
 		identical bool
 	}{
-		{name: "unquoted runs collapse", a: "go test   \t ./...", b: "go test ./...", identical: true},
-		{name: "leading and trailing trimmed", a: "  go vet ./...  ", b: "go vet ./...", identical: true},
-		{name: "newline separator collapses", a: "go test\n./...", b: "go test ./...", identical: true},
-		{name: "double-quoted whitespace preserved", a: `echo "a  b"`, b: `echo "a b"`},
-		{name: "single-quoted whitespace preserved", a: `echo 'a  b'`, b: `echo 'a b'`},
-		{name: "quoted runs in subcommand preserved", a: `sh -c "go  test"`, b: `sh -c "go test"`},
-		{name: "unquoted spacing around quotes collapses", a: `echo "a b"   x`, b: `echo "a b" x`, identical: true},
-		{name: "escaped space keeps word boundary", a: `echo a\  b`, b: `echo a\ b`},
-		{name: "escaped space differs from word separator", a: `echo a\ b`, b: `echo a b`},
-		{name: "escaped space equals quoted space", a: `echo a\ b`, b: `echo "a b"`, identical: true},
-		{name: "escaped quote outside quotes stays unquoted", a: `echo a\"b  c`, b: `echo a\"b c`, identical: true},
-		{name: "resolved escape equals literal byte", a: `echo a\b`, b: `echo ab`, identical: true},
-		{name: "backslash is data inside single quotes", a: `echo 'a\b'`, b: `echo a\b`},
-		{name: "double-quote backslash resolves to escaped byte", a: `echo "a\\ b"`, b: `echo "a\ b"`, identical: true},
-		{name: "unterminated quote preserves to the end", a: `echo "a  b`, b: `echo "a b`},
+		{name: "exact bytes share", a: "go test ./...", b: "go test ./...", identical: true},
+		{name: "double-quoted differs from single-quoted expansion", a: `echo "$HOME"`, b: `echo '$HOME'`},
+		{name: "quoted differs from bare expansion", a: `echo "$HOME"`, b: `echo $HOME`},
+		{name: "formatting whitespace is part of the identity", a: "go test   ./...", b: "go test ./..."},
+		{name: "trailing whitespace differs", a: "go vet ./... ", b: "go vet ./..."},
+		{name: "escaped quote differs from literal quote", a: `echo a\"b`, b: `echo a"b`},
+		{name: "backslash differs from resolved byte", a: `echo a\b`, b: `echo ab`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := normalizeCheckCommand(tc.a) == normalizeCheckCommand(tc.b)
+			got := checkStateKey(tc.a, tip, env) == checkStateKey(tc.b, tip, env)
 			if got != tc.identical {
-				t.Fatalf("normalizeCheckCommand(%q) == normalizeCheckCommand(%q): shared identity = %v, want %v (renders %q vs %q)",
-					tc.a, tc.b, got, tc.identical, normalizeCheckCommand(tc.a), normalizeCheckCommand(tc.b))
+				t.Fatalf("checkStateKey(%q) == checkStateKey(%q) = %v, want %v", tc.a, tc.b, got, tc.identical)
 			}
 		})
+	}
+	if checkStateKey("go test ./...", "tip-a", env) == checkStateKey("go test ./...", "tip-b", env) {
+		t.Fatal("state key ignores the snapshot tip")
+	}
+	if checkStateKey("go test ./...", tip, "env-a") == checkStateKey("go test ./...", tip, "env-b") {
+		t.Fatal("state key ignores the bootstrap environment digest")
 	}
 }
 
@@ -499,10 +570,11 @@ func TestCheckRefreshSharesInFlightDispatch(t *testing.T) {
 }
 
 // TestCheckShellRunInvalidatesMatchingReceipt pins the evidence-freshness
-// rule: a completed plain shell run of the exact command against the same
-// state drops the matching receipt, so a later check dispatches instead of
-// serving evidence older than the shell run — while an unrelated shell
-// command leaves every receipt in place.
+// rule: a completed plain shell run of the exact command bytes against the
+// same state drops the matching receipt, so a later check dispatches
+// instead of serving evidence older than the shell run — while an unrelated
+// command and a differently spelled equivalent one leave every receipt in
+// place.
 func TestCheckShellRunInvalidatesMatchingReceipt(t *testing.T) {
 	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
 	defer cleanupWorker()
@@ -510,6 +582,7 @@ func TestCheckShellRunInvalidatesMatchingReceipt(t *testing.T) {
 	worker.ordinaryResults = []protocol.Result{
 		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "checked\n"},
 		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "unrelated\n"},
+		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "variant\n"},
 		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "shelled\n"},
 		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "rerun\n"},
 	}
@@ -533,13 +606,27 @@ func TestCheckShellRunInvalidatesMatchingReceipt(t *testing.T) {
 		t.Fatalf("check dispatches after unrelated shell = %d, want the receipt untouched", got)
 	}
 
-	// The same command via plain shell is fresh evidence: the receipt must
-	// yield to it.
-	shell := coordinator.runShell(context.Background(), shellCall("go   test ./..."), "control", ToolResult{ToolCallID: "s2", Name: toolShell})
+	// A differently spelled equivalent command is its own identity: its
+	// shell run neither matches nor invalidates the stored receipt.
+	variant := coordinator.runShell(context.Background(), shellCall("go  test ./..."), "control", ToolResult{ToolCallID: "s2", Name: toolShell})
+	if variant.IsError {
+		t.Fatalf("variant shell = %+v, want success", variant)
+	}
+	stillReused := coordinator.runCheck(context.Background(), checkCall("go test ./..."), "", ToolResult{ToolCallID: "c3", Name: toolCheck})
+	if !strings.Contains(stillReused.Content, "check receipt: reused") {
+		t.Fatalf("check after variant-spelling shell = %q, want the saved receipt reused", stillReused.Content)
+	}
+	if got := checkDispatchCount(worker); got != 1 {
+		t.Fatalf("check dispatches after variant-spelling shell = %d, want the receipt untouched", got)
+	}
+
+	// The exact same command bytes via plain shell is fresh evidence: the
+	// receipt must yield to it.
+	shell := coordinator.runShell(context.Background(), shellCall("go test ./..."), "control", ToolResult{ToolCallID: "s3", Name: toolShell})
 	if shell.IsError {
 		t.Fatalf("matching shell = %+v, want success", shell)
 	}
-	third := coordinator.runCheck(context.Background(), checkCall("go test ./..."), "", ToolResult{ToolCallID: "c3", Name: toolCheck})
+	third := coordinator.runCheck(context.Background(), checkCall("go test ./..."), "", ToolResult{ToolCallID: "c4", Name: toolCheck})
 	if got := checkDispatchCount(worker); got != 2 {
 		t.Fatalf("check dispatches after matching shell = %d, want a fresh dispatch after the receipt was invalidated", got)
 	}
@@ -548,6 +635,40 @@ func TestCheckShellRunInvalidatesMatchingReceipt(t *testing.T) {
 	}
 	if !strings.Contains(first.Content, "checked\n") {
 		t.Fatalf("first check content = %q, want the initial receipt", first.Content)
+	}
+}
+
+// TestCheckFailedShellRunInvalidatesMatchingReceipt pins the other half of
+// the failed-exit classification on the invalidation path: the worker
+// reports a nonzero exit as ResultFailed, and a completed failing shell run
+// is fresh evidence, so the matching receipt must yield to it — a receipt
+// must never outlive a run the coordinator just performed, pass or fail.
+func TestCheckFailedShellRunInvalidatesMatchingReceipt(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.snapshotTip = "snap-tip"
+	worker.ordinaryResults = []protocol.Result{
+		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "checked\n"},
+		{Status: protocol.ResultFailed, ExitCode: 1, StdoutTail: "--- FAIL\n"},
+		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "rerun\n"},
+	}
+	coordinator := newCheckCoordinator(t, delegator, snapshotProvider("snap-tip"))
+
+	first := coordinator.runCheck(context.Background(), checkCall("go test ./..."), "", ToolResult{ToolCallID: "c1", Name: toolCheck})
+	if got := checkDispatchCount(worker); first.IsError || got != 1 {
+		t.Fatalf("initial check = %+v (dispatches %d), want one fresh passing receipt", first, got)
+	}
+
+	shell := coordinator.runShell(context.Background(), shellCall("go test ./..."), "control", ToolResult{ToolCallID: "s1", Name: toolShell})
+	if !shell.IsError {
+		t.Fatalf("failing shell = %+v, want the nonzero exit reported", shell)
+	}
+	second := coordinator.runCheck(context.Background(), checkCall("go test ./..."), "", ToolResult{ToolCallID: "c2", Name: toolCheck})
+	if got := checkDispatchCount(worker); got != 2 {
+		t.Fatalf("check dispatches after failing shell run = %d, want the receipt invalidated by the fresh failing evidence", got)
+	}
+	if !strings.Contains(second.Content, "check receipt: fresh") || !strings.Contains(second.Content, "rerun\n") {
+		t.Fatalf("check after failing shell = %q, want a fresh receipt", second.Content)
 	}
 }
 

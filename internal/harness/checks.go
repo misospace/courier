@@ -33,14 +33,32 @@ type checkReceipt struct {
 }
 
 // reusable reports whether a repeat request at the same state key may be
-// served from this receipt without re-executing. Only a verified completion
-// is reusable: a cancelled or failed worker status stays recorded for
-// observability, and a repeat request at its key is a miss that reruns. A
-// completed receipt with a nonzero exit code is still reusable — an
-// unchanged failing suite is reprinted, never rerun, and never presented as
-// passing.
+// served from this receipt without re-executing. Only a completed run is
+// reusable (completedRun): a cancelled dispatch and a run that never
+// produced an exit status stay recorded for observability, and a repeat
+// request at their key is a miss that reruns. A completed run with a
+// nonzero exit code is reusable — an unchanged failing suite is reprinted,
+// never rerun, and never presented as passing.
 func (r *checkReceipt) reusable() bool {
-	return r.status == protocol.ResultCompleted
+	return completedRun(r.status, r.exitCode)
+}
+
+// completedRun reports whether a worker result records an invocation that
+// ran to completion and produced its own exit status. The worker reports a
+// nonzero exit as ResultFailed (protocol runTask), so a failing exit is a
+// completed run and real evidence, not a dispatch failure. ResultFailed
+// carrying the sentinel exit code -1 means the task never started or died
+// to a signal: the run produced no exit status, so it is not evidence.
+// Cancellation is never evidence.
+func completedRun(status string, exitCode int) bool {
+	switch status {
+	case protocol.ResultCompleted:
+		return true
+	case protocol.ResultFailed:
+		return exitCode > 0
+	default:
+		return false
+	}
 }
 
 // checkEntry holds one state key's tracked check: an in-flight dispatch
@@ -195,9 +213,9 @@ func (r *checkRegistry) dropOrder(key string) {
 }
 
 // runCheck executes one tracked check on the sandbox worker. The check's
-// identity is the normalized command together with the workspace state it ran
-// against — the snapshot tip and the applied bootstrap environment — so an
-// identical command against an unchanged state serves the saved receipt
+// identity is the exact command bytes together with the workspace state it
+// ran against — the snapshot tip and the applied bootstrap environment — so
+// an identical command against an unchanged state serves the saved receipt
 // without a second dispatch, while any state change invalidates it. Like
 // runShell this is coordinator-only, binds to the synthetic "control" work
 // unit, and dispatches over the signed protocol onto the untrusted worker.
@@ -220,9 +238,9 @@ func (c *Coordinator) runCheck(ctx context.Context, call ToolCall, briefID strin
 		return result
 	}
 	if strings.ContainsRune(args.Command, '\x00') {
-		// A NUL byte cannot appear in an exec argv, but it is the word
-		// separator of the canonical command identity: a command carrying
-		// one would collide identities across tokenizations.
+		// An embedded NUL byte cannot survive the exec boundary: the
+		// argument would reach sh truncated at the NUL, so the program
+		// executed would not be the one this identity records.
 		result.IsError = true
 		result.Content = "a check command must not contain a NUL byte"
 		return result
@@ -233,7 +251,13 @@ func (c *Coordinator) runCheck(ctx context.Context, call ToolCall, briefID strin
 		result.Content = safeToolError(err)
 		return result
 	}
-	command := normalizeCheckCommand(args.Command)
+	// The identity is the exact command bytes because the task runs as
+	// `sh -c <command>`: no tokenization can witness what sh will execute,
+	// and a quote-resolved form aliases distinct programs — `echo "$HOME"`
+	// and `echo '$HOME'` tokenize alike but expand differently. Exact
+	// bytes plus state is the complete identity; any future canonical form
+	// must prove semantic equivalence, not merely collapse formatting.
+	command := args.Command
 	env := c.currentBootstrapEnv()
 	key := checkStateKey(command, tip, bootstrapEnvDigest(env))
 
@@ -313,88 +337,6 @@ func renderCheckResult(receipt *checkReceipt, fresh bool, result ToolResult) Too
 	return result
 }
 
-// normalizeCheckCommand canonicalizes a command to its sh tokenization:
-// the argument words the shell would produce, each rendered byte-for-byte
-// as the argv word (escape sequences are resolved to the escaped byte), and
-// joined by a separator that can never appear in a word. Two commands share
-// a receipt identity exactly when sh would hand the command the same argv —
-// formatting whitespace collapses, while different argv (`echo "a  b"` vs
-// `echo "a b"`, `echo a\  b` vs `echo a\ b`) keeps words apart, because
-// merging those would serve one command's evidence for another's. Quoting
-// is scanned the way sh reads it: a backslash resolves the next byte
-// everywhere except inside single quotes, where it is plain data.
-func normalizeCheckCommand(command string) string {
-	return strings.Join(splitShellWords(command), "\x00")
-}
-
-func splitShellWords(command string) []string {
-	var words []string
-	var word strings.Builder
-	started := false
-	var quote byte
-	flush := func() {
-		if started {
-			words = append(words, word.String())
-			word.Reset()
-			started = false
-		}
-	}
-	for i := 0; i < len(command); i++ {
-		ch := command[i]
-		switch {
-		case quote != 0:
-			started = true
-			if quote == '"' && ch == '\\' && i+1 < len(command) {
-				// Inside double quotes the backslash resolves the next
-				// byte only before $, `, ", or \; before anything else it
-				// is literal data and the next byte is ordinary.
-				switch command[i+1] {
-				case '$', '`', '"', '\\':
-					i++
-					word.WriteByte(command[i])
-					continue
-				}
-			}
-			if ch == quote {
-				quote = 0
-				continue
-			}
-			word.WriteByte(ch)
-		case ch == '\\':
-			// Outside quotes the backslash resolves the next byte into
-			// the current word — it is never a separator and never the
-			// start of a quoted section.
-			started = true
-			if i+1 < len(command) {
-				i++
-				word.WriteByte(command[i])
-			} else {
-				word.WriteByte(ch)
-			}
-		case ch == '\'' || ch == '"':
-			quote = ch
-			started = true
-		case isShellSpace(ch):
-			flush()
-		default:
-			started = true
-			word.WriteByte(ch)
-		}
-	}
-	flush()
-	return words
-}
-
-// isShellSpace covers the bytes sh treats as argument separators outside
-// quotes.
-func isShellSpace(ch byte) bool {
-	switch ch {
-	case ' ', '\t', '\n', '\v', '\f', '\r':
-		return true
-	}
-	return false
-}
-
 // bootstrapEnvDigest digests the applied bootstrap environment delta in a
 // canonical (sorted, NUL-joined) form, so a delta that changes in content or
 // order invalidates every tracked receipt.
@@ -404,8 +346,13 @@ func bootstrapEnvDigest(env []string) string {
 	return digestOf(strings.Join(sorted, "\x00"))
 }
 
-// checkStateKey digests the check's full identity: the normalized command and
-// the workspace state it ran against.
+// checkStateKey digests the check's full identity: the exact command bytes
+// and the workspace state it ran against. Commands are keyed verbatim
+// because the worker executes them through `sh -c`: only identical bytes
+// guarantee an identical program, so no two spellings ever share a receipt.
+// The NUL join is collision-free as written because tip and envDigest are
+// hex digests that cannot carry one; a command carrying a NUL is rejected
+// before the key is built.
 //
 // The workspace half of the identity is sound because every check dispatch
 // first prepares a fresh snapshot: control re-renders the bundle from the

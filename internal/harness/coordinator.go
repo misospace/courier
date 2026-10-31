@@ -710,7 +710,7 @@ func shellTool() ToolDef {
 func checkTool() ToolDef {
 	return ToolDef{
 		Name:        toolCheck,
-		Description: "Run one shell command on the sandbox worker as a tracked check. Identical command against unchanged state (snapshot tip, bootstrap environment) returns the saved receipt; state changes invalidate it. refresh:true forces a fresh dispatch; a plain shell run of the same command also invalidates the receipt.",
+		Description: "Run one shell command on the sandbox worker as a tracked check. An identical command (exact bytes) against unchanged state (snapshot tip, bootstrap environment) returns the saved receipt; state changes invalidate it. refresh:true forces a fresh dispatch; a completed plain shell run of the exact same command also invalidates the receipt.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -890,16 +890,18 @@ func (c *Coordinator) runShell(ctx context.Context, call ToolCall, briefID strin
 	// command-and-state identity the tracked checks use: the snapshot was
 	// just re-materialized at the current tip. Drop any stored receipt for
 	// that identity so a later check cannot serve evidence older than the
-	// run the coordinator just performed (#635). Only a verified completion
-	// counts: a cancelled or otherwise unfinished dispatch produced no
-	// evidence and leaves the registry untouched, and an unrelated command
-	// leaves every receipt in place. The match is exact on the normalized
-	// command; an equivalent command spelled differently leaves the receipt
-	// to its own identity. If an in-flight check for the same identity
-	// completes after this run, its receipt lands and is equally fresh
-	// evidence at the same re-materialized tip.
-	if briefID == "control" && workerResult.Status == protocol.ResultCompleted {
-		c.checks.invalidate(checkStateKey(normalizeCheckCommand(args.Command), tip, bootstrapEnvDigest(env)))
+	// run the coordinator just performed (#635). Only a completed run
+	// counts (completedRun): a failing exit is fresh failing evidence —
+	// the worker reports a nonzero exit as ResultFailed — while a
+	// cancelled dispatch or a run that never produced an exit status
+	// produced no evidence and leaves the registry untouched, and an
+	// unrelated command leaves every receipt in place. The match is exact
+	// on the command bytes; an equivalent command spelled differently
+	// leaves the receipt to its own identity. If an in-flight check for
+	// the same identity completes after this run, its receipt lands and is
+	// equally fresh evidence at the same re-materialized tip.
+	if briefID == "control" && completedRun(workerResult.Status, workerResult.ExitCode) {
+		c.checks.invalidate(checkStateKey(args.Command, tip, bootstrapEnvDigest(env)))
 	}
 	return workerResultToTool(workerResult, result)
 }

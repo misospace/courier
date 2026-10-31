@@ -493,22 +493,31 @@ trusted execution surface as `shell`: the command dispatches over the signed
 protocol to the untrusted worker, and the result is the worker's own exit
 status and bounded output tails — never a summary grep, a shell pipeline
 masking the test exit, or a process-name observation. Each check is tracked
-by a receipt whose identity is the normalized command plus the workspace
+by a receipt whose identity is the exact command bytes plus the workspace
 state it ran against: the snapshot tip and the applied bootstrap environment
-digest. The identity is complete because every check dispatch first prepares
-a fresh snapshot — the worker's unpack re-materializes the workspace at that
-tip before anything runs, so the workspace is a pure function of the tip and
+digest. Commands are keyed verbatim, never by a tokenized form: the task
+executes as `sh -c <command>`, and a quote-resolved identity aliases
+distinct programs — `echo "$HOME"` and `echo '$HOME'` tokenize alike but
+expand differently — so only identical bytes guarantee an identical program,
+and collapsing cosmetic whitespace is not worth that aliasing risk. The
+identity is complete because every check dispatch first prepares a fresh
+snapshot — the worker's unpack re-materializes the workspace at that tip
+before anything runs, so the workspace is a pure function of the tip and
 every relevant change reaches it through artifact integration, which advances
 the tip. A repeat request against unchanged state is served from the saved
-receipt — pass or fail — instead of re-executing; any state change, a lost
-receipt, or a concrete concern reruns. A cancelled or worker-failed dispatch
-is never reusable as evidence. Concrete concerns have two explicit
-invalidation paths: `check` accepts `refresh:true`, which ignores and
-replaces the saved receipt with a fresh dispatch, and a completed plain
-`shell` run of the same command against the same state drops the matching
+receipt instead of re-executing; any state change, a lost receipt, or a
+concrete concern reruns. A completed run is evidence whether it passed or
+failed: the worker reports a nonzero exit as `ResultFailed`, so a failing
+suite is reprinted on repeat rather than rerun forever. A cancelled dispatch
+and a run that never produced its own exit status (`ResultFailed` carrying
+the sentinel exit code `-1`: never started, or died to a signal) are never
+reusable as evidence. Concrete concerns have two explicit invalidation
+paths: `check` accepts `refresh:true`, which ignores and replaces the saved
+receipt with a fresh dispatch, and a completed plain `shell` run — pass or
+fail — of the exact command against the same state drops the matching
 receipt, so a later check cannot serve evidence older than the run the
-coordinator just performed. Invalidation matches the exact normalized
-command; an equivalent command spelled differently keeps its own identity.
+coordinator just performed. Invalidation matches the exact command bytes; an
+equivalent command spelled differently keeps its own identity.
 
 While an equivalent check is in flight, a duplicate request waits on that
 dispatch instead of launching a second one. Receipts are bounded (evicted
