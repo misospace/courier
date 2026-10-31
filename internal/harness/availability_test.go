@@ -310,6 +310,7 @@ func TestCoordinatorEndsBlockedExternalOnAllowanceExhaustion(t *testing.T) {
 }
 
 func TestCoordinatorEndsBlockedExternalOnPersistentRateLimit(t *testing.T) {
+	shrinkRetryDelays(t)
 	script := make([]gatewayResponse, maxStreamRetries+1)
 	for i := range script {
 		script[i] = gatewayResponse{status: http.StatusTooManyRequests, errBody: `{"error":{"message":"slow down"}}`}
@@ -333,6 +334,7 @@ func TestCoordinatorEndsBlockedExternalOnPersistentRateLimit(t *testing.T) {
 }
 
 func TestCoordinatorKeepsInfraErrorOnProviderOutage(t *testing.T) {
+	shrinkRetryDelays(t)
 	script := make([]gatewayResponse, maxStreamRetries+1)
 	for i := range script {
 		script[i] = gatewayResponse{status: http.StatusServiceUnavailable}
@@ -482,6 +484,7 @@ func TestCoordinatorEndsBlockedExternalOnDelegatedExhaustion(t *testing.T) {
 }
 
 func TestDelegatedOrdinaryStreamFailureStaysToolFailure(t *testing.T) {
+	shrinkRetryDelays(t)
 	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
 	defer cleanupWorker()
 	worker.completeAll = true

@@ -131,6 +131,6 @@ func awaitForTest(t *testing.T, client *protocol.Client, opID string) protocol.R
 		if time.Now().After(deadline) {
 			t.Fatalf("operation %s did not complete", opID)
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
 }

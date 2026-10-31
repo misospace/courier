@@ -362,12 +362,14 @@ func (e *TransientPublicationError) Error() string {
 func (e *TransientPublicationError) Unwrap() error { return e.Err }
 
 // publishRetryRounds bounds transport-class retries inside one broker call,
-// and publishRetryDelay spaces them. They are availability retries, never a
-// duration limit on the work.
-const (
-	publishRetryRounds = 3
-	publishRetryDelay  = 2 * time.Second
-)
+// and publishRetryDelay spaces them. They are availability retries, never
+// a duration limit on the work.
+const publishRetryRounds = 3
+
+// publishRetryDelay is a variable, not a constant, so an in-process test can
+// shrink it. Production never reassigns it: the delay is the production
+// spacing between transport-class retries.
+var publishRetryDelay = 2 * time.Second
 
 // worldReconcileRounds bounds how many times one publication re-observes the
 // world and reclassifies before it refuses to guess: a tip that keeps moving

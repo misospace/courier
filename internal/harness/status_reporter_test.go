@@ -111,6 +111,7 @@ func TestStatusReporterFailedHeartbeatRetriesOnNextActivity(t *testing.T) {
 }
 
 func TestStatusReporterBeginOperationIsUIDFencedAndRetried(t *testing.T) {
+	shrinkRetryDelays(t)
 	transport := &recordingStatusTransport{errs: []error{brokerUnavailable(), brokerUnavailable()}}
 	reporter := testReporter(transport)
 
@@ -170,6 +171,7 @@ func TestStatusReporterEndOperationWritesHeartbeatOnlyOnCompletion(t *testing.T)
 }
 
 func TestStatusReporterRetainsFailedClearUntilFlush(t *testing.T) {
+	shrinkRetryDelays(t)
 	// Four transient failures exhaust the retry rounds: the entry is
 	// retained, never claimed cleared, and a later flush retries the clear.
 	transport := &recordingStatusTransport{errs: []error{
@@ -530,7 +532,7 @@ func TestHeartbeatWriteNeverBlocksTheStreamPath(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("the in-flight write never settled")
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(200 * time.Microsecond)
 	}
 	reporter.mu.Lock()
 	reporter.lastWritten = time.Time{}
@@ -699,6 +701,7 @@ func delegateChangesScript() []gatewayResponse {
 // retried through transient availability, and skipped entirely for an unset
 // kind — the legacy shape whose classification stays with the exit code.
 func TestStatusReporterTerminalResultPersistsBeforeExit(t *testing.T) {
+	shrinkRetryDelays(t)
 	transport := &recordingStatusTransport{errs: []error{brokerUnavailable()}}
 	reporter := testReporter(transport)
 	result := courierv1alpha1.NativeResult{

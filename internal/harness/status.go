@@ -14,10 +14,12 @@ import (
 // single harness operation, and statusRetryDelay spaces them. They are
 // availability retries for a broker that is momentarily unreachable, never a
 // duration limit on work.
-const (
-	statusRetryRounds = 3
-	statusRetryDelay  = 2 * time.Second
-)
+const statusRetryRounds = 3
+
+// statusRetryDelay is a variable, not a constant, so an in-process test can
+// shrink it. Production never reassigns it: the delay is the production
+// spacing between availability retries.
+var statusRetryDelay = 2 * time.Second
 
 // defaultHeartbeatCadence bounds heartbeat status writes while successful
 // activity is continuous (§7: coalescing to at most one patch per cadence).

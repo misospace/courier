@@ -193,18 +193,47 @@ type mockWorker struct {
 	// landed, but the worker's process group is not empty, so the
 	// reconciliation observes NO termination.
 	liveDescendants int
-	// pollDelay makes an in-flight result poll for a still-running (not
-	// tombstoned) operation fail with 503 only after the delay: the
-	// caller's liveness bound expires while the poll is in flight, so the
-	// poll-failure path — not the poll wait — is the one that reconciles.
-	// It never delays a tombstoned poll, so a reconcile's own observation
-	// answers immediately.
-	pollDelay time.Duration
+	// hangPoll makes an in-flight result poll for a still-running (not
+	// tombstoned) operation block until its request context is canceled and
+	// only then fail: the poll fails while the operation is still running,
+	// so the poll-failure path — not the poll wait — is the one that
+	// reconciles. It never hangs a tombstoned poll, so a reconcile's own
+	// observation answers immediately, and it never sleeps on a wall clock.
+	hangPoll bool
+	// pollInFlight reports that a hanging poll reached the worker. The
+	// handler never blocks on it, so the test can await the poll's arrival
+	// and abort it at a moment it chooses.
+	pollInFlight chan struct{}
+	// hangPolls counts the polls that hung until their request context was
+	// canceled, so a test can prove the hanging path engaged.
+	hangPolls int
 	// tombstones records cancelled op IDs, mirroring the real worker: a
 	// cancellation tombstone is final, and a result poll for a
 	// tombstoned operation answers the verified cancellation instead of
 	// hanging — the reconcile must be able to observe it.
 	tombstones map[string]bool
+}
+
+// hangingPollCeiling bounds how long a test waits for a scripted hanging
+// poll to reach the worker before it aborts the poll anyway. It is a
+// failure ceiling, never the mechanism under test: the cases assert that
+// the hanging poll engaged.
+const hangingPollCeiling = 10 * time.Second
+
+// shrinkRetryDelays shrinks the harness's production retry delays for the
+// duration of one test: the retry rounds, the retry classification, and the
+// final outcome are still proven, but the test does not wait out the
+// production-scale spacing between attempts. The production values are never
+// changed — the seam exists only so a test can own the bound it waits on.
+func shrinkRetryDelays(t *testing.T) {
+	t.Helper()
+	status, publish, backoff := statusRetryDelay, publishRetryDelay, retryBackoff
+	statusRetryDelay = 2 * time.Millisecond
+	publishRetryDelay = 2 * time.Millisecond
+	retryBackoff = 2 * time.Millisecond
+	t.Cleanup(func() {
+		statusRetryDelay, publishRetryDelay, retryBackoff = status, publish, backoff
+	})
 }
 
 func isWorkerBootstrapTask(task protocol.Task) bool {
@@ -377,7 +406,8 @@ func (m *mockWorker) handleResult(w http.ResponseWriter, r *http.Request) {
 		m.results = map[string]protocol.ResultState{}
 	}
 	tombstoned := m.tombstones[opID]
-	pollDelay := m.pollDelay
+	hangPoll := m.hangPoll
+	inFlight := m.pollInFlight
 	if tombstoned && m.reconcileFails {
 		// The cancellation landed, but observing the operation afterward
 		// fails: reconciliation that cannot verify termination.
@@ -412,10 +442,22 @@ func (m *mockWorker) handleResult(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if !tombstoned && state.Status == "running" && pollDelay > 0 {
-		// The poll stays in flight past the caller's liveness bound and
-		// then fails: the bound expires while the poll is outstanding.
-		time.Sleep(pollDelay)
+	if !tombstoned && state.Status == "running" && hangPoll {
+		// The poll stays in flight until the caller aborts it: the poll
+		// fails while the operation is still running, so the poll-failure
+		// path — not the poll wait — is the one that reconciles. The mock
+		// never sleeps on a wall clock: it reports that the poll is in
+		// flight and waits for the request context to be canceled.
+		m.mu.Lock()
+		m.hangPolls++
+		m.mu.Unlock()
+		if inFlight != nil {
+			select {
+			case inFlight <- struct{}{}:
+			default:
+			}
+		}
+		<-r.Context().Done()
 		w.WriteHeader(http.StatusServiceUnavailable)
 		fmt.Fprint(w, "poll failed while in flight")
 		return
@@ -439,15 +481,33 @@ func (m *mockWorker) cancelCount() int {
 }
 
 // scriptUnobservedTermination scripts the worker whose cancellation lands
-// but whose task tree is not empty, and whose result poll for a running
-// operation stays in flight for the given delay. The knobs are written
-// under the mock's lock and read under the same lock, so the worker
+// but whose task tree is not empty, and arms the in-flight poll signal. It
+// returns the channel that reports the poll in flight, so a test can await
+// the poll's arrival and abort it at a moment it chooses. The knobs are
+// written under the mock's lock and read under the same lock, so the worker
 // goroutine and the test never race over them.
-func (m *mockWorker) scriptUnobservedTermination(liveDescendants int, pollDelay time.Duration) {
+func (m *mockWorker) scriptUnobservedTermination(liveDescendants int) <-chan struct{} {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.liveDescendants = liveDescendants
-	m.pollDelay = pollDelay
+	m.pollInFlight = make(chan struct{}, 1)
+	return m.pollInFlight
+}
+
+// scriptHangingPoll makes a result poll for a still-running operation block
+// until its request context is canceled and then fail, so the poll fails
+// while the operation is still running.
+func (m *mockWorker) scriptHangingPoll() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.hangPoll = true
+}
+
+// hangingPolls reports how many polls hung until they were aborted.
+func (m *mockWorker) hangingPolls() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.hangPolls
 }
 
 // --- recording activity sink ----------------------------------------------
@@ -1100,6 +1160,7 @@ func TestGatewayStatusErrorIsRedacted(t *testing.T) {
 // --- acceptance: failed retry vs successful chunk --------------------------
 
 func TestFailedStreamRetriesThenSuccessfulChunkEarnsActivity(t *testing.T) {
+	shrinkRetryDelays(t)
 	gateway, mocker, cleanup := gatewayFor(
 		gatewayResponse{status: http.StatusServiceUnavailable},
 		gatewayResponse{status: http.StatusBadGateway},
@@ -1127,6 +1188,7 @@ func TestFailedStreamRetriesThenSuccessfulChunkEarnsActivity(t *testing.T) {
 }
 
 func TestFailedStreamNeverEarnsActivityAndExhaustsRetries(t *testing.T) {
+	shrinkRetryDelays(t)
 	script := make([]gatewayResponse, maxStreamRetries+1)
 	for i := range script {
 		script[i] = gatewayResponse{status: http.StatusServiceUnavailable}
@@ -1385,9 +1447,11 @@ func TestDispatchAndAwaitUnobservedTerminationIsUnverified(t *testing.T) {
 			prepare: func(worker *mockWorker) (context.Context, context.CancelFunc) {
 				// The dispatch fails ambiguously: the worker may have
 				// accepted the task, so control reconciles through
-				// cancellation instead of redelivering.
+				// cancellation instead of redelivering. The dispatch never
+				// reaches the worker, so no poll of a running operation
+				// ever reaches the mock either.
 				worker.dispatchPlan = []int{http.StatusServiceUnavailable}
-				worker.scriptUnobservedTermination(3, 0)
+				worker.scriptUnobservedTermination(3)
 				return context.WithCancel(context.Background())
 			},
 			wantDispatches: 0,
@@ -1395,12 +1459,27 @@ func TestDispatchAndAwaitUnobservedTerminationIsUnverified(t *testing.T) {
 		{
 			name: "in-flight poll failure",
 			prepare: func(worker *mockWorker) (context.Context, context.CancelFunc) {
-				// The operation keeps running and its poll stays in flight
-				// past the caller's bound, so the poll-failure path — not
-				// the poll wait — is the one that reconciles.
+				// The operation keeps running and its poll hangs until the
+				// test aborts it, so the poll-failure path — not the poll
+				// wait — is the one that reconciles. The abort happens at
+				// a moment the test chooses: no wall clock decides when
+				// the poll fails.
 				worker.hangResults = true
-				worker.scriptUnobservedTermination(3, 750*time.Millisecond)
-				return context.WithTimeout(context.Background(), 250*time.Millisecond)
+				worker.scriptHangingPoll()
+				inFlight := worker.scriptUnobservedTermination(3)
+				ctx, cancel := context.WithCancel(context.Background())
+				go func() {
+					select {
+					case <-inFlight:
+						cancel()
+					case <-ctx.Done():
+					case <-time.After(hangingPollCeiling):
+						// Failure ceiling only: the case asserts that
+						// the hanging poll actually engaged.
+						cancel()
+					}
+				}()
+				return ctx, cancel
 			},
 			wantDispatches: 1,
 		},
@@ -1431,6 +1510,13 @@ func TestDispatchAndAwaitUnobservedTerminationIsUnverified(t *testing.T) {
 			// happened after the task was accepted.
 			if got := worker.dispatchCount(); got != tc.wantDispatches {
 				t.Fatalf("worker dispatches = %d, want %d — the case must exercise the path it scripts", got, tc.wantDispatches)
+			}
+			if tc.wantDispatches > 0 {
+				// The poll really hung and was aborted: the poll-failure
+				// path reconciled, not the poll wait.
+				if got := worker.hangingPolls(); got != 1 {
+					t.Fatalf("hanging polls = %d, want 1 — the case must exercise the poll-failure path", got)
+				}
 			}
 			// The worker is fenced: no further dispatch may run against it.
 			dispatches := worker.dispatchCount()
@@ -1855,7 +1941,7 @@ func TestDelegatorEndToEndWithRealWorker(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("worker task did not complete")
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
 	// A same-ID redispatch is a definite conflict: no redelivery path.
 	if _, err := delegator.Dispatch(ctx, opID, "b1", protocol.Task{Command: []string{"true"}}); err == nil {
@@ -2223,6 +2309,7 @@ func containsTool(tools []ToolDef, name string) bool {
 // A real transport failure (connection refused) is retried by the session
 // loop and classified retryable by the probe machinery.
 func TestTransportFailureIsRetriedAndClassifiedRetryable(t *testing.T) {
+	shrinkRetryDelays(t)
 	var connections atomic.Int32
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -2724,6 +2811,7 @@ func noLeakedCredential(t *testing.T, err error, forbidden ...string) {
 // own credential has already been replaced on disk, the refusal is the swap
 // window: retryable, and the next attempt carries the fresh bytes.
 func TestBroker401DuringTokenSwapRetriesWithFreshToken(t *testing.T) {
+	shrinkRetryDelays(t)
 	rec := swapBroker(t, "token-two")
 	reads := 0
 	source := funcTokenSource(func() ([]byte, error) {
@@ -2781,6 +2869,7 @@ func TestBroker401WithoutRotationStaysADenial(t *testing.T) {
 // failure that relaunching reconciles — never a blocked publication, and
 // never an unbounded loop.
 func TestBroker401SpinAcrossRoundsStaysTransient(t *testing.T) {
+	shrinkRetryDelays(t)
 	rec := swapBroker(t, "never-accepted")
 	reads := 0
 	source := funcTokenSource(func() ([]byte, error) {
@@ -2817,6 +2906,7 @@ func TestBroker401SpinAcrossRoundsStaysTransient(t *testing.T) {
 // window retries with the fresh bytes instead of persisting a failure that
 // only a human could clear.
 func TestTrustedStatusSurvivesTokenSwapWindow(t *testing.T) {
+	shrinkRetryDelays(t)
 	rec := swapBroker(t, "token-two")
 	reads := 0
 	source := funcTokenSource(func() ([]byte, error) {
@@ -2947,40 +3037,56 @@ func TestProbe401DuringTokenSwapIsRetryable(t *testing.T) {
 
 // --- broker transport reuse (#384) -----------------------------------------
 
+// tlsServerCounts reports the connections a counting TLS server opened and
+// closed, and carries one signal per observed close so a test can await a
+// close instead of polling for it.
+type tlsServerCounts struct {
+	opened *atomic.Int64
+	closed *atomic.Int64
+	closes chan struct{}
+}
+
 // countingTLSServer is an httptest TLS server that counts the connections it
-// opens and closes, and hands back its certificate as a CA PEM so a default
-// broker client can trust it.
-func countingTLSServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *atomic.Int64, *atomic.Int64, []byte) {
+// opens and closes, reports every close on a channel, and hands back its
+// certificate as a CA PEM so a default broker client can trust it.
+func countingTLSServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *tlsServerCounts, []byte) {
 	t.Helper()
 	server := httptest.NewUnstartedServer(handler)
-	var opened, closed atomic.Int64
+	counts := &tlsServerCounts{opened: &atomic.Int64{}, closed: &atomic.Int64{}, closes: make(chan struct{}, 64)}
 	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
 		switch state {
 		case http.StateNew:
-			opened.Add(1)
+			counts.opened.Add(1)
 		case http.StateClosed:
-			closed.Add(1)
+			counts.closed.Add(1)
+			// The signal never blocks the server's connection hook.
+			select {
+			case counts.closes <- struct{}{}:
+			default:
+			}
 		}
 	}
 	server.StartTLS()
 	t.Cleanup(server.Close)
 	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw})
-	return server, &opened, &closed, caPEM
+	return server, counts, caPEM
 }
 
-// waitForClosed polls until the server has observed want connection closes.
-func waitForClosed(t *testing.T, closed *atomic.Int64, want int64) {
+// waitForClosed awaits want connection closes on the server's close signal.
+// The bound is only a failure ceiling: the close is reported, not polled for.
+func waitForClosed(t *testing.T, counts *tlsServerCounts, want int64) {
 	t.Helper()
-	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
-		if closed.Load() >= want {
-			return
+	for seen := int64(0); seen < want; seen++ {
+		select {
+		case <-counts.closes:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("server closed %d connections, want %d", counts.closed.Load(), want)
 		}
 	}
-	t.Fatalf("server closed %d connections, want %d", closed.Load(), want)
 }
 
 func TestBrokerClientReusesOneTransportAcrossRequests(t *testing.T) {
-	server, opened, closed, caPEM := countingTLSServer(t, func(w http.ResponseWriter, r *http.Request) {
+	server, counts, caPEM := countingTLSServer(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/trusted/v1/status" || r.Method != http.MethodPost {
 			http.NotFound(w, r)
 			return
@@ -2993,7 +3099,7 @@ func TestBrokerClientReusesOneTransportAcrossRequests(t *testing.T) {
 			t.Fatalf("status post %d: %v", i, err)
 		}
 	}
-	if got := opened.Load(); got != 1 {
+	if got := counts.opened.Load(); got != 1 {
 		t.Fatalf("five sequential status posts opened %d TLS connections, want 1", got)
 	}
 	built, err := client.transport()
@@ -3009,11 +3115,11 @@ func TestBrokerClientReusesOneTransportAcrossRequests(t *testing.T) {
 			transport.IdleConnTimeout, transport.MaxIdleConns, transport.MaxIdleConnsPerHost)
 	}
 	client.CloseIdleConnections()
-	waitForClosed(t, closed, 1)
+	waitForClosed(t, counts, 1)
 }
 
 func TestBrokerClientConcurrentRequestsShareOneTransport(t *testing.T) {
-	server, opened, _, caPEM := countingTLSServer(t, func(w http.ResponseWriter, _ *http.Request) {
+	server, counts, caPEM := countingTLSServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	client := &BrokerClient{BaseURL: server.URL, TokenSource: NewStaticBrokerTokenSource([]byte("tok")), CA: caPEM}
@@ -3028,7 +3134,7 @@ func TestBrokerClientConcurrentRequestsShareOneTransport(t *testing.T) {
 		}()
 	}
 	group.Wait()
-	if got := opened.Load(); got == 0 || got > 8 {
+	if got := counts.opened.Load(); got == 0 || got > 8 {
 		t.Fatalf("eight concurrent status posts opened %d TLS connections, want between 1 and 8", got)
 	}
 	first, err := client.transport()
@@ -3045,7 +3151,7 @@ func TestBrokerClientConcurrentRequestsShareOneTransport(t *testing.T) {
 }
 
 func TestBrokerProbeClientReusesOneTransportAcrossProbes(t *testing.T) {
-	server, opened, closed, caPEM := countingTLSServer(t, func(w http.ResponseWriter, r *http.Request) {
+	server, counts, caPEM := countingTLSServer(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/capabilities" {
 			http.NotFound(w, r)
 			return
@@ -3060,18 +3166,41 @@ func TestBrokerProbeClientReusesOneTransportAcrossProbes(t *testing.T) {
 			t.Fatalf("probe %d = %+v, err %v", i, report, err)
 		}
 	}
-	if got := opened.Load(); got != 1 {
+	if got := counts.opened.Load(); got != 1 {
 		t.Fatalf("three sequential capability probes opened %d TLS connections, want 1", got)
 	}
 	client.CloseIdleConnections()
-	waitForClosed(t, closed, 1)
+	waitForClosed(t, counts, 1)
+}
+
+// closeCountingTransport wraps a real transport, forwards every request to it,
+// and counts the CloseIdleConnections calls it receives. It proves whether a
+// client ever asked its transport to close the idle pool.
+type closeCountingTransport struct {
+	base   http.RoundTripper
+	closes atomic.Int64
+}
+
+func (t *closeCountingTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return t.base.RoundTrip(request)
+}
+
+func (t *closeCountingTransport) CloseIdleConnections() {
+	t.closes.Add(1)
+	if closer, ok := t.base.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
+	}
 }
 
 func TestSuppliedHTTPClientKeepsOwnership(t *testing.T) {
-	server, _, closed, _ := countingTLSServer(t, func(w http.ResponseWriter, _ *http.Request) {
+	server, _, _ := countingTLSServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	supplied := server.Client()
+	// The supplied transport records whether anyone asked it to close its
+	// idle pool: the client must never touch a pool it does not own.
+	recorder := &closeCountingTransport{base: supplied.Transport}
+	supplied.Transport = recorder
 	client := &BrokerClient{BaseURL: server.URL, TokenSource: NewStaticBrokerTokenSource([]byte("tok")), HTTP: supplied}
 	if got, err := client.transport(); err != nil || got != supplied {
 		t.Fatalf("transport() = %v, %v, want the supplied client itself", got, err)
@@ -3080,8 +3209,7 @@ func TestSuppliedHTTPClientKeepsOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 	client.CloseIdleConnections()
-	time.Sleep(200 * time.Millisecond)
-	if got := closed.Load(); got != 0 {
+	if got := recorder.closes.Load(); got != 0 {
 		t.Fatalf("CloseIdleConnections closed %d connections on a supplied client, want 0: the supplier owns the pool", got)
 	}
 }

@@ -266,7 +266,7 @@ func waitFor(t *testing.T, condition func() bool, timeout time.Duration, message
 		if condition() {
 			return
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal(message)
 }

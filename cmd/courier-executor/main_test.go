@@ -34,6 +34,15 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	// The subprocess scenarios need a real process to signal, and the real
+	// process is this test binary re-entered as the executor. The dispatch
+	// comes before the COURIER_* scrub below, because the helper needs its
+	// own run configuration intact; main() ends in os.Exit(run(...)), so the
+	// helper exits with the run's exit code and never runs a test.
+	if os.Getenv(executorHelperProcessEnv) == "1" {
+		main()
+		return
+	}
 	// Tests supply their own run configuration; never inherit a live pod's
 	// termination path or other COURIER_* settings.
 	for _, entry := range os.Environ() {

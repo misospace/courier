@@ -69,12 +69,18 @@ func startBrokerRBACRun(t *testing.T, name string) (ctrlclient.Client, *SecureCo
 
 func applyBrokerRole(t *testing.T, c ctrlclient.Client, run *courier.CoderRun, role *rbacv1.Role) {
 	t.Helper()
+	binding := topology.BrokerRoleBinding(run)
 	if err := c.Create(context.Background(), role); err != nil {
 		t.Fatalf("create broker Role: %v", err)
 	}
-	if err := c.Create(context.Background(), topology.BrokerRoleBinding(run)); err != nil {
+	if err := c.Create(context.Background(), binding); err != nil {
 		t.Fatalf("create broker RoleBinding: %v", err)
 	}
+	// The grants belong to the run that created them, so a run leaves none
+	// behind: a second run in the same process would otherwise find them
+	// and fail on the leftover.
+	t.Cleanup(func() { _ = c.Delete(context.Background(), binding) })
+	t.Cleanup(func() { _ = c.Delete(context.Background(), role) })
 }
 
 // grantBrokerTokenReviewCluster provisions the deployment-scoped ClusterRole
@@ -110,18 +116,28 @@ func brokerReadAllowed(control *SecureControl, broker string, review accessRevie
 
 // eventually polls check until it passes or a deadline lapses, so a freshly
 // applied binding has propagated through the API server's RBAC informers.
+// The observed propagation is logged against the ceiling the poll allows, so
+// the suite records how long the API server actually took.
 func eventually(t *testing.T, check func() error) {
 	t.Helper()
-	deadline := time.Now().Add(15 * time.Second)
+	const (
+		ceiling  = 10 * time.Second
+		interval = 10 * time.Millisecond
+	)
+	started := time.Now()
+	deadline := started.Add(ceiling)
 	var last error
 	for {
 		if last = check(); last == nil {
+			elapsed := time.Since(started)
+			t.Logf("RBAC propagation took %s of the %s ceiling (%s of headroom)",
+				elapsed.Round(time.Millisecond), ceiling, (ceiling - elapsed).Round(time.Millisecond))
 			return
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("condition not met before deadline: %v", last)
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(interval)
 	}
 }
 
@@ -255,7 +271,8 @@ func TestPreflightBrokerRBACTokenReviewNotNamespacedEnvtest(t *testing.T) {
 	if err := c.Create(context.Background(), nsRole); err != nil {
 		t.Fatalf("create namespaced tokenreviews Role: %v", err)
 	}
-	if err := c.Create(context.Background(), &rbacv1.RoleBinding{
+	t.Cleanup(func() { _ = c.Delete(context.Background(), nsRole) })
+	nsBinding := &rbacv1.RoleBinding{
 		ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: roleName},
 		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: roleName},
 		Subjects: []rbacv1.Subject{{
@@ -263,9 +280,11 @@ func TestPreflightBrokerRBACTokenReviewNotNamespacedEnvtest(t *testing.T) {
 			Name:      topology.BrokerSAName(run.Name),
 			Namespace: run.Namespace,
 		}},
-	}); err != nil {
+	}
+	if err := c.Create(context.Background(), nsBinding); err != nil {
 		t.Fatalf("create namespaced tokenreviews RoleBinding: %v", err)
 	}
+	t.Cleanup(func() { _ = c.Delete(context.Background(), nsBinding) })
 
 	broker := topology.BrokerSAName(run.Name)
 	// Once the control pod read is allowed the whole Role (bound atomically via
