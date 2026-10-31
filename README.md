@@ -132,6 +132,31 @@ the lanes through its mounted bootstrap config file. Separately applied
 (user-managed) LaneProfile CRs remain supported. See
 [BOOTSTRAP.md](./BOOTSTRAP.md) for both paths.
 
+Secure mode adds one cluster requirement: every run's broker must reach the
+Kubernetes API server on port 443. Under identity-based CNIs such as Cilium,
+the API server carries a reserved identity that plain NetworkPolicy `ipBlock`
+rules cannot match, so the run namespace needs a companion policy from the CNI
+itself. On Cilium, apply a `CiliumNetworkPolicy` like this in the run
+namespace:
+
+```yaml
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: courier-broker-apiserver
+spec:
+  endpointSelector:
+    matchLabels:
+      courier.misospace.dev/component: broker
+  egress:
+    - toEntities:
+        - kube-apiserver
+```
+
+Without it, preflight's broker probe stops each run with a `BrokerEgress`
+verdict instead of launching a broker that cannot reach the API server.
+IP-based CNIs (kube-proxy) need nothing extra.
+
 ## Design
 
 - **Inform, don't constrain.** Give the coordinator context and tools; trust its

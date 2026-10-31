@@ -24,6 +24,18 @@ import (
 // Requeue delay while waiting for probe pods or terminating topology pods.
 const secureRequeueDelay = 2 * time.Second
 
+// brokerVerdictGrace bounds how long a young control pod is spared the
+// broken-topology fence after its broker dies (#680). The broker's death is
+// precisely the condition the control's startup capability gate converts into
+// a needs-human termination handoff, so a control still inside this window
+// may be seconds from recording that verdict; deferring the fence lets a
+// deterministic environment failure terminalize in one round instead of
+// consuming the crashloop ceiling. The supervisor stays alive for the whole
+// window, so no untrusted worker or credentialed broker outlives it, and a
+// control that never concludes falls back to the normal fenceAndRelaunch at
+// grace expiry.
+const brokerVerdictGrace = 90 * time.Second
+
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=create;delete;get;list
 // +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=create;delete;get;list
 // +kubebuilder:rbac:groups="",resources=services,verbs=create;delete;get;list
@@ -442,6 +454,26 @@ func (s *SecureControl) ObserveTopology(ctx context.Context, run *courier.CoderR
 	// reaches Running only after the launch path has created all three pods,
 	// so a missing component here is a post-launch vanishing, not a window
 	// the launch path is still filling.
+	// The broker-verdict grace (#680): a broken broker while the control is
+	// young may be the very condition the control's startup capability gate
+	// is converting into a needs-human termination handoff — the broker
+	// cannot reach the API server, and that is the verdict the gate reports.
+	// Deferring the fence a bounded window lets that verdict land so a
+	// deterministic environment failure terminalizes in one round instead of
+	// consuming the crashloop ceiling; the supervisor (control) stays alive
+	// for the whole window, so the invariant that no untrusted worker or
+	// credentialed broker outlives its supervisor holds, and a control that
+	// never concludes resumes the normal fenceAndRelaunch at grace expiry. A
+	// simultaneous worker loss is plain infrastructure failure and fences
+	// immediately, and a control with no recorded coordinator start fails
+	// closed toward the fence.
+	if control.DeletionTimestamp == nil &&
+		worker != nil && worker.DeletionTimestamp == nil &&
+		broker != nil && broker.DeletionTimestamp == nil &&
+		!topologyBroken(worker) && topologyBroken(broker) &&
+		controlWithinBrokerVerdictGrace(control, s.now()) {
+		return ctrl.Result{RequeueAfter: secureRequeueDelay}, true, nil
+	}
 	if worker == nil || broker == nil || worker.DeletionTimestamp != nil || broker.DeletionTimestamp != nil {
 		return s.fenceAndRelaunch(ctx, run)
 	}
@@ -468,6 +500,26 @@ func topologyBroken(pod *corev1.Pod) bool {
 		return false // terminating pods are not re-deleted; deletion is in flight
 	}
 	return pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded
+}
+
+// controlWithinBrokerVerdictGrace reports whether the control pod's
+// coordinator container is running with a recorded start young enough that
+// its startup capability gate may still be converging on the broker-verdict
+// termination handoff (#680). A control with no running coordinator container
+// or a zero start time fails closed: it is treated as past the grace and
+// fences immediately.
+func controlWithinBrokerVerdictGrace(control *corev1.Pod, now time.Time) bool {
+	for _, cs := range control.Status.ContainerStatuses {
+		if cs.Name != topology.ControlContainerName || cs.State.Running == nil {
+			continue
+		}
+		started := cs.State.Running.StartedAt.Time
+		if started.IsZero() {
+			return false
+		}
+		return now.Sub(started) < brokerVerdictGrace
+	}
+	return false
 }
 
 // fenceAndRelaunch deletes the run's topology pods and returns the run to
@@ -508,6 +560,20 @@ func (s *SecureControl) fenceAndRelaunch(ctx context.Context, run *courier.Coder
 	controlPod, err := s.podLive(ctx, run, topology.ComponentCoordinator)
 	if err != nil {
 		return ctrl.Result{}, true, err
+	}
+	// A live control pod that has already terminated with a validated
+	// termination handoff is the run's verdict evidence (#680): the cached
+	// pod list this reconcile observed still showed the control running, but
+	// the world has moved on. Deleting it would destroy the exit-code
+	// mapping's record — the very needs-human verdict the broken broker
+	// produced — and charge a crashloop round for a death that needs no
+	// relaunch. Preserve the pod, fence the round, and requeue so the next
+	// pass maps the handoff and terminalizes the run.
+	if controlPod != nil && coordinatorHandoffValid(controlPod) {
+		if err := s.Fence(ctx, run); err != nil {
+			return ctrl.Result{}, true, err
+		}
+		return ctrl.Result{RequeueAfter: secureRequeueDelay}, true, nil
 	}
 	atCeiling := run.Status.Restarts >= crashloopCeiling(s.MaxRestarts)
 	// A control object that reports no outcome — terminal phase, no recorded
@@ -1007,9 +1073,9 @@ func (s *SecureControl) podLive(ctx context.Context, run *courier.CoderRun, comp
 }
 
 // podOfComponent finds one run-owned pod for a component through the given
-// reader. Preflight probe pods carry the worker's component label (so the
-// worker's own NetworkPolicy applies to them) and are excluded by the probe
-// label.
+// reader. Preflight probe pods carry the component label of the workload whose
+// NetworkPolicy they exercise (worker or broker) and are excluded by the
+// probe label.
 func podOfComponent(ctx context.Context, reader client.Reader, run *courier.CoderRun, component string) (*corev1.Pod, error) {
 	var pods corev1.PodList
 	if err := reader.List(ctx, &pods, client.InNamespace(run.Namespace)); err != nil {

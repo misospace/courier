@@ -716,6 +716,20 @@ to die.
   `needs-human` with the counter left at the ceiling, rather than one further
   relaunch. This is the one counter that matters, and it is death-detection, not
   work-retry.
+- A secure round whose **broker** dies while its control is still young defers
+  the fence for a bounded window (90s from the coordinator container's start):
+  the broker's death is exactly the condition the control's startup capability
+  gate turns into a needs-human termination handoff, so letting that verdict
+  land terminalizes a deterministic environment failure in one round instead of
+  spending the crashloop ceiling on rounds that all reach the same conclusion
+  (#680). The supervisor stays alive for the whole window, so the fence
+  invariant — nothing outlives its supervisor — holds throughout; a control
+  whose start time is zero or past the window, or a simultaneous worker loss,
+  fences immediately as before. The secure relaunch path also preserves a
+  control pod whose live read shows a valid termination handoff (fencing the
+  round without charging a relaunch), so a verdict the cached observation had
+  not yet caught up with is never deleted before the exit-code mapping reads
+  it.
 - A pod's **disappearance** — no coordinator pod **object** at all — is
   infrastructure loss on its own terms, detected without any heartbeat,
   because there is no pod left to heartbeat from. A pod whose coordinator exit
@@ -2244,7 +2258,7 @@ Requeueing cannot change a permanently invalid spec, so the rejection is caught
 where it happens and the run stops rather than cycling claim, preflight, and
 release on every reconcile. The secure path's dry-run proof is the primary
 catch: it admits
-the control, worker, and broker pods, and the probe pod too on the passes that
+the control, worker, and broker pods, and the probe pods too on the passes that
 create probes live, so no pass creates a spec it has not proved. The secure
 workload creates behind that proof return ordinary errors and rely on it; the two
 creates a dry run cannot stand in for — the live probe create and the legacy
@@ -2271,6 +2285,22 @@ not name. No retry can change what the request names, so the run stops and
 names the request instead of launching against an unverified base. A transient
 forge read that never completed is not that verdict: it proves nothing about
 the base, so the claim is released and the run is retried.
+The live probe phase proves the worker's deny paths and, on passes that
+create probes, one allow path the broker itself requires: a broker-labeled
+probe pod per eligible node carries the broker's component label, so the
+broker's own NetworkPolicy — not an exception — is what the probe
+exercises, and it dials the API server service on 443. The broker must
+reach the API server by design (`read own pod` adopts the run binding
+from the owner chain), so a deny there is the `BrokerEgress` verdict:
+the environment's CNI classifies API-server traffic by a reserved
+identity that vanilla NetworkPolicy `ipBlock` rules cannot match —
+Cilium does this, and an explicit ClusterIP `ipBlock` entry drops the
+same way — so the run namespace needs a companion CNI policy (for
+example a `CiliumNetworkPolicy` granting `toEntities: kube-apiserver`
+to the run's broker pod). Under kube-proxy networking the same
+probe passes, which is why envtest and the deny probes never caught the
+gap: the data path is environment-dependent, and the probe proves the
+request at the request's scope.
 Every other preflight verdict keeps the claim/release requeue, because
 each of them clears on a later pass — a live probe can outrun the dataplane
 programming of the NetworkPolicy the same reconcile just wrote, and an access
@@ -2281,7 +2311,8 @@ The claim/release requeue a permanent-class verdict keeps is rate-bounded. A
 verdict outside the terminal classes — the broker's own grants
 (`BrokerRBAC`), the operator's own grants (`OperatorRBAC`), the run
 namespace's Pod Security label (`PodSecurity`), the admission proofs
-(`AdmissionBroken`, `IsolationBroken`), and the provider and policy verdicts
+(`AdmissionBroken`, `IsolationBroken`), the broker's own API-server
+allow path (`BrokerEgress`), and the provider and policy verdicts
 the launch path raises (`ProviderSelection`, `PolicyConflict`) — requeued as
 fast as the API server allowed would churn the run through Pending and Claimed
 several times a second, the retry churn #644 required to stop. The operator
@@ -3285,9 +3316,13 @@ only informs.
   material distinguishes it. Control-to-worker tasks use signed
   run/incarnation-bound envelopes; the worker has no secret, service-account
   token, or signing key. Worker network access is limited to the dedicated Go
-  module/checksum cache and no DNS, never broker or forge. Enforced
-  network policy, live deny probes, and secure preflight fail closed before
-  workload exposure; the preflight separates static admission/spec checks from
+   module/checksum cache and no DNS, never broker or forge. Enforced
+   network policy, live deny probes, and secure preflight fail closed before
+   workload exposure; the broker's own API-server allow path is probed the
+   same way, and on identity-based CNIs such as Cilium the deployment must
+   supply a companion policy granting the run's broker pod
+   `toEntities: kube-apiserver`, because vanilla NetworkPolicy cannot express
+   it (#680). The preflight separates static admission/spec checks from
   live probes, and neither proves a privileged cluster actor cannot create or
   mutate pods outside those controls — a stated residual risk, not a closed
   hole. [HARNESS.md](./HARNESS.md) specifies the contract; the isolation wiring

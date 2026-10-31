@@ -700,9 +700,10 @@ func ControlPod(run *courier.CoderRun, in ControlInputs) (*corev1.Pod, error) {
 }
 
 // LabelProbe marks disposable preflight probe pods. Probe pods deliberately
-// carry the worker's component label so the worker's own NetworkPolicy — not
-// a special exception — is what the probe exercises; this extra label lets
-// the operator's workload lookups distinguish them.
+// carry the component label of the workload whose NetworkPolicy they exercise
+// — the worker's for ProbePod, the broker's for BrokerProbePod — so the
+// policy under test is the workload's own, not a special exception; this
+// extra label lets the operator's workload lookups distinguish them.
 const LabelProbe = "courier.misospace.dev/probe"
 
 // ProbePod renders one disposable identity-less network probe pod pinned to a
@@ -714,12 +715,26 @@ const LabelProbe = "courier.misospace.dev/probe"
 // reserving lane-scale capacity can stay Pending on a request-tight cluster
 // and wedge preflight (#402).
 func ProbePod(run *courier.CoderRun, node, image, script string) *corev1.Pod {
-	suffix := "-probe-" + nodeNameTag(node)
+	return probePod(run, node, image, script, ComponentWorker, WorkerSAName(run.Name), "-probe-")
+}
+
+// BrokerProbePod renders the broker's twin of ProbePod: the same disposable,
+// identity-less network probe pod pinned to a node, but carrying the broker's
+// component label and running as the broker's service account, so it
+// exercises the broker's own NetworkPolicy egress — in particular the
+// broker-to-API-server allow path preflight must prove.
+//
+// Its sizing is the fixed probe value for the same reason ProbePod's is.
+func BrokerProbePod(run *courier.CoderRun, node, image, script string) *corev1.Pod {
+	return probePod(run, node, image, script, ComponentBroker, BrokerSAName(run.Name), "-broker-probe-")
+}
+
+func probePod(run *courier.CoderRun, node, image, script, component, serviceAccount, suffix string) *corev1.Pod {
 	pod := &corev1.Pod{
-		ObjectMeta: objectMeta(run, podResourceName(run.Name, suffix), ComponentWorker),
+		ObjectMeta: objectMeta(run, podResourceName(run.Name, suffix+nodeNameTag(node)), component),
 		Spec: corev1.PodSpec{
 			NodeName:                     node,
-			ServiceAccountName:           WorkerSAName(run.Name),
+			ServiceAccountName:           serviceAccount,
 			AutomountServiceAccountToken: boolPtr(false),
 			RestartPolicy:                corev1.RestartPolicyNever,
 			SecurityContext:              podSecurityContext(),

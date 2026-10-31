@@ -474,6 +474,60 @@ func TestProbePodSizingIgnoresTheLane(t *testing.T) {
 	}
 }
 
+// TestBrokerProbePodMirrorsProbePodExceptItsIdentity pins the broker probe as
+// the worker probe's exact twin except for the identity that selects the
+// policy it exercises: the broker's component label (so the broker's
+// NetworkPolicy — not the worker's — is what the pod's traffic is judged
+// against) and the broker's service account. Everything else — the probe
+// label, the no-token automount, the Never restart policy, the fixed probe
+// sizing, the container shape — must match, and its name must stay
+// deterministic and distinct from the worker probe's on the same node.
+func TestBrokerProbePodMirrorsProbePodExceptItsIdentity(t *testing.T) {
+	run := testRun("broker-probe")
+	worker := ProbePod(run, "node-a", "busybox:test", "true")
+	broker := BrokerProbePod(run, "node-a", "busybox:test", "true")
+
+	if got := broker.Labels["courier.misospace.dev/component"]; got != ComponentBroker {
+		t.Fatalf("broker probe component label = %q, want %q", got, ComponentBroker)
+	}
+	if worker.Labels["courier.misospace.dev/component"] != ComponentWorker {
+		t.Fatalf("worker probe component label = %q, want %q", worker.Labels["courier.misospace.dev/component"], ComponentWorker)
+	}
+	if broker.Labels[LabelProbe] != "true" {
+		t.Fatal("broker probe must carry the probe label")
+	}
+	if broker.Name == worker.Name {
+		t.Fatalf("broker and worker probes for the same node share the name %q", broker.Name)
+	}
+	if again := BrokerProbePod(run, "node-a", "busybox:test", "true").Name; again != broker.Name {
+		t.Fatalf("broker probe name is not deterministic: %q then %q", broker.Name, again)
+	}
+	if broker.Spec.ServiceAccountName != BrokerSAName(run.Name) {
+		t.Fatalf("broker probe service account = %q, want %q", broker.Spec.ServiceAccountName, BrokerSAName(run.Name))
+	}
+	if broker.Spec.AutomountServiceAccountToken == nil || *broker.Spec.AutomountServiceAccountToken {
+		t.Fatal("broker probe must not automount a service account token")
+	}
+	if broker.Spec.RestartPolicy != corev1.RestartPolicyNever {
+		t.Fatalf("broker probe restart policy = %q", broker.Spec.RestartPolicy)
+	}
+	if broker.Spec.NodeName != worker.Spec.NodeName {
+		t.Fatalf("broker probe node = %q, want the probe's node %q", broker.Spec.NodeName, worker.Spec.NodeName)
+	}
+	if want := courier.ProbePodResources(); !reflect.DeepEqual(broker.Spec.Containers[0].Resources, want) {
+		t.Fatalf("broker probe container resources = %+v, want the fixed probe sizing %+v", broker.Spec.Containers[0].Resources, want)
+	}
+	if broker.Spec.Containers[0].Name != "probe" {
+		t.Fatalf("broker probe container name = %q, want \"probe\"", broker.Spec.Containers[0].Name)
+	}
+	if broker.Spec.Containers[0].TerminationMessagePolicy != corev1.TerminationMessageReadFile {
+		t.Fatalf("broker probe termination message policy = %q", broker.Spec.Containers[0].TerminationMessagePolicy)
+	}
+	if got, want := broker.Spec.Containers[0].Command, worker.Spec.Containers[0].Command; !reflect.DeepEqual(got, want) {
+		t.Fatalf("broker probe command = %v, want the worker probe's %v", got, want)
+	}
+}
+
 // TestRenderedPodsDoNotAliasLaneSizing pins that a rendered pod owns its sizing
 // maps. The caller renders from a LaneProfile that controller-runtime may hold
 // in its informer cache, so a pod spec that still referenced those maps could
