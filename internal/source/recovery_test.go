@@ -20,7 +20,7 @@ func TestBlockedRecoveryRequiresFreshSourceAttemptAndRetainsEvidence(t *testing.
 			lane := testLane()
 			lane.Spec.Concurrency = 4
 			blocked := &courierv1alpha1.CoderRun{
-				ObjectMeta: metav1.ObjectMeta{Name: runName(binding, "generation-7"), Namespace: "courier", UID: types.UID("retained-attempt")},
+				ObjectMeta: metav1.ObjectMeta{Name: RunName(binding, "generation-7"), Namespace: "courier", UID: types.UID("retained-attempt")},
 				Spec:       courierv1alpha1.CoderRunSpec{Source: binding, WorkItemID: "generation-7", Mode: courierv1alpha1.ModeFixPR, Repo: "acme/widgets", Ref: 42, Lane: "local"},
 				Status: courierv1alpha1.CoderRunStatus{
 					Phase:                           courierv1alpha1.PhaseBlockedExternal,
