@@ -216,6 +216,15 @@ type mockWorker struct {
 	// tombstoned operation answers the verified cancellation instead of
 	// hanging — the reconcile must be able to observe it.
 	tombstones map[string]bool
+	// unpackDuringCheck counts unpack dispatches that executed while a
+	// check-kind operation was still in flight (its result state still
+	// "running" and not tombstoned). That is exactly the hazard the
+	// tracked checks' claim ordering must prevent: an unpack resets and
+	// cleans the shared workspace a running check validates. The mock only
+	// records the count; the test asserts it from the outside, so a
+	// regression fails with a clear message instead of from inside the
+	// worker's goroutine.
+	unpackDuringCheck int
 }
 
 func isWorkerBootstrapTask(task protocol.Task) bool {
@@ -298,6 +307,18 @@ func (m *mockWorker) handleDispatch(w http.ResponseWriter, r *http.Request) {
 	m.dispatches = append(m.dispatches, dispatchRecord{envelope: req.Envelope, task: task})
 	if m.results == nil {
 		m.results = map[string]protocol.ResultState{}
+	}
+	// An unpack that executes while a check-kind operation is still in
+	// flight is the tracked-checks hazard: the unpack resets and cleans
+	// the shared workspace the running check validates. Record it for the
+	// test to assert — never fail here, inside the worker's goroutine.
+	if isWorkerUnpackTask(task) {
+		for opID, state := range m.results {
+			if state.Status == "running" && !m.tombstones[opID] && opIDKindOf(opID, []string{"check"}) {
+				m.unpackDuringCheck++
+				break
+			}
+		}
 	}
 	// A hung operation stays running: like the real worker, its result
 	// polls answer "running" immediately until a cancellation tombstones
@@ -473,6 +494,15 @@ func (m *mockWorker) cancelCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.cancels)
+}
+
+// unpackDuringCheckCount reports how many unpack dispatches executed while a
+// check-kind operation was still in flight — the destructive-materialization
+// hazard the tracked checks' claim ordering must prevent.
+func (m *mockWorker) unpackDuringCheckCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.unpackDuringCheck
 }
 
 // scriptUnobservedTermination scripts the worker whose cancellation lands

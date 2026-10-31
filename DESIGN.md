@@ -493,31 +493,65 @@ trusted execution surface as `shell`: the command dispatches over the signed
 protocol to the untrusted worker, and the result is the worker's own exit
 status and bounded output tails — never a summary grep, a shell pipeline
 masking the test exit, or a process-name observation. Each check is tracked
-by a receipt whose identity is the exact command bytes plus the workspace
-state it ran against: the snapshot tip and the applied bootstrap environment
-digest. Commands are keyed verbatim, never by a tokenized form: the task
-executes as `sh -c <command>`, and a quote-resolved identity aliases
+by a receipt whose identity at the registry is the exact command bytes plus
+the snapshot tip. Commands are keyed verbatim, never by a tokenized form: the
+task executes as `sh -c <command>`, and a quote-resolved identity aliases
 distinct programs — `echo "$HOME"` and `echo '$HOME'` tokenize alike but
 expand differently — so only identical bytes guarantee an identical program,
 and collapsing cosmetic whitespace is not worth that aliasing risk. The
-identity is complete because every check dispatch first prepares a fresh
-snapshot — the worker's unpack re-materializes the workspace at that tip
-before anything runs, so the workspace is a pure function of the tip and
-every relevant change reaches it through artifact integration, which advances
-the tip. A repeat request against unchanged state is served from the saved
-receipt instead of re-executing; any state change, a lost receipt, or a
-concrete concern reruns. A completed run is evidence whether it passed or
-failed: the worker reports a nonzero exit as `ResultFailed`, so a failing
-suite is reprinted on repeat rather than rerun forever. A cancelled dispatch
-and a run that never produced its own exit status (`ResultFailed` carrying
-the sentinel exit code `-1`: never started, or died to a signal) are never
-reusable as evidence. Concrete concerns have two explicit invalidation
-paths: `check` accepts `refresh:true`, which ignores and replaces the saved
-receipt with a fresh dispatch, and a completed plain `shell` run — pass or
-fail — of the exact command against the same state drops the matching
-receipt, so a later check cannot serve evidence older than the run the
-coordinator just performed. Invalidation matches the exact command bytes; an
-equivalent command spelled differently keeps its own identity.
+applied bootstrap environment is deliberately outside the registry key: it is
+settled only by the destructive materialization that also produces the
+workspace, so keying on it pre-materialization would force every caller,
+including a joining waiter, to re-materialize the workspace underneath the
+in-flight check. Instead each receipt records the environment digest (for
+observability) and the snapshot generation it ran against — the
+coordinator-local count of successful materializations, whose bump
+witnesses each mutating flow: a control shell or fresh check materializes
+per run, and a delegate brief materializes once for its whole epoch. The registry key's claim strictly precedes the destructive
+snapshot materialization: a caller that joins an in-flight equivalent check
+performs no upload-unpack and cannot mutate the workspace the running check
+validates.
+
+The generation guard is what keeps a served receipt honest. Every
+coordinator-driven workspace mutation is witnessed by a generation bump,
+and worker-side mutation — files a check or shell run leaves behind, gitignored
+outputs included — is wiped only by the next unpack. "No materialization
+since the receipt's run" is therefore exactly "the workspace still holds the
+state the receipt describes": a receipt is servable only while no
+re-materialization has happened since its run, and a receipt from an older
+generation describes a state that no longer exists, so the guard refuses it
+(both on the reuse path and for a waiter whose in-flight dispatch completed
+after an intervening materialization) and the request reruns. This narrows
+reuse honestly: any intervening control shell run, delegate brief
+materialization, or other check dispatch makes stored receipts unservable,
+while back-to-back identical check requests with nothing in between still
+reuse — the deduplication goal. The guard's keystone is that `check` is
+coordinator-only and the coordinator pump executes tool calls serially: a
+delegate epoch can never overlap a check receipt's lifetime, so no receipt
+exists inside an epoch whose mutations it does not describe. A completed
+plain `shell` run of the exact
+command against the same state additionally drops the matching receipt
+outright, so a later check cannot serve evidence older than the run the
+coordinator just performed. The identity is complete because the workspace a
+check runs against is a pure function of the tip on the materialization
+path: a worktree change that does not change the tip cannot exist on the
+materialized workspace, because worker-side edits never survive the next
+unpack, and every relevant change reaches it through artifact integration,
+which advances the tip. A repeat request against unchanged state is served
+from the saved receipt instead of re-executing; any state change, a lost
+receipt, or a concrete concern reruns. A completed run is
+evidence whether it passed or failed: the worker reports a nonzero exit as
+`ResultFailed`, so a failing suite is reprinted on repeat rather than rerun
+forever. A cancelled dispatch and a run that never produced its own exit
+status (`ResultFailed` carrying the sentinel exit code `-1`: never started,
+or died to a signal) are never reusable as evidence. Concrete concerns have
+two explicit invalidation paths: `check` accepts `refresh:true`, which
+ignores and replaces the saved receipt with a fresh dispatch, and a completed
+plain `shell` run — pass or fail — of the exact command against the same
+state drops the matching receipt, so a later check cannot serve evidence
+older than the run the coordinator just performed. Invalidation matches the
+exact command bytes; an equivalent command spelled differently keeps its own
+identity.
 
 While an equivalent check is in flight, a duplicate request waits on that
 dispatch instead of launching a second one. Receipts are bounded (evicted

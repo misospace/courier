@@ -26,6 +26,7 @@ type checkReceipt struct {
 	command    string
 	tip        string
 	envDigest  string
+	gen        uint64
 	status     string
 	exitCode   int
 	stdoutTail string
@@ -218,10 +219,14 @@ func (r *checkRegistry) dropOrder(key string) {
 }
 
 // runCheck executes one tracked check on the sandbox worker. The check's
-// identity is the exact command bytes together with the workspace state it
-// ran against — the snapshot tip and the applied bootstrap environment — so
-// an identical command against an unchanged state serves the saved receipt
-// without a second dispatch, while any state change invalidates it. Like
+// identity at the registry is the exact command bytes together with the
+// snapshot tip — the workspace state it ran against. Each receipt also
+// records the snapshot generation it ran against, and the serve-time guard
+// refuses receipts from an older generation: any coordinator-driven
+// workspace mutation is witnessed by a materialization bump, so an
+// intervening materialization means the workspace no longer holds the state
+// the receipt describes. An identical command with no materialization since
+// the receipt's run serves the saved receipt without a second dispatch. Like
 // runShell this is coordinator-only, binds to the synthetic "control" work
 // unit, and dispatches over the signed protocol onto the untrusted worker.
 func (c *Coordinator) runCheck(ctx context.Context, call ToolCall, briefID string, result ToolResult) ToolResult {
@@ -250,7 +255,13 @@ func (c *Coordinator) runCheck(ctx context.Context, call ToolCall, briefID strin
 		result.Content = "a check command must not contain a NUL byte"
 		return result
 	}
-	tip, err := c.prepareSnapshot(ctx, briefID)
+	// Rendering the snapshot is non-destructive: it re-renders the bundle
+	// from the integration head and answers its tip, uploading and unpacking
+	// nothing. The registry claim below strictly precedes the destructive
+	// materialization, so a caller that joins an in-flight equivalent check
+	// performs no upload-unpack and cannot reset the workspace the running
+	// check validates.
+	snap, err := c.renderSnapshot(ctx)
 	if err != nil {
 		result.IsError = true
 		result.Content = safeToolError(err)
@@ -263,57 +274,123 @@ func (c *Coordinator) runCheck(ctx context.Context, call ToolCall, briefID strin
 	// bytes plus state is the complete identity; any future canonical form
 	// must prove semantic equivalence, not merely collapse formatting.
 	command := args.Command
-	env := c.currentBootstrapEnv()
-	key := checkStateKey(command, tip, bootstrapEnvDigest(env))
+	key := checkStateKey(command, snap.Tip)
 
 	// A forced request is the concrete-concern invalidation path (#635): the
 	// caller doubts the stored receipt, so it is ignored and replaced by a
 	// fresh dispatch. An in-flight dispatch is still shared — a concern
 	// never justifies a duplicate launch.
+	//
+	// The loop serves or replaces: a reusable terminal receipt is served
+	// only while the snapshot generation is unchanged, and a completed
+	// in-flight dispatch is served only under the same guard; a stale
+	// receipt is force-re-claimed (replacing the stale terminal entry, or
+	// joining an in-flight replacement) until a servable outcome or a
+	// fresh claim is reached.
 	entry, outcome := c.checks.claim(key, args.Refresh)
-	switch outcome {
-	case claimReuse:
-		return renderCheckResult(entry.receipt, false, result)
-	case claimActive:
-		select {
-		case <-entry.done:
-		case <-ctx.Done():
-			result.IsError = true
-			result.Content = safeToolError(ctx.Err())
-			return result
+	for {
+		switch outcome {
+		case claimReuse:
+			// Serve-time generation guard: the receipt recorded the
+			// snapshot generation it ran against. If any materialization
+			// has run since — an intervening control shell, delegate
+			// materialization, or other check dispatch — the shared
+			// workspace was reset and re-established, so worker-side
+			// mutation from the receipt's era was wiped and the
+			// workspace no longer holds the state the receipt describes.
+			// A receipt from an older generation describes a state that
+			// no longer exists; re-claim with force to replace the
+			// stale terminal entry.
+			//
+			// The two-step re-claim is safe even though each claim takes
+			// the registry mutex independently: a non-forced claim cannot
+			// displace a terminal reusable entry, so the entry observed
+			// in the first claim is necessarily the one the forced claim
+			// replaces — no concurrent claim can interpose a different
+			// terminal entry between the two steps — and concurrent
+			// forced claimants share the resulting in-flight entry, so a
+			// duplicate launch never happens.
+			//
+			// The environment needs no separate guard: it is settled by
+			// the same materialization that bumps the generation, so
+			// generation equality implies environment equality. The
+			// receipt's envDigest stays recorded for observability.
+			if entry.receipt.gen == c.currentSnapshotGen() {
+				return renderCheckResult(entry.receipt, false, result)
+			}
+		case claimActive:
+			select {
+			case <-entry.done:
+			case <-ctx.Done():
+				result.IsError = true
+				result.Content = safeToolError(ctx.Err())
+				return result
+			}
+			if entry.receipt == nil {
+				// The winner's dispatch never produced a result; its own
+				// tool result already carries the sanitized failure. Serve
+				// a fixed error here rather than dispatching a second
+				// operation.
+				result.IsError = true
+				result.Content = "the tracked check failed to launch; no receipt was recorded"
+				return result
+			}
+			// The same generation guard applies to a served wait: the
+			// state diverged mid-flight — a materialization ran while this
+			// check was in flight — so the landed receipt describes a
+			// state that no longer exists and rerunning is the sound
+			// answer.
+			if entry.receipt.gen == c.currentSnapshotGen() {
+				return renderCheckResult(entry.receipt, false, result)
+			}
+		default:
+			// claimFresh: this caller owns the key's active entry. Only
+			// now — after the claim — run the destructive
+			// materialization: every other caller at this key has either
+			// joined the in-flight entry or been served the receipt, so
+			// none of them can re-materialize the workspace while this
+			// check executes against it.
+			if err := c.materializeSnapshot(ctx, briefID, snap); err != nil {
+				// A failed launch leaves no receipt: the next request at
+				// this key reruns, exactly like missing evidence.
+				c.checks.complete(entry, nil)
+				result.IsError = true
+				result.Content = safeToolError(err)
+				return result
+			}
+			// Capture the state this dispatch runs against immediately
+			// after the materialization that produced it: the generation
+			// and the applied environment are settled by that
+			// materialization, and recording them here — not after the
+			// await — keeps the receipt's identity exactly what the run
+			// started from.
+			env := c.currentBootstrapEnv()
+			gen := c.currentSnapshotGen()
+			task := protocol.Task{Command: []string{"sh", "-c", args.Command}, Env: env}
+			opID := newOpID("check", briefID)
+			workerResult, err := c.dispatchAndAwait(ctx, opID, briefID, task)
+			if err != nil {
+				c.checks.complete(entry, nil)
+				result.IsError = true
+				result.Content = safeToolError(err)
+				return result
+			}
+			receipt := &checkReceipt{
+				opID:       opID,
+				command:    command,
+				tip:        snap.Tip,
+				envDigest:  bootstrapEnvDigest(env),
+				gen:        gen,
+				status:     workerResult.Status,
+				exitCode:   workerResult.ExitCode,
+				stdoutTail: workerResult.StdoutTail,
+				stderrTail: workerResult.StderrTail,
+			}
+			c.checks.complete(entry, receipt)
+			return renderCheckResult(receipt, true, result)
 		}
-		if entry.receipt == nil {
-			// The winner's dispatch never produced a result; its own tool
-			// result already carries the sanitized failure. Serve a fixed
-			// error here rather than dispatching a second operation.
-			result.IsError = true
-			result.Content = "the tracked check failed to launch; no receipt was recorded"
-			return result
-		}
-		return renderCheckResult(entry.receipt, false, result)
+		entry, outcome = c.checks.claim(key, true)
 	}
-
-	task := protocol.Task{Command: []string{"sh", "-c", args.Command}, Env: env}
-	opID := newOpID("check", briefID)
-	workerResult, err := c.dispatchAndAwait(ctx, opID, briefID, task)
-	if err != nil {
-		c.checks.complete(entry, nil)
-		result.IsError = true
-		result.Content = safeToolError(err)
-		return result
-	}
-	receipt := &checkReceipt{
-		opID:       opID,
-		command:    command,
-		tip:        tip,
-		envDigest:  bootstrapEnvDigest(env),
-		status:     workerResult.Status,
-		exitCode:   workerResult.ExitCode,
-		stdoutTail: workerResult.StdoutTail,
-		stderrTail: workerResult.StderrTail,
-	}
-	c.checks.complete(entry, receipt)
-	return renderCheckResult(receipt, true, result)
 }
 
 // renderCheckResult renders a receipt as the tool result. IsError follows the
@@ -351,24 +428,47 @@ func bootstrapEnvDigest(env []string) string {
 	return digestOf(strings.Join(sorted, "\x00"))
 }
 
-// checkStateKey digests the check's full identity: the exact command bytes
-// and the workspace state it ran against. Commands are keyed verbatim
-// because the worker executes them through `sh -c`: only identical bytes
-// guarantee an identical program, so no two spellings ever share a receipt.
-// The NUL join is collision-free as written because tip and envDigest are
-// hex digests that cannot carry one; a command carrying a NUL is rejected
-// before the key is built.
+// checkStateKey digests the check's registry identity: the exact command
+// bytes and the snapshot tip. Commands are keyed verbatim because the worker
+// executes them through `sh -c`: only identical bytes guarantee an identical
+// program, so no two spellings ever share a receipt. The NUL join is
+// collision-free as written because tip is a hex digest that cannot carry
+// one; a command carrying a NUL is rejected before the key is built.
 //
-// The workspace half of the identity is sound because every check dispatch
-// first prepares a fresh snapshot: control re-renders the bundle from the
-// integration head and the worker's unpack re-materializes the workspace at
-// that tip (reset --hard plus clean -fdx) before anything runs. The
-// workspace a check runs against is therefore a pure function of the tip —
-// a worktree change that does not change the tip cannot exist on this path,
-// because worker-side edits never survive the next unpack, and every
-// relevant change reaches the workspace through artifact integration, which
-// advances the tip. The digest also covers the applied bootstrap environment
-// delta, the declared dependency/config/environment scope.
+// The full receipt identity needs one more coordinate than the key holds:
+// the applied bootstrap environment. That environment is settled only by the
+// destructive snapshot materialization that also produces the workspace, so
+// keying on it pre-materialization would force every caller, including a
+// joining waiter, to re-materialize the workspace underneath the in-flight
+// check. Instead each receipt records the environment digest (for
+// observability) and the snapshot generation it ran against, and the
+// serve-time guard in runCheck refuses receipts from an older generation:
+// every coordinator-driven workspace mutation is witnessed by a generation
+// bump at the materialization that precedes or opens the mutating flow — a
+// control shell or fresh check materializes per run, and a delegate brief
+// materializes once for its whole epoch. "No materialization since the
+// receipt's run" is therefore exactly "the workspace still holds the state
+// the receipt describes". The keystone is that checks are coordinator-only
+// and the coordinator pump is serial: a delegate epoch can never overlap a
+// check receipt's lifetime, so no receipt exists inside an epoch whose
+// mutations it does not describe. Generation equality implies environment
+// equality, because the environment is settled by the same materialization
+// that bumps the generation.
+//
+// The workspace half of the identity is sound because the workspace a check
+// runs against is a pure function of the tip on the materialization path —
+// a worktree change that does not change the tip cannot exist on the
+// materialized workspace, because worker-side edits never survive the next
+// unpack, and every relevant change reaches the workspace through artifact
+// integration, which advances the tip. Re-materializations at an unchanged
+// tip are what the generation guard exists for: they wipe worker-side
+// mutation the tip does not capture, so a receipt from before such a
+// materialization is refused even at the same tip.
+//
+// The claim-ordering guarantee: the registry claim strictly precedes the
+// destructive snapshot materialization in runCheck, so a caller that joins
+// an in-flight equivalent check performs no upload-unpack and cannot mutate
+// the workspace the running check validates.
 //
 // The dispatch carries no working directory and the worker runs every task in
 // its fixed sanitized workspace root (protocol.WorkerConfig.WorkspaceDir), so
@@ -379,8 +479,8 @@ func bootstrapEnvDigest(env []string) string {
 // applies to any future surface that mutates undeclared worker-side state
 // outside the workspace root: such state is worker-ephemeral, never part of
 // the dispatched snapshot, and a receipt identity cannot vouch for it.
-func checkStateKey(command, tip, envDigest string) string {
-	return digestOf(command + "\x00" + tip + "\x00" + envDigest)
+func checkStateKey(command, tip string) string {
+	return digestOf(command + "\x00" + tip)
 }
 
 // digestOf is the canonical SHA-256 hex digest for registry keys.
