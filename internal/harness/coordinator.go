@@ -710,11 +710,12 @@ func shellTool() ToolDef {
 func checkTool() ToolDef {
 	return ToolDef{
 		Name:        toolCheck,
-		Description: "Run one shell command on the sandbox worker as a tracked check. When an identical command runs against an unchanged workspace state (snapshot tip and bootstrap environment), the saved receipt is returned instead of rerunning; state changes invalidate receipts automatically. Use the plain shell tool to bypass receipt reuse.",
+		Description: "Run one shell command on the sandbox worker as a tracked check. Identical command against unchanged state (snapshot tip, bootstrap environment) returns the saved receipt; state changes invalidate it. refresh:true forces a fresh dispatch; a plain shell run of the same command also invalidates the receipt.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"command": map[string]any{"type": "string", "description": "The shell command to run as a tracked check."},
+				"refresh": map[string]any{"type": "boolean", "description": "Dispatch fresh, replacing any saved receipt."},
 			},
 			"required": []string{"command"},
 		},
@@ -863,8 +864,9 @@ func (c *Coordinator) runShell(ctx context.Context, call ToolCall, briefID strin
 		return result
 	}
 	var err error
+	var tip string
 	if briefID == "control" {
-		_, err = c.prepareSnapshot(ctx, briefID)
+		tip, err = c.prepareSnapshot(ctx, briefID)
 	} else {
 		err = c.ensureSnapshot(ctx)
 	}
@@ -876,12 +878,28 @@ func (c *Coordinator) runShell(ctx context.Context, call ToolCall, briefID strin
 	// Only model-influenced tasks carry the applied bootstrap environment
 	// delta (#414): fixed control scripts (unpack, pack) run under the
 	// worker's own environment.
-	task := protocol.Task{Command: []string{"sh", "-c", args.Command}, ArtifactPath: args.ArtifactPath, Env: c.currentBootstrapEnv()}
+	env := c.currentBootstrapEnv()
+	task := protocol.Task{Command: []string{"sh", "-c", args.Command}, ArtifactPath: args.ArtifactPath, Env: env}
 	workerResult, err := c.dispatchAndAwait(ctx, newOpID("shell", briefID), briefID, task)
 	if err != nil {
 		result.IsError = true
 		result.Content = safeToolError(err)
 		return result
+	}
+	// A completed control shell run is fresh evidence against the exact
+	// command-and-state identity the tracked checks use: the snapshot was
+	// just re-materialized at the current tip. Drop any stored receipt for
+	// that identity so a later check cannot serve evidence older than the
+	// run the coordinator just performed (#635). Only a verified completion
+	// counts: a cancelled or otherwise unfinished dispatch produced no
+	// evidence and leaves the registry untouched, and an unrelated command
+	// leaves every receipt in place. The match is exact on the normalized
+	// command; an equivalent command spelled differently leaves the receipt
+	// to its own identity. If an in-flight check for the same identity
+	// completes after this run, its receipt lands and is equally fresh
+	// evidence at the same re-materialized tip.
+	if briefID == "control" && workerResult.Status == protocol.ResultCompleted {
+		c.checks.invalidate(checkStateKey(normalizeCheckCommand(args.Command), tip, bootstrapEnvDigest(env)))
 	}
 	return workerResultToTool(workerResult, result)
 }

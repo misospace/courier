@@ -495,18 +495,28 @@ status and bounded output tails — never a summary grep, a shell pipeline
 masking the test exit, or a process-name observation. Each check is tracked
 by a receipt whose identity is the normalized command plus the workspace
 state it ran against: the snapshot tip and the applied bootstrap environment
-digest. A repeat request against unchanged state is served from the saved
+digest. The identity is complete because every check dispatch first prepares
+a fresh snapshot — the worker's unpack re-materializes the workspace at that
+tip before anything runs, so the workspace is a pure function of the tip and
+every relevant change reaches it through artifact integration, which advances
+the tip. A repeat request against unchanged state is served from the saved
 receipt — pass or fail — instead of re-executing; any state change, a lost
 receipt, or a concrete concern reruns. A cancelled or worker-failed dispatch
-is never reusable as evidence.
+is never reusable as evidence. Concrete concerns have two explicit
+invalidation paths: `check` accepts `refresh:true`, which ignores and
+replaces the saved receipt with a fresh dispatch, and a completed plain
+`shell` run of the same command against the same state drops the matching
+receipt, so a later check cannot serve evidence older than the run the
+coordinator just performed. Invalidation matches the exact normalized
+command; an equivalent command spelled differently keeps its own identity.
 
 While an equivalent check is in flight, a duplicate request waits on that
 dispatch instead of launching a second one. Receipts are bounded (evicted
-least-recently tracked first) and live only in the coordinator incarnation: a harness
-restart loses them and simply reruns, while the durable operation evidence
-stays in the existing status operations. The tool is coordinator-only —
-sub-agents keep plain shell — and plain `shell` remains the bypass for a
-deliberate fresh run.
+least-recently tracked first) and live only in the coordinator incarnation:
+the coordinator session itself has no durable resume — a restart relaunches
+the incarnation from scratch — so receipt persistence beyond that lifecycle
+would record nothing a rerun could not safely reproduce; a restart simply
+reruns. The tool is coordinator-only — sub-agents keep plain shell.
 
 ### Coordinator pod process lifetime
 

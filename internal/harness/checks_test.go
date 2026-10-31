@@ -47,6 +47,38 @@ func taskDispatchCount(m *mockWorker, keep func(protocol.Task) bool) int {
 	return n
 }
 
+// checkDispatchCount counts recorded dispatches of check-kind operations
+// only: shell and pack tasks are also non-unpack dispatches.
+func checkDispatchCount(m *mockWorker) int {
+	return dispatchKindCount(m, "check")
+}
+
+func dispatchKindCount(m *mockWorker, kind string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, record := range m.dispatches {
+		if opKind, _, _ := strings.Cut(record.envelope.OpID, "."); opKind == kind {
+			n++
+		}
+	}
+	return n
+}
+
+// awaitDispatchKind polls until the worker has recorded want dispatches of
+// the named op kind, bounded by a deadline.
+func awaitDispatchKind(t *testing.T, m *mockWorker, kind string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if dispatchKindCount(m, kind) >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("worker %s dispatches never reached %d", kind, want)
+}
+
 func notUnpackTask(task protocol.Task) bool {
 	return !isWorkerUnpackTask(task)
 }
@@ -319,6 +351,225 @@ func TestCheckNormalizesWhitespaceInIdentity(t *testing.T) {
 	}
 	if first.IsError || second.IsError {
 		t.Fatalf("checks = %+v / %+v, want passing receipts", first, second)
+	}
+}
+
+// TestCheckNormalizesWhitespaceOutsideQuotesOnly pins the normalization
+// contract: commands sh tokenizes into the same argv share one receipt,
+// while different argv — quoted whitespace, escaped spaces, literal
+// backslashes — never merge.
+func TestCheckNormalizesWhitespaceOutsideQuotesOnly(t *testing.T) {
+	cases := []struct {
+		name      string
+		a, b      string
+		identical bool
+	}{
+		{name: "unquoted runs collapse", a: "go test   \t ./...", b: "go test ./...", identical: true},
+		{name: "leading and trailing trimmed", a: "  go vet ./...  ", b: "go vet ./...", identical: true},
+		{name: "newline separator collapses", a: "go test\n./...", b: "go test ./...", identical: true},
+		{name: "double-quoted whitespace preserved", a: `echo "a  b"`, b: `echo "a b"`},
+		{name: "single-quoted whitespace preserved", a: `echo 'a  b'`, b: `echo 'a b'`},
+		{name: "quoted runs in subcommand preserved", a: `sh -c "go  test"`, b: `sh -c "go test"`},
+		{name: "unquoted spacing around quotes collapses", a: `echo "a b"   x`, b: `echo "a b" x`, identical: true},
+		{name: "escaped space keeps word boundary", a: `echo a\  b`, b: `echo a\ b`},
+		{name: "escaped space differs from word separator", a: `echo a\ b`, b: `echo a b`},
+		{name: "escaped space equals quoted space", a: `echo a\ b`, b: `echo "a b"`, identical: true},
+		{name: "escaped quote outside quotes stays unquoted", a: `echo a\"b  c`, b: `echo a\"b c`, identical: true},
+		{name: "resolved escape equals literal byte", a: `echo a\b`, b: `echo ab`, identical: true},
+		{name: "backslash is data inside single quotes", a: `echo 'a\b'`, b: `echo a\b`},
+		{name: "double-quote backslash resolves to escaped byte", a: `echo "a\\ b"`, b: `echo "a\ b"`, identical: true},
+		{name: "unterminated quote preserves to the end", a: `echo "a  b`, b: `echo "a b`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := normalizeCheckCommand(tc.a) == normalizeCheckCommand(tc.b)
+			if got != tc.identical {
+				t.Fatalf("normalizeCheckCommand(%q) == normalizeCheckCommand(%q): shared identity = %v, want %v (renders %q vs %q)",
+					tc.a, tc.b, got, tc.identical, normalizeCheckCommand(tc.a), normalizeCheckCommand(tc.b))
+			}
+		})
+	}
+}
+
+// TestCheckRefreshReplacesReceipt covers the concrete-concern invalidation
+// input: a refresh request ignores the saved receipt, dispatches fresh, and
+// replaces it, so a later plain request serves the refreshed evidence.
+func TestCheckRefreshReplacesReceipt(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.snapshotTip = "snap-tip"
+	worker.ordinaryResults = []protocol.Result{
+		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "first\n"},
+		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "second\n"},
+	}
+	coordinator := newCheckCoordinator(t, delegator, snapshotProvider("snap-tip"))
+
+	first := coordinator.runCheck(context.Background(), checkCall("go test ./..."), "", ToolResult{ToolCallID: "c1", Name: toolCheck})
+	refresh := ToolCall{ID: "call-refresh", Name: toolCheck, Arguments: `{"command":"go test ./...","refresh":true}`}
+	second := coordinator.runCheck(context.Background(), refresh, "", ToolResult{ToolCallID: "c2", Name: toolCheck})
+	third := coordinator.runCheck(context.Background(), checkCall("go test ./..."), "", ToolResult{ToolCallID: "c3", Name: toolCheck})
+
+	if got := taskDispatchCount(worker, notUnpackTask); got != 2 {
+		t.Fatalf("check dispatches = %d, want exactly two (fresh, then refreshed) across three requests", got)
+	}
+	if !strings.Contains(first.Content, "check receipt: fresh") || !strings.Contains(first.Content, "first\n") {
+		t.Fatalf("first check content = %q, want the first fresh receipt", first.Content)
+	}
+	if !strings.Contains(second.Content, "check receipt: fresh") || !strings.Contains(second.Content, "second\n") {
+		t.Fatalf("refreshed check content = %q, want a fresh receipt with the second run's output", second.Content)
+	}
+	if receiptOp(first.Content) == receiptOp(second.Content) {
+		t.Fatalf("refresh reused the old op %q, want a fresh dispatch", receiptOp(second.Content))
+	}
+	if !strings.Contains(third.Content, "check receipt: reused") || !strings.Contains(third.Content, "second\n") {
+		t.Fatalf("third check content = %q, want the refreshed receipt reused", third.Content)
+	}
+	if receiptOp(second.Content) != receiptOp(third.Content) {
+		t.Fatalf("third check served op %q, want the refreshed op %q", receiptOp(third.Content), receiptOp(second.Content))
+	}
+}
+
+// TestCheckRefreshSharesInFlightDispatch pins that a refresh while an
+// equivalent check is in flight waits on that dispatch instead of launching
+// a duplicate: a concern justifies replacing stored evidence, never a
+// second concurrent operation.
+func TestCheckRefreshSharesInFlightDispatch(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.snapshotTip = "snap-tip"
+	worker.hangKinds = []string{"check"}
+	coordinator := newCheckCoordinator(t, delegator, snapshotProvider("snap-tip"))
+
+	first := make(chan ToolResult, 1)
+	go func() {
+		first <- coordinator.runCheck(context.Background(), checkCall("go test ./..."), "", ToolResult{ToolCallID: "c-a", Name: toolCheck})
+	}()
+	awaitDispatchCount(t, worker, notUnpackTask, 1)
+
+	refresh := ToolCall{ID: "call-refresh", Name: toolCheck, Arguments: `{"command":"go test ./...","refresh":true}`}
+	second := make(chan ToolResult, 1)
+	go func() {
+		second <- coordinator.runCheck(context.Background(), refresh, "", ToolResult{ToolCallID: "c-b", Name: toolCheck})
+	}()
+	awaitDispatchCount(t, worker, notUnpackTask, 1)
+
+	worker.mu.Lock()
+	var opID string
+	for _, record := range worker.dispatches {
+		if notUnpackTask(record.task) {
+			opID = record.envelope.OpID
+		}
+	}
+	worker.results[opID] = protocol.ResultState{
+		Status: protocol.ResultCompleted,
+		Result: &protocol.Result{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "shared\n"},
+	}
+	worker.mu.Unlock()
+
+	gotA := <-first
+	gotB := <-second
+	if got := taskDispatchCount(worker, notUnpackTask); got != 1 {
+		t.Fatalf("check dispatches = %d, want the refresh to share the in-flight dispatch", got)
+	}
+	if !strings.Contains(gotA.Content, "shared\n") || !strings.Contains(gotB.Content, "shared\n") {
+		t.Fatalf("results = %q / %q, want both served from the one shared dispatch", gotA.Content, gotB.Content)
+	}
+}
+
+// TestCheckShellRunInvalidatesMatchingReceipt pins the evidence-freshness
+// rule: a completed plain shell run of the exact command against the same
+// state drops the matching receipt, so a later check dispatches instead of
+// serving evidence older than the shell run — while an unrelated shell
+// command leaves every receipt in place.
+func TestCheckShellRunInvalidatesMatchingReceipt(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.snapshotTip = "snap-tip"
+	worker.ordinaryResults = []protocol.Result{
+		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "checked\n"},
+		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "unrelated\n"},
+		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "shelled\n"},
+		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "rerun\n"},
+	}
+	coordinator := newCheckCoordinator(t, delegator, snapshotProvider("snap-tip"))
+
+	first := coordinator.runCheck(context.Background(), checkCall("go test ./..."), "", ToolResult{ToolCallID: "c1", Name: toolCheck})
+	if got := checkDispatchCount(worker); got != 1 {
+		t.Fatalf("initial check dispatches = %d, want one", got)
+	}
+
+	// An unrelated control shell command must not touch the receipt.
+	unrelated := coordinator.runShell(context.Background(), shellCall("echo unrelated"), "control", ToolResult{ToolCallID: "s1", Name: toolShell})
+	second := coordinator.runCheck(context.Background(), checkCall("go test ./..."), "", ToolResult{ToolCallID: "c2", Name: toolCheck})
+	if unrelated.IsError {
+		t.Fatalf("unrelated shell = %+v, want success", unrelated)
+	}
+	if !strings.Contains(second.Content, "check receipt: reused") {
+		t.Fatalf("check after unrelated shell = %q, want the saved receipt reused", second.Content)
+	}
+	if got := checkDispatchCount(worker); got != 1 {
+		t.Fatalf("check dispatches after unrelated shell = %d, want the receipt untouched", got)
+	}
+
+	// The same command via plain shell is fresh evidence: the receipt must
+	// yield to it.
+	shell := coordinator.runShell(context.Background(), shellCall("go   test ./..."), "control", ToolResult{ToolCallID: "s2", Name: toolShell})
+	if shell.IsError {
+		t.Fatalf("matching shell = %+v, want success", shell)
+	}
+	third := coordinator.runCheck(context.Background(), checkCall("go test ./..."), "", ToolResult{ToolCallID: "c3", Name: toolCheck})
+	if got := checkDispatchCount(worker); got != 2 {
+		t.Fatalf("check dispatches after matching shell = %d, want a fresh dispatch after the receipt was invalidated", got)
+	}
+	if !strings.Contains(third.Content, "check receipt: fresh") || !strings.Contains(third.Content, "rerun\n") {
+		t.Fatalf("check after matching shell = %q, want a fresh receipt", third.Content)
+	}
+	if !strings.Contains(first.Content, "checked\n") {
+		t.Fatalf("first check content = %q, want the initial receipt", first.Content)
+	}
+}
+
+// TestCheckCancelledShellRunLeavesReceipt pins the other half of the
+// evidence-freshness rule: only a verified completion invalidates. A shell
+// dispatch that ends cancelled produced no evidence, so the matching receipt
+// stays and the next check serves it.
+func TestCheckCancelledShellRunLeavesReceipt(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.snapshotTip = "snap-tip"
+	worker.hangKinds = []string{"shell"}
+	worker.ordinaryResults = []protocol.Result{
+		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "checked\n"},
+	}
+	coordinator := newCheckCoordinator(t, delegator, snapshotProvider("snap-tip"))
+
+	first := coordinator.runCheck(context.Background(), checkCall("go test ./..."), "", ToolResult{ToolCallID: "c1", Name: toolCheck})
+	if !strings.Contains(first.Content, "check receipt: fresh") {
+		t.Fatalf("first check content = %q, want a fresh receipt", first.Content)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan ToolResult, 1)
+	go func() {
+		result <- coordinator.runShell(ctx, shellCall("go test ./..."), "control", ToolResult{ToolCallID: "s1", Name: toolShell})
+	}()
+	awaitDispatchKind(t, worker, "shell", 1)
+	cancel()
+	select {
+	case <-result:
+		// The cancelled shell attempt settles however the dispatch path
+		// renders it (here as a tool error); what matters is that it
+		// produced no evidence.
+	case <-time.After(10 * time.Second):
+		t.Fatal("cancelled shell did not return")
+	}
+
+	second := coordinator.runCheck(context.Background(), checkCall("go test ./..."), "", ToolResult{ToolCallID: "c2", Name: toolCheck})
+	if got := checkDispatchCount(worker); got != 1 {
+		t.Fatalf("check dispatches = %d, want the cancelled shell run to leave the receipt in place", got)
+	}
+	if !strings.Contains(second.Content, "check receipt: reused") || !strings.Contains(second.Content, "checked\n") {
+		t.Fatalf("check after cancelled shell = %q, want the saved receipt reused", second.Content)
 	}
 }
 
@@ -634,6 +885,35 @@ func TestCheckEvictsOldestReceiptBeyondBound(t *testing.T) {
 	if !strings.Contains(kept.Content, "check receipt: reused") {
 		t.Fatalf("newest receipt content = %q, want the still-tracked receipt to be reused", kept.Content)
 	}
+}
+
+// TestCheckInvalidateDropsOnlyTerminalReceipts pins the registry half of
+// invalidation: a terminal entry is dropped so the next claim dispatches
+// fresh, while an in-flight dispatch is never dropped — its waiters keep
+// their dispatch and its completion still lands — and an unknown key is a
+// no-op.
+func TestCheckInvalidateDropsOnlyTerminalReceipts(t *testing.T) {
+	registry := newCheckRegistry()
+
+	active, outcome := registry.claim("in-flight", false)
+	if outcome != claimFresh {
+		t.Fatalf("first claim outcome = %v, want claimFresh", outcome)
+	}
+	registry.invalidate("in-flight")
+	if _, outcome := registry.claim("in-flight", false); outcome != claimActive {
+		t.Fatalf("claim after invalidating an active entry = %v, want claimActive", outcome)
+	}
+	registry.complete(active, &checkReceipt{status: protocol.ResultCompleted, exitCode: 0})
+	if _, outcome := registry.claim("in-flight", false); outcome != claimReuse {
+		t.Fatalf("claim after completion = %v, want claimReuse", outcome)
+	}
+
+	registry.invalidate("in-flight")
+	if _, outcome := registry.claim("in-flight", false); outcome != claimFresh {
+		t.Fatalf("claim after invalidating a terminal entry = %v, want claimFresh", outcome)
+	}
+
+	registry.invalidate("never-tracked")
 }
 
 func TestCheckIsCoordinatorOnly(t *testing.T) {

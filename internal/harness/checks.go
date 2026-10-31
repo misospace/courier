@@ -84,14 +84,19 @@ const (
 // A terminal entry whose receipt is not reusable (cancelled, worker-failed,
 // or a failed launch with no receipt) is replaced: the new active entry
 // takes the key, and any waiter still holding the old entry serves the old
-// receipt.
-func (r *checkRegistry) claim(key string) (*checkEntry, claimOutcome) {
+// receipt. A forced claim (an explicit invalidation of the stored receipt)
+// treats a terminal entry the same way — a receipt the caller doubted is
+// replaced even when it was reusable, and if the forced dispatch then fails
+// to launch, no receipt remains and the next request reruns, exactly like
+// missing evidence. An in-flight dispatch is still waited on, so a duplicate
+// launch never happens.
+func (r *checkRegistry) claim(key string, force bool) (*checkEntry, claimOutcome) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if entry, ok := r.entries[key]; ok {
 		select {
 		case <-entry.done:
-			if entry.receipt != nil && entry.receipt.reusable() {
+			if !force && entry.receipt != nil && entry.receipt.reusable() {
 				return entry, claimReuse
 			}
 		default:
@@ -101,6 +106,26 @@ func (r *checkRegistry) claim(key string) (*checkEntry, claimOutcome) {
 	entry := &checkEntry{key: key, done: make(chan struct{})}
 	r.install(key, entry)
 	return entry, claimFresh
+}
+
+// invalidate drops the terminal entry at the key, if any, so the next claim
+// dispatches fresh. It is the concrete-concern invalidation path: fresher
+// evidence exists or the stored receipt is no longer trusted. An in-flight
+// entry is left alone — its dispatch is real evidence in progress, and
+// dropping it would strand its waiters.
+func (r *checkRegistry) invalidate(key string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry, ok := r.entries[key]
+	if !ok {
+		return
+	}
+	select {
+	case <-entry.done:
+		delete(r.entries, key)
+		r.dropOrder(key)
+	default:
+	}
 }
 
 // complete records the entry's terminal outcome and closes its done channel,
@@ -175,10 +200,19 @@ func (c *Coordinator) runCheck(ctx context.Context, call ToolCall, briefID strin
 	}
 	var args struct {
 		Command string `json:"command"`
+		Refresh bool   `json:"refresh"`
 	}
 	if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil || strings.TrimSpace(args.Command) == "" {
 		result.IsError = true
 		result.Content = "check arguments must carry a command string"
+		return result
+	}
+	if strings.ContainsRune(args.Command, '\x00') {
+		// A NUL byte cannot appear in an exec argv, but it is the word
+		// separator of the canonical command identity: a command carrying
+		// one would collide identities across tokenizations.
+		result.IsError = true
+		result.Content = "a check command must not contain a NUL byte"
 		return result
 	}
 	tip, err := c.prepareSnapshot(ctx, briefID)
@@ -191,7 +225,11 @@ func (c *Coordinator) runCheck(ctx context.Context, call ToolCall, briefID strin
 	env := c.currentBootstrapEnv()
 	key := checkStateKey(command, tip, bootstrapEnvDigest(env))
 
-	entry, outcome := c.checks.claim(key)
+	// A forced request is the concrete-concern invalidation path (#635): the
+	// caller doubts the stored receipt, so it is ignored and replaced by a
+	// fresh dispatch. An in-flight dispatch is still shared — a concern
+	// never justifies a duplicate launch.
+	entry, outcome := c.checks.claim(key, args.Refresh)
 	switch outcome {
 	case claimReuse:
 		return renderCheckResult(entry.receipt, false, result)
@@ -263,11 +301,86 @@ func renderCheckResult(receipt *checkReceipt, fresh bool, result ToolResult) Too
 	return result
 }
 
-// normalizeCheckCommand collapses whitespace runs so commands that differ
-// only in formatting share one receipt: the model's intent, not its spacing,
-// is what the receipt tracks.
+// normalizeCheckCommand canonicalizes a command to its sh tokenization:
+// the argument words the shell would produce, each rendered byte-for-byte
+// as the argv word (escape sequences are resolved to the escaped byte), and
+// joined by a separator that can never appear in a word. Two commands share
+// a receipt identity exactly when sh would hand the command the same argv —
+// formatting whitespace collapses, while different argv (`echo "a  b"` vs
+// `echo "a b"`, `echo a\  b` vs `echo a\ b`) keeps words apart, because
+// merging those would serve one command's evidence for another's. Quoting
+// is scanned the way sh reads it: a backslash resolves the next byte
+// everywhere except inside single quotes, where it is plain data.
 func normalizeCheckCommand(command string) string {
-	return strings.Join(strings.Fields(command), " ")
+	return strings.Join(splitShellWords(command), "\x00")
+}
+
+func splitShellWords(command string) []string {
+	var words []string
+	var word strings.Builder
+	started := false
+	var quote byte
+	flush := func() {
+		if started {
+			words = append(words, word.String())
+			word.Reset()
+			started = false
+		}
+	}
+	for i := 0; i < len(command); i++ {
+		ch := command[i]
+		switch {
+		case quote != 0:
+			started = true
+			if quote == '"' && ch == '\\' && i+1 < len(command) {
+				// Inside double quotes the backslash resolves the next
+				// byte only before $, `, ", or \; before anything else it
+				// is literal data and the next byte is ordinary.
+				switch command[i+1] {
+				case '$', '`', '"', '\\':
+					i++
+					word.WriteByte(command[i])
+					continue
+				}
+			}
+			if ch == quote {
+				quote = 0
+				continue
+			}
+			word.WriteByte(ch)
+		case ch == '\\':
+			// Outside quotes the backslash resolves the next byte into
+			// the current word — it is never a separator and never the
+			// start of a quoted section.
+			started = true
+			if i+1 < len(command) {
+				i++
+				word.WriteByte(command[i])
+			} else {
+				word.WriteByte(ch)
+			}
+		case ch == '\'' || ch == '"':
+			quote = ch
+			started = true
+		case isShellSpace(ch):
+			flush()
+		default:
+			started = true
+			word.WriteByte(ch)
+		}
+	}
+	flush()
+	return words
+}
+
+// isShellSpace covers the bytes sh treats as argument separators outside
+// quotes.
+func isShellSpace(ch byte) bool {
+	switch ch {
+	case ' ', '\t', '\n', '\v', '\f', '\r':
+		return true
+	}
+	return false
 }
 
 // bootstrapEnvDigest digests the applied bootstrap environment delta in a
@@ -282,12 +395,26 @@ func bootstrapEnvDigest(env []string) string {
 // checkStateKey digests the check's full identity: the normalized command and
 // the workspace state it ran against.
 //
+// The workspace half of the identity is sound because every check dispatch
+// first prepares a fresh snapshot: control re-renders the bundle from the
+// integration head and the worker's unpack re-materializes the workspace at
+// that tip (reset --hard plus clean -fdx) before anything runs. The
+// workspace a check runs against is therefore a pure function of the tip —
+// a worktree change that does not change the tip cannot exist on this path,
+// because worker-side edits never survive the next unpack, and every
+// relevant change reaches the workspace through artifact integration, which
+// advances the tip. The digest also covers the applied bootstrap environment
+// delta, the declared dependency/config/environment scope.
+//
 // The dispatch carries no working directory and the worker runs every task in
 // its fixed sanitized workspace root (protocol.WorkerConfig.WorkspaceDir), so
 // cwd is a per-worker constant and the command-plus-state identity is
 // complete as stands. If a cwd surface is ever added to the check tool or to
 // protocol.Task, it must become part of this key — otherwise the same command
-// string from a different directory would reuse a stale receipt.
+// string from a different directory would reuse a stale receipt. The same
+// applies to any future surface that mutates undeclared worker-side state
+// outside the workspace root: such state is worker-ephemeral, never part of
+// the dispatched snapshot, and a receipt identity cannot vouch for it.
 func checkStateKey(command, tip, envDigest string) string {
 	return digestOf(command + "\x00" + tip + "\x00" + envDigest)
 }
