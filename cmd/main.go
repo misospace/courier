@@ -32,6 +32,7 @@ import (
 	"github.com/misospace/courier/internal/forge"
 	couriergithub "github.com/misospace/courier/internal/github"
 	courierlog "github.com/misospace/courier/internal/log"
+	"github.com/misospace/courier/internal/skills"
 	"github.com/misospace/courier/internal/source"
 	"github.com/misospace/courier/internal/source/adhoc"
 	"github.com/misospace/courier/internal/source/cron"
@@ -115,6 +116,7 @@ func main() {
 	var dependencyCachePort int
 	var probeImage string
 	var bootstrapLaneProfilesFile string
+	var skillBundlesFile string
 	var modelGatewayURL string
 	var modelGatewayKeySecret string
 	var modelGatewayKeyName string
@@ -152,6 +154,7 @@ func main() {
 	flag.IntVar(&dependencyCachePort, "dependency-cache-port", 0, "Secure mode: cache port override; empty uses the Service's first port.")
 	flag.StringVar(&probeImage, "probe-image", defaultsProbeImage, "Secure mode: image for disposable network-probe pods.")
 	flag.StringVar(&bootstrapLaneProfilesFile, "bootstrap-lane-profiles-file", "", "Path to a YAML file of deployment-managed bootstrap LaneProfiles; empty disables bootstrap lane management.")
+	flag.StringVar(&skillBundlesFile, "skill-bundles-file", "", "Path to YAML file of deployment-approved skill bundles registered at startup; empty disables skill bundle registration.")
 	flag.StringVar(&modelGatewayURL, "model-gateway-url", "", "Secure mode: OpenAI-compatible model gateway API root (for example http://litellm:4000/v1); empty means the native harness fails closed on the model-bindings capability.")
 	flag.StringVar(&modelGatewayKeySecret, "model-gateway-key-secret", "", "Secure mode: namespace/name of the deployment's model-gateway key Secret; copied per run into trusted control only.")
 	flag.StringVar(&modelGatewayKeyName, "model-gateway-key-name", "key", "Secure mode: key within the model-gateway key Secret.")
@@ -273,6 +276,23 @@ func main() {
 			os.Exit(1)
 		}
 		setupLog.Info("bootstrap LaneProfiles configured", "profiles", len(profiles), "namespace", podNamespace)
+	}
+
+	// Deployment-approved skill bundles register once at trusted setup from
+	// a deployment-mounted file; nothing run- or model-controlled ever
+	// registers a bundle. The registry stays block-local until the upcoming
+	// lane-resolution wiring consumes it (#658).
+	skillBundlesFile = strings.TrimSpace(skillBundlesFile)
+	if skillBundlesFile != "" {
+		registry, err := skills.Load(skillBundlesFile)
+		if err != nil {
+			setupLog.Error(err, "unable load skill bundles")
+			os.Exit(1)
+		}
+		setupLog.Info("skill bundles registered", "bundles", len(registry.Names()))
+		for _, bundle := range registry.Bundles() {
+			setupLog.Info("skill bundle registered", "name", bundle.Name, "digest", bundle.Digest, "files", bundle.Files, "bytes", bundle.Bytes)
+		}
 	}
 
 	podConfig := executor.DefaultPodConfig()

@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	bootstrap "github.com/misospace/courier/internal/bootstrap"
+	"github.com/misospace/courier/internal/skills"
 	"github.com/misospace/courier/internal/source/cron"
 	"sigs.k8s.io/yaml"
 )
@@ -1142,6 +1143,157 @@ func configMapsChecksum(t *testing.T, output string) string {
 		t.Fatalf("rendered output carries no checksum/configMaps annotation")
 	}
 	return match[1]
+}
+
+// TestChartRendersSkillBundles checks the skillBundles values transport:
+// values serialize into a release ConfigMap the manager reads through the
+// --skill-bundles-file seam, the rendered config round-trips through the
+// manager's own parser and resolver, and an omitted source defaults to
+// /etc/courier/skill-bundles/<name>.
+func TestChartRendersSkillBundles(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+	chartDir := copyChart(t)
+	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
+		t.Fatalf("configure chart repository: %v", err)
+	}
+	runHelm(t, chartDir, "dependency", "build")
+	valuesFile := filepath.Join(chartDir, "values-skills.yaml")
+	bundleDir := t.TempDir()
+	files := map[string]string{
+		"SKILL.md":           "# simple english\n",
+		"assets/glossary.md": "words\n",
+	}
+	for rel, content := range files {
+		full := filepath.Join(bundleDir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	values := "skillBundles:\n  simple-english:\n    source: " + bundleDir + "\n  no-source: {}\n"
+	if err := os.WriteFile(valuesFile, []byte(values), 0o600); err != nil {
+		t.Fatalf("write skill values: %v", err)
+	}
+	out := runHelm(t, chartDir, "template", "courier", ".", "--values", "values-skills.yaml")
+	for _, want := range []string{
+		"--skill-bundles-file=/etc/courier/skill-bundles-config/bundles.yaml",
+		"name: courier-bootstrap-skill-bundles",
+		"mountPath: /etc/courier/skill-bundles-config",
+		"checksum/configMaps:",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("skill-bundles chart output missing %q", want)
+		}
+	}
+	configMap := findDocument(t, out, "kind: ConfigMap", "name: courier-bootstrap-skill-bundles")
+	var rendered struct {
+		Data map[string]string `json:"data"`
+	}
+	if err := yaml.Unmarshal([]byte(configMap), &rendered); err != nil {
+		t.Fatalf("parse rendered skill-bundle ConfigMap: %v", err)
+	}
+	config, ok := rendered.Data["bundles.yaml"]
+	if !ok {
+		t.Fatalf("skill-bundle ConfigMap carries no bundles.yaml key:\n%s", configMap)
+	}
+	specs, err := skills.Parse([]byte(config))
+	if err != nil {
+		t.Fatalf("manager parser rejected rendered skill-bundle config: %v", err)
+	}
+	if len(specs) != 2 {
+		t.Fatalf("expected two bundle specs, got %#v", specs)
+	}
+	if specs[0].Name != "no-source" || specs[0].Source != "/etc/courier/skill-bundles/no-source" {
+		t.Fatalf("default source missing for no-source entry: %#v", specs[0])
+	}
+	var resolved bool
+	for _, spec := range specs {
+		if spec.Name != "simple-english" {
+			continue
+		}
+		if spec.Source != bundleDir {
+			t.Fatalf("simple-english source = %q, want %q", spec.Source, bundleDir)
+		}
+		bundle, err := skills.Resolve(spec)
+		if err != nil {
+			t.Fatalf("manager resolver rejected rendered bundle: %v", err)
+		}
+		if bundle.Files != 2 || bundle.Bytes != int64(len("# simple english\n")+len("words\n")) {
+			t.Fatalf("unexpected resolution counts: files=%d bytes=%d", bundle.Files, bundle.Bytes)
+		}
+		if !regexp.MustCompile(`^sha256:[0-9a-f]{64}$`).MatchString(bundle.Digest) {
+			t.Fatalf("digest %q does not match sha256:<64 lowercase hex>", bundle.Digest)
+		}
+		resolved = true
+	}
+	if !resolved {
+		t.Fatal("simple-english spec missing from rendered config")
+	}
+}
+
+// TestChartRejectsInvalidSkillBundleValues covers render-time skill-bundle
+// validation and explicit-arg precedence: a user-supplied
+// --skill-bundles-file arg wins over skillBundles values, which then render
+// no ConfigMap, mount, or flag of their own.
+func TestChartRejectsInvalidSkillBundleValues(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+	chartDir := copyChart(t)
+	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
+		t.Fatalf("configure chart repository: %v", err)
+	}
+	runHelm(t, chartDir, "dependency", "build")
+
+	out, err := runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "skillBundles.Bad.source=/etc/courier/skill-bundles/bad",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template to fail for an invalid bundle name, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "must be a valid DNS-1123 label") {
+		t.Fatalf("helm template failed without the expected DNS-1123 message:\n%s", out)
+	}
+
+	out, err = runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "skillBundles.local.source=relative/path",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template to fail for a relative bundle source, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "must be an absolute path") {
+		t.Fatalf("helm template failed without the expected absolute-path message:\n%s", out)
+	}
+
+	out, err = runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "skillBundles.local=null",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template to fail for a non-mapping bundle entry, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "must be a mapping of bundle fields") {
+		t.Fatalf("helm template failed without the expected mapping message:\n%s", out)
+	}
+
+	overridden := runHelm(t, chartDir, "template", "courier", ".",
+		"--set", "skillBundles.local.source=/etc/courier/skill-bundles/local",
+		"--set", "controllers.main.containers.main.args={--leader-elect,--skill-bundles-file=/custom/bundles.yaml}",
+	)
+	for _, unwanted := range []string{
+		"courier-bootstrap-skill-bundles",
+		"/etc/courier/skill-bundles-config",
+	} {
+		if strings.Contains(overridden, unwanted) {
+			t.Fatalf("explicit --skill-bundles-file arg did not disable the skillBundles transport: output contains %q", unwanted)
+		}
+	}
+	if !strings.Contains(overridden, "--skill-bundles-file=/custom/bundles.yaml") {
+		t.Fatalf("explicit --skill-bundles-file arg missing from output")
+	}
 }
 
 // TestChartRendersCronSchedules checks the cron.schedules values transport:

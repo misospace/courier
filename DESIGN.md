@@ -2370,6 +2370,42 @@ pod template, so a values change rolls the manager on a normal upgrade. The
 chart never renders LaneProfile objects, keeping the CRD-ordering hazard
 structurally closed. (#74)
 
+## Deployment-provided skill bundles
+
+Skill bundles are deployment-owned directories of operator-authored skill
+content — a `SKILL.md` plus optional assets — that the manager registers at
+startup under stable logical names. The trust boundary has the same shape as
+bootstrap lane config: registration runs only in trusted manager setup, from
+a deployment-mounted YAML file (`--skill-bundles-file`), and CoderRun,
+source, issue, pull-request, and model data can never register a bundle or
+influence what a bundle's name resolves to. There are no runtime network
+fetches; each registration resolves its bundle to an immutable content
+identity — a deterministic, domain-separated `sha256:` digest over the
+materialized tree, hashed in sorted relative-path order with per-file
+lengths so equal bytes in different locations digest identically and any
+content change, addition, or rename changes the digest. Registration grants
+no shell, forge, or Kubernetes authority: skill bytes are untrusted data
+exposed to workers later, and lane-profile selection and harness loading are
+future work (#658/#659).
+
+Resolution contract: the registered source may be a symlink (kubelet
+ConfigMap/Secret projections place per-key symlinks and a `..data` ->
+`..<timestamp>` chain at the mount root), and resolution lands on the real
+content directory via symlink evaluation — the timestamp lives only in the
+resolved root path, never in relative paths, so digests stay stable across
+kubelet remounts that only change the timestamp name. Everything inside the
+resolved root must be a plain directory tree: any symlink inside is
+rejected, which closes the traversal-escape class by construction since the
+walker only yields paths under the resolved root. A bundle must carry a
+non-empty `SKILL.md` at its root and is bounded at 512 files and 8 MiB.
+
+Restart and failure semantics: the same bytes produce the same registration
+on every restart, and a malformed config, missing source, or invalid bundle
+fails manager startup explicitly — the registry never silently omits or
+degrades an entry. The chart serializes `skillBundles` values into a release
+ConfigMap mounted beside the manager and passed through the same flag,
+mirroring the lane-profiles transport.
+
 ## Reconcile loop
 
 Two operator releases may run side-by-side on one cluster (a native canary
@@ -3250,6 +3286,11 @@ only informs.
 - Source-state transitions (claim, in-review, needs-human, resolve) are the
   operator's, done by deterministic code — the one place non-determinism would be
   dangerous, kept mechanical.
+- **No run- or model-controlled data can register skills.** Skill bundle
+registration is deployment-controlled setup: CoderRun, source, issue,
+pull-request, and model data can never add, replace, or redirect a bundle,
+and skill bytes are untrusted data exposed to workers later, not trusted
+control code — registration grants no shell, forge, or Kubernetes authority.
 - Provider credentials for model access are a per-deployment secret concern,
   and the core assumes no particular provider. In legacy mode the pod itself
   holds whatever its lane needs (an Anthropic, OpenAI, or MiniMax token, a
