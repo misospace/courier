@@ -747,7 +747,11 @@ func eligibleNodes(nodes *corev1.NodeList) []string {
 }
 
 // probeScript renders the busybox shell script one probe pod runs. Each
-// result line is a compact JSON object written to the termination log.
+// result line is a compact JSON object written to the termination log. The
+// final write is a redirection, not cp: kubelet pre-creates the termination
+// log, and the pinned busybox cp refuses to create onto an existing file —
+// "File exists" — which left every probe Failed with an empty result and
+// preflight forever at 0 of N checks (#672).
 func probeScript(checks []probeCheck) string {
 	var b strings.Builder
 	b.WriteString("results=/tmp/probe-results; : > $results\n")
@@ -757,6 +761,6 @@ func probeScript(checks []probeCheck) string {
 	for _, check := range checks {
 		fmt.Fprintf(&b, "check %s %s %d %s\n", check.Name, check.IP, check.Port, check.Expect)
 	}
-	b.WriteString("cp $results /dev/termination-log\n")
+	b.WriteString("cat $results > /dev/termination-log\n")
 	return b.String()
 }

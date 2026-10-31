@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.1.13](https://github.com/misospace/courier/compare/v0.1.12...v0.1.13) (2026-10-31)
+
+
+### Features
+
+* **executor:** render the admitted contribution goal into execution ([#654](https://github.com/misospace/courier/issues/654)) ([8cef042](https://github.com/misospace/courier/commit/8cef042cdf219fa6fad671c69a30739da971ae5b))
+* **source:** best-effort execution observations to Dispatch ([#637](https://github.com/misospace/courier/issues/637)) ([2a2b04b](https://github.com/misospace/courier/commit/2a2b04b463ef4f0d269f3c4537f8ba1a0d7ff54f))
+
+
+### Bug Fixes
+
+* **chart:** authorize broker tokenreview binding for secure operator ([#645](https://github.com/misospace/courier/issues/645)) ([4731534](https://github.com/misospace/courier/commit/4731534352633dc1d992e8de658d18c9df33b853))
+* **controller:** route secure provisioning reads through the uncached API reader ([#642](https://github.com/misospace/courier/issues/642)) ([#646](https://github.com/misospace/courier/issues/646)) ([7debeb6](https://github.com/misospace/courier/commit/7debeb6152ef600ac9cf039a2050bf28ef4758e4))
+* **controller:** settle permanent Dispatch refusals on the Done-run resolve path ([#666](https://github.com/misospace/courier/issues/666)) ([e279a5d](https://github.com/misospace/courier/commit/e279a5d416472dff485bad06c26b6629c586b33f))
+* **deps:** update module github.com/prometheus/common (v0.73.0 → v0.73.1) ([#649](https://github.com/misospace/courier/issues/649)) ([4d09b77](https://github.com/misospace/courier/commit/4d09b77ec5a645120d755c65343de4eb4a222f6c))
+* **dev:** run the documented verification path without GNU make ([#643](https://github.com/misospace/courier/issues/643)) ([54ca510](https://github.com/misospace/courier/commit/54ca5101973934e2920d6ad1a1d7cdb35cb890b7))
+* **harness:** wire native context budgets through courier-control ([#660](https://github.com/misospace/courier/issues/660)) ([8205b96](https://github.com/misospace/courier/commit/8205b9648dc83f29980254ead47a5ae76b38d4f7))
+* **preflight:** check named broker pod permissions ([#651](https://github.com/misospace/courier/issues/651)) ([22d3f01](https://github.com/misospace/courier/commit/22d3f01c18fd202aa9684152a24bf55eec75c190))
+* **secure:** read preflight and credential kinds uncached ([#647](https://github.com/misospace/courier/issues/647)) ([aa0a496](https://github.com/misospace/courier/commit/aa0a496cc9e7f7b0833bc19bac76b791fbe54940))
+
 ## [0.1.12](https://github.com/misospace/courier/compare/v0.1.11...v0.1.12) (2026-10-29)
 
 

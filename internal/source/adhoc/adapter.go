@@ -196,7 +196,7 @@ func (a Adapter) Admit(ctx context.Context, in Admission) (Admitted, error) {
 		return Admitted{}, err
 	}
 
-	name := runName(key)
+	name := source.RunName(SourceName, key)
 
 	existing := &courierv1alpha1.CoderRun{}
 	switch err := a.reader().Get(ctx, types.NamespacedName{Namespace: in.Namespace, Name: name}, existing); {
@@ -318,15 +318,6 @@ func hasWhitespace(s string) bool {
 func mintKey(baseRepo, baseRef, goal, workRepo string) string {
 	digest := sha256.Sum256([]byte(baseRepo + "\x00" + baseRef + "\x00" + goal + "\x00" + workRepo))
 	return "adhoc-" + hex.EncodeToString(digest[:])[:12]
-}
-
-// runName derives the CoderRun object name for a key. It mirrors the
-// digest shape of runName() in internal/source/runner.go (source name +
-// NUL + key, first 32 hex of sha256) as a convention, keeping one naming
-// scheme for every key-derived run name.
-func runName(key string) string {
-	digest := sha256.Sum256([]byte(SourceName + "\x00" + key))
-	return "courier-" + hex.EncodeToString(digest[:])[:32]
 }
 
 // encodeContext renders the run's SourceContext as deterministic JSON:

@@ -182,9 +182,12 @@
 {{- if hasPrefix "--github-credential-secret=" $arg }}
 {{- if ne (trimPrefix "--github-credential-secret=" $arg) "" }}{{- $hasCredential = true }}{{- end }}
 {{- end }}
+{{- if hasPrefix "--observer-credential-secret=" $arg }}
+{{- if ne (trimPrefix "--observer-credential-secret=" $arg) "" }}{{- $hasCredential = true }}{{- end }}
+{{- end }}
 {{- end }}
 {{- if not $hasCredential }}
-{{- fail "labelSource.enabled requires a non-empty --git-credential-secret or --github-credential-secret arg: the label source reuses the operator's own forge credential and fails fast without one" }}
+{{- fail "labelSource.enabled requires a non-empty --observer-credential-secret, --github-credential-secret, or --git-credential-secret arg: the label source reuses the operator's own forge credential and fails fast without one" }}
 {{- end }}
 {{- if not $hasLabelSourceEnabled }}{{- $args = append $args "--label-source-enabled=true" }}{{- end }}
 {{- if not $hasLabelSourceRepos }}{{- $args = append $args (printf "--label-source-repos=%s" (join "," $labelSource.repos)) }}{{- end }}

@@ -496,6 +496,36 @@ func TestReapHoldsWhenSourceResolveFails(t *testing.T) {
 	}
 }
 
+func TestReapDonePermanentRefusalResolveReaps(t *testing.T) {
+	c := phaseClient(t, reapRun("refused-resolve"))
+	reconciler := reapReconciler(c, failResolveSource{err: source.ErrPermanentRefusal}, reapClock)
+
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("refused-resolve"))
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v; a permanent resolve refusal must settle, not retry", err)
+	}
+	if result.RequeueAfter != 10*time.Minute {
+		t.Fatalf("RequeueAfter = %v, want a full retention window on the settled refusal", result.RequeueAfter)
+	}
+	var stored courierv1alpha1.CoderRun
+	if err := c.Get(context.Background(), admissionKey("refused-resolve"), &stored); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if got := stored.Annotations[doneAtAnnotation]; got != reapClock.UTC().Format(time.RFC3339) {
+		t.Fatalf("done-at = %q, want the settled refusal to start the clock at %q", got, reapClock.UTC().Format(time.RFC3339))
+	}
+
+	// Past the window the run reaps without re-resolving: the marker proves
+	// the resolve settled, so the refusal is never re-presented.
+	after := reapReconciler(c, failResolveSource{err: source.ErrPermanentRefusal}, reapClock.Add(11*time.Minute))
+	if _, err := after.Reconcile(context.Background(), admissionRequest("refused-resolve")); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	if err := c.Get(context.Background(), admissionKey("refused-resolve"), &courierv1alpha1.CoderRun{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("get run = %v, want NotFound; a permanently refused resolve must not hold the run past retention", err)
+	}
+}
+
 func TestReapMalformedMarkerRestartsWindow(t *testing.T) {
 	src := &admissionSource{}
 	run := reapRun("corrupt")

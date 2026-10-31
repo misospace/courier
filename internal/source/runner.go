@@ -99,6 +99,42 @@ type Runner struct {
 	// Metrics emits the discovery signal layer (§3.2). Nil means emit nothing:
 	// nothing is registered by default, and the process wires it explicitly.
 	Metrics *DiscoveryMetrics
+	// dedupeLogged names the retained owner already logged for each work key
+	// by this process, carried across polls. Poll is serialized by pollMu, so
+	// no lock guards it; a nil map on the first poll means nothing logged yet.
+	dedupeLogged map[string]dedupeOwner
+}
+
+// dedupeOwner names the retained CoderRun that absorbs a re-offered item.
+type dedupeOwner struct {
+	run   string
+	phase string
+	pr    string
+}
+
+// dedupeOwnerOf projects the retained run a dedupe key resolved to onto the
+// posture the re-offer log tracks.
+func dedupeOwnerOf(run *courierv1alpha1.CoderRun) dedupeOwner {
+	return dedupeOwner{run: run.Name, phase: string(run.Status.Phase), pr: run.Status.PR}
+}
+
+// retainOwner resolves one retained owner per dedupe key deterministically:
+// several retained runs can share a key when distinct raw item IDs normalize
+// to one adapter work identity, and whichever run the list happened to order
+// last would name an obsolete predecessor in the re-offer log and track the
+// wrong posture. Newest creation wins and name breaks ties, matching
+// settledPredecessor: the newest run is the attempt that currently owns the
+// identity.
+func retainOwner(owners map[string]*courierv1alpha1.CoderRun, key string, run *courierv1alpha1.CoderRun) {
+	prev, ok := owners[key]
+	if !ok {
+		owners[key] = run
+		return
+	}
+	if run.CreationTimestamp.Time.After(prev.CreationTimestamp.Time) ||
+		(run.CreationTimestamp.Time.Equal(prev.CreationTimestamp.Time) && run.Name > prev.Name) {
+		owners[key] = run
+	}
 }
 
 func (r *Runner) clock() time.Time {
@@ -354,8 +390,8 @@ func (r *Runner) Poll(ctx context.Context) error {
 	}
 	items = validItems
 
-	existing := make(map[string]struct{}, len(runs.Items))
-	legacyIdentities := make(map[string]struct{})
+	existing := make(map[string]*courierv1alpha1.CoderRun, len(runs.Items))
+	legacyIdentities := make(map[string]*courierv1alpha1.CoderRun)
 	for i := range runs.Items {
 		run := &runs.Items[i]
 		if strings.TrimSpace(run.Spec.WorkItemID) == "" {
@@ -365,14 +401,14 @@ func (r *Runner) Poll(ctx context.Context) error {
 		legacyBinding := run.Spec.Source == "dispatch" || strings.HasPrefix(run.Spec.Source, "dispatch:")
 		if run.Spec.Source == r.Config.Source {
 			if !settledCapacityExhaustion(run) {
-				existing[workKey(run.Spec.Source, identity)] = struct{}{}
-				existing[workKey(run.Spec.Source, run.Spec.WorkItemID)] = struct{}{}
+				retainOwner(existing, workKey(run.Spec.Source, identity), run)
+				retainOwner(existing, workKey(run.Spec.Source, run.Spec.WorkItemID), run)
 			}
 		}
 		// Previous Dispatch bindings encoded queue lanes in Source. Keep those
 		// retained runs from being rematerialized during the identity rollout.
 		if legacyBinding && !settledCapacityExhaustion(run) {
-			legacyIdentities[identity] = struct{}{}
+			retainOwner(legacyIdentities, identity, run)
 		}
 	}
 
@@ -381,6 +417,15 @@ func (r *Runner) Poll(ctx context.Context) error {
 	// endpoint can never delay the materialization of another item (#456).
 	pendingAcks := make([]WorkItem, 0, len(items))
 	defer func() { r.drainHandoutAcks(ctx, pendingAcks) }()
+
+	// dedupeSeen dedupes the re-offer log within one pass: the source can
+	// offer the same work identity through several items, and one owner
+	// posture is one line. It is installed as this poll's
+	// dedupeLogged when the pass ends, so a key the source stops offering
+	// forgets its posture and the next offer re-logs; a pass that
+	// ends early installs the partial map instead.
+	dedupeSeen := make(map[string]dedupeOwner)
+	defer func() { r.dedupeLogged = dedupeSeen }()
 
 	seen := make(map[string]struct{}, len(items))
 	for _, item := range items {
@@ -401,6 +446,16 @@ func (r *Runner) Poll(ctx context.Context) error {
 			// the ack: it is idempotent and a known moot refusal proves
 			// the ledger already moved on (#456).
 			pendingAcks = append(pendingAcks, item)
+			// The skip is counted, and logged once per change of the
+			// retained owner's posture with the operator action that ends
+			// the repeats, so a source re-offering work a prior run already
+			// concluded is visible at default verbosity (#665).
+			r.Metrics.IncSkipped(r.Config.Source, r.Config.LaneProfile, "duplicate")
+			ownerRun := existing[key]
+			if !hasExistingRun {
+				ownerRun = legacyIdentities[itemIdentity]
+			}
+			r.observeDedupe(ctx, key, item.ID, dedupeOwnerOf(ownerRun), dedupeSeen)
 			continue
 		}
 		if _, ok := seen[key]; ok {
@@ -431,7 +486,7 @@ func (r *Runner) Poll(ctx context.Context) error {
 				Debug:             spec.Debug,
 			},
 		}
-		name := runName(r.Config.Source, itemIdentity)
+		name := RunName(r.Config.Source, itemIdentity)
 		if predecessor := settledPredecessor(runs.Items, r.Config.Source, itemIdentity, r); predecessor != nil {
 			name = successorRunName(r.Config.Source, itemIdentity, predecessor.UID)
 		}
@@ -448,9 +503,49 @@ func (r *Runner) Poll(ctx context.Context) error {
 		// materialization or starve the rest of this discovery pass, so the
 		// ack is queued and drained once every item has been materialized.
 		pendingAcks = append(pendingAcks, item)
-		existing[key] = struct{}{}
+		// The created run has no phase or PR yet; it re-logs on its first
+		// phase or PR change, which is the posture change that matters.
+		existing[key] = run
 	}
 	return nil
+}
+
+// observeDedupe logs one absorbed re-offer at most once per owner posture.
+// A retained run that has reached a concluded phase logs at default
+// verbosity (Info): that is the shape of a source that keeps re-offering
+// work a prior run already concluded. A re-offer absorbed by a run still
+// in flight logs at V(1) so normal claim re-offers stay quiet. State lives
+// in dedupeLogged and is replaced each poll, so an identity that stops
+// being offered forgets its posture, and each change of run, phase, or PR
+// — or the identity's return after a gap — logs one new line.
+func (r *Runner) observeDedupe(ctx context.Context, key, itemID string, owner dedupeOwner, dedupeSeen map[string]dedupeOwner) {
+	if seen, ok := dedupeSeen[key]; ok && seen == owner {
+		return
+	}
+	if logged, ok := r.dedupeLogged[key]; ok && logged == owner {
+		dedupeSeen[key] = owner
+		return
+	}
+	dedupeSeen[key] = owner
+	unsettled := phaseUnsettled(courierv1alpha1.Phase(owner.phase))
+	logger := log.FromContext(ctx)
+	if unsettled {
+		logger = logger.V(1)
+	}
+	fields := []any{
+		"workItemID", itemID,
+		"retainedRun", owner.run,
+		"retainedPhase", owner.phase,
+	}
+	if owner.pr != "" {
+		fields = append(fields, "pullRequest", owner.pr)
+	}
+	// The operator action is the remedy for the concluded-run shape, so it
+	// rides only on the default-verbosity line, not the in-flight one.
+	if !unsettled {
+		fields = append(fields, "operatorAction", "an operator retry request on the retained run requeues the work; settling or closing the source item ends the repeats")
+	}
+	logger.Info("work item was offered again while a retained run still owns it", fields...)
 }
 
 // drainHandoutAcks acknowledges the pass's stamped hand-outs after every item
@@ -652,7 +747,12 @@ func workKey(sourceName, workItemID string) string {
 	return sourceName + "\x00" + workItemID
 }
 
-func runName(sourceName, workItemID string) string {
+// RunName derives the CoderRun object name for a source work item:
+// "courier-" plus the first 32 hex characters of the sha256 digest over
+// (source name, NUL, work item ID). One naming scheme for every
+// key-derived run name, including push-based adapters that create
+// CoderRuns directly.
+func RunName(sourceName, workItemID string) string {
 	digest := sha256.Sum256([]byte(workKey(sourceName, workItemID)))
 	return "courier-" + hex.EncodeToString(digest[:])[:32]
 }

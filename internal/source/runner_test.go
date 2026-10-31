@@ -343,7 +343,7 @@ func TestRunnerKeepsPendingBlockedExternalRunSuppressed(t *testing.T) {
 	lane := testLane()
 	lane.Spec.Concurrency = 2
 	blocked := &courierv1alpha1.CoderRun{
-		ObjectMeta: metav1.ObjectMeta{Name: runName("dispatch", "opaque/generation-7"), Namespace: "courier"},
+		ObjectMeta: metav1.ObjectMeta{Name: RunName("dispatch", "opaque/generation-7"), Namespace: "courier"},
 		Spec:       courierv1alpha1.CoderRunSpec{Source: "dispatch", WorkItemID: "opaque/generation-7", Mode: courierv1alpha1.ModeFixPR, Repo: "acme/widgets", Ref: 42, Lane: "local"},
 		Status: courierv1alpha1.CoderRunStatus{
 			Phase: courierv1alpha1.PhaseBlockedExternal,
@@ -378,7 +378,7 @@ func TestRunnerLeavesUnofferedPublishedBlockedExternalRun(t *testing.T) {
 	lane := testLane()
 	lane.Spec.Concurrency = 2
 	blocked := &courierv1alpha1.CoderRun{
-		ObjectMeta: metav1.ObjectMeta{Name: runName("dispatch", "opaque/generation-7"), Namespace: "courier"},
+		ObjectMeta: metav1.ObjectMeta{Name: RunName("dispatch", "opaque/generation-7"), Namespace: "courier"},
 		Spec:       courierv1alpha1.CoderRunSpec{Source: "dispatch", WorkItemID: "opaque/generation-7", Mode: courierv1alpha1.ModeFixPR, Repo: "acme/widgets", Ref: 42, Lane: "local"},
 		Status: courierv1alpha1.CoderRunStatus{
 			Phase: courierv1alpha1.PhaseBlockedExternal,
@@ -420,7 +420,7 @@ func TestRunnerKeepsPublishedAwaitingReviewRunSuppressed(t *testing.T) {
 	lane := testLane()
 	lane.Spec.Concurrency = 2
 	retained := &courierv1alpha1.CoderRun{
-		ObjectMeta: metav1.ObjectMeta{Name: runName("dispatch", "opaque/generation-7"), Namespace: "courier"},
+		ObjectMeta: metav1.ObjectMeta{Name: RunName("dispatch", "opaque/generation-7"), Namespace: "courier"},
 		Spec:       courierv1alpha1.CoderRunSpec{Source: "dispatch", WorkItemID: "opaque/generation-7", Mode: courierv1alpha1.ModeFixPR, Repo: "acme/widgets", Ref: 42, Lane: "local"},
 		Status: courierv1alpha1.CoderRunStatus{
 			Phase: courierv1alpha1.PhaseAwaitingReview,
@@ -716,7 +716,7 @@ func (c *createBarrierClient) Create(ctx context.Context, obj client.Object, opt
 
 func TestRunnerPreservesRetainedLegacyDispatchRun(t *testing.T) {
 	item := WorkItem{ID: "opaque-a", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1}
-	legacy := &courierv1alpha1.CoderRun{ObjectMeta: metav1.ObjectMeta{Name: runName("dispatch:local", item.ID), Namespace: "courier"}, Spec: courierv1alpha1.CoderRunSpec{Source: "dispatch:local", WorkItemID: item.ID, Mode: courierv1alpha1.ModeResolveIssue, Repo: item.Repo, Ref: item.Ref, Lane: "local"}}
+	legacy := &courierv1alpha1.CoderRun{ObjectMeta: metav1.ObjectMeta{Name: RunName("dispatch:local", item.ID), Namespace: "courier"}, Spec: courierv1alpha1.CoderRunSpec{Source: "dispatch:local", WorkItemID: item.ID, Mode: courierv1alpha1.ModeResolveIssue, Repo: item.Repo, Ref: item.Ref, Lane: "local"}}
 	kubeClient := newTestClient(t, testLane(), legacy)
 	runner := NewRunner(kubeClient, &testAdapter{items: []WorkItem{item}}, RunnerConfig{Source: "dispatch", SourceAgent: "courier-local", LaneProfile: "local", Namespace: "courier"})
 	if err := runner.Poll(context.Background()); err != nil {

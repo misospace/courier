@@ -35,6 +35,8 @@ import (
 	"github.com/misospace/courier/internal/forge"
 	"github.com/misospace/courier/internal/forge/forgetest"
 	"github.com/misospace/courier/internal/source"
+	"github.com/misospace/courier/internal/source/adhoc"
+	"github.com/misospace/courier/internal/source/manual"
 	"github.com/misospace/courier/internal/status"
 	"github.com/misospace/courier/internal/topology"
 )
@@ -241,6 +243,10 @@ func secureControl(t *testing.T, objects ...client.Object) (*SecureControl, clie
 	control := &SecureControl{
 		Client:  c,
 		Patcher: &CoderRunReconciler{Client: c, StatusWriter: fakeStatusWriter{client: c}},
+		Sources: NewSourceRegistry(map[string]source.Adapter{
+			adhoc.SourceName: adhoc.New(c, c),
+			"manual":         manual.New(nil),
+		}),
 		Config: SecureConfig{
 			RunNamespace:      secureTestNamespace,
 			Registry:          secureRegistry(),
@@ -371,12 +377,22 @@ func contributeForge() *fakeAdmissionForge {
 	}
 }
 
+// adhocContext renders the source-owned context an ad-hoc admission
+// persists, with the goal and base ref the adapter's decode re-derives.
+// The key is the adapter's own; the existing goal-bridge tests hardcode it
+// the same way.
+func adhocContext(goal, baseRef string) string {
+	return fmt.Sprintf(`{"adhoc.courier.misospace.dev/v1":{"goal":%q,"baseRef":%q}}`, goal, baseRef)
+}
+
 func contributeRun(name string) *courier.CoderRun {
 	run := secureRun(name)
 	run.Spec.Mode = courier.ModeContribute
+	run.Spec.Source = adhoc.SourceName
 	run.Spec.Ref = 0
 	run.Spec.WorkItemID = "adhoc-abcdef123456"
 	run.Spec.WorkRepo = "contrib/fork"
+	run.Spec.SourceContext = adhocContext("add the widget", "main")
 	return run
 }
 
@@ -441,6 +457,93 @@ func TestResolveAdmissionContribute(t *testing.T) {
 		policy.SourceIssue != nil || len(policy.AcceptanceCriteria) > 0 || policy.AcceptanceCriteriaDigest != "" {
 		t.Fatalf("a contribute run pins no PR anchors, source issue, or criteria: %+v", policy)
 	}
+}
+
+// The admitted base ref — carried in the source's own durable context and
+// stated by the rendered goal — is what the persisted publication policy
+// pins, not the base repository's default branch (#653). The broker refuses
+// any pull request whose base differs from the pinned value, so goal,
+// admission, and broker must name one base for every admitted ref.
+func TestResolveAdmissionContributePinsAdmittedBaseRef(t *testing.T) {
+	const admittedRef = "release-1.0"
+	provider := contributeForge()
+	provider.refs["Acme/Widgets:"+admittedRef] = forge.RefState{Ref: admittedRef, OID: "releaseoid", Exists: true}
+	control, _ := secureControl(t)
+	control.Config.Providers = fakeProviderFactory(provider)
+
+	run := contributeRun("contribute-admitted-base")
+	run.Spec.SourceContext = adhocContext("add the widget", admittedRef)
+
+	_, policy, err := control.ResolveAdmission(context.Background(), run)
+	if err != nil {
+		t.Fatalf("ResolveAdmission: %v", err)
+	}
+	if policy.BaseRef != admittedRef || policy.BaseOID != "releaseoid" {
+		t.Fatalf("policy pinned base = %s@%s, want the admitted ref %s@releaseoid", policy.BaseRef, policy.BaseOID, admittedRef)
+	}
+
+	// The goal the coordinator renders states the same base the policy pins.
+	contribution, err := launchContribution(control.Sources, run)
+	if err != nil {
+		t.Fatalf("launch contribution: %v", err)
+	}
+	goal, err := executor.GoalWithContribution(run, contribution)
+	if err != nil {
+		t.Fatalf("render contribute goal: %v", err)
+	}
+	if !strings.Contains(goal, admittedRef) {
+		t.Fatalf("rendered goal omits the admitted base ref %q:\n%s", admittedRef, goal)
+	}
+	if !strings.Contains(goal, policy.BaseRef) {
+		t.Fatalf("rendered goal does not state the pinned base %q:\n%s", policy.BaseRef, goal)
+	}
+}
+
+// An admitted base ref the base repository does not carry is immutable-spec
+// misdirection no retry can fix: admission fails closed with a NeedsHuman
+// reason instead of pinning a substitute branch.
+func TestResolveAdmissionContributeRefusesUnknownAdmittedBaseRef(t *testing.T) {
+	control, _ := secureControl(t)
+	control.Config.Providers = fakeProviderFactory(contributeForge())
+
+	run := contributeRun("contribute-missing-base")
+	run.Spec.SourceContext = adhocContext("add the widget", "no-such-branch")
+
+	_, _, err := control.ResolveAdmission(context.Background(), run)
+	var permanent *SecureNeedsHumanError
+	if !errors.As(err, &permanent) || permanent.Reason != "ProviderRead" {
+		t.Fatalf("error = %v, want NeedsHuman ProviderRead", err)
+	}
+}
+
+// Admission classifies a contribute run's context failures exactly as the
+// launch paths do: a context the owning source refuses is permanent
+// ContributionContext, and a failure to reach an owning adapter at all stays
+// retryable.
+func TestResolveAdmissionContributeContextClassification(t *testing.T) {
+	t.Run("refused context is permanent", func(t *testing.T) {
+		control, _ := secureControl(t)
+		run := contributeRun("contribute-empty-context")
+		run.Spec.SourceContext = ""
+		_, _, err := control.ResolveAdmission(context.Background(), run)
+		var permanent *SecureNeedsHumanError
+		if !errors.As(err, &permanent) || permanent.Reason != contributionContextReason {
+			t.Fatalf("error = %v, want NeedsHuman %s", err, contributionContextReason)
+		}
+	})
+	t.Run("unwired registry is retryable", func(t *testing.T) {
+		control, _ := secureControl(t)
+		control.Sources = nil
+		run := contributeRun("contribute-unwired")
+		_, _, err := control.ResolveAdmission(context.Background(), run)
+		if err == nil {
+			t.Fatal("admission without a source registry must fail")
+		}
+		var permanent *SecureNeedsHumanError
+		if errors.As(err, &permanent) {
+			t.Fatalf("error = %v, want a retryable failure, not NeedsHuman", err)
+		}
+	})
 }
 
 // An existing fork branch tip is adopted only when Courier recorded it for
