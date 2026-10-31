@@ -699,6 +699,64 @@ func TestCheckWaiterDoesNotRematerializeWorkspace(t *testing.T) {
 	}
 }
 
+// TestCheckMutatingWritesCannotLeakIntoLaterEvidence pins the evidence
+// semantics against a completed check's own worker-side writes: the mock
+// models the shared workspace's dirty state worker-side — a terminally
+// completed shell- or check-kind task dirties it, and only the unpack's
+// reset cleans it — and records, per model-controlled dispatch, the dirty
+// state that task started against. The first check's writes may dirty the
+// workspace after its receipt lands, but the identical repeat is served
+// from the receipt without dispatching anything, and the next dispatched
+// evidence producer (a distinct command) starts clean because its own
+// materialization wiped the earlier writes first. No dispatched task ever
+// observes another task's writes, so command-plus-tip plus generation stays
+// a complete identity for the evidence a receipt serves.
+func TestCheckMutatingWritesCannotLeakIntoLaterEvidence(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.snapshotTip = "snap-tip"
+	worker.ordinaryResults = []protocol.Result{
+		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "suite ok\n"},
+		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "build ok\n"},
+		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "suite ok again\n"},
+	}
+	coordinator := newCheckCoordinator(t, delegator, snapshotProvider("snap-tip"))
+
+	first := coordinator.runCheck(context.Background(), checkCall("go test ./..."), "", ToolResult{ToolCallID: "c1", Name: toolCheck})
+	repeat := coordinator.runCheck(context.Background(), checkCall("go test ./..."), "", ToolResult{ToolCallID: "c2", Name: toolCheck})
+	other := coordinator.runCheck(context.Background(), checkCall("go build ./..."), "", ToolResult{ToolCallID: "c3", Name: toolCheck})
+	again := coordinator.runCheck(context.Background(), checkCall("go test ./..."), "", ToolResult{ToolCallID: "c4", Name: toolCheck})
+
+	if got := taskDispatchCount(worker, notUnpackTask); got != 3 {
+		t.Fatalf("check dispatches = %d, want the repeat served from the receipt and both materialization-following requests dispatched fresh", got)
+	}
+	if !strings.Contains(first.Content, "check receipt: fresh") || !strings.Contains(repeat.Content, "check receipt: reused") {
+		t.Fatalf("first/repeat = %q / %q, want fresh then reused", first.Content, repeat.Content)
+	}
+	if !strings.Contains(other.Content, "check receipt: fresh") {
+		t.Fatalf("distinct command = %q, want a fresh dispatch", other.Content)
+	}
+	if !strings.Contains(again.Content, "check receipt: fresh") {
+		t.Fatalf("post-materialization repeat = %q, want a fresh dispatch: the intervening materialization bumped the generation", again.Content)
+	}
+	// The witness: every dispatched check started against a clean
+	// workspace. Had any dispatch observed an earlier task's writes without
+	// an intervening materialization, the recorded state would be dirty and
+	// the receipt identity would not describe what a fresh dispatch would
+	// measure.
+	worker.mu.Lock()
+	states := append([]bool(nil), worker.dirtyAtDispatch...)
+	worker.mu.Unlock()
+	if len(states) != 3 {
+		t.Fatalf("recorded dispatch start states = %v, want one per dispatched check", states)
+	}
+	for i, dirty := range states {
+		if dirty {
+			t.Fatalf("dispatch %d started against a workspace dirtied by an earlier task's writes: worker-side mutation leaked into later evidence without an intervening materialization", i+1)
+		}
+	}
+}
+
 // registryReceipt reports the terminal receipt the registry tracks for the
 // exact command-and-tip identity, or (nil, false) when the key is untracked.
 // For sequential test flows the entry is never still in flight at read time.

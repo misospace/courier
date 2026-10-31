@@ -81,6 +81,10 @@ type checkEntry struct {
 // makes concurrent runCheck calls safe: the first caller at a key installs
 // the active entry before dispatching, so every other caller with the same
 // key waits on its done channel instead of dispatching a second operation.
+// The registry is coordinator-memory-only by design: receipts are scoped to
+// the coordinator incarnation, and a relaunched incarnation has no session
+// memory of earlier requests plus a fresh generation counter, so a
+// cross-restart receipt could never be soundly served (see checkStateKey).
 type checkRegistry struct {
 	mu      sync.Mutex
 	order   []string
@@ -302,6 +306,19 @@ func (c *Coordinator) runCheck(ctx context.Context, call ToolCall, briefID strin
 			// no longer exists; re-claim with force to replace the
 			// stale terminal entry.
 			//
+			// The writes the completed check itself left behind are
+			// different: they exist without a generation bump, but no
+			// evidence can observe them. The reuse path executes
+			// nothing, and every later evidence producer dispatches only
+			// after the materialization that resets the workspace first,
+			// so the writes cannot reach a later dispatch's observation.
+			// A fresh dispatch at this key would itself re-materialize
+			// before running, so a served receipt describes exactly what
+			// a fresh dispatch would have measured; the only
+			// nondeterminism reuse inherits is the command's own, the
+			// same class any test cache carries. A coordinator that
+			// doubts a receipt anyway has refresh:true.
+			//
 			// The two-step re-claim is safe even though each claim takes
 			// the registry mutex independently: a non-forced claim cannot
 			// displace a terminal reusable entry, so the entry observed
@@ -464,6 +481,25 @@ func bootstrapEnvDigest(env []string) string {
 // tip are what the generation guard exists for: they wipe worker-side
 // mutation the tip does not capture, so a receipt from before such a
 // materialization is refused even at the same tip.
+//
+// The completed check's own writes are the one worker-side mutation a
+// generation bump does not witness, and they need no witness: no evidence
+// can observe them, because the reuse path executes nothing and every later
+// evidence producer materializes (and so wipes them) before its dispatch. A
+// fresh dispatch at the same key would itself re-materialize before
+// running, so a served receipt describes exactly what a fresh dispatch
+// would have measured; the only nondeterminism reuse inherits is the
+// command's own, the same class any test cache carries.
+//
+// Receipts are scoped to the coordinator incarnation, and persistence
+// across incarnations would be unservable by construction, not merely
+// unimplemented: a relaunched incarnation starts a fresh generation
+// counter, has no session memory of any earlier request, and must
+// materialize before its first dispatch, so a pre-restart receipt would be
+// refused by the generation guard even if it had been persisted — the
+// workspace it describes no longer exists. The receipt's durability is its
+// bounded record over the incarnation's lifetime, not a cross-restart
+// surface.
 //
 // The claim-ordering guarantee: the registry claim strictly precedes the
 // destructive snapshot materialization in runCheck, so a caller that joins

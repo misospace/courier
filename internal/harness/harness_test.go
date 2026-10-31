@@ -225,6 +225,19 @@ type mockWorker struct {
 	// regression fails with a clear message instead of from inside the
 	// worker's goroutine.
 	unpackDuringCheck int
+	// dirtyWorkspace models worker-side files a model-controlled task
+	// leaves in the shared workspace: a terminal shell- or check-kind task
+	// sets it, and only the unpack's reset (the materialization) clears
+	// it. This is the reviewer's scenario made concrete: a completed
+	// check's own writes changing the workspace its receipt describes.
+	dirtyWorkspace bool
+	// dirtyAtDispatch records, per shell/check-kind dispatch in order, the
+	// dirty-workspace state that task started against. The evidence
+	// semantics require every dispatched task to start clean — its
+	// materialization wiped earlier tasks' writes — so a test asserting
+	// all-false pins that no task's writes ever leak into a later task's
+	// observation.
+	dirtyAtDispatch []bool
 }
 
 func isWorkerBootstrapTask(task protocol.Task) bool {
@@ -305,6 +318,12 @@ func (m *mockWorker) handleDispatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m.dispatches = append(m.dispatches, dispatchRecord{envelope: req.Envelope, task: task})
+	// A model-controlled dispatch records the dirty-workspace state it
+	// starts against: the evidence semantics require it to be clean, its
+	// own materialization having wiped earlier tasks' writes.
+	if opIDKindOf(req.Envelope.OpID, []string{"shell", "check"}) {
+		m.dirtyAtDispatch = append(m.dirtyAtDispatch, m.dirtyWorkspace)
+	}
 	if m.results == nil {
 		m.results = map[string]protocol.ResultState{}
 	}
@@ -383,6 +402,19 @@ func (m *mockWorker) handleDispatch(w http.ResponseWriter, r *http.Request) {
 				ExitCode:   0,
 				StdoutTail: "I published PR #999",
 			},
+		}
+	}
+	// Model the workspace's dirty state the way the real worker behaves:
+	// the unpack's reset cleans everything a previous task left behind,
+	// fixed control tasks change nothing the receipts vouch for, and a
+	// terminally completed model-controlled task may leave files behind.
+	if !running {
+		switch {
+		case isWorkerUnpackTask(task):
+			m.dirtyWorkspace = false
+		case isWorkerPackTask(task), isWorkerBootstrapTask(task), isWorkerEnvCaptureTask(task):
+		default:
+			m.dirtyWorkspace = true
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")

@@ -513,13 +513,21 @@ performs no upload-unpack and cannot mutate the workspace the running check
 validates.
 
 The generation guard is what keeps a served receipt honest. Every
-coordinator-driven workspace mutation is witnessed by a generation bump,
-and worker-side mutation — files a check or shell run leaves behind, gitignored
-outputs included — is wiped only by the next unpack. "No materialization
-since the receipt's run" is therefore exactly "the workspace still holds the
-state the receipt describes": a receipt is servable only while no
-re-materialization has happened since its run, and a receipt from an older
-generation describes a state that no longer exists, so the guard refuses it
+coordinator-driven workspace mutation is witnessed by a generation bump.
+The one worker-side mutation a bump does not witness — files the completed
+check itself leaves behind, gitignored outputs included — needs no witness:
+the reuse path executes nothing, and every later evidence producer
+dispatches only after the materialization that resets the workspace first
+(`git reset --hard` plus `git clean -qfdx`), so one task's writes can never
+reach a later task's observation. A fresh dispatch at the same key would
+itself re-materialize before running, so a served receipt describes exactly
+what a fresh dispatch would have measured; the only nondeterminism reuse
+inherits is the command's own, the same class any test cache carries. "No
+materialization since the receipt's run" is therefore exactly "no evidence
+has run against any workspace state the receipt does not describe": a
+receipt is servable only while no re-materialization has happened since its
+run, and a receipt from an older generation describes a state that no
+longer exists, so the guard refuses it
 (both on the reuse path and for a waiter whose in-flight dispatch completed
 after an intervening materialization) and the request reruns. This narrows
 reuse honestly: any intervening control shell run, delegate brief
@@ -555,11 +563,17 @@ identity.
 
 While an equivalent check is in flight, a duplicate request waits on that
 dispatch instead of launching a second one. Receipts are bounded (evicted
-least-recently tracked first) and live only in the coordinator incarnation:
-the coordinator session itself has no durable resume — a restart relaunches
-the incarnation from scratch — so receipt persistence beyond that lifecycle
-would record nothing a rerun could not safely reproduce; a restart simply
-reruns. The tool is coordinator-only — sub-agents keep plain shell.
+least-recently tracked first) and live only in the coordinator incarnation.
+That scoping is deliberate, not a missing persistence layer: a restart
+relaunches the incarnation from scratch — the session is in-memory and
+rebuilds nothing from a prior transcript — and a relaunched incarnation has
+no session memory of earlier requests, starts a fresh generation counter,
+and must materialize before its first dispatch, so a cross-restart receipt
+would be refused by the generation guard even if it had been persisted: the
+workspace it describes no longer exists. Receipt persistence beyond the
+incarnation would record nothing a rerun could not safely reproduce; a
+restart simply reruns. The tool is coordinator-only — sub-agents keep plain
+shell.
 
 ### Coordinator pod process lifetime
 
