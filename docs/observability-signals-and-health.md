@@ -100,7 +100,7 @@ source runner is not configured emits nothing.
 | `courier_source_discovery_successes_total` | counter | polls | `source`, `lane` | Source calls that returned without error, **including zero items**. This is what makes an idle queue observable as healthy. |
 | `courier_source_discovery_failures_total` | counter | polls | `source`, `lane` | Source calls that returned an error. The authoritative discovery-failure rate (#291 §6.2). |
 | `courier_source_items_offered_total` | counter | items | `source`, `lane` | Items returned by discovery before core validation and dedupe. |
-| `courier_source_discovery_skipped_total` | counter | items | `source`, `lane`, `reason` | Items dropped by runner validation; `reason` ∈ `missing-id`, `unsupported-mode`, `invalid-ref` (`internal/source/runner.go:330-345`). |
+| `courier_source_discovery_skipped_total` | counter | items | `source`, `lane`, `reason` | Items dropped by runner validation or by dedupe against a retained run; `reason` ∈ `missing-id`, `unsupported-mode`, `invalid-ref`, `duplicate` (`internal/source/runner.go:349-434`). |
 | `courier_source_items_materialized_total` | counter | runs | `source`, `lane` | Items that became `CoderRun`s. Dedupe and exclusions may make this smaller than `items_offered_total` (`internal/source/runner.go:350-443`). |
 | `courier_source_last_attempt_timestamp_seconds` | gauge | unix seconds | `source`, `lane` | When the source was last called. |
 | `courier_source_last_success_timestamp_seconds` | gauge | unix seconds | `source`, `lane` | When discovery last succeeded. **Absent until the first success** — absence is `starting`/`unknown`, never `idle`. |
@@ -113,7 +113,12 @@ under `discovery_paused_total`, not as attempts. The current-state
 scrape never observes two reasons at 1, nor a half-applied reason transition,
 even when several runners share one `(source, lane)` pair. The gap between
 `items_offered_total` and `items_materialized_total` is the observable cost of
-dedupe/exclusion, not an error. The failure **cause** (transport, auth, HTTP
+dedupe/exclusion, not an error. Dedupe counts every absorbed re-offer under
+`reason="duplicate"`. When the retained run has already reached a concluded
+phase, the runner also logs the absorbed re-offer at default verbosity — once
+per owner posture — and names the operator action that ends the repeats
+(#665). The failure
+**cause** (transport, auth, HTTP
 class, malformed response) is deliberately **not** a core label: it is the
 connector's `connector.diagnostic` breakdown (#291 §3.3, §6.2), joined by the
 shared adapter name.
@@ -406,7 +411,7 @@ from §3.2 and is per binding:
 | `disabled` | the adapter is not configured for this deployment (a configuration fact, not a signal). |
 | `starting` | enabled, no successful poll yet (`last_success` absent) and within the startup grace. |
 | `ok` | the last poll succeeded (`failures_total` flat since the last success; `last_success` fresh). **Zero items is still `ok`.** |
-| `degraded` | recent failures but a success within the evaluation window, or a partial result (`skipped_total` rising) without total failure. |
+| `degraded` | recent failures but a success within the evaluation window, or a partial result (`skipped_total` rising for a validation reason) without total failure. A rise under `reason="duplicate"` is absorbed traffic, never `degraded`. |
 | `unavailable` | enabled, not paused, and no success within the evaluation window. |
 | `unknown` | telemetry absent for a source the view believes is enabled (e.g. metrics not scraped), or a restart before the first poll. |
 
@@ -696,7 +701,7 @@ A label-driven forge connector (`github-label`, implemented in
 | Capability | Behaviour under this design |
 | --- | --- |
 | discovery | emits `courier_source_discovery_*` from its own forge client; failure causes are its own `connector.diagnostic` reasons (#291) |
-| exclusions | implemented — the adapter filters retained same-source work itself, so `courier_source_discovery_skipped` stays limited to core validation reasons |
+| exclusions | implemented — the adapter filters retained same-source work itself. Whatever the filter misses is absorbed by the runner's dedupe and counted under `reason="duplicate"` |
 | lifecycle report | optional; if unsupported, runs still record their terminal phase and `LifecycleReportSupported=False` is simply not set |
 | reservations/capacity | identical core signals; the connector knows nothing about them |
 | health | `ok`/`degraded`/`unavailable`/`starting`/`disabled` from the same rules |
