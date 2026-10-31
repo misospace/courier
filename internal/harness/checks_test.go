@@ -440,6 +440,15 @@ func TestCheckRefreshSharesInFlightDispatch(t *testing.T) {
 	worker.hangKinds = []string{"check"}
 	coordinator := newCheckCoordinator(t, delegator, snapshotProvider("snap-tip"))
 
+	// claimed reports that a caller committed to waiting on the active
+	// entry. A's dispatch cannot complete before the manual result write
+	// below, and that write happens only after the waiter has claimed, so
+	// the waiter cannot mistake a terminal entry for an in-flight one and
+	// re-dispatch: the sharing window is held open by construction, not
+	// by timing.
+	claimed := make(chan string, 1)
+	coordinator.checks.waitHook = claimed
+
 	first := make(chan ToolResult, 1)
 	go func() {
 		first <- coordinator.runCheck(context.Background(), checkCall("go test ./..."), "", ToolResult{ToolCallID: "c-a", Name: toolCheck})
@@ -451,7 +460,11 @@ func TestCheckRefreshSharesInFlightDispatch(t *testing.T) {
 	go func() {
 		second <- coordinator.runCheck(context.Background(), refresh, "", ToolResult{ToolCallID: "c-b", Name: toolCheck})
 	}()
-	awaitDispatchCount(t, worker, notUnpackTask, 1)
+	select {
+	case <-claimed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the refresh caller never claimed the in-flight entry")
+	}
 
 	worker.mu.Lock()
 	var opID string
@@ -466,8 +479,17 @@ func TestCheckRefreshSharesInFlightDispatch(t *testing.T) {
 	}
 	worker.mu.Unlock()
 
-	gotA := <-first
-	gotB := <-second
+	var gotA, gotB ToolResult
+	select {
+	case gotA = <-first:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the original check did not return")
+	}
+	select {
+	case gotB = <-second:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the refresh did not return")
+	}
 	if got := taskDispatchCount(worker, notUnpackTask); got != 1 {
 		t.Fatalf("check dispatches = %d, want the refresh to share the in-flight dispatch", got)
 	}
@@ -606,6 +628,13 @@ func TestCheckWaiterOnFailedLaunchSeesNoReceipt(t *testing.T) {
 	}
 	coordinator := newCheckCoordinator(t, delegator, snapshotProvider("snap-tip"))
 
+	// claimed reports that the waiter committed to waiting on the active
+	// entry: the cancellation below cannot terminalize the entry before
+	// the waiter has claimed it, so the waiter serves the failed dispatch
+	// instead of re-launching.
+	claimed := make(chan string, 1)
+	coordinator.checks.waitHook = claimed
+
 	ctxA, cancelA := context.WithCancel(context.Background())
 	defer cancelA()
 	resultA := make(chan ToolResult, 1)
@@ -618,12 +647,11 @@ func TestCheckWaiterOnFailedLaunchSeesNoReceipt(t *testing.T) {
 	go func() {
 		resultB <- coordinator.runCheck(context.Background(), checkCall("go test ./..."), "", ToolResult{ToolCallID: "c-b", Name: toolCheck})
 	}()
-	// The waiter's unpack is its last I/O before its claim; once its
-	// dispatch is recorded, only local computation separates it from the
-	// claim, so a short margin makes the ordering deterministic while the
-	// gated cancel keeps the entry active.
-	awaitDispatchCount(t, worker, isWorkerUnpackTask, 2)
-	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-claimed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the waiter never claimed the active entry")
+	}
 
 	// Cancelling the dispatching caller leaves its entry without a receipt:
 	// the waiter wakes to the fixed failed-launch notice, never a second

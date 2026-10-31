@@ -61,6 +61,12 @@ type checkRegistry struct {
 	mu      sync.Mutex
 	order   []string
 	entries map[string]*checkEntry
+	// waitHook, when non-nil, receives one value when a claim returns
+	// claimActive — the caller is committed to waiting on that entry's
+	// done channel. Test-only observability of the in-flight-sharing
+	// window; the send never blocks, so a test that stops receiving
+	// cannot deadlock the registry's callers.
+	waitHook chan string
 }
 
 func newCheckRegistry() *checkRegistry {
@@ -100,6 +106,12 @@ func (r *checkRegistry) claim(key string, force bool) (*checkEntry, claimOutcome
 				return entry, claimReuse
 			}
 		default:
+			if r.waitHook != nil {
+				select {
+				case r.waitHook <- key:
+				default:
+				}
+			}
 			return entry, claimActive
 		}
 	}
