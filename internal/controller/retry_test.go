@@ -1056,6 +1056,206 @@ func TestRetryIdempotencyKeyShape(t *testing.T) {
 	}
 }
 
+func listRetryRuns(t *testing.T, c client.Client) []courierv1alpha1.CoderRun {
+	t.Helper()
+	var runs courierv1alpha1.CoderRunList
+	if err := c.List(context.Background(), &runs); err != nil {
+		t.Fatalf("list runs: %v", err)
+	}
+	return runs.Items
+}
+
+func findRun(runs []courierv1alpha1.CoderRun, name string) *courierv1alpha1.CoderRun {
+	for i := range runs {
+		if runs[i].Name == name {
+			return &runs[i]
+		}
+	}
+	return nil
+}
+
+func TestRetryControllerMaterializesSuccessor(t *testing.T) {
+	// #609: an adapter whose requeue mints the fresh identity in its own
+	// namespace promises no discovery will offer it, so the reconcile that
+	// settles Requeued creates the successor run itself: one extra run, named
+	// from the fresh identity and the predecessor UID, carrying the copied
+	// immutable spec and the minted WorkItemID, with the source-issued
+	// assignment deliberately not copied.
+	src := &requeueSource{admissionSource: &admissionSource{}, result: source.AttemptRequeueResult{AttemptID: "rr/retry/req-1", ControllerMaterializesSuccessor: true}}
+	buf := &bytes.Buffer{}
+	run := retryRun("rr", courierv1alpha1.PhaseFailed, "req-1")
+	run.Spec.SourceContext = `{"goal":"retry the same work"}`
+	run.Spec.Debug = true
+	run.Spec.AssignmentKind = source.AssignmentCIFailure
+	run.Spec.AssignmentReasons = []string{"source said so"}
+	c := phaseClient(t, run)
+
+	if _, err := retryReconciler(c, src, reapClock, nil, buf).Reconcile(context.Background(), admissionRequest("rr")); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	stored := getRetryRun(t, c, "rr")
+	if stored.Status.RetryRequest.State != courierv1alpha1.RetryRequestStateRequeued || stored.Status.RetryRequest.AttemptID != "rr/retry/req-1" {
+		t.Fatalf("retryRequest = %+v, want Requeued attemptID=rr/retry/req-1", stored.Status.RetryRequest)
+	}
+	wantName := source.SuccessorRunName("test", "rr/retry/req-1", stored.UID)
+	runs := listRetryRuns(t, c)
+	if len(runs) != 2 {
+		t.Fatalf("runs = %d, want exactly predecessor + successor: %+v", len(runs), runNames(runs))
+	}
+	successor := findRun(runs, wantName)
+	if successor == nil {
+		t.Fatalf("successor %q not materialized: %+v", wantName, runNames(runs))
+	}
+	if successor.Spec.WorkItemID != "rr/retry/req-1" {
+		t.Fatalf("successor WorkItemID = %q, want the minted identity", successor.Spec.WorkItemID)
+	}
+	if successor.Spec.Mode != run.Spec.Mode || successor.Spec.Source != run.Spec.Source ||
+		successor.Spec.Repo != run.Spec.Repo || successor.Spec.Ref != run.Spec.Ref ||
+		successor.Spec.Lane != run.Spec.Lane || successor.Spec.Debug != run.Spec.Debug {
+		t.Fatalf("successor spec = %+v, want the predecessor's immutable work fields copied", successor.Spec)
+	}
+	if successor.Spec.SourceContext != run.Spec.SourceContext {
+		t.Fatalf("successor sourceContext = %q, want the predecessor's task context", successor.Spec.SourceContext)
+	}
+	if successor.Spec.AssignmentKind != "" || successor.Spec.AssignmentReasons != nil {
+		t.Fatalf("successor assignment = %q/%v, want empty; no source re-issued this attempt", successor.Spec.AssignmentKind, successor.Spec.AssignmentReasons)
+	}
+	if successor.Status.Phase != "" {
+		t.Fatalf("successor phase = %q, want a fresh run", successor.Status.Phase)
+	}
+	if successor.Namespace != stored.Namespace {
+		t.Fatalf("successor namespace = %q, want the predecessor's", successor.Namespace)
+	}
+	events := parseRetryEvents(t, buf)
+	if len(events) != 2 || events[1]["status"] != "Requeued" {
+		t.Fatalf("run.retry events = %+v, want Requested then Requeued", events)
+	}
+	if eventDetailString(events[1], "successor_run") != wantName {
+		t.Fatalf("requeued event successor_run = %q, want %q", eventDetailString(events[1], "successor_run"), wantName)
+	}
+}
+
+func runNames(runs []courierv1alpha1.CoderRun) []string {
+	names := make([]string, 0, len(runs))
+	for i := range runs {
+		names = append(names, runs[i].Name)
+	}
+	return names
+}
+
+func TestRetryMaterializationReplayCollidesOnOneName(t *testing.T) {
+	// A replay of the committed key after a lost settle write must not
+	// duplicate the successor: the name is deterministic in the fresh identity
+	// and predecessor UID, so the second Create is an AlreadyExists the
+	// materialization tolerates and the record still settles.
+	src := &requeueSource{admissionSource: &admissionSource{}, result: source.AttemptRequeueResult{AttemptID: "rr/retry/req-1", ControllerMaterializesSuccessor: true}}
+	run := retryRun("rr", courierv1alpha1.PhaseFailed, "req-1")
+	c := phaseClient(t, run)
+	uid := getRetryRun(t, c, "rr").UID
+	// Stand in for the successor a previous reconcile already created: a
+	// distinguishable sentinel spec proves the replay neither overwrites nor
+	// adds a second run.
+	if err := c.Create(context.Background(), &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: source.SuccessorRunName("test", "rr/retry/req-1", uid), Namespace: admissionNamespace},
+		Spec:       courierv1alpha1.CoderRunSpec{Mode: courierv1alpha1.ModeResolveIssue, Source: "test", WorkItemID: "rr/retry/req-1", Repo: "acme/widgets", Ref: 1, Lane: "sentinel-lane"},
+	}); err != nil {
+		t.Fatalf("pre-create successor: %v", err)
+	}
+
+	if _, err := retryReconciler(c, src, reapClock, nil, nil).Reconcile(context.Background(), admissionRequest("rr")); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if rec := getRetryRun(t, c, "rr").Status.RetryRequest; rec == nil || rec.State != courierv1alpha1.RetryRequestStateRequeued {
+		t.Fatalf("retryRequest = %+v, want the replay to settle Requeued", rec)
+	}
+	runs := listRetryRuns(t, c)
+	if len(runs) != 2 {
+		t.Fatalf("runs = %d, want the existing successor kept and no duplicate: %+v", len(runs), runNames(runs))
+	}
+	if got := findRun(runs, source.SuccessorRunName("test", "rr/retry/req-1", uid)); got == nil || got.Spec.Lane != "sentinel-lane" {
+		t.Fatalf("successor = %+v, want the pre-created object untouched", got)
+	}
+}
+
+func TestRetryMaterializationTransientCreateKeepsRequested(t *testing.T) {
+	// A failed successor create leaves the durable Requested record standing:
+	// the error surfaces so the workqueue re-arms, nothing settles, and the
+	// next reconcile — replaying the same minted identity — creates the one
+	// successor and settles.
+	src := &requeueSource{admissionSource: &admissionSource{}, result: source.AttemptRequeueResult{AttemptID: "rr/retry/req-1", ControllerMaterializesSuccessor: true}}
+	buf := &bytes.Buffer{}
+	run := retryRun("rr", courierv1alpha1.PhaseFailed, "req-1")
+	base := phaseClient(t, run)
+	blocked := true
+	c := interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
+		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if successor, ok := obj.(*courierv1alpha1.CoderRun); ok && successor.Name != "rr" && blocked {
+				return errors.New("api server unavailable")
+			}
+			return cl.Create(ctx, obj, opts...)
+		},
+	})
+	rec := retryReconciler(c, src, reapClock, nil, buf)
+	rec.StatusWriter = fakeStatusWriter{client: base}
+
+	if _, err := rec.Reconcile(context.Background(), admissionRequest("rr")); err == nil {
+		t.Fatalf("Reconcile: want the failed successor create surfaced")
+	}
+	stored := getRetryRun(t, base, "rr")
+	if stored.Status.RetryRequest == nil || stored.Status.RetryRequest.State != courierv1alpha1.RetryRequestStateRequested {
+		t.Fatalf("retryRequest = %+v, want it to stay Requested when materialization fails", stored.Status.RetryRequest)
+	}
+	if len(listRetryRuns(t, base)) != 1 {
+		t.Fatalf("a successor exists even though its create failed: %+v", runNames(listRetryRuns(t, base)))
+	}
+	events := parseRetryEvents(t, buf)
+	if len(events) != 1 || events[0]["status"] != "Requested" {
+		t.Fatalf("run.retry events = %+v, want only the Requested record so far", events)
+	}
+
+	blocked = false
+	if _, err := rec.Reconcile(context.Background(), admissionRequest("rr")); err != nil {
+		t.Fatalf("second Reconcile: %v", err)
+	}
+	if got := getRetryRun(t, base, "rr").Status.RetryRequest; got == nil || got.State != courierv1alpha1.RetryRequestStateRequeued || got.AttemptID != "rr/retry/req-1" {
+		t.Fatalf("retryRequest = %+v, want the replay to settle Requeued", got)
+	}
+	if runs := listRetryRuns(t, base); len(runs) != 2 {
+		t.Fatalf("runs = %d, want exactly one successor after the retry: %+v", len(runs), runNames(runs))
+	}
+	if src.calls != 2 {
+		t.Fatalf("requeue calls = %d, want the committed key replayed once", src.calls)
+	}
+}
+
+func TestRetryMaterializationNamesFromUnnormalizedIdentity(t *testing.T) {
+	// The successor name hashes the minted identity, so an identity over the
+	// CRD's status bound still names exactly one successor; only the recorded
+	// attemptID is normalized away, and a later reconcile opens nothing new.
+	oversized := "rr/retry/" + strings.Repeat("é", courierv1alpha1.RetryRequestMaxAttemptIDLength)
+	src := &requeueSource{admissionSource: &admissionSource{}, result: source.AttemptRequeueResult{AttemptID: oversized, ControllerMaterializesSuccessor: true}}
+	run := retryRun("rr", courierv1alpha1.PhaseFailed, "req-1")
+	c := phaseClient(t, run)
+
+	if _, err := retryReconciler(c, src, reapClock, nil, nil).Reconcile(context.Background(), admissionRequest("rr")); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	stored := getRetryRun(t, c, "rr")
+	if stored.Status.RetryRequest.State != courierv1alpha1.RetryRequestStateRequeued || stored.Status.RetryRequest.AttemptID != "" {
+		t.Fatalf("retryRequest = %+v, want Requeued with the oversized identity dropped", stored.Status.RetryRequest)
+	}
+	wantName := source.SuccessorRunName("test", oversized, stored.UID)
+	if _, err := retryReconciler(c, src, reapClock, nil, nil).Reconcile(context.Background(), admissionRequest("rr")); err != nil {
+		t.Fatalf("second Reconcile: %v", err)
+	}
+	// The settle already landed, so the second reconcile opens nothing and
+	// duplicates nothing; the successor named by the raw identity stands.
+	runs := listRetryRuns(t, c)
+	if len(runs) != 2 || findRun(runs, wantName) == nil {
+		t.Fatalf("runs = %+v, want exactly the successor named from the raw identity", runNames(runs))
+	}
+}
+
 func TestValidRetryRequestID(t *testing.T) {
 	if !validRetryRequestID("req-1") {
 		t.Fatal("a normal id must be valid")

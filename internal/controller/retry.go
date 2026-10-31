@@ -12,6 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -223,7 +224,7 @@ func (r *CoderRunReconciler) beginRetry(ctx context.Context, run *courierv1alpha
 		return ctrl.Result{}, true, err
 	}
 	r.observeRetry(run, retryOutcomeRequested)
-	r.emitRetry(run, requestID, courierv1alpha1.RetryRequestStateRequested, "", "")
+	r.emitRetry(run, requestID, courierv1alpha1.RetryRequestStateRequested, "", "", "")
 	return r.callRequeue(ctx, run, run.Status.RetryRequest, requeuer, item)
 }
 
@@ -265,14 +266,34 @@ func (r *CoderRunReconciler) callRequeue(ctx context.Context, run *courierv1alph
 	}
 	result, err := requeuer.RequeueAttempt(ctx, item, req)
 	if err == nil {
-		return r.settleRetryOutcome(ctx, run, record, courierv1alpha1.RetryRequestStateRequeued, "", normalizeRetryAttemptID(ctx, run, result.AttemptID))
+		// The controller-directed materialization branch (#609): an adapter
+		// that mints the fresh attempt identity in its own namespace promises
+		// no discovery will ever re-offer it, so the successor run must exist
+		// before the settled Requeued record closes this predecessor's retry
+		// surface. Materialize before the settle write: a failed create leaves
+		// the durable Requested record standing, and a replay of the committed
+		// key mints the same identity, so the retry collides on one successor
+		// name through Create AlreadyExists rather than duplicating or losing
+		// it. An adapter that asks for materialization without an identity
+		// has nothing to name a successor with; the requeue still settles, and
+		// the missing successor is that adapter's bug, not a silent core
+		// imitation.
+		successor := ""
+		if result.ControllerMaterializesSuccessor && result.AttemptID != "" {
+			name, err := r.materializeRetrySuccessor(ctx, run, result.AttemptID)
+			if err != nil {
+				return ctrl.Result{}, true, err
+			}
+			successor = name
+		}
+		return r.settleRetryOutcome(ctx, run, record, courierv1alpha1.RetryRequestStateRequeued, "", normalizeRetryAttemptID(ctx, run, result.AttemptID), successor)
 	}
 	// A source that cannot fence a requeue at all is permanent for this predecessor: the durable record settles
 	// Refused/unsupported-source instead of retrying under the key forever, which would also hold the run behind
 	// the retry reap gate indefinitely. It precedes the refusal branch because the sentinel is not a
 	// RetryRefusalError; the core still never imitates the requeue with ordinary lifecycle calls.
 	if errors.Is(err, source.ErrUnsupportedRetry) {
-		return r.settleRetryOutcome(ctx, run, record, courierv1alpha1.RetryRequestStateRefused, courierv1alpha1.RetryRefusalUnsupportedSource, "")
+		return r.settleRetryOutcome(ctx, run, record, courierv1alpha1.RetryRequestStateRefused, courierv1alpha1.RetryRefusalUnsupportedSource, "", "")
 	}
 	var refusal *source.RetryRefusalError
 	if errors.As(err, &refusal) {
@@ -285,13 +306,13 @@ func (r *CoderRunReconciler) callRequeue(ctx context.Context, run *courierv1alph
 			// 128-code-point bound — is normalized to it, so a hostile or buggy
 			// adapter cannot mint free text, and an oversized reason cannot fail the
 			// settle write and wedge the durable record Requested forever.
-			return r.settleRetryOutcome(ctx, run, record, courierv1alpha1.RetryRequestStateMoot, courierv1alpha1.RetryRefusalAlreadyRequeued, "")
+			return r.settleRetryOutcome(ctx, run, record, courierv1alpha1.RetryRequestStateMoot, courierv1alpha1.RetryRefusalAlreadyRequeued, "", "")
 		}
 		reason := refusal.Reason
 		if !isRetryAdapterRefusalReason(reason) {
 			reason = courierv1alpha1.RetryRefusalSourceRefused
 		}
-		return r.settleRetryOutcome(ctx, run, record, courierv1alpha1.RetryRequestStateRefused, reason, "")
+		return r.settleRetryOutcome(ctx, run, record, courierv1alpha1.RetryRequestStateRefused, reason, "", "")
 	}
 	// A transient source failure proves nothing about the requeue, so the durable
 	// Requested record stands unchanged and retries under the same key. Nothing is
@@ -320,9 +341,12 @@ func normalizeRetryAttemptID(ctx context.Context, run *courierv1alpha1.CoderRun,
 // settleRetryOutcome overwrites the Requested record with its settled state — same
 // ID and RequestedAt, new state, bounded reason, optional attempt identity, and a
 // settled timestamp — mirrors the condition, and records one event and one metric.
+// The successor name, when set, rides the event only: it is the controller-
+// materialized successor of a minting adapter (#609), and the durable link
+// between predecessor and successor is the successor's UID-hashed name.
 // The record's serialization always carries reason and settledAt, so a later
 // replacement Requested clears this record's sub-keys under a merge patch.
-func (r *CoderRunReconciler) settleRetryOutcome(ctx context.Context, run *courierv1alpha1.CoderRun, record *courierv1alpha1.RetryRequest, state courierv1alpha1.RetryRequestState, reason, attemptID string) (ctrl.Result, bool, error) {
+func (r *CoderRunReconciler) settleRetryOutcome(ctx context.Context, run *courierv1alpha1.CoderRun, record *courierv1alpha1.RetryRequest, state courierv1alpha1.RetryRequestState, reason, attemptID, successor string) (ctrl.Result, bool, error) {
 	before := run.DeepCopy()
 	now := r.clock().UTC()
 	run.Status.RetryRequest = &courierv1alpha1.RetryRequest{
@@ -338,10 +362,51 @@ func (r *CoderRunReconciler) settleRetryOutcome(ctx context.Context, run *courie
 		return ctrl.Result{}, true, err
 	}
 	r.observeRetry(run, retryMetricOutcome(state))
-	r.emitRetry(run, record.ID, state, reason, attemptID)
+	r.emitRetry(run, record.ID, state, reason, attemptID, successor)
 	// Once settled, the ordinary terminal dispatch resumes ownership: the run's
 	// retention window starts (or resumes) and the report path proceeds.
 	return ctrl.Result{}, false, nil
+}
+
+// materializeRetrySuccessor creates the successor run for a committed requeue
+// whose adapter minted the fresh attempt identity itself (#609) — the one
+// documented exception to discovery-driven materialization, reached only when
+// the adapter's result says no discovery will ever offer that identity. The
+// manual adapter is that source: the operator's act of creating the run *is*
+// the source action, so a requeued manual item would never be re-offered and
+// the controller brings the successor into the world instead.
+//
+// The successor is a normal fresh run of the same work: it copies the
+// predecessor's immutable spec fields and carries the minted identity, named
+// through the same deterministic predecessor-UID successor naming discovery
+// uses, so repeats of one request — a replayed committed key, a reconcile
+// after a lost settle write — collide on one name and Create AlreadyExists
+// absorbs them. The source-issued assignment fields are deliberately not
+// copied: no source re-issued this attempt with a classified assignment, and
+// the core imitates no source signal. The predecessor is never touched: the
+// successor is a new object, and exactly-one-replacement holds because the
+// predecessor's record settles Requeued once and its UID seeds one name.
+func (r *CoderRunReconciler) materializeRetrySuccessor(ctx context.Context, run *courierv1alpha1.CoderRun, freshIdentity string) (string, error) {
+	name := source.SuccessorRunName(run.Spec.Source, freshIdentity, run.UID)
+	successor := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: name},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode:          run.Spec.Mode,
+			Source:        run.Spec.Source,
+			SourceAgent:   run.Spec.SourceAgent,
+			SourceContext: run.Spec.SourceContext,
+			WorkItemID:    freshIdentity,
+			Repo:          run.Spec.Repo,
+			WorkRepo:      run.Spec.WorkRepo,
+			Ref:           run.Spec.Ref,
+			Lane:          run.Spec.Lane,
+			Debug:         run.Spec.Debug,
+		},
+	}
+	if err := r.Create(ctx, successor); err != nil && !apierrors.IsAlreadyExists(err) {
+		return "", fmt.Errorf("create retry successor for %q: %w", run.Name, err)
+	}
+	return name, nil
 }
 
 // writeRetryRefusal records a core, pre-dispatch refusal as a settled Refused
@@ -361,7 +426,7 @@ func (r *CoderRunReconciler) writeRetryRefusal(ctx context.Context, run *courier
 		return ctrl.Result{}, true, err
 	}
 	r.observeRetry(run, retryOutcomeRefused)
-	r.emitRetry(run, requestID, courierv1alpha1.RetryRequestStateRefused, reason, "")
+	r.emitRetry(run, requestID, courierv1alpha1.RetryRequestStateRefused, reason, "", "")
 	return ctrl.Result{}, true, nil
 }
 
@@ -396,7 +461,7 @@ func (r *CoderRunReconciler) announceAlreadyRequeued(ctx context.Context, run *c
 		return ctrl.Result{}, false, err
 	}
 	r.observeRetry(run, retryOutcomeRefused)
-	r.emitRetry(run, annotation, courierv1alpha1.RetryRequestStateRefused, courierv1alpha1.RetryRefusalAlreadyRequeued, "")
+	r.emitRetry(run, annotation, courierv1alpha1.RetryRequestStateRefused, courierv1alpha1.RetryRefusalAlreadyRequeued, "", "")
 	return ctrl.Result{}, false, nil
 }
 
@@ -619,10 +684,11 @@ func (r *CoderRunReconciler) observeRetry(run *courierv1alpha1.CoderRun, result 
 }
 
 // emitRetry writes one structured run.retry event carrying the request ID, state,
-// and — when present — the bounded reason and returned attempt identity. It is
+// and — when present — the bounded reason, the returned attempt identity, and the
+// name of the controller-materialized successor run (#609). It is
 // always Verbose so the audit trail reaches the log store on every request, not
 // only debug runs.
-func (r *CoderRunReconciler) emitRetry(run *courierv1alpha1.CoderRun, requestID string, state courierv1alpha1.RetryRequestState, reason, attemptID string) {
+func (r *CoderRunReconciler) emitRetry(run *courierv1alpha1.CoderRun, requestID string, state courierv1alpha1.RetryRequestState, reason, attemptID, successor string) {
 	if r == nil || r.Events == nil || run == nil {
 		return
 	}
@@ -632,6 +698,9 @@ func (r *CoderRunReconciler) emitRetry(run *courierv1alpha1.CoderRun, requestID 
 	}
 	if attemptID != "" {
 		detail["attempt_id"] = attemptID
+	}
+	if successor != "" {
+		detail["successor_run"] = successor
 	}
 	_ = r.Events.Emit(courierlog.Event{
 		Type:    courierlog.EventRunRetry,
