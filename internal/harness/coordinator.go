@@ -30,6 +30,7 @@ type ForgeOps interface {
 // no publish and no merge tool: publication is not model-influenced.
 const (
 	toolShell       = "shell"
+	toolCheck       = "check"
 	toolDelegate    = "delegate"
 	toolCancelBrief = "cancel_brief"
 	toolForge       = "forge"
@@ -53,6 +54,7 @@ type Coordinator struct {
 	publisher Publisher
 	activity  ActivitySink
 	briefs    *BriefRegistry
+	checks    *checkRegistry
 	status    *StatusReporter
 	control   *ControlWatcher
 	// budgets is the context policy resolved per role at startup; a role
@@ -270,6 +272,7 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 		compactions:             config.Compactions,
 		bootstrapReceipts:       config.BootstrapReceipts,
 		briefs:                  NewBriefRegistry(),
+		checks:                  newCheckRegistry(),
 		status:                  config.Status,
 		control:                 config.Control,
 		workRefBeyondAnchor:     config.WorkRefBeyondAnchor,
@@ -704,6 +707,21 @@ func shellTool() ToolDef {
 	}
 }
 
+func checkTool() ToolDef {
+	return ToolDef{
+		Name:        toolCheck,
+		Description: "Run one shell command on the sandbox worker as a tracked check. An identical command (exact bytes) against unchanged state (snapshot tip, bootstrap environment) returns the saved receipt; state changes invalidate it. refresh:true forces a fresh dispatch; a completed plain shell run of the exact same command also invalidates the receipt.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"command": map[string]any{"type": "string", "description": "The shell command to run as a tracked check."},
+				"refresh": map[string]any{"type": "boolean", "description": "Dispatch fresh, replacing any saved receipt."},
+			},
+			"required": []string{"command"},
+		},
+	}
+}
+
 func forgeTool() ToolDef {
 	return ToolDef{
 		Name:        toolForge,
@@ -723,7 +741,7 @@ func forgeTool() ToolDef {
 // offered: worker shell, delegation, cancellation, and — when the forge seam
 // is wired — broker forge reads. Publication is never a tool.
 func (c *Coordinator) coordinatorTools() []ToolDef {
-	tools := []ToolDef{shellTool()}
+	tools := []ToolDef{shellTool(), checkTool()}
 	tools = append(tools,
 		ToolDef{
 			Name:        toolDelegate,
@@ -780,6 +798,13 @@ func (c *Coordinator) runTool(ctx context.Context, call ToolCall, briefID string
 	switch call.Name {
 	case toolShell:
 		return c.runShell(ctx, call, briefID, result)
+	case toolCheck:
+		if subagent {
+			result.IsError = true
+			result.Content = "tracked checks are not available to sub-agents"
+			return result
+		}
+		return c.runCheck(ctx, call, briefID, result)
 	case toolDelegate:
 		if subagent {
 			result.IsError = true
@@ -839,8 +864,9 @@ func (c *Coordinator) runShell(ctx context.Context, call ToolCall, briefID strin
 		return result
 	}
 	var err error
+	var tip string
 	if briefID == "control" {
-		_, err = c.prepareSnapshot(ctx, briefID)
+		tip, err = c.prepareSnapshot(ctx, briefID)
 	} else {
 		err = c.ensureSnapshot(ctx)
 	}
@@ -852,12 +878,30 @@ func (c *Coordinator) runShell(ctx context.Context, call ToolCall, briefID strin
 	// Only model-influenced tasks carry the applied bootstrap environment
 	// delta (#414): fixed control scripts (unpack, pack) run under the
 	// worker's own environment.
-	task := protocol.Task{Command: []string{"sh", "-c", args.Command}, ArtifactPath: args.ArtifactPath, Env: c.currentBootstrapEnv()}
+	env := c.currentBootstrapEnv()
+	task := protocol.Task{Command: []string{"sh", "-c", args.Command}, ArtifactPath: args.ArtifactPath, Env: env}
 	workerResult, err := c.dispatchAndAwait(ctx, newOpID("shell", briefID), briefID, task)
 	if err != nil {
 		result.IsError = true
 		result.Content = safeToolError(err)
 		return result
+	}
+	// A completed control shell run is fresh evidence against the exact
+	// command-and-state identity the tracked checks use: the snapshot was
+	// just re-materialized at the current tip. Drop any stored receipt for
+	// that identity so a later check cannot serve evidence older than the
+	// run the coordinator just performed (#635). Only a completed run
+	// counts (completedRun): a failing exit is fresh failing evidence —
+	// the worker reports a nonzero exit as ResultFailed — while a
+	// cancelled dispatch or a run that never produced an exit status
+	// produced no evidence and leaves the registry untouched, and an
+	// unrelated command leaves every receipt in place. The match is exact
+	// on the command bytes; an equivalent command spelled differently
+	// leaves the receipt to its own identity. If an in-flight check for
+	// the same identity completes after this run, its receipt lands and is
+	// equally fresh evidence at the same re-materialized tip.
+	if briefID == "control" && completedRun(workerResult.Status, workerResult.ExitCode) {
+		c.checks.invalidate(checkStateKey(args.Command, tip, bootstrapEnvDigest(env)))
 	}
 	return workerResultToTool(workerResult, result)
 }
