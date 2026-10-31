@@ -991,6 +991,26 @@ likewise bounded: a value over the CRD's 256-code-point limit on
 than allowed to fail the settle write and wedge the record `Requested` — the
 requeue has already committed.
 
+**Materialization is discovery-driven, with one documented exception.** For a
+queue-backed source a requeue makes the source re-offer a fresh attempt and
+discovery materializes the successor; core only names it after the settled
+predecessor. The manual source has no external lifecycle to re-enter — the
+operator's act of creating the run *is* the source action — so its adapter
+implements the requeue as a validated no-op that mints
+`<workItemID>/retry/<requestID>` in its own namespace and marks the requeue
+result as one no discovery pass will ever offer. On such a result the
+reconciler creates the successor run itself, before writing the settled
+`Requeued` record: the predecessor's namespace, its copied immutable work
+fields (no source-issued assignment is fabricated for an attempt no source
+re-issued), the minted identity as the successor's `workItemID`, and a name
+derived from the fresh identity and the predecessor UID — the same deterministic
+naming discovery uses, so a create replayed after a lost response collides on
+exactly one successor through `Create` `AlreadyExists`. The settled event
+carries the successor's name, and the successor carries no owner reference:
+reaping the predecessor must never cascade onto the replacement. An adapter
+that does not set the directive never has core materialize anything; discovery
+stays the sole materializer for every queue-backed source.
+
 **The fix-pr guard reads the world through the forge.** A fix-pr run's recorded
 pull request is read through the forge read-pull-request capability, exactly as
 the merge observation reads it — including its exact head-identity check. A

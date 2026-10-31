@@ -265,7 +265,13 @@ opaque `WorkItemID` (the #98 semantics). For issue work, the reactivated
 item re-offers under a fresh attempt identity. Core never derives identity
 from wall-clock time, PR head, reason strings, or request IDs (the
 `#1045` fallback rule stands for adapters without durable attempt identity;
-such an adapter simply does not implement the capability).
+such an adapter simply does not implement the capability). The manual source
+is the one documented exception (#609): its adapter has no external lifecycle
+to mint a fresh identity from, so the capability call mints
+`<workItemID>/retry/<requestID>` in the manual namespace and marks the result
+`ControllerMaterializesSuccessor` — no discovery pass will ever offer that
+identity, so the controller, not the runner, brings the successor into the
+world (see below).
 
 The discovery barrier gains a second settled-history state — but **not** by
 extending the existing one. Today `settledCapacityExhaustion` is the sole
@@ -322,11 +328,30 @@ needs the opposite map behavior, so the two contracts stay distinct:
 - `Moot` is deliberately **not** a barrier release: the work moved without
   this record; a successor, if any, arrives through whichever path moved it.
 
+**The manual successor is controller-materialized** (#609). Because no
+discovery pass will ever offer the minted identity, the reconcile whose
+adapter call succeeds creates the successor run itself, before writing the
+settled `Requeued` record: the predecessor's namespace, its copied immutable
+work fields (no source-issued assignment is fabricated), the minted identity
+as the successor's `WorkItemID`, and the same
+`successorRunName(source, freshIdentity, predecessorUID)` naming discovery
+uses — so a create replayed after a lost response collides on one successor
+through `Create` `AlreadyExists` exactly like the runner's does. The successor
+carries no owner reference: reaping the predecessor never cascades onto it.
+The predecessor-correlation-by-`attemptID` machinery is queue-side only; for
+a manual successor the durable link is its UID-hashed name and the
+`run.retry` event, which carries the successor name. If the minted identity
+exceeds the `attemptID` bound the status record keeps dropping it rather than
+failing the settle write, and the successor name still hashes the raw mint —
+correlation then lives in the events alone, the same rule that naming is
+history preservation, never a correctness gate.
+
 Exactly-one-replacement holds at every layer: the request settles `Requeued`
 once (idempotent key), the predecessor requeues once ever, the source offers
-the fresh attempt under one identity, and the runner's dedupe map plus
-`Create` `AlreadyExists` absorb re-offers. Two concurrent annotations are
-two requests; only the first can settle `Requeued`.
+the fresh attempt under one identity (or, for the manual source, mints one
+deterministic identity), and the runner's dedupe map plus `Create`
+`AlreadyExists` absorb re-offers and create replays alike. Two concurrent
+annotations are two requests; only the first can settle `Requeued`.
 
 ## Ordering, atomicity, and crash recovery
 
@@ -437,10 +462,11 @@ the structured `run.retry` events. The #510 read model projects
 ## Decomposition
 
 Implementation is split into bounded, dependency-ordered, file-scoped issues,
-none scheduled `status/ready` until this design lands. Status: the core
-request surface and controller state machine of item 1 landed on main via
-#613; items 2–4 remain open, and until an adapter implements the
-`AttemptRequeuer` capability a retry settles `unsupported-source`.
+none scheduled `status/ready` until this design lands. Status: all four items
+have landed — item 1 on main via #613, item 2 via #631, item 3 via #628, and
+item 4 via #609 (the manual adapter's minted identity plus controller-directed
+successor materialization). An adapter that does not implement
+`AttemptRequeuer` still settles `unsupported-source`.
 
 1. **Core request surface and controller state machine** — API types
    (`api/v1alpha1/coderun_types.go`: annotation constant, `status.retryRequest`,

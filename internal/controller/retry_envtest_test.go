@@ -14,10 +14,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	courierlog "github.com/misospace/courier/internal/log"
 	"github.com/misospace/courier/internal/source"
+	"github.com/misospace/courier/internal/source/manual"
 	"github.com/misospace/courier/internal/status"
 )
 
@@ -374,5 +376,128 @@ func TestEnvtestRetryRetentionGate(t *testing.T) {
 	}
 	if _, stamped := settled.Annotations[failedAtAnnotation]; !stamped {
 		t.Fatalf("failed-at retention marker not stamped after the record settled")
+	}
+}
+
+func listRetryNamespaceRuns(t *testing.T, namespace string) []courierv1alpha1.CoderRun {
+	t.Helper()
+	var runs courierv1alpha1.CoderRunList
+	if err := envtestClient.List(context.Background(), &runs, client.InNamespace(namespace)); err != nil {
+		t.Fatalf("list runs in %q: %v", namespace, err)
+	}
+	return runs.Items
+}
+
+func retryNamespaceRunNames(runs []courierv1alpha1.CoderRun) []string {
+	names := make([]string, 0, len(runs))
+	for i := range runs {
+		names = append(names, runs[i].Name)
+	}
+	return names
+}
+
+// TestEnvtestManualRetryMaterializesOneSuccessor proves the #609 manual-source
+// exception end to end against the real API server and the real manual
+// adapter: the requeue mints the fresh identity in the manual namespace, the
+// reconcile that settles Requeued creates exactly one successor run named from
+// that identity and the predecessor's UID with the copied immutable spec, and
+// repeated reconciles after the successful create never duplicate it.
+func TestEnvtestManualRetryMaterializesOneSuccessor(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	const name, namespace = "retry-manual-successor", "retry-manual-successor"
+	ctx := context.Background()
+	createRetryTerminalRun(t, name, namespace, courierv1alpha1.PhaseFailed, "req-1", courierv1alpha1.ModeResolveIssue)
+	predecessor := getRetryEnvtestRun(t, name, namespace)
+
+	buf := &bytes.Buffer{}
+	reconciler := newEnvtestRetryReconciler(manual.New(nil), nil, buf)
+	if _, err := reconciler.Reconcile(ctx, retryEnvtestRequest(name, namespace)); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	settled := getRetryEnvtestRun(t, name, namespace)
+	freshIdentity := name + "/retry/req-1"
+	rec := settled.Status.RetryRequest
+	if rec == nil || rec.State != courierv1alpha1.RetryRequestStateRequeued || rec.AttemptID != freshIdentity {
+		t.Fatalf("retryRequest = %+v, want Requeued with the minted identity %q", rec, freshIdentity)
+	}
+	wantName := source.SuccessorRunName("manual", freshIdentity, predecessor.UID)
+	runs := listRetryNamespaceRuns(t, namespace)
+	if len(runs) != 2 {
+		t.Fatalf("runs = %d, want exactly predecessor + successor: %v", len(runs), retryNamespaceRunNames(runs))
+	}
+	var successor *courierv1alpha1.CoderRun
+	for i := range runs {
+		if runs[i].Name == wantName {
+			successor = &runs[i]
+		}
+	}
+	if successor == nil {
+		t.Fatalf("successor %q not materialized: %v", wantName, retryNamespaceRunNames(runs))
+	}
+	if successor.Spec.WorkItemID != freshIdentity || successor.Spec.Source != "manual" ||
+		successor.Spec.Mode != courierv1alpha1.ModeResolveIssue || successor.Spec.Repo != "acme/widgets" ||
+		successor.Spec.Ref != 14 || successor.Spec.Lane != "retry-lane" {
+		t.Fatalf("successor spec = %+v, want the copied work identity with the minted WorkItemID", successor.Spec)
+	}
+	if successor.Spec.AssignmentKind != "" || successor.Spec.AssignmentReasons != nil {
+		t.Fatalf("successor assignment = %q/%v, want empty; no source re-issued this attempt", successor.Spec.AssignmentKind, successor.Spec.AssignmentReasons)
+	}
+	if len(successor.OwnerReferences) != 0 {
+		t.Fatalf("successor owner references = %+v, want none: reaping the predecessor must not cascade onto the replacement", successor.OwnerReferences)
+	}
+
+	// Repeated reconciles after the successful create change nothing: the
+	// settled record closes the predecessor's retry surface, so the source is
+	// not re-called, no second successor appears, and the same two retry
+	// events are the whole story — with the successor name on the Requeued
+	// one.
+	for i := 0; i < 2; i++ {
+		if _, err := reconciler.Reconcile(ctx, retryEnvtestRequest(name, namespace)); err != nil {
+			t.Fatalf("reconcile %d: %v", i+2, err)
+		}
+	}
+	if runs := listRetryNamespaceRuns(t, namespace); len(runs) != 2 {
+		t.Fatalf("runs after repeats = %d, want still exactly two: %v", len(runs), retryNamespaceRunNames(runs))
+	}
+	after := getRetryEnvtestRun(t, name, namespace)
+	if after.Status.RetryRequest.State != courierv1alpha1.RetryRequestStateRequeued ||
+		!after.Status.RetryRequest.SettledAt.Equal(rec.SettledAt) {
+		t.Fatalf("retryRequest after repeats = %+v, want the settled record untouched", after.Status.RetryRequest)
+	}
+	events := parseRetryEvents(t, buf)
+	if len(events) != 2 || events[1]["status"] != "Requeued" {
+		t.Fatalf("run.retry events = %+v, want Requested then Requeued only", events)
+	}
+	if got, _ := events[1]["detail"].(map[string]any)["successor_run"].(string); got != wantName {
+		t.Fatalf("requeued event successor_run = %q, want %q", got, wantName)
+	}
+}
+
+// TestEnvtestManualRetryWithoutRequeueCapabilityRefuses pins the regression
+// gate: a manual run whose registered adapter has lost the requeue capability
+// refuses unsupported-source — permanently and durably — instead of silently
+// doing nothing or letting the core imitate the requeue with ordinary calls.
+func TestEnvtestManualRetryWithoutRequeueCapabilityRefuses(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	const name, namespace = "retry-manual-nocap", "retry-manual-nocap"
+	ctx := context.Background()
+	createRetryTerminalRun(t, name, namespace, courierv1alpha1.PhaseFailed, "req-1", courierv1alpha1.ModeResolveIssue)
+
+	reconciler := newEnvtestRetryReconciler(&admissionSource{}, nil, nil)
+	if _, err := reconciler.Reconcile(ctx, retryEnvtestRequest(name, namespace)); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	after := getRetryEnvtestRun(t, name, namespace)
+	rec := after.Status.RetryRequest
+	if rec == nil || rec.State != courierv1alpha1.RetryRequestStateRefused || rec.Reason != courierv1alpha1.RetryRefusalUnsupportedSource {
+		t.Fatalf("retryRequest = %+v, want Refused unsupported-source", rec)
+	}
+	if runs := listRetryNamespaceRuns(t, namespace); len(runs) != 1 {
+		t.Fatalf("runs = %d, want no successor without a committed requeue: %v", len(runs), retryNamespaceRunNames(runs))
 	}
 }

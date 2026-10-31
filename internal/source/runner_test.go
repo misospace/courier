@@ -290,7 +290,7 @@ func TestRunnerSettledCapacityExhaustionAllowsSameOfferWithSuccessorUIDName(t *t
 			if len(runs.Items) != 2 {
 				t.Fatalf("runs=%d, want retained predecessor and successor", len(runs.Items))
 			}
-			wantName := successorRunName("source", item.ID, old.UID)
+			wantName := SuccessorRunName("source", item.ID, old.UID)
 			found := false
 			for _, run := range runs.Items {
 				found = found || run.Name == wantName

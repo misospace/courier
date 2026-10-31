@@ -141,7 +141,7 @@ func TestRunnerRetrySettledPredecessorNamesSuccessorAndDedupesOldIdentity(t *tes
 	if len(runs.Items) != 2 {
 		t.Fatalf("runs = %d, want predecessor plus one successor", len(runs.Items))
 	}
-	wantName := successorRunName("test", "fresh-2", types.UID("pred-uid"))
+	wantName := SuccessorRunName("test", "fresh-2", types.UID("pred-uid"))
 	var successor *courierv1alpha1.CoderRun
 	for i := range runs.Items {
 		if runs.Items[i].Name == wantName {
@@ -216,7 +216,7 @@ func TestRunnerRetryConcurrentRunnersCreateOneSuccessor(t *testing.T) {
 	}
 	// Exactly one run carries the predecessor-UID successor name: the absorbed
 	// AlreadyExists landed on the successor path, not an ordinary fallback.
-	wantName := successorRunName("test", "fresh-2", types.UID("pred-uid"))
+	wantName := SuccessorRunName("test", "fresh-2", types.UID("pred-uid"))
 	successors := 0
 	for _, run := range runs.Items {
 		if run.Name == wantName {
@@ -258,7 +258,7 @@ func TestRunnerRetryCorrelatesPredecessorByNormalizedAttemptID(t *testing.T) {
 	if len(runs.Items) != 2 {
 		t.Fatalf("runs = %d, want predecessor plus one successor (the fresh generation must not dedupe against the predecessor)", len(runs.Items))
 	}
-	wantName := successorRunName("test", "issue-7@gen2", types.UID("pred-uid"))
+	wantName := SuccessorRunName("test", "issue-7@gen2", types.UID("pred-uid"))
 	if !containsName(runs.Items, wantName) {
 		t.Fatalf("successor under the normalized identity %q not materialized; runs = %v", wantName, runNames(runs.Items))
 	}
@@ -297,13 +297,13 @@ func TestRunnerNonRequeueRecordsKeepTheBarrierAndNeverNameSuccessor(t *testing.T
 			// fresh-9 materializes under the ordinary deterministic name: the
 			// non-requeue record claims no predecessor link.
 			ordinary := RunName("test", "fresh-9")
-			if successorRunName("test", "fresh-9", types.UID("pred-uid")) == ordinary {
+			if SuccessorRunName("test", "fresh-9", types.UID("pred-uid")) == ordinary {
 				t.Fatal("test fixture collision between ordinary and successor names")
 			}
 			if !containsName(runs.Items, ordinary) {
 				t.Fatalf("fresh offer did not materialize under ordinary name %q; runs = %v", ordinary, runNames(runs.Items))
 			}
-			if containsName(runs.Items, successorRunName("test", "fresh-9", types.UID("pred-uid"))) {
+			if containsName(runs.Items, SuccessorRunName("test", "fresh-9", types.UID("pred-uid"))) {
 				t.Fatalf("a non-requeue record named a successor by predecessor UID; runs = %v", runNames(runs.Items))
 			}
 			// The consumed identity stays excluded; a stale re-offer of it adds no run.
