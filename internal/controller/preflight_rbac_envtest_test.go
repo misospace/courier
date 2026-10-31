@@ -358,7 +358,8 @@ func TestPreflightOperatorClusterScopedReviewNotNamespacedEnvtest(t *testing.T) 
 	// The production review set, asked for the subject that holds only those
 	// namespaced grants.
 	clusterScoped := []accessReview{}
-	for _, review := range control.operatorAccessReviews(run) {
+	registration := secureRegistry().Registrations()[0]
+	for _, review := range control.operatorAccessReviews(run, &registration) {
 		if review.namespace == "" {
 			clusterScoped = append(clusterScoped, review)
 		}
@@ -414,7 +415,11 @@ func TestPreflightOperatorClusterScopedReviewNotNamespacedEnvtest(t *testing.T) 
 // authorizer evaluates the namespace literally — so the review for that read
 // is asked where the read happens, and a deployment whose only secrets-get
 // grant is scoped to the run namespace is refused here, with the OperatorRBAC
-// verdict the caller sees, before the operator creates anything.
+// verdict the caller sees, before the operator creates anything. The grants
+// that turn the check green are minimally sufficient, as the launch path's
+// real requests are: get on secrets scoped by resourceNames to the Secret the
+// registration names, and a list-only pod grant, because the path's only pod
+// read is the list.
 //
 // The subject asked here is the operator's own identity as the API server
 // resolves it: the clientset impersonates the provisioning service account,
@@ -453,10 +458,31 @@ func TestPreflightOperatorReadGrantsNamespaceScopedEnvtest(t *testing.T) {
 		t.Fatalf("create run: %v", err)
 	}
 	t.Cleanup(func() { _ = c.Delete(context.Background(), run) })
+	registry := secureRegistry()
+	registration := registry.Registrations()[0]
 	fetched := &courier.CoderRun{}
 	if err := c.Get(context.Background(), ctrlclient.ObjectKeyFromObject(run), fetched); err != nil {
 		t.Fatalf("get run: %v", err)
 	}
+	// The persisted publication policy the launch path verifies before
+	// checkOperatorAccess runs: it pins the registration whose credential
+	// Secret names the reviews derive.
+	fetched.Status.PublicationPolicy = &courier.PublicationPolicy{
+		RunUID:              string(fetched.UID),
+		ProviderConfigRef:   registration.Name,
+		ProviderEndpoint:    registration.Endpoint,
+		CredentialRefDigest: registration.Projection().Digest,
+		BaseRepo:            "Acme/Widgets",
+		BaseRef:             "main",
+		BaseOID:             "baseoid",
+		WorkRepo:            "Acme/Widgets",
+		WorkRef:             "courier/Acme/Widgets/issue-14",
+		WorkInitiallyAbsent: true,
+	}
+	if err := c.Status().Update(context.Background(), fetched); err != nil {
+		t.Fatalf("persist publication policy: %v", err)
+	}
+	run = fetched
 	clientset, err := kubernetes.NewForConfig(envtestServer.Config)
 	if err != nil {
 		t.Fatalf("envtest clientset: %v", err)
@@ -466,6 +492,7 @@ func TestPreflightOperatorReadGrantsNamespaceScopedEnvtest(t *testing.T) {
 		Config: SecureConfig{
 			RunNamespace:      runNamespace,
 			OperatorNamespace: "courier-system",
+			Registry:          registry,
 			Kubernetes:        clientset,
 		},
 	}
@@ -516,9 +543,10 @@ func TestPreflightOperatorReadGrantsNamespaceScopedEnvtest(t *testing.T) {
 	readRole := &rbacv1.Role{
 		ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: run.Name + "-operator-reads"},
 		Rules: []rbacv1.PolicyRule{
-			// pods list mirrors the cached list topologyPodsExist issues; the
-			// gets cover the named reads the proof pins.
-			{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"get", "list"}},
+			// pods list mirrors the cached list topologyPodsExist issues — the
+			// only pod read the launch path makes on its own behalf, so no
+			// pods get is granted here.
+			{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"list"}},
 			{APIGroups: []string{""}, Resources: []string{"secrets", "services"}, Verbs: []string{"get"}},
 			{APIGroups: []string{courier.GroupVersion.Group}, Resources: []string{"laneprofiles"}, Verbs: []string{"get"}},
 		},
@@ -558,12 +586,12 @@ func TestPreflightOperatorReadGrantsNamespaceScopedEnvtest(t *testing.T) {
 	// are the scope of the grants and not a sync lag.
 	eventually(t, func() error {
 		allowed, err := control.subjectAccessReviewAs(context.Background(), serviceAccount,
-			accessReview{group: "", resource: "pods", verb: "get", name: topology.ControlPodName(run.Name), namespace: run.Namespace})
+			accessReview{group: "", resource: "pods", verb: "list", namespace: run.Namespace})
 		if err != nil {
 			return err
 		}
 		if !allowed {
-			return errors.New("run-namespace pod read not yet allowed")
+			return errors.New("run-namespace pod list not yet allowed")
 		}
 		return nil
 	})
@@ -571,7 +599,7 @@ func TestPreflightOperatorReadGrantsNamespaceScopedEnvtest(t *testing.T) {
 	// The run-namespace reads are allowed: the grants exist where the reads
 	// target them.
 	for _, review := range []accessReview{
-		{group: "", resource: "pods", verb: "get", name: topology.ControlPodName(run.Name), namespace: run.Namespace},
+		{group: "", resource: "pods", verb: "list", namespace: run.Namespace},
 		{group: "", resource: "secrets", verb: "get", name: topology.SigningSecretName(run.Name), namespace: run.Namespace},
 		{group: courier.GroupVersion.Group, resource: "laneprofiles", verb: "get", name: run.Spec.Lane, namespace: run.Namespace},
 		{group: "", resource: "services", verb: "get", name: topology.BrokerServiceName(run.Name), namespace: run.Namespace},
@@ -589,7 +617,7 @@ func TestPreflightOperatorReadGrantsNamespaceScopedEnvtest(t *testing.T) {
 	// where the probe targets live, is refused: a grant scoped to one
 	// namespace never authorizes a request in another.
 	for _, review := range []accessReview{
-		{group: "", resource: "secrets", verb: "get", namespace: operatorNamespace},
+		{group: "", resource: "secrets", verb: "get", name: "forge-creds", namespace: operatorNamespace},
 		{group: "", resource: "services", verb: "get", name: "kubernetes", namespace: "default"},
 	} {
 		allowed, err := control.subjectAccessReviewAs(context.Background(), serviceAccount, review)
@@ -607,6 +635,7 @@ func TestPreflightOperatorReadGrantsNamespaceScopedEnvtest(t *testing.T) {
 	verdict := &SecureControl{Config: SecureConfig{
 		RunNamespace:      control.Config.RunNamespace,
 		OperatorNamespace: operatorNamespace,
+		Registry:          registry,
 		Kubernetes:        impersonated,
 	}}
 	err = verdict.checkOperatorAccess(context.Background(), run)
@@ -620,11 +649,14 @@ func TestPreflightOperatorReadGrantsNamespaceScopedEnvtest(t *testing.T) {
 
 	// Grant the reads where they are asked for — the operator namespace for
 	// the credential source, default and kube-system for the probe targets —
-	// and the same check passes: the denials above were the grant scopes, not
-	// the review set itself.
+	// and the same check passes. The credential grant is minimally
+	// sufficient: get on secrets scoped by resourceNames to exactly the
+	// Secret the registration names, so a hardening Role never has to grant
+	// get on any other Secret to satisfy the proof. The pod grant is
+	// list-only, because the launch path's only pod read is the list.
 	for _, role := range []*rbacv1.Role{
 		{ObjectMeta: metav1.ObjectMeta{Namespace: operatorNamespace, Name: run.Name + "-operator-ns-reads"},
-			Rules: []rbacv1.PolicyRule{{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"get"}}}},
+			Rules: []rbacv1.PolicyRule{{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"get"}, ResourceNames: []string{"forge-creds"}}}},
 		{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: run.Name + "-default-reads"},
 			Rules: []rbacv1.PolicyRule{{APIGroups: []string{""}, Resources: []string{"services"}, Verbs: []string{"get"}}}},
 		{ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: run.Name + "-kube-system-reads"},
@@ -650,7 +682,7 @@ func TestPreflightOperatorReadGrantsNamespaceScopedEnvtest(t *testing.T) {
 	}
 	eventually(t, func() error {
 		allowed, err := control.subjectAccessReviewAs(context.Background(), serviceAccount,
-			accessReview{group: "", resource: "secrets", verb: "get", namespace: operatorNamespace})
+			accessReview{group: "", resource: "secrets", verb: "get", name: "forge-creds", namespace: operatorNamespace})
 		if err != nil {
 			return err
 		}

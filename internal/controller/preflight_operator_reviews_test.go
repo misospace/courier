@@ -43,9 +43,15 @@ func TestCheckOperatorAccessReviewScoping(t *testing.T) {
 	})
 
 	run := secureRun("review-scoping")
+	run.Status.PublicationPolicy = &courier.PublicationPolicy{
+		RunUID:              string(run.UID),
+		ProviderConfigRef:   "github",
+		CredentialRefDigest: secureRegistry().Registrations()[0].Projection().Digest,
+	}
 	control := &SecureControl{Config: SecureConfig{
 		RunNamespace:      runNamespace,
 		OperatorNamespace: operatorNamespace,
+		Registry:          secureRegistry(),
 		Kubernetes:        clientset,
 	}}
 	if err := control.checkOperatorAccess(context.Background(), run); err != nil {
@@ -73,18 +79,19 @@ func TestCheckOperatorAccessReviewScoping(t *testing.T) {
 		{"authorization.k8s.io", "subjectaccessreviews", "create", "", ""}:        1,
 		// The launch-path reads (#655): each mirrors a real request at the
 		// scope that request has. topologyPodsExist finds the pods through a
-		// cached run-namespace list, so the list is mirrored alongside the
-		// named gets.
+		// cached run-namespace list — the only pod read on the path — so the
+		// list is what the review mirrors, and no named gets are manufactured.
 		{"", "pods", "list", "", runNamespace}:                                           1,
-		{"", "pods", "get", topology.ControlPodName(run.Name), runNamespace}:             1,
-		{"", "pods", "get", topology.WorkerPodName(run.Name), runNamespace}:              1,
-		{"", "pods", "get", topology.BrokerPodName(run.Name), runNamespace}:              1,
 		{courier.GroupVersion.Group, "laneprofiles", "get", run.Spec.Lane, runNamespace}: 1,
 		{"", "secrets", "get", topology.SigningSecretName(run.Name), runNamespace}:       1,
-		{"", "secrets", "get", "", operatorNamespace}:                                    1,
-		{"", "services", "get", "kubernetes", "default"}:                                 1,
-		{"", "services", "get", "kube-dns", "kube-system"}:                               1,
-		{"", "services", "get", topology.BrokerServiceName(run.Name), runNamespace}:      1,
+		// The credential source Secrets the selected registration names, read
+		// in the operator's own namespace: the reviews carry the names the
+		// real requests will carry, so a resourceNames-scoped Role granting
+		// exactly those Secrets satisfies the proof.
+		{"", "secrets", "get", "forge-creds", operatorNamespace}:                    1,
+		{"", "services", "get", "kubernetes", "default"}:                            1,
+		{"", "services", "get", "kube-dns", "kube-system"}:                          1,
+		{"", "services", "get", topology.BrokerServiceName(run.Name), runNamespace}: 1,
 	}
 	for _, r := range reviews {
 		k := key{r.Group, r.Resource, r.Verb, r.Name, r.Namespace}

@@ -18,6 +18,7 @@ import (
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	courier "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/forge"
 	"github.com/misospace/courier/internal/topology"
 )
 
@@ -153,7 +154,16 @@ type accessReview struct {
 // cluster-scoped (#650), and a read in a namespace other than the run's is
 // asked in the namespace the read targets (#655).
 func (s *SecureControl) checkOperatorAccess(ctx context.Context, run *courier.CoderRun) error {
-	for _, review := range s.operatorAccessReviews(run) {
+	// The credential reads are reviewed by the names the launch path will
+	// read, so the registration the persisted policy pins is resolved here —
+	// the same selection the launch path makes, and a selection failure is
+	// already a verdict. The policy itself was verified before this check
+	// ran (secure_launcher.go:45), so it cannot fail here.
+	registration, err := s.selectedRegistration(run)
+	if err != nil {
+		return err
+	}
+	for _, review := range s.operatorAccessReviews(run, registration) {
 		allowed, err := s.selfSubjectAccessReview(ctx, review)
 		if err != nil {
 			return fmt.Errorf("secure preflight: access review for %s/%s %s: %w", review.group, review.resource, review.verb, err)
@@ -187,16 +197,20 @@ func (s *SecureControl) checkOperatorAccess(ctx context.Context, run *courier.Co
 // them.
 //
 // The launch-path reads (#655) mirror where the secure path reads outside the
-// provisioning set: the three topology pods read to decide whether a
-// replacement is due (secure_launcher.go:1037), the run's lane profile read for
-// its sizing (secure_launcher.go:295), the run's signing secret read for the
-// dry-run rendering (preflight.go:493), the credential
-// source secret read in the operator's own namespace (secure_launcher.go:866),
-// and the service reads the live probes make for their
-// targets (preflight.go:515). The credential-source read is
-// reviewed unnamed because the secret's name comes from the run's forge
-// registration; an unnamed review can only be harder to satisfy than the
-// named request, so it fails closed rather than open.
+// provisioning set: the run-namespace pod list read to decide whether a
+// replacement is due (secure_launcher.go:1037), the run's lane profile read
+// for its sizing (secure_launcher.go:295), the run's signing secret read for
+// the dry-run rendering (preflight.go:493), the credential source secrets the
+// selected registration names, read in the operator's own namespace
+// (secure_launcher.go:866), and the service reads the live probes
+// make for their targets (preflight.go:515). The pod review is the list the
+// real read issues — the operator does not read the topology pods by name on
+// this path, so no named gets are manufactured the real requests would not
+// need. The credential reads are reviewed by the Secret names the registration
+// carries: the persisted policy pins that registration before the launch path
+// runs, so the names are the ones the real requests will carry, and a
+// resourceNames-scoped Role granting exactly those Secrets satisfies the proof
+// without granting get on any other Secret.
 //
 // The SelfSubjectAccessReview the operator asks about itself is a canary
 // rather than a proof on a stock cluster: the API server's default
@@ -204,10 +218,10 @@ func (s *SecureControl) checkOperatorAccess(ctx context.Context, run *courier.Co
 // authenticated subject, so the review cannot fail there. It still matters on
 // a cluster whose default policy was replaced, where the operator could not
 // ask any question at all.
-func (s *SecureControl) operatorAccessReviews(run *courier.CoderRun) []accessReview {
+func (s *SecureControl) operatorAccessReviews(run *courier.CoderRun, registration *forge.Registration) []accessReview {
 	core := ""
 	runNamespace := s.Config.RunNamespace
-	return []accessReview{
+	reviews := []accessReview{
 		{group: core, resource: "secrets", verb: "create", namespace: runNamespace},
 		{group: core, resource: "secrets", verb: "delete", namespace: runNamespace},
 		{group: core, resource: "serviceaccounts", verb: "create", namespace: runNamespace},
@@ -226,32 +240,40 @@ func (s *SecureControl) operatorAccessReviews(run *courier.CoderRun) []accessRev
 		{group: "authorization.k8s.io", resource: "selfsubjectaccessreviews", verb: "create"},
 		{group: "authorization.k8s.io", resource: "subjectaccessreviews", verb: "create"},
 		// Launch-path reads (#655): each stands for a real request the secure
-		// launch path makes, at the scope that request has.
-		// secure_launcher.go:1037 finds the topology pods to decide whether a
-		// replacement is due, before the precondition proof can classify a
-		// missing grant; the read is a run-namespace list served through the
-		// cache, so the list is what the review mirrors, and the named gets
-		// stay in the proof as the stricter form a resourceNames-scoped
-		// deployment must also satisfy.
+		// launch path makes, at the scope that request has. secure_launcher.go
+		// reads the topology pods through a run-namespace list, so the list is
+		// the review — the path issues no named pod gets.
 		{group: core, resource: "pods", verb: "list", namespace: runNamespace},
-		{group: core, resource: "pods", verb: "get", name: topology.ControlPodName(run.Name), namespace: runNamespace},
-		{group: core, resource: "pods", verb: "get", name: topology.WorkerPodName(run.Name), namespace: runNamespace},
-		{group: core, resource: "pods", verb: "get", name: topology.BrokerPodName(run.Name), namespace: runNamespace},
 		// secure_launcher.go:295 reads the run's lane profile for its sizing.
 		{group: courier.GroupVersion.Group, resource: "laneprofiles", verb: "get", name: run.Spec.Lane, namespace: runNamespace},
 		// preflight.go:493 reads the run's signing secret for the dry-run
 		// rendering.
 		{group: core, resource: "secrets", verb: "get", name: topology.SigningSecretName(run.Name), namespace: runNamespace},
-		// secure_launcher.go:866 reads the credential source secret in the
-		// operator's own namespace; its name comes from the run's forge
-		// registration, so the review is unnamed and can only fail closed.
-		{group: core, resource: "secrets", verb: "get", namespace: s.Config.OperatorNamespace},
-		// preflight.go:515 locates the live probes' targets: the API server
-		// and cluster DNS services, and the run's own broker service.
-		{group: core, resource: "services", verb: "get", name: "kubernetes", namespace: "default"},
-		{group: core, resource: "services", verb: "get", name: "kube-dns", namespace: "kube-system"},
-		{group: core, resource: "services", verb: "get", name: topology.BrokerServiceName(run.Name), namespace: runNamespace},
 	}
+	// secure_launcher.go:866 reads the credential source Secrets in the
+	// operator's own namespace. The registration the persisted policy pins
+	// names each Secret the read targets, so the reviews name them too — the
+	// review set then demands exactly the authority the real reads need, and
+	// a resourceNames-scoped Role granting those Secrets satisfies it.
+	seen := map[string]bool{}
+	for _, purpose := range []string{forge.PurposeForgeAPI, forge.PurposeGit} {
+		ref, ok := registration.CredentialRef(purpose)
+		if !ok || seen[ref.SecretName] {
+			continue
+		}
+		seen[ref.SecretName] = true
+		reviews = append(reviews, accessReview{
+			group: core, resource: "secrets", verb: "get",
+			name: ref.SecretName, namespace: s.Config.OperatorNamespace,
+		})
+	}
+	// preflight.go:515 locates the live probes' targets: the API server
+	// and cluster DNS services, and the run's own broker service.
+	return append(reviews,
+		accessReview{group: core, resource: "services", verb: "get", name: "kubernetes", namespace: "default"},
+		accessReview{group: core, resource: "services", verb: "get", name: "kube-dns", namespace: "kube-system"},
+		accessReview{group: core, resource: "services", verb: "get", name: topology.BrokerServiceName(run.Name), namespace: runNamespace},
+	)
 }
 
 // checkBrokerRBAC verifies the broker's named grants two ways: the Role

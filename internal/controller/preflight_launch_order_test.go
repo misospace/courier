@@ -108,7 +108,13 @@ func TestCheckOperatorAccessForbiddenIsAVerdict(t *testing.T) {
 	})
 	control.Config.Kubernetes = forbidden
 
-	err := control.checkOperatorAccess(context.Background(), secureRun("operator-grants"))
+	run := secureRun("operator-grants")
+	run.Status.PublicationPolicy = &courier.PublicationPolicy{
+		RunUID:              string(run.UID),
+		ProviderConfigRef:   "github",
+		CredentialRefDigest: secureRegistry().Registrations()[0].Projection().Digest,
+	}
+	err := control.checkOperatorAccess(context.Background(), run)
 	var permanent *SecureNeedsHumanError
 	if !errors.As(err, &permanent) || permanent.Reason != "OperatorRBAC" {
 		t.Fatalf("checkOperatorAccess error = %v, want an OperatorRBAC verdict", err)
