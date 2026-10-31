@@ -2652,10 +2652,19 @@ provider read — and to stay distinct from the base, and it requires the
 persisted `workRef` to equal
 `branch.ResolveGoalBranch(canonicalSpecRepo, spec.workItemID)`, the same pure
 derivation admission uses, so a policy describing another branch is corruption.
-A contribution records no source-owned work item, so any source-issue or
-criterion pin, and any PR number or head anchor, fails the binding: the broker's
-discovery-based PR idempotency owns PR identity at publication. The work tip is
-either absent or a recorded adoption tip, never both.
+The persisted base ref is the ref the admission carried: secure admission
+resolves the contribution's execution input through the owning source adapter —
+the same decode the launch paths render the coordinator goal from — and pins
+that admitted ref, with its observed tip, instead of the base repository's
+default branch, so the goal the coordinator states, the pinned admission
+policy, and the broker's publication guards all name one base for every
+admitted value (#653). An admitted ref the base repository does not carry is
+immutable-spec misdirection, so admission fails closed to a human rather than
+pinning a substitute branch. A contribution records no source-owned work item,
+so any source-issue or criterion pin, and any PR number or head anchor, fails
+the binding: the broker's discovery-based PR idempotency owns PR identity at
+publication. The work tip is either absent or a recorded adoption tip, never
+both.
 
 ### Contribution execution bridge
 A `contribute` run carries no issue or pull-request number: its admitted
@@ -2688,10 +2697,11 @@ provisioned, rather than launching a coordinator with no objective. Reaching no
 owning adapter at all (no registry wired, no adapter registered under the run's
 source, a source that supplies no contribution surface) stays an ordinary
 retryable launch failure, because a later deployment can wire it. A contribution
-pins no acceptance criteria, so its goal
-carries no criterion-evidence grammar, and the base ref it states is task
-context only: publication stays bound to the base the broker's persisted policy
-pins (`PolicyFromRun`), which no model output can move.
+pins no acceptance criteria, so its goal carries no criterion-evidence
+grammar, and the base ref it states is the same ref publication pins: secure
+admission resolves the identical execution input through the owning adapter
+and pins that ref into the persisted policy (`PolicyFromRun`), which no model
+output can move (#653).
 
 ## Terminal retention and closed-unmerged PRs
 
