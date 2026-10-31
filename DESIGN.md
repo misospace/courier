@@ -3245,6 +3245,34 @@ only informs.
   holds whatever its lane needs (an Anthropic, OpenAI, or MiniMax token, a
   local endpoint's key, any combination); in the target design the provider key
   belongs to trusted harness control, and workers do not call models directly.
+- **The operator's own forge identity is a separate seam from pod credential
+  injection.** The operator reads forge state outside any model-controlled pod —
+  post-review PR state, existing-PR head resolution, Dispatch PR state, merge
+  observation, admission-time provider reads, and the label source's discovery
+  and settlement — with one credential pair settled once at startup. The
+  observer-only seam `--observer-credential-secret`/`--observer-credential-key`
+  wins over the legacy pod-injection flags `--github-credential-secret` and
+  `--git-credential-secret` (with the matching token-key fallbacks), and the
+  seam is atomic: a key without a seam Secret is a startup error, never a
+  silent re-key of a legacy Secret. The seam is never rendered into
+  `executor.PodConfig`, so a Secret named only there is structurally absent
+  from the pod injection that reaches model-controlled coordinator pods: those
+  pods take every Secret they get from the legacy credential flags and
+  `--executor-environment-secret` alone. (The secure control pod is trusted
+  harness control, not a model-controlled pod, and holds only operator-
+  generated per-run material — the model-gateway key copy, the signing key,
+  and the broker CA — never an upstream forge credential.) Secure mode rejects
+  a seam Secret that any of those flags exposes to a coordinator pod, and the
+  [HARNESS.md](./HARNESS.md) §9 taint rejects any registration referencing a
+  Secret any of them exposes — a credential injected into a model-controlled
+  pod is tainted for secure use. With the seam unset the operator's own
+  identity is the legacy credential Secret: the taint already keeps every
+  registration off it, and §9's migration is what removes it from pod
+  injection; the resolution itself is identical to the legacy chain. A secure
+  deployment therefore binds one Secret to one upstream credential — to the
+  registration and to the operator's own identity — instead of duplicating it
+  into two, and the chart's label-source guard accepts the seam as a
+  credential argument, mirroring the Go rule.
 - The gateway response is untrusted, unbounded input, and trusted control
   bounds both its shape and what it will hold: one SSE line is capped at 1 MiB,
   and per completion the buffered content deltas (8 MiB), the buffered
