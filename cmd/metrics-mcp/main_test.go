@@ -17,6 +17,14 @@ import (
 	couriermetrics "github.com/misospace/courier/internal/mcp/metrics"
 )
 
+// failingTransport fails every request the way a dial failure does, without
+// binding or releasing any port.
+type failingTransport struct{}
+
+func (failingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("dial tcp 127.0.0.1:1: connect: connection refused")
+}
+
 func TestRunValidatesOptions(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -326,9 +334,7 @@ func TestRunShutdownBoundedByIncompleteBody(t *testing.T) {
 func TestRunRedactsQueryCredentials(t *testing.T) {
 	const secret = "startup-log-secret-5f2c9"
 
-	dead := httptest.NewServer(http.NotFoundHandler())
-	transportURL := dead.URL
-	dead.Close() // nothing listens there anymore
+	const transportURL = "http://127.0.0.1:1"
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -342,8 +348,9 @@ func TestRunRedactsQueryCredentials(t *testing.T) {
 		done <- run(ctx, listener, options{
 			metricsURL: "http://alice:hunter2@" + strings.TrimPrefix(transportURL, "http://") +
 				"/metrics?token=" + secret + "&z=1#" + secret,
-			backend:       couriermetrics.BackendAuto,
-			scrapeTimeout: 2 * time.Second,
+			backend:         couriermetrics.BackendAuto,
+			scrapeTimeout:   2 * time.Second,
+			scrapeTransport: failingTransport{},
 		}, &logs)
 	}()
 

@@ -921,7 +921,7 @@ func TestDispatchCIParkRoute404LatchesUnsupported(t *testing.T) {
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 			http.Error(w, "gone", http.StatusNotFound)
 		})
-		f.server.Close()
+		f.client.httpClient = failingDoer{}
 		if err := f.adapter.ReportCIParked(context.Background(), ciparkWorkItem(), source.CIParkNotice{PR: "77", Head: ciparkHead1, IdempotencyKey: "k"}); err == nil || errors.Is(err, source.ErrUnsupportedCIPark) {
 			t.Fatalf("park against a dead server = %v, want the transport failure", err)
 		}

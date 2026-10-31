@@ -27,6 +27,9 @@ type options struct {
 	scrapeTimeout time.Duration
 	// shutdownGrace bounds Shutdown before remaining connections are force-closed.
 	shutdownGrace time.Duration
+	// scrapeTransport overrides the scraper's HTTP transport; tests set it to
+	// fail every scrape deterministically without binding a port.
+	scrapeTransport http.RoundTripper
 }
 
 // HTTP-server timeouts bound inbound reads: an incomplete header or body
@@ -92,7 +95,11 @@ func run(ctx context.Context, listener net.Listener, opts options, logw io.Write
 		return fmt.Errorf("-scrape-timeout must be positive (got %s)", opts.scrapeTimeout)
 	}
 	logger := log.New(logw, "metrics-mcp ", log.LstdFlags|log.Lmsgprefix)
-	scraper := couriermetrics.NewScraper(&http.Client{Timeout: opts.scrapeTimeout}, mapping)
+	scrapeClient := &http.Client{Timeout: opts.scrapeTimeout}
+	if opts.scrapeTransport != nil {
+		scrapeClient.Transport = opts.scrapeTransport
+	}
+	scraper := couriermetrics.NewScraper(scrapeClient, mapping)
 	server := couriermetrics.NewServer(opts.metricsURL, scraper)
 	httpServer := newHTTPServer(couriermetrics.HTTPHandler(server), opts.scrapeTimeout)
 
