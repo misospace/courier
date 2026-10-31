@@ -47,15 +47,20 @@ func (r *checkReceipt) reusable() bool {
 // ran to completion and produced its own exit status. The worker reports a
 // nonzero exit as ResultFailed (protocol runTask), so a failing exit is a
 // completed run and real evidence, not a dispatch failure. ResultFailed
-// carrying the sentinel exit code -1 means the task never started or died
-// to a signal: the run produced no exit status, so it is not evidence.
+// carrying the sentinel exit code -1 — never started, killed by a signal,
+// or rejected before execution — is the shape that is not evidence: the
+// run produced no exit status of its own. A completion downgraded to
+// ResultFailed over an unreadable artifact keeps its real exit status and
+// stays evidence: the command ran, and a stored receipt must yield to it.
 // Cancellation is never evidence.
 func completedRun(status string, exitCode int) bool {
 	switch status {
 	case protocol.ResultCompleted:
 		return true
 	case protocol.ResultFailed:
-		return exitCode > 0
+		// A real exit status is 0..255; -1 is the worker's sentinel for a
+		// run that never produced one.
+		return exitCode >= 0
 	default:
 		return false
 	}

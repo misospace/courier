@@ -331,7 +331,9 @@ func TestCheckCompletedRunClassification(t *testing.T) {
 		{status: protocol.ResultFailed, exitCode: 1, want: true},
 		{status: protocol.ResultFailed, exitCode: 2, want: true},
 		{status: protocol.ResultFailed, exitCode: 127, want: true},
-		{status: protocol.ResultFailed, exitCode: 0, want: false},
+		// An exit-0 completion downgraded to ResultFailed over an
+		// unreadable artifact still produced its own exit status.
+		{status: protocol.ResultFailed, exitCode: 0, want: true},
 		{status: protocol.ResultFailed, exitCode: -1, want: false},
 		{status: protocol.ResultCancelled, exitCode: -1, want: false},
 		{status: "running", exitCode: 0, want: false},
