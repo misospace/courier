@@ -404,3 +404,52 @@ the run moves to `Failed`; a crash before any session ID is observed moves it to
 The OpenCode shim resumes a run's session only inside the running pod; it does
 not survive pod/model restarts with conversational state. Git commits and the
 remote branch are its durable floor until the custom harness replaces it.
+
+## Skill bundles
+
+Skill bundles are directories of operator-authored skill content — a
+`SKILL.md` plus optional assets — registered under stable logical names at
+manager startup. The deployment owns registration entirely: the manager reads
+a YAML config file (`--skill-bundles-file`) that names each bundle and points
+at a mounted absolute path, and resolves each entry to an immutable content
+identity, a deterministic `sha256:` digest over the materialized tree. There
+are no runtime network fetches; the digest is recomputed only at startup, so
+the same bytes register the same identity on every restart. Each bundle must
+be a plain directory tree (no symlinks inside; kubelet projection symlinks at
+the mount root are handled by resolution), must carry a non-empty `SKILL.md`
+at its root, and is bounded at 512 files and 8 MiB. A bad config or an
+unavailable bundle prevents the manager from starting — registration fails
+explicitly, never by silent omission.
+
+Non-chart installs hand the manager the same config as a plain file:
+
+```yaml
+# --skill-bundles-file=/etc/courier/skill-bundles-config/bundles.yaml
+bundles:
+  - name: simple-english
+    source: /etc/courier/skill-bundles/simple-english
+```
+
+The chart carries the same seam natively: set `skillBundles` values (an
+omitted `source` defaults to `/etc/courier/skill-bundles/<name>`) and mount
+each bundle's content yourself, e.g. via a `persistence` entry:
+
+```yaml
+# charts/courier values
+skillBundles:
+  simple-english: {}
+
+persistence:
+  simple-english-content:
+    type: pvc
+    existingClaim: skill-bundles
+    globalMounts:
+      - path: /etc/courier/skill-bundles/simple-english
+        subPath: simple-english
+        readOnly: true
+```
+
+Registration is deployment-controlled setup: CoderRun, source, issue,
+pull-request, and model data can never register a bundle. Skill content is
+untrusted data exposed to workers later (#658/#659); registration grants no
+shell, forge, or Kubernetes authority.

@@ -3,6 +3,7 @@ package metrics
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -29,6 +30,14 @@ func mustMapping(t *testing.T, backend string) Mapping {
 		t.Fatalf("For(%q): %v", backend, err)
 	}
 	return mapping
+}
+
+// failingTransport fails every request the way a dial failure does, without
+// binding or releasing any port.
+type failingTransport struct{}
+
+func (failingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("dial tcp 127.0.0.1:1: connect: connection refused")
 }
 
 func TestScrapeNormalizesVLLMLoad(t *testing.T) {
@@ -116,6 +125,7 @@ process_cpu_seconds_total 4.2
 	tests := []struct {
 		name       string
 		url        func(t *testing.T) string
+		client     func(t *testing.T) *http.Client
 		wantDetail string
 	}{
 		{
@@ -124,13 +134,9 @@ process_cpu_seconds_total 4.2
 			wantDetail: "500",
 		},
 		{
-			name: "unreachable endpoint",
-			url: func(t *testing.T) string {
-				refused := httptest.NewServer(http.NotFoundHandler())
-				url := refused.URL
-				refused.Close() // nothing listens there anymore
-				return url
-			},
+			name:       "unreachable endpoint",
+			url:        func(*testing.T) string { return "http://127.0.0.1:1" },
+			client:     func(*testing.T) *http.Client { return &http.Client{Transport: failingTransport{}} },
 			wantDetail: "failed",
 		},
 		{
@@ -152,7 +158,11 @@ process_cpu_seconds_total 4.2
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			url := tt.url(t)
-			scraper := NewScraper(&http.Client{Timeout: 2 * time.Second}, mustMapping(t, BackendAuto))
+			client := &http.Client{Timeout: 2 * time.Second}
+			if tt.client != nil {
+				client = tt.client(t)
+			}
+			scraper := NewScraper(client, mustMapping(t, BackendAuto))
 			load := scraper.Scrape(context.Background(), url)
 			if load.Available {
 				t.Fatalf("load = %+v, want unavailable", load)
@@ -173,9 +183,7 @@ process_cpu_seconds_total 4.2
 // Query parameters and fragments can carry credentials too (?token=…), so
 // every failure path is exercised with a secret in each position.
 func TestScrapeRedactsCredentialsInDiagnostics(t *testing.T) {
-	dead := httptest.NewServer(http.NotFoundHandler())
-	host := dead.URL
-	dead.Close()
+	host := "http://127.0.0.1:1"
 	parsed, err := url.Parse(host)
 	if err != nil {
 		t.Fatal(err)
@@ -223,7 +231,7 @@ func TestScrapeRedactsCredentialsInDiagnostics(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			scraper := NewScraper(&http.Client{Timeout: 2 * time.Second}, mustMapping(t, BackendAuto))
+			scraper := NewScraper(&http.Client{Transport: failingTransport{}}, mustMapping(t, BackendAuto))
 			load := scraper.Scrape(context.Background(), tt.raw)
 			if load.Available {
 				t.Fatalf("load = %+v, want unavailable", load)
@@ -250,21 +258,24 @@ func TestScrapeRedactsQueryCredentialsOnFailurePaths(t *testing.T) {
 	defer serve500.Close()
 	malformed := serve(t, http.StatusOK, "this is {{{ not prometheus")
 	defer malformed.Close()
-	refused := httptest.NewServer(http.NotFoundHandler())
-	transportURL := refused.URL
-	refused.Close() // nothing listens there anymore
+	const transportURL = "http://127.0.0.1:1"
 
 	tests := []struct {
-		name string
-		raw  string
+		name    string
+		raw     string
+		refused bool
 	}{
 		{name: "non-200", raw: serve500.URL + "/metrics?token=" + secret + "&z=1#" + secret},
 		{name: "malformed response", raw: malformed.URL + "/metrics?token=" + secret + "&z=1#" + secret},
-		{name: "transport error", raw: transportURL + "/metrics?token=" + secret + "&z=1#" + secret},
+		{name: "transport error", raw: transportURL + "/metrics?token=" + secret + "&z=1#" + secret, refused: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			scraper := NewScraper(&http.Client{Timeout: 2 * time.Second}, mustMapping(t, BackendAuto))
+			client := &http.Client{Timeout: 2 * time.Second}
+			if tt.refused {
+				client.Transport = failingTransport{}
+			}
+			scraper := NewScraper(client, mustMapping(t, BackendAuto))
 			load := scraper.Scrape(context.Background(), tt.raw)
 			if load.Available {
 				t.Fatalf("load = %+v, want unavailable", load)

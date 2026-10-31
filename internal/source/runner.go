@@ -488,7 +488,7 @@ func (r *Runner) Poll(ctx context.Context) error {
 		}
 		name := RunName(r.Config.Source, itemIdentity)
 		if predecessor := settledPredecessor(runs.Items, r.Config.Source, itemIdentity, r); predecessor != nil {
-			name = successorRunName(r.Config.Source, itemIdentity, predecessor.UID)
+			name = SuccessorRunName(r.Config.Source, itemIdentity, predecessor.UID)
 		}
 		run.Name = name
 		if err := r.Create(ctx, run); err != nil && !apierrors.IsAlreadyExists(err) {
@@ -757,7 +757,16 @@ func RunName(sourceName, workItemID string) string {
 	return "courier-" + hex.EncodeToString(digest[:])[:32]
 }
 
-func successorRunName(sourceName, workItemID string, predecessorUID types.UID) string {
+// SuccessorRunName names the run that succeeds to a settled predecessor. It is
+// exported so core's controller-directed materialization (#609) derives the
+// successor name through the same deterministic function discovery uses: the
+// name hashes the fresh identity together with the predecessor's UID, so
+// replays of one request collide on one name and Create AlreadyExists absorbs
+// them. The identity is passed in the form that owns the successor's dedupe:
+// discovery passes its WorkIdentity-normalized identity; the minting-adapter
+// path passes the raw minted identity, whose adapter defines no normalization
+// (the manual adapter declares WorkIdentity unsupported).
+func SuccessorRunName(sourceName, workItemID string, predecessorUID types.UID) string {
 	digest := sha256.Sum256([]byte(workKey(sourceName, workItemID) + "\x00" + string(predecessorUID)))
 	return "courier-" + hex.EncodeToString(digest[:])[:32]
 }

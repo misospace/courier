@@ -60,7 +60,7 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 	// the topology first would surface the same misconfiguration as a raw
 	// Forbidden from a create — an ordinary error, retried as fast as the API
 	// server allowed, which is the churn #644 requires to stop.
-	if err := s.checkDeploymentPreconditions(ctx); err != nil {
+	if err := s.checkDeploymentPreconditions(ctx, run); err != nil {
 		return ctrl.Result{}, err
 	}
 

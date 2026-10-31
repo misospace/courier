@@ -3,10 +3,8 @@ package metrics
 import (
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -119,9 +117,7 @@ vllm:gpu_cache_usage_perc +Inf
 // A degraded scrape is still a successful tool call: degradation rides in the
 // payload so the coordinator gets an answer, never a failure.
 func TestMCPServerDegradesThroughProtocol(t *testing.T) {
-	endpoint := httptest.NewServer(http.NotFoundHandler())
-	endpoint.Close() // down before we ever call
-	session := connectMCP(t, NewServer(endpoint.URL, NewScraper(&http.Client{Timeout: time.Second}, mustMapping(t, BackendAuto))))
+	session := connectMCP(t, NewServer("http://127.0.0.1:1", NewScraper(&http.Client{Transport: failingTransport{}}, mustMapping(t, BackendAuto))))
 
 	result, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: ToolName})
 	if err != nil {

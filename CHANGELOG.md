@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.1.14](https://github.com/misospace/courier/compare/v0.1.13...v0.1.14) (2026-10-31)
+
+
+### Features
+
+* **admission:** courierctl contribute thin CLI frontend ([#601](https://github.com/misospace/courier/issues/601)) ([#675](https://github.com/misospace/courier/issues/675)) ([6c00b92](https://github.com/misospace/courier/commit/6c00b920473e28a7e1558a20957a470afb5c7059))
+* controller-directed successor materialization for manual-source retries ([#676](https://github.com/misospace/courier/issues/676)) ([8f2c3ab](https://github.com/misospace/courier/commit/8f2c3ab33555561bba357a669032df26775d3fa3))
+* **skills:** register and materialize approved deployment skill bundles ([#674](https://github.com/misospace/courier/issues/674)) ([bd31fd6](https://github.com/misospace/courier/commit/bd31fd6c4f1858a6c9d02b29cfa6ff7722dee3b7))
+
+
+### Bug Fixes
+
+* **controller:** pin the admitted base ref into contribute publication policy ([#670](https://github.com/misospace/courier/issues/670)) ([fc1d73c](https://github.com/misospace/courier/commit/fc1d73c7dc2713ae9715081ce852bf5b993a147b)), closes [#653](https://github.com/misospace/courier/issues/653)
+* **controller:** prove the secure launch path's read grants in preflight ([#669](https://github.com/misospace/courier/issues/669)) ([0caa7d7](https://github.com/misospace/courier/commit/0caa7d750ca300995485df74bb3ae50d1b2527bc))
+* **preflight:** publish probe results with an overwrite-safe redirect ([#673](https://github.com/misospace/courier/issues/673)) ([c62eb0a](https://github.com/misospace/courier/commit/c62eb0a32fc52c7a2a83c1f8c508a74c1da41b67))
+* **secure:** stop requiring duplicate Secrets for operator forge observation ([#648](https://github.com/misospace/courier/issues/648)) ([02a16de](https://github.com/misospace/courier/commit/02a16de8871c46accb19c59c7b6682e944b6f15e))
+* **source:** count and log dedupe-skipped re-offers ([#668](https://github.com/misospace/courier/issues/668)) ([3e1bdbd](https://github.com/misospace/courier/commit/3e1bdbd38e52a6bbe5409dcc4adcc27dfdbfd2d0))
+
+
+### Refactors
+
+* **source:** consolidate CoderRun name derivation in source.RunName ([#677](https://github.com/misospace/courier/issues/677)) ([d797304](https://github.com/misospace/courier/commit/d79730418861ef546af1f3647494b87d6e4402c1))
+
 ## [0.1.13](https://github.com/misospace/courier/compare/v0.1.12...v0.1.13) (2026-10-31)
 
 

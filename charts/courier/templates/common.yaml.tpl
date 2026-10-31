@@ -400,6 +400,55 @@
 {{- $args = append $args (printf "--cron-poll-interval=%s" $cronPollInterval) }}
 {{- end }}
 {{- end }}
+{{- /* Deployment-approved skill bundles serialize into a chart ConfigMap
+  mounted into the manager and passed through the --skill-bundles-file
+  seam, mirroring the bootstrap-lane-profiles transport: the library's
+  built-in configMaps checksum annotates the pod template, so a values
+  change rolls the manager on a normal upgrade, and an explicit
+  --skill-bundles-file arg takes precedence. Each entry's source must be a
+  plain directory tree mounted by the deployment; a bundle's interior must
+  not contain symlinks. */}}
+{{- $skillBundles := .Values.skillBundles | default (dict) }}
+{{- if $skillBundles }}
+{{- $hasSkillBundlesFile := false }}
+{{- range $arg := $args }}
+{{- if or (eq $arg "--skill-bundles-file") (hasPrefix "--skill-bundles-file=" $arg) }}{{- $hasSkillBundlesFile = true }}{{- end }}
+{{- end }}
+{{- if not $hasSkillBundlesFile }}
+{{- $bundles := list }}
+{{- range $name, $spec := $skillBundles }}
+{{- if not (kindIs "map" $spec) }}
+{{- fail (printf "skillBundles entry %q must be a mapping of bundle fields" $name) }}
+{{- end }}
+{{- if or (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $name)) (gt (len $name) 63) }}
+{{- fail (printf "skillBundles name %q must be a valid DNS-1123 label (lowercase alphanumeric or '-', at most 63 characters, starting and ending with an alphanumeric)" $name) }}
+{{- end }}
+{{- if hasKey $spec "source" }}
+{{- if or (not (kindIs "string" (index $spec "source"))) (not (index $spec "source")) }}
+{{- fail (printf "skillBundles entry %q source must be a non-empty string" $name) }}
+{{- end }}
+{{- end }}
+{{- $source := index $spec "source" | default (printf "/etc/courier/skill-bundles/%s" $name) }}
+{{- if not (hasPrefix "/" $source) }}
+{{- fail (printf "skillBundles entry %q source %q must be an absolute path starting with '/'" $name $source) }}
+{{- end }}
+{{- $bundles = append $bundles (dict "name" $name "source" $source) }}
+{{- end }}
+{{- $skillConfig := toYaml (dict "bundles" $bundles) }}
+{{- $configMaps := deepCopy (.Values.configMaps | default dict) }}
+{{- $_ := set $configMaps "bootstrap-skill-bundles" (dict
+  "suffix" "bootstrap-skill-bundles"
+  "data" (dict "bundles.yaml" $skillConfig)) }}
+{{- $_ := set .Values "configMaps" $configMaps }}
+{{- $persistence := deepCopy (.Values.persistence | default dict) }}
+{{- $_ := set $persistence "bootstrap-skill-bundles" (dict
+  "type" "configMap"
+  "identifier" "bootstrap-skill-bundles"
+  "globalMounts" (list (dict "path" "/etc/courier/skill-bundles-config" "readOnly" true))) }}
+{{- $_ := set .Values "persistence" $persistence }}
+{{- $args = append $args "--skill-bundles-file=/etc/courier/skill-bundles-config/bundles.yaml" }}
+{{- end }}
+{{- end }}
 {{- $evidence := .Values.evidence }}
 {{- if $evidence.enabled }}
 {{- if not $evidence.keySecret }}

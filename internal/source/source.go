@@ -287,6 +287,17 @@ type AttemptRequeueRequest struct {
 // write, since the requeue has already committed.
 type AttemptRequeueResult struct {
 	AttemptID string
+	// ControllerMaterializesSuccessor tells core that no discovery pass will
+	// ever observe the returned identity: the adapter's source has no
+	// lifecycle to re-enter, so the adapter minted the identity in its own
+	// namespace and the core creates the successor run itself when the
+	// request settles Requeued, naming it from the fresh identity and the
+	// predecessor's UID. Only a source whose act is the run itself (the
+	// manual adapter, #609) may set it; queue-backed sources leave successor
+	// materialization source-owned and discovery-driven. It rides the result,
+	// not a per-process flag, so a replayed committed result replays the
+	// same materialization directive.
+	ControllerMaterializesSuccessor bool
 }
 
 // RetryRefusalError is the typed, source-owned classification an AttemptRequeuer

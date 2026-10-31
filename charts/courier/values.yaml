@@ -96,6 +96,20 @@ laneProfiles: {}
   #     coordinator: litellm/your-model
   #   framing: |
   #     keep parallelism modest and leave the pull request ready for review
+  # -- Deployment-approved skill bundles registered at manager startup.
+  #    Map of bundle name to spec; the optional source must be a plain
+  #    directory tree mounted by the deployment (e.g. via persistence) at
+  #    the path given or the default /etc/courier/skill-bundles/<name>.
+  #    ConfigMap/Secret volume projections may embed internal symlinks only
+  #    at the mount root, which resolution handles; a bundle's interior must
+  #    not contain symlinks. See BOOTSTRAP.md. A values change updates the
+  #    ConfigMap and the pod template's configMaps checksum, so a normal
+  #    helm upgrade rolls the manager. An explicit --skill-bundles-file arg
+  #    under controllers.main.containers.main.args takes precedence and
+  #    disables this transport.
+skillBundles: {}
+  # simple-english:
+  #   source: /etc/courier/skill-bundles/simple-english
 cron:
   # -- Scheduled jobs, rendered into a release ConfigMap mounted into the
   # manager and passed through --cron-schedules-file; empty disables the

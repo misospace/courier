@@ -708,7 +708,7 @@ func TestDefaultDiscoveryAvailabilityStates(t *testing.T) {
 	})
 	t.Run("unreachable-on-transport-failure", func(t *testing.T) {
 		f := newDiagnosticsFixture(t, nil, func(_ *diagnosticsFixture, _ http.ResponseWriter, _ *http.Request) {})
-		f.server.Close()
+		f.client.httpClient = failingDoer{}
 		if _, err := f.client.Discover(context.Background()); err == nil {
 			t.Fatal("unreachable source unexpectedly succeeded")
 		}

@@ -1032,6 +1032,26 @@ likewise bounded: a value over the CRD's 256-code-point limit on
 than allowed to fail the settle write and wedge the record `Requested` — the
 requeue has already committed.
 
+**Materialization is discovery-driven, with one documented exception.** For a
+queue-backed source a requeue makes the source re-offer a fresh attempt and
+discovery materializes the successor; core only names it after the settled
+predecessor. The manual source has no external lifecycle to re-enter — the
+operator's act of creating the run *is* the source action — so its adapter
+implements the requeue as a validated no-op that mints
+`<workItemID>/retry/<requestID>` in its own namespace and marks the requeue
+result as one no discovery pass will ever offer. On such a result the
+reconciler creates the successor run itself, before writing the settled
+`Requeued` record: the predecessor's namespace, its copied immutable work
+fields (no source-issued assignment is fabricated for an attempt no source
+re-issued), the minted identity as the successor's `workItemID`, and a name
+derived from the fresh identity and the predecessor UID — the same deterministic
+naming discovery uses, so a create replayed after a lost response collides on
+exactly one successor through `Create` `AlreadyExists`. The settled event
+carries the successor's name, and the successor carries no owner reference:
+reaping the predecessor must never cascade onto the replacement. An adapter
+that does not set the directive never has core materialize anything; discovery
+stays the sole materializer for every queue-backed source.
+
 **The fix-pr guard reads the world through the forge.** A fix-pr run's recorded
 pull request is read through the forge read-pull-request capability, exactly as
 the merge observation reads it — including its exact head-identity check. A
@@ -2337,7 +2357,8 @@ error is not gated at all, because the design classifies it as transient.
 A permanent misconfiguration is only a verdict if the launch path can tell it
 from a transient one, and the deployment's own facts are what tell it: the
 operator's provisioning grants — the namespaced creates and deletes the secure
-topology needs, and the cluster-scoped grants the proof itself uses — and the
+topology needs, the reads the secure launch path makes on its own behalf, and
+the cluster-scoped grants the proof itself uses — and the
 dedicated run namespace's restricted Pod Security label are proven before the
 operator creates anything, so a missing one of those grants or an unlabelled
 namespace arrives as the `OperatorRBAC` or `PodSecurity` verdict the gate
@@ -2359,10 +2380,25 @@ cluster would refuse. The SelfSubjectAccessReview the operator asks about
 itself is a canary rather than a proof on a stock cluster, where the API
 server's default `system:basic-user` binding already allows that create to
 every authenticated subject. The proof covers what the secure topology's
-creation needs, not every grant the operator holds: the reads the secure path
-makes outside it — the lane profile, the signing secret, the topology pods,
-and the cluster's API server and DNS services — are outside the proof, so a
-deployment missing one of those still surfaces as an ordinary refusal.
+creation needs plus the reads the secure launch path makes on its own behalf:
+the run-namespace pod list it reads to decide whether a replacement is due,
+the run's lane profile, the run's signing secret, the credential source
+Secrets in the operator's own namespace — reviews asked in the namespace the
+reads target, since a grant scoped to one namespace never authorizes a request
+in another — and the services the live probes read for their targets (the API
+server in `default`, cluster DNS in `kube-system`, and the run's broker
+service in the run namespace). Each of those reviews mirrors the request it
+stands for, name included where the request names an object: the pod review is
+the list the real read issues — the launch path reads no topology pod by name
+on this path — and the credential reads are reviewed by the Secret names the
+persisted policy's registration carries, so the proof demands exactly the
+authority the real requests need and a resourceNames-scoped Role granting
+those Secrets satisfies it. A review proves a grant, not an object: a missing
+signing secret or an absent lane profile still arrives as an ordinary error,
+because requeueing can supply what a grant cannot. The proof also does not
+reach the reads the broker and control binaries make after launch — those rest
+on the broker's own reviewed grant set and the namespace/RBAC boundary
+assumption.
 The secure round is fenced before it terminalizes: a resumed launch
 reaches the launcher with a live worker and a credentialed broker, and a
 `NeedsHuman` run is no longer observed, so a fence deferred past that reconcile
@@ -2410,6 +2446,42 @@ the same file flag, and the chart library's config-map checksum annotates the
 pod template, so a values change rolls the manager on a normal upgrade. The
 chart never renders LaneProfile objects, keeping the CRD-ordering hazard
 structurally closed. (#74)
+
+## Deployment-provided skill bundles
+
+Skill bundles are deployment-owned directories of operator-authored skill
+content — a `SKILL.md` plus optional assets — that the manager registers at
+startup under stable logical names. The trust boundary has the same shape as
+bootstrap lane config: registration runs only in trusted manager setup, from
+a deployment-mounted YAML file (`--skill-bundles-file`), and CoderRun,
+source, issue, pull-request, and model data can never register a bundle or
+influence what a bundle's name resolves to. There are no runtime network
+fetches; each registration resolves its bundle to an immutable content
+identity — a deterministic, domain-separated `sha256:` digest over the
+materialized tree, hashed in sorted relative-path order with per-file
+lengths so equal bytes in different locations digest identically and any
+content change, addition, or rename changes the digest. Registration grants
+no shell, forge, or Kubernetes authority: skill bytes are untrusted data
+exposed to workers later, and lane-profile selection and harness loading are
+future work (#658/#659).
+
+Resolution contract: the registered source may be a symlink (kubelet
+ConfigMap/Secret projections place per-key symlinks and a `..data` ->
+`..<timestamp>` chain at the mount root), and resolution lands on the real
+content directory via symlink evaluation — the timestamp lives only in the
+resolved root path, never in relative paths, so digests stay stable across
+kubelet remounts that only change the timestamp name. Everything inside the
+resolved root must be a plain directory tree: any symlink inside is
+rejected, which closes the traversal-escape class by construction since the
+walker only yields paths under the resolved root. A bundle must carry a
+non-empty `SKILL.md` at its root and is bounded at 512 files and 8 MiB.
+
+Restart and failure semantics: the same bytes produce the same registration
+on every restart, and a malformed config, missing source, or invalid bundle
+fails manager startup explicitly — the registry never silently omits or
+degrades an entry. The chart serializes `skillBundles` values into a release
+ConfigMap mounted beside the manager and passed through the same flag,
+mirroring the lane-profiles transport.
 
 ## Reconcile loop
 
@@ -3291,6 +3363,11 @@ only informs.
 - Source-state transitions (claim, in-review, needs-human, resolve) are the
   operator's, done by deterministic code — the one place non-determinism would be
   dangerous, kept mechanical.
+- **No run- or model-controlled data can register skills.** Skill bundle
+registration is deployment-controlled setup: CoderRun, source, issue,
+pull-request, and model data can never add, replace, or redirect a bundle,
+and skill bytes are untrusted data exposed to workers later, not trusted
+control code — registration grants no shell, forge, or Kubernetes authority.
 - Provider credentials for model access are a per-deployment secret concern,
   and the core assumes no particular provider. In legacy mode the pod itself
   holds whatever its lane needs (an Anthropic, OpenAI, or MiniMax token, a
