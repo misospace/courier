@@ -74,6 +74,8 @@ func main() {
 	var gitTokenKey string
 	var githubCredentialSecret string
 	var githubTokenKey string
+	var observerCredentialSecret string
+	var observerCredentialKey string
 	var executorEnvironmentSecret string
 	var gitAuthorName string
 	var gitAuthorEmail string
@@ -128,6 +130,8 @@ func main() {
 	flag.StringVar(&gitTokenKey, "git-token-key", "", "Optional key in the git credential Secret; empty defaults to token.")
 	flag.StringVar(&githubCredentialSecret, "github-credential-secret", "", "Optional Secret containing the GitHub API token; empty falls back to --git-credential-secret.")
 	flag.StringVar(&githubTokenKey, "github-token-key", "", "Optional key in the GitHub API credential Secret; empty falls back to --git-token-key or token.")
+	flag.StringVar(&observerCredentialSecret, "observer-credential-secret", "", "Optional Secret carrying the trusted operator's own forge credential; when set it wins over --github-credential-secret and --git-credential-secret for operator observation and is never injected into coordinator pods (#638).")
+	flag.StringVar(&observerCredentialKey, "observer-credential-key", "", "Optional key in the observer credential Secret; requires --observer-credential-secret; empty falls back to --github-token-key, --git-token-key, or token.")
 	flag.StringVar(&executorEnvironmentSecret, "executor-environment-secret", "", "Optional Secret exposed as coordinator environment variables for model/provider configuration.")
 	flag.StringVar(&gitAuthorName, "git-author-name", defaults.Git.AuthorName, "Git author name rendered into operator-created coordinator pods; empty falls back to the explicit default. Separate from any forge authentication identity (#317).")
 	flag.StringVar(&gitAuthorEmail, "git-author-email", defaults.Git.AuthorEmail, "Git author email rendered into operator-created coordinator pods; empty falls back to the explicit default. Forge attribution requires an account-associated email (#317).")
@@ -369,7 +373,20 @@ func main() {
 		}
 	}
 
-	githubObserver, err := githubObserver(startupCtx, mgr.GetAPIReader(), os.Getenv("POD_NAMESPACE"), githubCredentialSecret, githubTokenKey, gitCredentialSecret, gitTokenKey, forgeRegistry)
+	// The operator's own forge read identity is settled once: the
+	// observer-only seam wins over the legacy flags, so a secure deployment
+	// can bind one Secret to one upstream credential without that Secret
+	// being the legacy pod-injection Secret (#638).
+	operatorCredentialSecret, operatorCredentialKey, err := resolveOperatorForgeCredential(
+		observerCredentialSecret, observerCredentialKey,
+		githubCredentialSecret, githubTokenKey,
+		gitCredentialSecret, gitTokenKey)
+	if err != nil {
+		setupLog.Error(err, "unable to configure the operator forge credential")
+		os.Exit(1)
+	}
+
+	githubObserver, err := githubObserver(startupCtx, mgr.GetAPIReader(), os.Getenv("POD_NAMESPACE"), operatorCredentialSecret, operatorCredentialKey, forgeRegistry)
 	if err != nil {
 		setupLog.Error(err, "unable to configure GitHub observer")
 		os.Exit(1)
@@ -511,13 +528,13 @@ func main() {
 		// The label source shares the operator's own forge read/write
 		// identity: every discovery read and settlement write routes through
 		// the forge.Provider capability seam, never a forge-specific CLI.
-		token, err := loadGitHubToken(startupCtx, mgr.GetAPIReader(), namespace, githubCredentialSecret, githubTokenKey, gitCredentialSecret, gitTokenKey)
+		token, err := loadGitHubToken(startupCtx, mgr.GetAPIReader(), namespace, operatorCredentialSecret, operatorCredentialKey)
 		if err != nil {
 			setupLog.Error(err, "unable to configure label source")
 			os.Exit(1)
 		}
 		if token == "" {
-			setupLog.Error(fmt.Errorf("label source requires a GitHub API credential Secret (--github-credential-secret or --git-credential-secret)"), "unable to configure label source")
+			setupLog.Error(fmt.Errorf("label source requires an operator forge credential Secret (--observer-credential-secret, --github-credential-secret, or --git-credential-secret)"), "unable to configure label source")
 			os.Exit(1)
 		}
 		githubClient, err := couriergithub.New(token)
@@ -622,24 +639,26 @@ func main() {
 	}
 	if secureMode {
 		secure, err := buildSecureControl(secureConfig{
-			providersFile:    forgeProvidersFile,
-			registry:         forgeRegistry,
-			runNamespace:     runNamespace,
-			harnessImage:     harnessImage,
-			probeImage:       probeImage,
-			cacheService:     dependencyCacheService,
-			cachePort:        dependencyCachePort,
-			gatewayURL:       modelGatewayURL,
-			gatewayKeySecret: modelGatewayKeySecret,
-			gatewayKeyName:   modelGatewayKeyName,
-			gatewayCIDR:      modelGatewayCIDR,
-			gatewayPort:      modelGatewayPort,
-			observer:         githubObserver,
-			legacyGitSecret:  gitCredentialSecret,
-			legacyAPISecret:  githubCredentialSecret,
-			operatorNS:       os.Getenv("POD_NAMESPACE"),
-			restConfig:       mgr.GetConfig(),
-			tokenReviewRole:  brokerTokenReviewClusterRole,
+			providersFile:     forgeProvidersFile,
+			registry:          forgeRegistry,
+			runNamespace:      runNamespace,
+			harnessImage:      harnessImage,
+			probeImage:        probeImage,
+			cacheService:      dependencyCacheService,
+			cachePort:         dependencyCachePort,
+			gatewayURL:        modelGatewayURL,
+			gatewayKeySecret:  modelGatewayKeySecret,
+			gatewayKeyName:    modelGatewayKeyName,
+			gatewayCIDR:       modelGatewayCIDR,
+			gatewayPort:       modelGatewayPort,
+			observer:          githubObserver,
+			observerSecret:    observerCredentialSecret,
+			legacyGitSecret:   gitCredentialSecret,
+			legacyAPISecret:   githubCredentialSecret,
+			executorEnvSecret: executorEnvironmentSecret,
+			operatorNS:        os.Getenv("POD_NAMESPACE"),
+			restConfig:        mgr.GetConfig(),
+			tokenReviewRole:   brokerTokenReviewClusterRole,
 		})
 		if err != nil {
 			setupLog.Error(err, "unable to configure secure mode")
@@ -915,9 +934,10 @@ func dispatchPRStateChecker(observer controller.WorldObserver) (dispatch.PullReq
 // (nil outside secure mode) is carried onto the observer so every observation
 // read — post-review PR state, existing-PR head resolution, Dispatch PR state,
 // and merge observation — resolves its destination through the registration
-// serving the repository rather than the GitHub.com default (#377).
-func githubObserver(ctx context.Context, reader client.Reader, namespace, configuredSecret, configuredKey, gitSecret, gitKey string, registry *forge.Registry) (controller.WorldObserver, error) {
-	token, err := loadGitHubToken(ctx, reader, namespace, configuredSecret, configuredKey, gitSecret, gitKey)
+// serving the repository rather than the GitHub.com default (#377). The
+// credential pair is the one settled by resolveOperatorForgeCredential.
+func githubObserver(ctx context.Context, reader client.Reader, namespace, credentialSecret, credentialKey string, registry *forge.Registry) (controller.WorldObserver, error) {
+	token, err := loadGitHubToken(ctx, reader, namespace, credentialSecret, credentialKey)
 	if err != nil {
 		return nil, err
 	}
@@ -931,18 +951,43 @@ func githubObserver(ctx context.Context, reader client.Reader, namespace, config
 	return couriergithub.Observer{Client: githubClient, Registrations: registry}, nil
 }
 
-// loadGitHubToken resolves the operator's own GitHub API credential from the
-// configured Secret, falling back from the API-specific Secret to the legacy
-// git credential Secret the way --github-credential-secret documents. Both
-// secret names empty means the deployment configured no API credential at
-// all: the helper returns an empty token with no error, so callers that can
-// run without the credential treat it as disabled while callers that cannot
-// fail fast on the empty token.
-func loadGitHubToken(ctx context.Context, reader client.Reader, namespace, configuredSecret, configuredKey, gitSecret, gitKey string) (string, error) {
-	secretName := strings.TrimSpace(configuredSecret)
-	if secretName == "" {
-		secretName = strings.TrimSpace(gitSecret)
+// resolveOperatorForgeCredential settles the Secret name and key the trusted
+// operator reads its own forge credential from. The observer-only seam wins
+// over the legacy flags; the legacy pair-fallback chain
+// (--github-credential-secret then --git-credential-secret, and the matching
+// token-key chain) is unchanged. The seam is atomic: a key without a seam
+// Secret would silently re-key a legacy Secret, so it is rejected. The seam
+// is never carried onto executor.PodConfig, so a Secret named only there is
+// structurally absent from legacy and model-controlled pod injection (#638).
+func resolveOperatorForgeCredential(observerSecret, observerKey, githubSecret, githubKey, gitSecret, gitKey string) (secret, key string, err error) {
+	if strings.TrimSpace(observerKey) != "" && strings.TrimSpace(observerSecret) == "" {
+		return "", "", fmt.Errorf("--observer-credential-key requires --observer-credential-secret")
 	}
+	secret = strings.TrimSpace(observerSecret)
+	if secret == "" {
+		secret = strings.TrimSpace(githubSecret)
+	}
+	if secret == "" {
+		secret = strings.TrimSpace(gitSecret)
+	}
+	key = strings.TrimSpace(observerKey)
+	if key == "" {
+		key = strings.TrimSpace(githubKey)
+	}
+	if key == "" {
+		key = strings.TrimSpace(gitKey)
+	}
+	return secret, key, nil
+}
+
+// loadGitHubToken reads the resolved operator forge credential from the named
+// Secret. An empty Secret name means the deployment configured no credential
+// at all: the helper returns an empty token with no error, so callers that
+// can run without the credential treat it as disabled while callers that
+// cannot fail fast on the empty token. The fallback chain that settles which
+// Secret and key to read lives in resolveOperatorForgeCredential.
+func loadGitHubToken(ctx context.Context, reader client.Reader, namespace, secretName, secretKey string) (string, error) {
+	secretName = strings.TrimSpace(secretName)
 	if secretName == "" {
 		return "", nil
 	}
@@ -950,10 +995,7 @@ func loadGitHubToken(ctx context.Context, reader client.Reader, namespace, confi
 	if namespace == "" {
 		return "", fmt.Errorf("POD_NAMESPACE is required when a GitHub credential Secret is configured")
 	}
-	secretKey := strings.TrimSpace(configuredKey)
-	if secretKey == "" {
-		secretKey = strings.TrimSpace(gitKey)
-	}
+	secretKey = strings.TrimSpace(secretKey)
 	if secretKey == "" {
 		secretKey = "token"
 	}
@@ -1001,24 +1043,26 @@ func loadEvidenceKey(ctx context.Context, reader client.Reader, namespace, name 
 
 // secureConfig carries the parsed secure-mode flags into buildSecureControl.
 type secureConfig struct {
-	providersFile    string
-	registry         *forge.Registry
-	runNamespace     string
-	harnessImage     string
-	probeImage       string
-	cacheService     string
-	cachePort        int
-	gatewayURL       string
-	gatewayKeySecret string
-	gatewayKeyName   string
-	gatewayCIDR      string
-	gatewayPort      int
-	observer         controller.WorldObserver
-	legacyGitSecret  string
-	legacyAPISecret  string
-	operatorNS       string
-	restConfig       *rest.Config
-	tokenReviewRole  string
+	providersFile     string
+	registry          *forge.Registry
+	runNamespace      string
+	harnessImage      string
+	probeImage        string
+	cacheService      string
+	cachePort         int
+	gatewayURL        string
+	gatewayKeySecret  string
+	gatewayKeyName    string
+	gatewayCIDR       string
+	gatewayPort       int
+	observer          controller.WorldObserver
+	observerSecret    string
+	legacyGitSecret   string
+	legacyAPISecret   string
+	executorEnvSecret string
+	operatorNS        string
+	restConfig        *rest.Config
+	tokenReviewRole   string
 }
 
 const (
@@ -1055,8 +1099,11 @@ func loadForgeRegistry(path string) (*forge.Registry, error) {
 
 // buildSecureControl validates the provider registry (preloaded by main, or
 // loaded from the providers file for callers that wire it directly), rejects
-// registrations that reference a credential exposed to legacy pods (the §9
-// taint rule, enforced where the deployment configuration is knowable), and
+// registrations that reference a credential exposed to coordinator pods
+// through any pod-injection flag — the legacy credential Secrets or the
+// executor environment Secret (the §9 taint rule, enforced where the
+// deployment configuration is knowable), keeps the observer-only credential
+// seam structurally separate from every pod-exposed Secret (#638), and
 // assembles the secure control.
 func buildSecureControl(config secureConfig) (*controller.SecureControl, error) {
 	if config.registry == nil && strings.TrimSpace(config.providersFile) == "" {
@@ -1073,22 +1120,36 @@ func buildSecureControl(config secureConfig) (*controller.SecureControl, error) 
 			return nil, err
 		}
 	}
-	tainted := map[string]bool{
-		strings.TrimSpace(config.legacyGitSecret): true,
-		strings.TrimSpace(config.legacyAPISecret): true,
-	}
-	for _, registration := range registry.Registrations() {
-		for purpose, ref := range registration.Credentials {
-			if tainted[ref.SecretName] {
-				return nil, fmt.Errorf(
-					"provider %q credential purpose %q references Secret %q, which is exposed to legacy coordinator pods: a credential exposed to any legacy pod is tainted and must not back a secure registration",
-					registration.Name, purpose, ref.SecretName)
+	tainted := map[string]string{}
+	for _, exposed := range []struct{ secret, flag string }{
+		{strings.TrimSpace(config.legacyGitSecret), "--git-credential-secret"},
+		{strings.TrimSpace(config.legacyAPISecret), "--github-credential-secret"},
+		{strings.TrimSpace(config.executorEnvSecret), "--executor-environment-secret"},
+	} {
+		if exposed.secret != "" {
+			if _, ok := tainted[exposed.secret]; !ok {
+				tainted[exposed.secret] = exposed.flag
 			}
 		}
 	}
+	for _, registration := range registry.Registrations() {
+		for purpose, ref := range registration.Credentials {
+			if exposure, ok := tainted[strings.TrimSpace(ref.SecretName)]; ok {
+				return nil, fmt.Errorf(
+					"provider %q credential purpose %q references Secret %q, which is exposed to coordinator pods through %s: a credential exposed to any model-controlled pod is tainted and must not back a secure registration",
+					registration.Name, purpose, ref.SecretName, exposure)
+			}
+		}
+	}
+	observerSecret := strings.TrimSpace(config.observerSecret)
+	if exposure, ok := tainted[observerSecret]; observerSecret != "" && ok {
+		return nil, fmt.Errorf(
+			"observer credential Secret %q is also exposed to coordinator pods through %s: the observer seam must name a Secret no legacy or model-controlled pod injects, so a deployment that shares one must drop that injection for it",
+			observerSecret, exposure)
+	}
 	observer, ok := config.observer.(couriergithub.Observer)
 	if !ok || observer.Client == nil {
-		return nil, fmt.Errorf("secure mode requires a GitHub observer credential for admission-time provider reads")
+		return nil, fmt.Errorf("secure mode requires an operator forge credential for admission-time provider reads: configure --observer-credential-secret or a legacy credential Secret")
 	}
 	if config.restConfig == nil {
 		return nil, fmt.Errorf("secure mode requires an API server connection for access reviews")

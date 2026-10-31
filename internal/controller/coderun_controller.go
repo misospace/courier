@@ -1137,7 +1137,10 @@ func (r *CoderRunReconciler) terminateStuckTerminatingCollision(ctx context.Cont
 // retention window never mutates the source again. A missing or malformed
 // marker proves nothing: the source resolve must then succeed before the
 // retention clock starts, because a run whose source could not be resolved is
-// never reaped.
+// never reaped. A resolve refused permanently is the one exception: the same
+// closed-target or moved-ownership class the lifecycle report settles as
+// refused can never succeed on retry, so holding the run retries nothing and
+// the clock starts instead (#664).
 func (r *CoderRunReconciler) resolveCompleted(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
 	if _, ok := doneAtMarker(run); !ok {
 		adapter, item, err := r.adapterAndWorkItem(run)
@@ -1145,7 +1148,11 @@ func (r *CoderRunReconciler) resolveCompleted(ctx context.Context, run *courierv
 			return ctrl.Result{}, err
 		}
 		if err := adapter.Resolve(ctx, item); err != nil {
-			return ctrl.Result{}, err
+			if !errors.Is(err, source.ErrPermanentRefusal) {
+				return ctrl.Result{}, err
+			}
+			log.FromContext(ctx).Info("source resolve permanently refused; settling the Done run for retention",
+				"run", run.Name, "error", err.Error())
 		}
 	}
 	return r.reapDone(ctx, run)

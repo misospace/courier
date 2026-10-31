@@ -390,7 +390,13 @@ legacy mode.
 `--github-credential-secret`, and `--github-mcp-url` flags remain legacy-mode
 configuration and are untouched until §9's migration removes the model-readable
 injection. The registry is the secure path's only provider source; legacy mode
-does not read it.
+does not read it. The operator's own trusted read identity has a dedicated
+seam, `--observer-credential-secret`/`--observer-credential-key` (#638): it
+wins over the legacy flags for observation and admission reads and is never
+rendered into a coordinator pod, so one Secret can back both a registration
+and trusted observation without the §9 taint, while the taint rule still
+rejects any registration referencing a Secret that legacy pod injection
+exposes, including the `--executor-environment-secret` envFrom source.
 
 ### Model-influenced forge operations
 

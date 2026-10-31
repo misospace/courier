@@ -279,23 +279,75 @@ func TestResolveDispatchBindingsBoundsTheBareConnectorIdentity(t *testing.T) {
 	}
 }
 
-func TestBuildSecureControlRejectsTaintedLegacyCredential(t *testing.T) {
-	registryFile := filepath.Join(t.TempDir(), "providers.json")
-	providers := `{"providers":[{"name":"github","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"courier-github","key":"token"}},"serves":["*"]}]}`
-	if err := os.WriteFile(registryFile, []byte(providers), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	_, err := buildSecureControl(secureConfig{
-		providersFile:   registryFile,
-		runNamespace:    "runs",
-		harnessImage:    "harness:test",
-		probeImage:      "busybox:test",
-		legacyGitSecret: "courier-github",
-		observer:        observerWithHeadResolver{},
-		operatorNS:      "courier-system",
-	})
-	if err == nil || !strings.Contains(err.Error(), "tainted") {
-		t.Fatalf("a registration referencing a legacy-exposed Secret must fail startup, got %v", err)
+// TestBuildSecureControlRejectsTaintedCredential covers the whole
+// pod-exposed Secret set: every flag that injects a Secret into a
+// model-controlled coordinator pod taints a registration that references it,
+// and the comparison trims both sides so a padded name cannot slip past
+// (#638).
+func TestBuildSecureControlRejectsTaintedCredential(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		registration string
+		legacyGit    string
+		legacyAPI    string
+		executorEnv  string
+		wantFlag     string
+	}{
+		{
+			name:         "legacy git credential Secret",
+			registration: "courier-github",
+			legacyGit:    "courier-github",
+			wantFlag:     "--git-credential-secret",
+		},
+		{
+			name:         "legacy GitHub API credential Secret",
+			registration: "courier-github-api",
+			legacyAPI:    "courier-github-api",
+			wantFlag:     "--github-credential-secret",
+		},
+		{
+			name:         "executor environment Secret",
+			registration: "courier-model-env",
+			executorEnv:  "courier-model-env",
+			wantFlag:     "--executor-environment-secret",
+		},
+		{
+			name:         "padded registration Secret name",
+			registration: "  courier-github  ",
+			legacyGit:    "courier-github",
+			wantFlag:     "--git-credential-secret",
+		},
+		{
+			name:         "padded flag value",
+			registration: "courier-github",
+			legacyGit:    "courier-github ",
+			wantFlag:     "--git-credential-secret",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			registryFile := filepath.Join(t.TempDir(), "providers.json")
+			providers := fmt.Sprintf(`{"providers":[{"name":"github","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":%q,"key":"token"}},"serves":["*"]}]}`, test.registration)
+			if err := os.WriteFile(registryFile, []byte(providers), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := buildSecureControl(secureConfig{
+				providersFile:     registryFile,
+				runNamespace:      "runs",
+				harnessImage:      "harness:test",
+				probeImage:        "busybox:test",
+				legacyGitSecret:   test.legacyGit,
+				legacyAPISecret:   test.legacyAPI,
+				executorEnvSecret: test.executorEnv,
+				observer:          observerWithHeadResolver{},
+				operatorNS:        "courier-system",
+			})
+			if err == nil || !strings.Contains(err.Error(), "tainted") {
+				t.Fatalf("a registration referencing a pod-exposed Secret must fail startup, got %v", err)
+			}
+			if !strings.Contains(err.Error(), test.wantFlag) {
+				t.Fatalf("the taint error must name the exposing flag %q, got %v", test.wantFlag, err)
+			}
+		})
 	}
 }
 
@@ -310,6 +362,229 @@ func TestBuildSecureControlRequiresObserverCredential(t *testing.T) {
 		runNamespace:  "runs",
 	}); err == nil || !strings.Contains(err.Error(), "observer") {
 		t.Fatalf("secure mode without an admission-read identity must fail startup, got %v", err)
+	}
+}
+
+func TestResolveOperatorForgeCredential(t *testing.T) {
+	tests := []struct {
+		name           string
+		observerSecret string
+		observerKey    string
+		githubSecret   string
+		githubKey      string
+		gitSecret      string
+		gitKey         string
+		wantSecret     string
+		wantKey        string
+		wantErr        bool
+	}{
+		{
+			name:           "observer seam wins over legacy flags",
+			observerSecret: "forge-creds",
+			observerKey:    "api",
+			githubSecret:   "courier-github-api",
+			githubKey:      "token",
+			gitSecret:      "courier-github",
+			gitKey:         "git-token",
+			wantSecret:     "forge-creds",
+			wantKey:        "api",
+		},
+		{
+			name:           "observer secret without key falls through the token-key chain",
+			observerSecret: "forge-creds",
+			githubKey:      "token",
+			wantSecret:     "forge-creds",
+			wantKey:        "token",
+		},
+		{
+			name:         "no observer seam keeps the legacy API fallback",
+			githubSecret: "courier-github-api",
+			gitSecret:    "courier-github",
+			wantSecret:   "courier-github-api",
+		},
+		{
+			name:       "no observer or API secret falls back to the git secret",
+			gitSecret:  "courier-github",
+			gitKey:     "git-token",
+			wantSecret: "courier-github",
+			wantKey:    "git-token",
+		},
+		{
+			name: "nothing configured stays empty",
+		},
+		{
+			name:         "observer key without observer secret is rejected",
+			observerKey:  "api",
+			githubSecret: "courier-github-api",
+			githubKey:    "token",
+			gitSecret:    "courier-github",
+			wantErr:      true,
+		},
+		{
+			name:           "whitespace-only seam falls through",
+			observerSecret: "  ",
+			gitSecret:      "courier-github",
+			wantSecret:     "courier-github",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			secret, key, err := resolveOperatorForgeCredential(test.observerSecret, test.observerKey, test.githubSecret, test.githubKey, test.gitSecret, test.gitKey)
+			if test.wantErr {
+				if err == nil {
+					t.Fatal("an observer key without an observer secret must fail startup")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveOperatorForgeCredential: %v", err)
+			}
+			if secret != test.wantSecret || key != test.wantKey {
+				t.Fatalf("resolveOperatorForgeCredential() = (%q, %q), want (%q, %q)", secret, key, test.wantSecret, test.wantKey)
+			}
+		})
+	}
+}
+
+// TestOperatorCredentialSeamResolvesSecureObserver pins the #638 fix at the
+// resolution layer: with the legacy credential flags cleared, the observer
+// seam alone resolves the one upstream credential Secret, and without a seam
+// the legacy fallback is unchanged.
+func TestOperatorCredentialSeamResolvesSecureObserver(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add core scheme: %v", err)
+	}
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "forge-creds", Namespace: "courier-system"},
+			Data:       map[string][]byte{"token": []byte("single-secret-token")},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "courier-github", Namespace: "courier-system"},
+			Data:       map[string][]byte{"token": []byte("legacy-token")},
+		},
+	).Build()
+	ctx := context.Background()
+
+	secret, key, err := resolveOperatorForgeCredential("forge-creds", "", "", "", "", "")
+	if err != nil {
+		t.Fatalf("resolveOperatorForgeCredential: %v", err)
+	}
+	token, err := loadGitHubToken(ctx, reader, "courier-system", secret, key)
+	if err != nil {
+		t.Fatalf("loadGitHubToken: %v", err)
+	}
+	if token != "single-secret-token" {
+		t.Fatalf("seam credential = %q, want the single upstream credential", token)
+	}
+	observer, err := githubObserver(ctx, reader, "courier-system", secret, key, nil)
+	if err != nil {
+		t.Fatalf("githubObserver: %v", err)
+	}
+	if observer == nil {
+		t.Fatal("clearing the legacy credential flags left secure mode without an observer credential")
+	}
+
+	secret, key, err = resolveOperatorForgeCredential("", "", "", "", "courier-github", "")
+	if err != nil {
+		t.Fatalf("resolveOperatorForgeCredential legacy fallback: %v", err)
+	}
+	token, err = loadGitHubToken(ctx, reader, "courier-system", secret, key)
+	if err != nil {
+		t.Fatalf("loadGitHubToken legacy fallback: %v", err)
+	}
+	if token != "legacy-token" {
+		t.Fatalf("legacy fallback credential = %q, want the legacy Secret token", token)
+	}
+}
+
+// TestBuildSecureControlAcceptsObserverSeamOnSecureSecret pins the issue's
+// desired shape: one Secret is the registration's credential and the trusted
+// observer's credential at once, with no legacy pod exposure.
+func TestBuildSecureControlAcceptsObserverSeamOnSecureSecret(t *testing.T) {
+	registryFile := filepath.Join(t.TempDir(), "providers.json")
+	providers := `{"providers":[{"name":"github","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"forge-creds","key":"token"}},"serves":["*"]}]}`
+	if err := os.WriteFile(registryFile, []byte(providers), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client, err := couriergithub.New("single-secret-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := buildSecureControl(secureConfig{
+		providersFile:  registryFile,
+		runNamespace:   "runs",
+		observer:       couriergithub.Observer{Client: client},
+		observerSecret: "forge-creds",
+		restConfig:     &rest.Config{Host: "https://127.0.0.1:1"},
+	}); err != nil {
+		t.Fatalf("a secure registration's Secret reached by the observer-only seam must start, got %v", err)
+	}
+}
+
+// TestBuildSecureControlRejectsObserverSeamNamedAsPodExposedSecret rejects an
+// observer seam Secret that any pod-injection flag exposes: either legacy
+// credential Secret or the executor environment Secret (#638). The comparison
+// trims both sides, so a padded name cannot slip past it.
+func TestBuildSecureControlRejectsObserverSeamNamedAsPodExposedSecret(t *testing.T) {
+	registryFile := filepath.Join(t.TempDir(), "providers.json")
+	providers := `{"providers":[{"name":"github","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"forge-creds","key":"token"}},"serves":["*"]}]}`
+	if err := os.WriteFile(registryFile, []byte(providers), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client, err := couriergithub.New("single-secret-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name           string
+		observerSecret string
+		expose         func(config *secureConfig)
+		wantFlag       string
+	}{
+		{
+			name:           "git",
+			observerSecret: "shared-secret",
+			expose:         func(config *secureConfig) { config.legacyGitSecret = "shared-secret" },
+			wantFlag:       "--git-credential-secret",
+		},
+		{
+			name:           "api",
+			observerSecret: "shared-secret",
+			expose:         func(config *secureConfig) { config.legacyAPISecret = "shared-secret" },
+			wantFlag:       "--github-credential-secret",
+		},
+		{
+			name:           "env",
+			observerSecret: "shared-secret",
+			expose:         func(config *secureConfig) { config.executorEnvSecret = "shared-secret" },
+			wantFlag:       "--executor-environment-secret",
+		},
+		{
+			name:           "padded seam name",
+			observerSecret: "  shared-secret  ",
+			expose:         func(config *secureConfig) { config.executorEnvSecret = "shared-secret" },
+			wantFlag:       "--executor-environment-secret",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config := secureConfig{
+				providersFile:  registryFile,
+				runNamespace:   "runs",
+				observer:       couriergithub.Observer{Client: client},
+				observerSecret: test.observerSecret,
+				restConfig:     &rest.Config{Host: "https://127.0.0.1:1"},
+			}
+			test.expose(&config)
+			_, err := buildSecureControl(config)
+			if err == nil || !strings.Contains(err.Error(), "observer credential Secret") {
+				t.Fatalf("an observer seam that is also pod-injected must fail startup, got %v", err)
+			}
+			if !strings.Contains(err.Error(), test.wantFlag) {
+				t.Fatalf("the overlap error must name the exposing flag %q, got %v", test.wantFlag, err)
+			}
+		})
 	}
 }
 
@@ -571,7 +846,7 @@ func TestGithubObserverCarriesRegistry(t *testing.T) {
 		Data:       map[string][]byte{"token": []byte("operator-read-token")},
 	}).Build()
 
-	observer, err := githubObserver(context.Background(), reader, "courier-system", "courier-github", "", "", "", registry)
+	observer, err := githubObserver(context.Background(), reader, "courier-system", "courier-github", "", registry)
 	if err != nil {
 		t.Fatalf("githubObserver() error = %v", err)
 	}
@@ -758,7 +1033,7 @@ func TestStartupReadsSurfaceDeadlineErrors(t *testing.T) {
 	t.Run("GitHub observer read", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 		defer cancel()
-		_, err := githubObserver(ctx, reader, "courier-system", "courier-github", "", "", "", nil)
+		_, err := githubObserver(ctx, reader, "courier-system", "courier-github", "", nil)
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("githubObserver() error = %v, want a deadline-exceeded error", err)
 		}

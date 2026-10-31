@@ -2684,10 +2684,19 @@ provider read — and to stay distinct from the base, and it requires the
 persisted `workRef` to equal
 `branch.ResolveGoalBranch(canonicalSpecRepo, spec.workItemID)`, the same pure
 derivation admission uses, so a policy describing another branch is corruption.
-A contribution records no source-owned work item, so any source-issue or
-criterion pin, and any PR number or head anchor, fails the binding: the broker's
-discovery-based PR idempotency owns PR identity at publication. The work tip is
-either absent or a recorded adoption tip, never both.
+The persisted base ref is the ref the admission carried: secure admission
+resolves the contribution's execution input through the owning source adapter —
+the same decode the launch paths render the coordinator goal from — and pins
+that admitted ref, with its observed tip, instead of the base repository's
+default branch, so the goal the coordinator states, the pinned admission
+policy, and the broker's publication guards all name one base for every
+admitted value (#653). An admitted ref the base repository does not carry is
+immutable-spec misdirection, so admission fails closed to a human rather than
+pinning a substitute branch. A contribution records no source-owned work item,
+so any source-issue or criterion pin, and any PR number or head anchor, fails
+the binding: the broker's discovery-based PR idempotency owns PR identity at
+publication. The work tip is either absent or a recorded adoption tip, never
+both.
 
 ### Contribution execution bridge
 A `contribute` run carries no issue or pull-request number: its admitted
@@ -2720,10 +2729,11 @@ provisioned, rather than launching a coordinator with no objective. Reaching no
 owning adapter at all (no registry wired, no adapter registered under the run's
 source, a source that supplies no contribution surface) stays an ordinary
 retryable launch failure, because a later deployment can wire it. A contribution
-pins no acceptance criteria, so its goal
-carries no criterion-evidence grammar, and the base ref it states is task
-context only: publication stays bound to the base the broker's persisted policy
-pins (`PolicyFromRun`), which no model output can move.
+pins no acceptance criteria, so its goal carries no criterion-evidence
+grammar, and the base ref it states is the same ref publication pins: secure
+admission resolves the identical execution input through the owning adapter
+and pins that ref into the persisted policy (`PolicyFromRun`), which no model
+output can move (#653).
 
 ## Terminal retention and closed-unmerged PRs
 
@@ -2735,7 +2745,7 @@ pins (`PolicyFromRun`), which no model output can move.
 
 **Closed-unmerged PRs:** A run terminalizes as `NeedsHuman` with a precise reason; no new CRD phase. Today a `Verifying` run whose PR is closed without merge observes an empty `PRObservation` and transitions to `NeedsHuman` (#146); the gap is a PR closed after the run already settled `AwaitingReview`, which is never observed. The slow, bounded world observation added for #250 (merged -> `Done`) classifies the run's exact recorded PR identity as: merged -> `Done` (existing resolve + reap); open -> stay `AwaitingReview`; closed without merge -> `NeedsHuman` with a new `PullRequestClosedUnmerged` condition (`Status=True`, reason `ClosedUnmerged`) whose message carries the recorded PR identity, under the existing needs-human source policy (a `blocked` lifecycle report; the source parks the item and owns retry/escalation); absent, ambiguous, or a transient forge error -> no transition, stay `AwaitingReview`, and retry the observation later. A missing or unreadable PR is never treated as closed. The observation's slow cadence is durable: the `courier.misospace.dev/merge-observed-at` annotation on the run records when the recorded pull request was last read, and every wake before that cadence has passed skips the forge read entirely — whatever caused the wake, including a wake the run's own duties produce. The marker is stamped only on the paths that leave the run in `AwaitingReview`; a run that transitions to `Done` or `NeedsHuman` leaves the observation behind. The `NeedsHuman` transition publishes a `blocked` source lifecycle, and the per-phase `courier.misospace.dev/needs-human-at` annotation is stamped by the reaper on the first reap-eligible reconcile after that report settles (not derived from the original `FinishedAt`), so the seven-day inspection window starts at the operator-visible close event. No new CRD phase: `Done` would falsely attest shipped work, and a bespoke `Closed` phase is unnecessary because an existing non-successful phase already covers it. Implementation hook (#277): the `AwaitingReview` observation branch reads the run's exact recorded pull request through the configured forge `read-pull-request` capability (`PullRequestReader` / `forge.PullRequest`, the same #250 seam), where `State` distinguishes a closed pull request from an open or absent one; no `PRObservation` signal is needed, because the `Verifying` path already maps a missing pull request to `NeedsHuman`.
 
-**Deletion gates:** A terminal run is deleted only when all hold: (a) phase is `Done` (existing path) or `Failed`/`NeedsHuman` past its per-phase annotation window; (b) the lifecycle report has reached a **positive, settled state** — the run carries a `LifecycleReported` condition with `Status=True` and a permitted reason (`Published`, `Superseded`, or `PermanentRefusal` — the only reasons the condition's `Status=True` carries; `Accepted` belongs to the separate `LifecycleReportSupported` capability condition); a missing, `Unknown`, or `False` condition does **not** satisfy this gate, because a legacy, partially-upgraded, or corrupted terminal CoderRun with no published/superseded/permanently-refused report proof must not be deleted (it is the only durable retry intent and a transient `Unknown` does not prove success); a superseded report means a newer generation owns the item and the older run is reclaimable; a permanently-refused report means the source proved it will never accept this report (closed target, moved ownership, or a refused worker identity), so holding the run retries nothing and it too is reclaimable; for that settlement it is the source's own durable state, not a landed park transition, that keeps the identity from being re-offered; (c) the source report reached settlement: for `NeedsHuman` and non-CI `Failed` that is a `blocked` transition, which parks the source item so `source.Runner.Poll` will not re-offer it; for `Done`, `Resolve` (source `done`) precedes the clock; (d) owned resources: evidence Secrets and coordinator pods are owner-referenced to the run and are garbage-collected with it, so the retention window is also the evidence inspection window; (e) no park close is outstanding: a run that still owes the source its close is not deleted, because deletion would drop the owed close with the object, so its retention window starts only once the close has landed; (f) no explicit retry is outstanding: a run carrying a `Requested` retry record is not deleted, because deletion would drop the durable requeue intent with the object, and once the record settles the ordinary window applies unchanged — the window is never restarted or extended (see "Operator-initiated explicit retry"). Operators who need longer raise the TTL before it expires or retrieve evidence out-of-band (label `courier.misospace.dev/evidence=<run>`). No separate evidence clock or sweeper is added; this aligns #198/#200/#202 without duplicating them. The implementation must include regression tests for the legacy missing-condition case, the `Unknown` capability case, the still-`False` (pending) case, the `True-Published` case, the `True-Superseded` case, and the controller-restart case (gate evaluation is derived from the condition and the per-phase annotation on the object, not process memory).
+**Deletion gates:** A terminal run is deleted only when all hold: (a) phase is `Done` (existing path) or `Failed`/`NeedsHuman` past its per-phase annotation window; (b) the lifecycle report has reached a **positive, settled state** — the run carries a `LifecycleReported` condition with `Status=True` and a permitted reason (`Published`, `Superseded`, or `PermanentRefusal` — the only reasons the condition's `Status=True` carries; `Accepted` belongs to the separate `LifecycleReportSupported` capability condition); a missing, `Unknown`, or `False` condition does **not** satisfy this gate, because a legacy, partially-upgraded, or corrupted terminal CoderRun with no published/superseded/permanently-refused report proof must not be deleted (it is the only durable retry intent and a transient `Unknown` does not prove success); a superseded report means a newer generation owns the item and the older run is reclaimable; a permanently-refused report means the source proved it will never accept this report (closed target, moved ownership, or a refused worker identity), so holding the run retries nothing and it too is reclaimable; for that settlement it is the source's own durable state, not a landed park transition, that keeps the identity from being re-offered; (c) the source report reached settlement: for `NeedsHuman` and non-CI `Failed` that is a `blocked` transition, which parks the source item so `source.Runner.Poll` will not re-offer it; for `Done`, `Resolve` (source `done`) precedes the clock — except that a `Resolve` refused permanently (the same closed-target or moved-ownership class gate (b) settles reports on) starts the clock too: an identical retry can never succeed, and the run's evidence stays intact through the retention window (#664); (d) owned resources: evidence Secrets and coordinator pods are owner-referenced to the run and are garbage-collected with it, so the retention window is also the evidence inspection window; (e) no park close is outstanding: a run that still owes the source its close is not deleted, because deletion would drop the owed close with the object, so its retention window starts only once the close has landed; (f) no explicit retry is outstanding: a run carrying a `Requested` retry record is not deleted, because deletion would drop the durable requeue intent with the object, and once the record settles the ordinary window applies unchanged — the window is never restarted or extended (see "Operator-initiated explicit retry"). Operators who need longer raise the TTL before it expires or retrieve evidence out-of-band (label `courier.misospace.dev/evidence=<run>`). No separate evidence clock or sweeper is added; this aligns #198/#200/#202 without duplicating them. The implementation must include regression tests for the legacy missing-condition case, the `Unknown` capability case, the still-`False` (pending) case, the `True-Published` case, the `True-Superseded` case, and the controller-restart case (gate evaluation is derived from the condition and the per-phase annotation on the object, not process memory).
 
 **No accidental resubmission:** The runner dedupes only against currently-existing CoderRuns. Reaping a `Failed`/`NeedsHuman` run whose source report is positively settled is safe because the source, not the CoderRun, is the dedupe authority: the blocked report parks the item. If a source later re-offers the same identity (for example a human unblocks it), that is a new, intended dispatch that materializes a fresh CoderRun, not a duplicate of the reaped attempt. Deleting before the report reaches a positive, settled state is forbidden by gate (b). No automatic retry loop is added to fix retention; retry and escalation stay source-owned.
 
@@ -3277,6 +3287,34 @@ only informs.
   holds whatever its lane needs (an Anthropic, OpenAI, or MiniMax token, a
   local endpoint's key, any combination); in the target design the provider key
   belongs to trusted harness control, and workers do not call models directly.
+- **The operator's own forge identity is a separate seam from pod credential
+  injection.** The operator reads forge state outside any model-controlled pod —
+  post-review PR state, existing-PR head resolution, Dispatch PR state, merge
+  observation, admission-time provider reads, and the label source's discovery
+  and settlement — with one credential pair settled once at startup. The
+  observer-only seam `--observer-credential-secret`/`--observer-credential-key`
+  wins over the legacy pod-injection flags `--github-credential-secret` and
+  `--git-credential-secret` (with the matching token-key fallbacks), and the
+  seam is atomic: a key without a seam Secret is a startup error, never a
+  silent re-key of a legacy Secret. The seam is never rendered into
+  `executor.PodConfig`, so a Secret named only there is structurally absent
+  from the pod injection that reaches model-controlled coordinator pods: those
+  pods take every Secret they get from the legacy credential flags and
+  `--executor-environment-secret` alone. (The secure control pod is trusted
+  harness control, not a model-controlled pod, and holds only operator-
+  generated per-run material — the model-gateway key copy, the signing key,
+  and the broker CA — never an upstream forge credential.) Secure mode rejects
+  a seam Secret that any of those flags exposes to a coordinator pod, and the
+  [HARNESS.md](./HARNESS.md) §9 taint rejects any registration referencing a
+  Secret any of them exposes — a credential injected into a model-controlled
+  pod is tainted for secure use. With the seam unset the operator's own
+  identity is the legacy credential Secret: the taint already keeps every
+  registration off it, and §9's migration is what removes it from pod
+  injection; the resolution itself is identical to the legacy chain. A secure
+  deployment therefore binds one Secret to one upstream credential — to the
+  registration and to the operator's own identity — instead of duplicating it
+  into two, and the chart's label-source guard accepts the seam as a
+  credential argument, mirroring the Go rule.
 - The gateway response is untrusted, unbounded input, and trusted control
   bounds both its shape and what it will hold: one SSE line is capped at 1 MiB,
   and per completion the buffered content deltas (8 MiB), the buffered

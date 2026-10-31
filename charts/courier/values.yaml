@@ -59,9 +59,9 @@ dispatch:
 
 # Forge label source (#16): issues carrying the trigger label become
 # resolve-issue runs and pull requests carrying the fix label become fix-pr
-# runs. Discovery and settlement reuse the operator's own GitHub credential
-# Secret (--github-credential-secret or --git-credential-secret); no separate
-# token is configured here.
+# runs. Discovery and settlement reuse the operator's own forge credential
+# Secret (--observer-credential-secret, --github-credential-secret, or
+# --git-credential-secret); no separate token is configured here.
 labelSource:
   enabled: false
   # -- owner/repo list the label source discovers work in.
@@ -248,6 +248,17 @@ controllers:
         #                               empty falls back to --git-credential-secret
         #   --github-token-key          Optional key for the GitHub API token;
         #                               empty falls back to --git-token-key or token
+        #   --observer-credential-secret
+        #                               Secret carrying the trusted operator's
+        #                               own forge credential; wins over
+        #                               --github-credential-secret and
+        #                               --git-credential-secret for operator
+        #                               observation and is never injected into
+        #                               coordinator pods (#638)
+        #   --observer-credential-key   Optional key within it; requires
+        #                               --observer-credential-secret; empty
+        #                               falls back to --github-token-key,
+        #                               --git-token-key, or token
         #   --executor-environment-secret
         #                               Secret exposed to coordinator pods for
         #                               model/provider environment

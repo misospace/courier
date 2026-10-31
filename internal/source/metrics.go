@@ -8,9 +8,10 @@ import (
 )
 
 // DiscoverySkipReasons is the closed vocabulary of reasons the runner drops an
-// offered item during validation. Tests reference this slice as the single
-// source of truth.
-var DiscoverySkipReasons = []string{"missing-id", "unsupported-mode", "invalid-ref"}
+// offered item. The validation reasons name malformed items; duplicate names
+// items absorbed by same-identity dedupe against a retained run. Tests
+// reference this slice as the single source of truth.
+var DiscoverySkipReasons = []string{"missing-id", "unsupported-mode", "invalid-ref", "duplicate"}
 
 // DiscoveryPauseReasons is the closed vocabulary of reasons a poll is skipped
 // before the source is called. capacity-cooldown was added by #327 after the
@@ -67,7 +68,7 @@ func NewDiscoveryMetrics(reg prometheus.Registerer) *DiscoveryMetrics {
 		}, []string{"source", "lane"}),
 		skipped: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "courier_source_discovery_skipped_total",
-			Help: "Items dropped by runner validation, by reason.",
+			Help: "Items dropped by runner validation or by same-identity dedupe, by reason.",
 		}, []string{"source", "lane", "reason"}),
 		materialized: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "courier_source_items_materialized_total",

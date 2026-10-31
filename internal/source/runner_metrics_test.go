@@ -407,11 +407,17 @@ func TestRunnerMetricsOfferedSkippedAndMaterialized(t *testing.T) {
 	if v, ok := counterValueIfPresent(t, reg, "courier_source_items_offered_total", labels); !ok || v != 5 {
 		t.Fatalf("offered = (%v, %v), want (5, true): offered counts pre-validation items", v, ok)
 	}
-	for _, reason := range DiscoverySkipReasons {
+	// The fixture never dedupes, so only the validation reasons fire. The
+	// duplicate reason belongs to the dedupe path and its series stays
+	// absent here.
+	for _, reason := range []string{"missing-id", "unsupported-mode", "invalid-ref"} {
 		reasonLabels := map[string]string{"source": "test", "lane": "local", "reason": reason}
 		if v, ok := counterValueIfPresent(t, reg, "courier_source_discovery_skipped_total", reasonLabels); !ok || v != 1 {
 			t.Fatalf("skipped[%s] = (%v, %v), want (1, true)", reason, v, ok)
 		}
+	}
+	if _, ok := counterValueIfPresent(t, reg, "courier_source_discovery_skipped_total", map[string]string{"source": "test", "lane": "local", "reason": "duplicate"}); ok {
+		t.Fatal("skipped[duplicate] series present, want absent: this fixture never dedupes")
 	}
 	if v, ok := counterValueIfPresent(t, reg, "courier_source_items_materialized_total", labels); !ok || v != 2 {
 		t.Fatalf("materialized = (%v, %v), want (2, true)", v, ok)
