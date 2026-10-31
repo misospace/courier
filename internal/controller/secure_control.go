@@ -431,6 +431,23 @@ func (s *SecureControl) ResolveAdmission(ctx context.Context, run *courier.Coder
 		policy.HeadAnchorOID = pr.HeadSHA
 		policy.PRNumber = pr.Number
 	case courier.ModeContribute:
+		// The admitted objective and base ref live in the source's own
+		// durable context, and the coordinator goal is rendered from the
+		// same decode (#624). Publication must pin that admitted ref, not
+		// the base repository's default branch: the broker refuses any
+		// pull request whose base differs from the pinned value, so a
+		// policy pinned to the default while the goal states another ref
+		// would surface the mismatch only at publication, after the run
+		// has done the work (#653). Admission resolves the execution input
+		// through the owning adapter here and pins the ref it carries. A
+		// context the owning source refuses is immutable spec data, so its
+		// refusal keeps the permanent ContributionContext classification;
+		// a failure to reach an owning adapter at all stays retryable,
+		// exactly as the launch paths treat it.
+		contribution, err := launchContribution(s.Sources, run)
+		if err != nil {
+			return nil, nil, err
+		}
 		// The approved fork's canonical identity is resolved through the
 		// operator's read identity, exactly like the base. Write authority
 		// is never verified here: admission establishes it from
@@ -454,16 +471,18 @@ func (s *SecureControl) ResolveAdmission(ctx context.Context, run *courier.Coder
 				"the approved fork %q is the base repository; a contribution publishes from a distinct head",
 				workRepo.Canonical)
 		}
-		// The base ref is not a spec field for a contribution: the base
-		// repository's default branch is resolved read-only here and pinned
-		// with its observed tip, which publication later rechecks.
-		base, err := admission.Policy.ReadRef(ctx, canonical, canonical.DefaultRef)
+		// The admitted base ref is resolved read-only through the
+		// operator's read identity and pinned with its observed tip, which
+		// publication later rechecks. A ref the admission named but the
+		// base repository does not carry is immutable-spec misdirection no
+		// retry can fix, so it fails closed.
+		base, err := admission.Policy.ReadRef(ctx, canonical, contribution.BaseRef)
 		if err != nil {
 			return nil, nil, transientOrNeedsHuman(err, "ProviderRead", "base ref read for %q failed: %v", canonical.Canonical, err)
 		}
 		if !base.Exists || base.OID == "" {
 			return nil, nil, secureNeedsHuman("ProviderRead",
-				"base ref %q of %q does not exist", canonical.DefaultRef, canonical.Canonical)
+				"admitted base ref %q of %q does not exist", contribution.BaseRef, canonical.Canonical)
 		}
 		workRef := branch.ResolveGoalBranch(canonical.Canonical, run.Spec.WorkItemID)
 		if workRef == "" {
@@ -518,7 +537,7 @@ func (s *SecureControl) ResolveAdmission(ctx context.Context, run *courier.Coder
 		if err != nil {
 			return nil, nil, transientOrNeedsHuman(err, "ProviderRead", "work ref read for %q failed: %v", workRef, err)
 		}
-		policy.BaseRef = canonical.DefaultRef
+		policy.BaseRef = contribution.BaseRef
 		policy.BaseOID = base.OID
 		policy.WorkRepo = workRepo.Canonical
 		policy.WorkRef = workRef
