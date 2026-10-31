@@ -112,6 +112,31 @@ type dedupeOwner struct {
 	pr    string
 }
 
+// dedupeOwnerOf projects the retained run a dedupe key resolved to onto the
+// posture the re-offer log tracks.
+func dedupeOwnerOf(run *courierv1alpha1.CoderRun) dedupeOwner {
+	return dedupeOwner{run: run.Name, phase: string(run.Status.Phase), pr: run.Status.PR}
+}
+
+// retainOwner resolves one retained owner per dedupe key deterministically:
+// several retained runs can share a key when distinct raw item IDs normalize
+// to one adapter work identity, and whichever run the list happened to order
+// last would name an obsolete predecessor in the re-offer log and track the
+// wrong posture. Newest creation wins and name breaks ties, matching
+// settledPredecessor: the newest run is the attempt that currently owns the
+// identity.
+func retainOwner(owners map[string]*courierv1alpha1.CoderRun, key string, run *courierv1alpha1.CoderRun) {
+	prev, ok := owners[key]
+	if !ok {
+		owners[key] = run
+		return
+	}
+	if run.CreationTimestamp.Time.After(prev.CreationTimestamp.Time) ||
+		(run.CreationTimestamp.Time.Equal(prev.CreationTimestamp.Time) && run.Name > prev.Name) {
+		owners[key] = run
+	}
+}
+
 func (r *Runner) clock() time.Time {
 	if r.Now != nil {
 		return r.Now()
@@ -365,8 +390,8 @@ func (r *Runner) Poll(ctx context.Context) error {
 	}
 	items = validItems
 
-	existing := make(map[string]dedupeOwner, len(runs.Items))
-	legacyIdentities := make(map[string]dedupeOwner)
+	existing := make(map[string]*courierv1alpha1.CoderRun, len(runs.Items))
+	legacyIdentities := make(map[string]*courierv1alpha1.CoderRun)
 	for i := range runs.Items {
 		run := &runs.Items[i]
 		if strings.TrimSpace(run.Spec.WorkItemID) == "" {
@@ -374,17 +399,16 @@ func (r *Runner) Poll(ctx context.Context) error {
 		}
 		identity := r.identity(run.Spec.WorkItemID)
 		legacyBinding := run.Spec.Source == "dispatch" || strings.HasPrefix(run.Spec.Source, "dispatch:")
-		owner := dedupeOwner{run: run.Name, phase: string(run.Status.Phase), pr: run.Status.PR}
 		if run.Spec.Source == r.Config.Source {
 			if !settledCapacityExhaustion(run) {
-				existing[workKey(run.Spec.Source, identity)] = owner
-				existing[workKey(run.Spec.Source, run.Spec.WorkItemID)] = owner
+				retainOwner(existing, workKey(run.Spec.Source, identity), run)
+				retainOwner(existing, workKey(run.Spec.Source, run.Spec.WorkItemID), run)
 			}
 		}
 		// Previous Dispatch bindings encoded queue lanes in Source. Keep those
 		// retained runs from being rematerialized during the identity rollout.
 		if legacyBinding && !settledCapacityExhaustion(run) {
-			legacyIdentities[identity] = owner
+			retainOwner(legacyIdentities, identity, run)
 		}
 	}
 
@@ -427,11 +451,11 @@ func (r *Runner) Poll(ctx context.Context) error {
 			// the repeats, so a source re-offering work a prior run already
 			// concluded is visible at default verbosity (#665).
 			r.Metrics.IncSkipped(r.Config.Source, r.Config.LaneProfile, "duplicate")
-			owner := legacyIdentities[itemIdentity]
-			if hasExistingRun {
-				owner = existing[key]
+			ownerRun := existing[key]
+			if !hasExistingRun {
+				ownerRun = legacyIdentities[itemIdentity]
 			}
-			r.observeDedupe(ctx, key, item.ID, owner, dedupeSeen)
+			r.observeDedupe(ctx, key, item.ID, dedupeOwnerOf(ownerRun), dedupeSeen)
 			continue
 		}
 		if _, ok := seen[key]; ok {
@@ -481,7 +505,7 @@ func (r *Runner) Poll(ctx context.Context) error {
 		pendingAcks = append(pendingAcks, item)
 		// The created run has no phase or PR yet; it re-logs on its first
 		// phase or PR change, which is the posture change that matters.
-		existing[key] = dedupeOwner{run: run.Name}
+		existing[key] = run
 	}
 	return nil
 }

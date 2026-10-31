@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
@@ -285,5 +286,118 @@ func TestRunnerPollReOfferRelogsWhenOwnerPostureChanges(t *testing.T) {
 	}
 	if got, _ := lines[1].field("retainedPhase"); got != "Done" {
 		t.Fatalf("second line retainedPhase = %v, want Done", got)
+	}
+}
+
+// TestRetainOwnerKeepsNewestRun pins the deterministic owner selection
+// (#668 review): when several retained runs share a dedupe key, the newest
+// creation wins and name breaks ties, whichever order the runs arrive in —
+// never the run the list happened to order last.
+func TestRetainOwnerKeepsNewestRun(t *testing.T) {
+	older := &courierv1alpha1.CoderRun{ObjectMeta: metav1.ObjectMeta{
+		Name:              "courier-older",
+		CreationTimestamp: metav1.NewTime(time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)),
+	}}
+	newer := &courierv1alpha1.CoderRun{ObjectMeta: metav1.ObjectMeta{
+		Name:              "courier-newer",
+		CreationTimestamp: metav1.NewTime(time.Date(2026, 10, 31, 0, 1, 0, 0, time.UTC)),
+	}}
+	for name, order := range map[string][2]*courierv1alpha1.CoderRun{
+		"older first": {older, newer},
+		"newer first": {newer, older},
+	} {
+		t.Run(name, func(t *testing.T) {
+			owners := map[string]*courierv1alpha1.CoderRun{}
+			retainOwner(owners, "key", order[0])
+			retainOwner(owners, "key", order[1])
+			if got := owners["key"]; got != newer {
+				t.Fatalf("owner = %v, want the newest run regardless of arrival order", got.Name)
+			}
+		})
+	}
+	t.Run("equal timestamps break ties by name", func(t *testing.T) {
+		same := metav1.NewTime(time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC))
+		early := &courierv1alpha1.CoderRun{ObjectMeta: metav1.ObjectMeta{Name: "courier-a", CreationTimestamp: same}}
+		late := &courierv1alpha1.CoderRun{ObjectMeta: metav1.ObjectMeta{Name: "courier-b", CreationTimestamp: same}}
+		for name, order := range map[string][2]*courierv1alpha1.CoderRun{
+			"lesser name first":  {late, early},
+			"greater name first": {early, late},
+		} {
+			t.Run(name, func(t *testing.T) {
+				owners := map[string]*courierv1alpha1.CoderRun{}
+				retainOwner(owners, "key", order[0])
+				retainOwner(owners, "key", order[1])
+				if got := owners["key"]; got != late {
+					t.Fatalf("owner = %v, want the lexicographically greater name %q", got.Name, late.Name)
+				}
+			})
+		}
+	})
+}
+
+// TestRunnerPollReOfferNamesNewestOwnerWhenIdentitiesCollide pins the
+// owner-selection contract at the poll level (#668 review): two retained runs
+// whose distinct raw item IDs normalize to one adapter work identity share a
+// dedupe key, and the re-offer log names the newest run — the attempt that
+// currently owns the identity — with its posture, so the log can never point
+// an operator at an obsolete predecessor.
+func TestRunnerPollReOfferNamesNewestOwnerWhenIdentitiesCollide(t *testing.T) {
+	newer := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "courier-newer",
+			Namespace:         "courier",
+			CreationTimestamp: metav1.NewTime(time.Date(2026, 10, 31, 0, 1, 0, 0, time.UTC)),
+		},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode:       courierv1alpha1.ModeResolveIssue,
+			Source:     "test",
+			WorkItemID: "attempt-2",
+			Repo:       "acme/widgets",
+			Ref:        1,
+			Lane:       "local",
+		},
+		Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseAwaitingReview},
+	}
+	older := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "courier-older",
+			Namespace:         "courier",
+			CreationTimestamp: metav1.NewTime(time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)),
+		},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode:       courierv1alpha1.ModeResolveIssue,
+			Source:     "test",
+			WorkItemID: "attempt-1",
+			Repo:       "acme/widgets",
+			Ref:        1,
+			Lane:       "local",
+		},
+		Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseDone},
+	}
+	lane := testLane()
+	lane.Spec.Concurrency = 2
+	kubeClient := newTestClient(t, lane, older, newer)
+	adapter := &mappedIdentityAdapter{testAdapter: testAdapter{
+		items: []WorkItem{{ID: "attempt-2", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1}},
+	}, identity: "shared"}
+	reg := prometheus.NewRegistry()
+	runner := newInstrumentedRunner(t, reg, kubeClient, adapter, RunnerConfig{Source: "test", LaneProfile: "local", Namespace: "courier"})
+	sink := &recordingSink{verbosity: 0}
+	ctx := crlog.IntoContext(context.Background(), logr.New(sink))
+	if err := runner.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := counterValueIfPresent(t, reg, "courier_source_discovery_skipped_total", map[string]string{"source": "test", "lane": "local", "reason": "duplicate"}); !ok || v != 1 {
+		t.Fatalf("skipped[duplicate] = (%v, %v), want (1, true)", v, ok)
+	}
+	lines := sink.lines()
+	if len(lines) != 1 {
+		t.Fatalf("recorded lines = %d, want exactly 1: %#v", len(lines), lines)
+	}
+	if got, _ := lines[0].field("retainedRun"); got != "courier-newer" {
+		t.Fatalf("retainedRun = %v, want the newest run courier-newer, not the list-order survivor", got)
+	}
+	if got, _ := lines[0].field("retainedPhase"); got != "AwaitingReview" {
+		t.Fatalf("retainedPhase = %v, want the newest run's phase AwaitingReview", got)
 	}
 }
