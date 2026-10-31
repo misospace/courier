@@ -2296,7 +2296,8 @@ error is not gated at all, because the design classifies it as transient.
 A permanent misconfiguration is only a verdict if the launch path can tell it
 from a transient one, and the deployment's own facts are what tell it: the
 operator's provisioning grants — the namespaced creates and deletes the secure
-topology needs, and the cluster-scoped grants the proof itself uses — and the
+topology needs, the reads the secure launch path makes on its own behalf, and
+the cluster-scoped grants the proof itself uses — and the
 dedicated run namespace's restricted Pod Security label are proven before the
 operator creates anything, so a missing one of those grants or an unlabelled
 namespace arrives as the `OperatorRBAC` or `PodSecurity` verdict the gate
@@ -2318,10 +2319,23 @@ cluster would refuse. The SelfSubjectAccessReview the operator asks about
 itself is a canary rather than a proof on a stock cluster, where the API
 server's default `system:basic-user` binding already allows that create to
 every authenticated subject. The proof covers what the secure topology's
-creation needs, not every grant the operator holds: the reads the secure path
-makes outside it — the lane profile, the signing secret, the topology pods,
-and the cluster's API server and DNS services — are outside the proof, so a
-deployment missing one of those still surfaces as an ordinary refusal.
+creation needs plus the reads the secure launch path makes on its own behalf:
+the three topology pods it reads to decide whether a replacement is due, the
+run's lane profile, the run's signing secret, the credential source secret in
+the operator's own namespace — a review asked in the namespace the read
+targets, since a grant scoped to one namespace never authorizes a request in
+another — and the services the live probes read for their targets (the API
+server in `default`, cluster DNS in `kube-system`, and the run's broker
+service in the run namespace). Each of those reviews mirrors the request it
+stands for, name included where the request names an object; the
+credential-source read is the one exception, reviewed unnamed because the
+secret's name comes from the run's forge registration, and an unnamed review
+can only be harder to satisfy than the named request, so the exception fails
+closed. A review proves a grant, not an object: a missing signing secret or an
+absent lane profile still arrives as an ordinary error, because requeueing can
+supply what a grant cannot. The proof also does not reach the reads the
+broker and control binaries make after launch — those rest on the broker's
+own reviewed grant set and the namespace/RBAC boundary assumption.
 The secure round is fenced before it terminalizes: a resumed launch
 reaches the launcher with a live worker and a credentialed broker, and a
 `NeedsHuman` run is no longer observed, so a fence deferred past that reconcile

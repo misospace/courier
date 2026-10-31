@@ -8,22 +8,29 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	fakek8s "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+
+	courier "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/topology"
 )
 
-// TestCheckOperatorAccessReviewScoping pins the namespace each of the
-// operator's own access reviews carries.
+// TestCheckOperatorAccessReviewScoping pins the namespace and name each of
+// the operator's own access reviews carries.
 //
-// The operator's provisioning grants are proven before it creates anything, so
-// a review that credited a grant the real request would be refused by turns a
-// missing cluster grant into a run that launches and then fails. The
-// cluster-scoped requests — the broker's ClusterRoleBinding create, the node
-// list, the run namespace read, and the two access-review creates — are
-// therefore reviewed with no namespace: a namespaced Role can satisfy a
-// namespaced review of a cluster-scoped resource, and the RBAC authorizer
-// evaluates the attributes literally, so only an empty namespace keeps the
-// decision to cluster-wide grants (#650).
+// The operator's grants are proven before it creates anything, so a review
+// that credited a grant the real request would be refused by either turns a
+// missing cluster grant into a run that launches and then fails, or hides a
+// missing namespaced grant behind a namespace the request does not target.
+// Each review therefore mirrors the request it stands for: the cluster-scoped
+// requests — the broker's ClusterRoleBinding create, the node list, the run
+// namespace read, and the two access-review creates — carry no namespace, so
+// a namespaced Role cannot satisfy them (#650), and every namespaced request
+// is reviewed in the namespace it targets, including the reads the secure
+// launch path makes outside the run namespace (#655).
 func TestCheckOperatorAccessReviewScoping(t *testing.T) {
-	const runNamespace = "courier-run"
+	const (
+		runNamespace      = "courier-run"
+		operatorNamespace = "courier-system"
+	)
 
 	var reviews []authorizationv1.ResourceAttributes
 	clientset := fakek8s.NewSimpleClientset()
@@ -35,8 +42,13 @@ func TestCheckOperatorAccessReviewScoping(t *testing.T) {
 		}, nil
 	})
 
-	control := &SecureControl{Config: SecureConfig{RunNamespace: runNamespace, Kubernetes: clientset}}
-	if err := control.checkOperatorAccess(context.Background()); err != nil {
+	run := secureRun("review-scoping")
+	control := &SecureControl{Config: SecureConfig{
+		RunNamespace:      runNamespace,
+		OperatorNamespace: operatorNamespace,
+		Kubernetes:        clientset,
+	}}
+	if err := control.checkOperatorAccess(context.Background(), run); err != nil {
 		t.Fatalf("checkOperatorAccess with every grant allowed = %v, want nil", err)
 	}
 
@@ -59,6 +71,20 @@ func TestCheckOperatorAccessReviewScoping(t *testing.T) {
 		{"", "namespaces", "get", "", ""}:                                         1,
 		{"authorization.k8s.io", "selfsubjectaccessreviews", "create", "", ""}:    1,
 		{"authorization.k8s.io", "subjectaccessreviews", "create", "", ""}:        1,
+		// The launch-path reads (#655): each mirrors a real request at the
+		// scope that request has. topologyPodsExist finds the pods through a
+		// cached run-namespace list, so the list is mirrored alongside the
+		// named gets.
+		{"", "pods", "list", "", runNamespace}:                                           1,
+		{"", "pods", "get", topology.ControlPodName(run.Name), runNamespace}:             1,
+		{"", "pods", "get", topology.WorkerPodName(run.Name), runNamespace}:              1,
+		{"", "pods", "get", topology.BrokerPodName(run.Name), runNamespace}:              1,
+		{courier.GroupVersion.Group, "laneprofiles", "get", run.Spec.Lane, runNamespace}: 1,
+		{"", "secrets", "get", topology.SigningSecretName(run.Name), runNamespace}:       1,
+		{"", "secrets", "get", "", operatorNamespace}:                                    1,
+		{"", "services", "get", "kubernetes", "default"}:                                 1,
+		{"", "services", "get", "kube-dns", "kube-system"}:                               1,
+		{"", "services", "get", topology.BrokerServiceName(run.Name), runNamespace}:      1,
 	}
 	for _, r := range reviews {
 		k := key{r.Group, r.Resource, r.Verb, r.Name, r.Namespace}
@@ -75,12 +101,12 @@ func TestCheckOperatorAccessReviewScoping(t *testing.T) {
 	}
 	for k, count := range want {
 		if count != 0 {
-			t.Errorf("review %s/%s %s in namespace %q issued %d times, want once", k.group, k.resource, k.verb, k.namespace, 1-count)
+			t.Errorf("review %s/%s %s (name %q) in namespace %q issued %d times, want once", k.group, k.resource, k.verb, k.name, k.namespace, 1-count)
 		}
 	}
 
-	// The cluster-scoped resources are never reviewed under the run
-	// namespace: that is the whole defect (#650).
+	// The cluster-scoped resources are never reviewed under a namespace: that
+	// is the whole defect (#650).
 	for _, r := range reviews {
 		switch r.Resource {
 		case "clusterrolebindings", "nodes", "namespaces", "selfsubjectaccessreviews", "subjectaccessreviews":

@@ -12,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	courier "github.com/misospace/courier/api/v1alpha1"
@@ -57,7 +58,11 @@ func startBrokerRBACRun(t *testing.T, name string) (ctrlclient.Client, *SecureCo
 	}
 	control := &SecureControl{
 		Client: c,
-		Config: SecureConfig{RunNamespace: fetched.Namespace, Kubernetes: clientset},
+		Config: SecureConfig{
+			RunNamespace:      fetched.Namespace,
+			OperatorNamespace: "courier-system",
+			Kubernetes:        clientset,
+		},
 	}
 	return c, control, fetched
 }
@@ -135,11 +140,13 @@ func TestPreflightBrokerRBACNamedGrantsEnvtest(t *testing.T) {
 	broker := topology.BrokerSAName(run.Name)
 	eventually(t, func() error {
 		for _, review := range []accessReview{
-			{group: "", resource: "pods", verb: "get", name: topology.ControlPodName(run.Name)},
-			{group: "", resource: "pods", verb: "get", name: topology.WorkerPodName(run.Name)},
-			{group: "", resource: "pods", verb: "get", name: topology.BrokerPodName(run.Name)},
-			{group: "", resource: "pods", verb: "list"},
-			{group: "authentication.k8s.io", resource: "tokenreviews", verb: "create", clusterScoped: true},
+			{group: "", resource: "pods", verb: "get", name: topology.ControlPodName(run.Name), namespace: run.Namespace},
+			{group: "", resource: "pods", verb: "get", name: topology.WorkerPodName(run.Name), namespace: run.Namespace},
+			{group: "", resource: "pods", verb: "get", name: topology.BrokerPodName(run.Name), namespace: run.Namespace},
+			{group: "", resource: "pods", verb: "list", namespace: run.Namespace},
+			// TokenReview creation is cluster-scoped: the review carries no
+			// namespace so only a cluster-wide grant satisfies it (#644).
+			{group: "authentication.k8s.io", resource: "tokenreviews", verb: "create"},
 		} {
 			allowed, err := brokerReadAllowed(control, broker, review)
 			if err != nil {
@@ -156,8 +163,8 @@ func TestPreflightBrokerRBACNamedGrantsEnvtest(t *testing.T) {
 	// a get on an unrelated pod must be denied. These never become allowed, so
 	// they hold once the positive reads above synced.
 	for _, review := range []accessReview{
-		{group: "", resource: "pods", verb: "get"},
-		{group: "", resource: "pods", verb: "get", name: "unrelated-pod"},
+		{group: "", resource: "pods", verb: "get", namespace: run.Namespace},
+		{group: "", resource: "pods", verb: "get", name: "unrelated-pod", namespace: run.Namespace},
 	} {
 		allowed, err := brokerReadAllowed(control, broker, review)
 		if err != nil {
@@ -199,7 +206,7 @@ func TestPreflightBrokerRBACMissingNamedGrantFailsEnvtest(t *testing.T) {
 	// denial there is the name-scope, not a sync lag.
 	eventually(t, func() error {
 		allowed, err := brokerReadAllowed(control, broker,
-			accessReview{group: "", resource: "pods", verb: "get", name: topology.ControlPodName(run.Name)})
+			accessReview{group: "", resource: "pods", verb: "get", name: topology.ControlPodName(run.Name), namespace: run.Namespace})
 		if err != nil {
 			return err
 		}
@@ -209,7 +216,7 @@ func TestPreflightBrokerRBACMissingNamedGrantFailsEnvtest(t *testing.T) {
 		return nil
 	})
 	if allowed, err := brokerReadAllowed(control, broker,
-		accessReview{group: "", resource: "pods", verb: "get", name: topology.WorkerPodName(run.Name)}); err != nil {
+		accessReview{group: "", resource: "pods", verb: "get", name: topology.WorkerPodName(run.Name), namespace: run.Namespace}); err != nil {
 		t.Fatalf("worker read review: %v", err)
 	} else if allowed {
 		t.Fatal("worker pod get must be denied when its name is not in the Role's resourceNames")
@@ -266,7 +273,7 @@ func TestPreflightBrokerRBACTokenReviewNotNamespacedEnvtest(t *testing.T) {
 	// and any failure must be the cluster-scoped TokenReview itself.
 	eventually(t, func() error {
 		allowed, err := brokerReadAllowed(control, broker,
-			accessReview{group: "", resource: "pods", verb: "get", name: topology.ControlPodName(run.Name)})
+			accessReview{group: "", resource: "pods", verb: "get", name: topology.ControlPodName(run.Name), namespace: run.Namespace})
 		if err != nil {
 			return err
 		}
@@ -351,8 +358,8 @@ func TestPreflightOperatorClusterScopedReviewNotNamespacedEnvtest(t *testing.T) 
 	// The production review set, asked for the subject that holds only those
 	// namespaced grants.
 	clusterScoped := []accessReview{}
-	for _, review := range operatorAccessReviews() {
-		if review.clusterScoped {
+	for _, review := range control.operatorAccessReviews(run) {
+		if review.namespace == "" {
 			clusterScoped = append(clusterScoped, review)
 		}
 	}
@@ -365,7 +372,7 @@ func TestPreflightOperatorClusterScopedReviewNotNamespacedEnvtest(t *testing.T) 
 	// scope and not a sync lag.
 	eventually(t, func() error {
 		allowed, err := control.subjectAccessReviewAs(context.Background(), serviceAccount,
-			accessReview{group: "", resource: "nodes", verb: "list"})
+			accessReview{group: "", resource: "nodes", verb: "list", namespace: run.Namespace})
 		if err != nil {
 			return err
 		}
@@ -386,7 +393,7 @@ func TestPreflightOperatorClusterScopedReviewNotNamespacedEnvtest(t *testing.T) 
 		// The same grant, asked in the run namespace, is allowed: the denial
 		// above is about the scope of the grant, not a missing one.
 		namespaced := review
-		namespaced.clusterScoped = false
+		namespaced.namespace = run.Namespace
 		allowed, err = control.subjectAccessReviewAs(context.Background(), serviceAccount, namespaced)
 		if err != nil {
 			t.Fatalf("namespaced %s review: %v", review.resource, err)
@@ -394,5 +401,265 @@ func TestPreflightOperatorClusterScopedReviewNotNamespacedEnvtest(t *testing.T) 
 		if !allowed {
 			t.Errorf("the namespaced %s %s grant must be allowed in namespace %q", review.verb, review.resource, run.Namespace)
 		}
+	}
+}
+
+// TestPreflightOperatorReadGrantsNamespaceScopedEnvtest proves the operator's
+// read-grant coverage against a real RBAC authorizer (#655).
+//
+// The secure launch path reads objects outside the set the provisioning proof
+// covers, and one of those reads targets the operator's own namespace rather
+// than the run's: the credential source secret. A grant that exists in the run
+// namespace must not satisfy a review asked in another namespace — the RBAC
+// authorizer evaluates the namespace literally — so the review for that read
+// is asked where the read happens, and a deployment whose only secrets-get
+// grant is scoped to the run namespace is refused here, with the OperatorRBAC
+// verdict the caller sees, before the operator creates anything.
+//
+// The subject asked here is the operator's own identity as the API server
+// resolves it: the clientset impersonates the provisioning service account,
+// so the SelfSubjectAccessReviews checkOperatorAccess issues are answered for
+// that account's real grants.
+func TestPreflightOperatorReadGrantsNamespaceScopedEnvtest(t *testing.T) {
+	if envtestServer == nil || envtestServer.Config == nil {
+		t.Skip("envtest is not available")
+	}
+	// A dedicated run namespace, so "default" and "kube-system" stay genuinely
+	// outside it: the default envtest run namespace is "default", which would
+	// collapse the cross-namespace distinctions under test.
+	const (
+		runNamespace      = "rbac-operator-reads"
+		operatorNamespace = "courier-system"
+	)
+	c, err := ctrlclient.New(envtestServer.Config, ctrlclient.Options{Scheme: rbacTestScheme()})
+	if err != nil {
+		t.Fatalf("envtest client: %v", err)
+	}
+	if err := c.Create(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: runNamespace}}); err != nil {
+		t.Fatalf("create run namespace: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = c.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: runNamespace}})
+	})
+	if err := c.Create(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: operatorNamespace}}); err != nil {
+		t.Fatalf("create operator namespace: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = c.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: operatorNamespace}})
+	})
+
+	run := envtestRunInNamespace("rbac-operator-reads", "rbac-lane", runNamespace)
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Delete(context.Background(), run) })
+	fetched := &courier.CoderRun{}
+	if err := c.Get(context.Background(), ctrlclient.ObjectKeyFromObject(run), fetched); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	clientset, err := kubernetes.NewForConfig(envtestServer.Config)
+	if err != nil {
+		t.Fatalf("envtest clientset: %v", err)
+	}
+	control := &SecureControl{
+		Client: c,
+		Config: SecureConfig{
+			RunNamespace:      runNamespace,
+			OperatorNamespace: "courier-system",
+			Kubernetes:        clientset,
+		},
+	}
+
+	serviceAccount := run.Name + "-operator-reads"
+	sa := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: serviceAccount},
+	}
+	if err := c.Create(context.Background(), sa); err != nil {
+		t.Fatalf("create service account: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Delete(context.Background(), sa) })
+
+	// The provisioning grants, delivered cluster-wide as the chart's
+	// rbac.roles.operator ClusterRole does — but read grants deliberately
+	// excluded, so the only secrets/services get the subject holds come from
+	// the run-namespace Role below.
+	clusterRole := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{Name: run.Name + "-operator-provisioning"},
+		Rules: []rbacv1.PolicyRule{
+			{APIGroups: []string{""}, Resources: []string{"secrets", "serviceaccounts", "pods", "services"}, Verbs: []string{"create", "delete"}},
+			{APIGroups: []string{"networking.k8s.io"}, Resources: []string{"networkpolicies"}, Verbs: []string{"create", "delete"}},
+			{APIGroups: []string{"rbac.authorization.k8s.io"}, Resources: []string{"roles", "rolebindings", "clusterrolebindings"}, Verbs: []string{"create"}},
+			{APIGroups: []string{""}, Resources: []string{"nodes"}, Verbs: []string{"list"}},
+			{APIGroups: []string{""}, Resources: []string{"namespaces"}, Verbs: []string{"get"}},
+			{APIGroups: []string{"authorization.k8s.io"}, Resources: []string{"selfsubjectaccessreviews", "subjectaccessreviews"}, Verbs: []string{"create"}},
+		},
+	}
+	if err := c.Create(context.Background(), clusterRole); err != nil {
+		t.Fatalf("create provisioning ClusterRole: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Delete(context.Background(), clusterRole) })
+	clusterBinding := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: clusterRole.Name},
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: clusterRole.Name},
+		Subjects: []rbacv1.Subject{{
+			Kind:      rbacv1.ServiceAccountKind,
+			Name:      serviceAccount,
+			Namespace: run.Namespace,
+		}},
+	}
+	if err := c.Create(context.Background(), clusterBinding); err != nil {
+		t.Fatalf("create provisioning ClusterRoleBinding: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Delete(context.Background(), clusterBinding) })
+
+	// The run-namespace read grants: what the secure launch path reads there.
+	readRole := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: run.Name + "-operator-reads"},
+		Rules: []rbacv1.PolicyRule{
+			// pods list mirrors the cached list topologyPodsExist issues; the
+			// gets cover the named reads the proof pins.
+			{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"get", "list"}},
+			{APIGroups: []string{""}, Resources: []string{"secrets", "services"}, Verbs: []string{"get"}},
+			{APIGroups: []string{courier.GroupVersion.Group}, Resources: []string{"laneprofiles"}, Verbs: []string{"get"}},
+		},
+	}
+	if err := c.Create(context.Background(), readRole); err != nil {
+		t.Fatalf("create run-namespace read Role: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Delete(context.Background(), readRole) })
+	readBinding := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: readRole.Name},
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: readRole.Name},
+		Subjects: []rbacv1.Subject{{
+			Kind:      rbacv1.ServiceAccountKind,
+			Name:      serviceAccount,
+			Namespace: run.Namespace,
+		}},
+	}
+	if err := c.Create(context.Background(), readBinding); err != nil {
+		t.Fatalf("create run-namespace read RoleBinding: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Delete(context.Background(), readBinding) })
+
+	// The identity checkOperatorAccess asks about: the service account above,
+	// through impersonation, so the SelfSubjectAccessReviews resolve its real
+	// grants.
+	impCfg := rest.CopyConfig(envtestServer.Config)
+	impCfg.Impersonate = rest.ImpersonationConfig{
+		UserName: "system:serviceaccount:" + run.Namespace + ":" + serviceAccount,
+	}
+	impersonated, err := kubernetes.NewForConfig(impCfg)
+	if err != nil {
+		t.Fatalf("impersonated clientset: %v", err)
+	}
+
+	// Once a run-namespace read is allowed, the Role has propagated through
+	// the API server's RBAC informers, so the cross-namespace denials below
+	// are the scope of the grants and not a sync lag.
+	eventually(t, func() error {
+		allowed, err := control.subjectAccessReviewAs(context.Background(), serviceAccount,
+			accessReview{group: "", resource: "pods", verb: "get", name: topology.ControlPodName(run.Name), namespace: run.Namespace})
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			return errors.New("run-namespace pod read not yet allowed")
+		}
+		return nil
+	})
+
+	// The run-namespace reads are allowed: the grants exist where the reads
+	// target them.
+	for _, review := range []accessReview{
+		{group: "", resource: "pods", verb: "get", name: topology.ControlPodName(run.Name), namespace: run.Namespace},
+		{group: "", resource: "secrets", verb: "get", name: topology.SigningSecretName(run.Name), namespace: run.Namespace},
+		{group: courier.GroupVersion.Group, resource: "laneprofiles", verb: "get", name: run.Spec.Lane, namespace: run.Namespace},
+		{group: "", resource: "services", verb: "get", name: topology.BrokerServiceName(run.Name), namespace: run.Namespace},
+	} {
+		allowed, err := control.subjectAccessReviewAs(context.Background(), serviceAccount, review)
+		if err != nil {
+			t.Fatalf("run-namespace %s %s review: %v", review.verb, review.resource, err)
+		}
+		if !allowed {
+			t.Errorf("the run-namespace %s %s grant must satisfy the review in namespace %q", review.verb, review.resource, review.namespace)
+		}
+	}
+
+	// The same secrets-get grant, asked where the credential source lives and
+	// where the probe targets live, is refused: a grant scoped to one
+	// namespace never authorizes a request in another.
+	for _, review := range []accessReview{
+		{group: "", resource: "secrets", verb: "get", namespace: operatorNamespace},
+		{group: "", resource: "services", verb: "get", name: "kubernetes", namespace: "default"},
+	} {
+		allowed, err := control.subjectAccessReviewAs(context.Background(), serviceAccount, review)
+		if err != nil {
+			t.Fatalf("cross-namespace %s %s review: %v", review.verb, review.resource, err)
+		}
+		if allowed {
+			t.Errorf("the run-namespace %s %s grant must not satisfy the review in namespace %q", review.verb, review.resource, review.namespace)
+		}
+	}
+
+	// The caller's verdict: with the credential-source read unproven, the
+	// operator's own check refuses the deployment with the OperatorRBAC
+	// verdict the retry gate bounds, not an ordinary error.
+	verdict := &SecureControl{Config: SecureConfig{
+		RunNamespace:      control.Config.RunNamespace,
+		OperatorNamespace: operatorNamespace,
+		Kubernetes:        impersonated,
+	}}
+	err = verdict.checkOperatorAccess(context.Background(), run)
+	var permanent *SecureNeedsHumanError
+	if !errors.As(err, &permanent) || permanent.Reason != "OperatorRBAC" {
+		t.Fatalf("checkOperatorAccess error = %v, want an OperatorRBAC verdict", err)
+	}
+	if !strings.Contains(err.Error(), "secrets") {
+		t.Fatalf("checkOperatorAccess error = %v, want the refused secrets read named", err)
+	}
+
+	// Grant the reads where they are asked for — the operator namespace for
+	// the credential source, default and kube-system for the probe targets —
+	// and the same check passes: the denials above were the grant scopes, not
+	// the review set itself.
+	for _, role := range []*rbacv1.Role{
+		{ObjectMeta: metav1.ObjectMeta{Namespace: operatorNamespace, Name: run.Name + "-operator-ns-reads"},
+			Rules: []rbacv1.PolicyRule{{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"get"}}}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: run.Name + "-default-reads"},
+			Rules: []rbacv1.PolicyRule{{APIGroups: []string{""}, Resources: []string{"services"}, Verbs: []string{"get"}}}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: run.Name + "-kube-system-reads"},
+			Rules: []rbacv1.PolicyRule{{APIGroups: []string{""}, Resources: []string{"services"}, Verbs: []string{"get"}}}},
+	} {
+		if err := c.Create(context.Background(), role); err != nil {
+			t.Fatalf("create read Role %s/%s: %v", role.Namespace, role.Name, err)
+		}
+		binding := &rbacv1.RoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Namespace: role.Namespace, Name: role.Name},
+			RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: role.Name},
+			Subjects: []rbacv1.Subject{{
+				Kind:      rbacv1.ServiceAccountKind,
+				Name:      serviceAccount,
+				Namespace: run.Namespace,
+			}},
+		}
+		if err := c.Create(context.Background(), binding); err != nil {
+			t.Fatalf("create read RoleBinding %s/%s: %v", role.Namespace, role.Name, err)
+		}
+		t.Cleanup(func() { _ = c.Delete(context.Background(), role) })
+		t.Cleanup(func() { _ = c.Delete(context.Background(), binding) })
+	}
+	eventually(t, func() error {
+		allowed, err := control.subjectAccessReviewAs(context.Background(), serviceAccount,
+			accessReview{group: "", resource: "secrets", verb: "get", namespace: operatorNamespace})
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			return errors.New("operator-namespace secrets read not yet allowed")
+		}
+		return nil
+	})
+	if err := verdict.checkOperatorAccess(context.Background(), run); err != nil {
+		t.Fatalf("checkOperatorAccess with every launch-path grant allowed = %v, want nil", err)
 	}
 }
