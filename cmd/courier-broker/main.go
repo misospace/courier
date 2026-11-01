@@ -19,7 +19,6 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -534,13 +533,25 @@ func lastCommitValidator(adapter *broker.ForgeAdapter, policy broker.Policy) bro
 	}
 }
 
-func serveTLSHandler(ctx context.Context, handler http.Handler, addr, certFile, keyFile string) error {
-	server := &http.Server{
+// newStatusServer builds the trusted status listener's TLS server. It applies
+// the broker's shared inbound HTTP bounds, so a client that completes the
+// header read and then stalls — or that leaves an established connection idle
+// — cannot pin its connection, goroutine, and file descriptor for the broker
+// pod's entire lifetime.
+func newStatusServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
 		Addr:              addr,
 		Handler:           handler,
 		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS13},
-		ReadHeaderTimeout: 10 * time.Second,
+		ReadHeaderTimeout: broker.InboundReadHeaderTimeout,
+		ReadTimeout:       broker.InboundReadTimeout,
+		WriteTimeout:      broker.InboundWriteTimeout,
+		IdleTimeout:       broker.InboundIdleTimeout,
 	}
+}
+
+func serveTLSHandler(ctx context.Context, handler http.Handler, addr, certFile, keyFile string) error {
+	server := newStatusServer(addr, handler)
 	err := server.ListenAndServeTLS(certFile, keyFile)
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
