@@ -110,6 +110,80 @@ func TestCRDManifestContextSchema(t *testing.T) {
 	}
 }
 
+// TestSkillsWire round-trips the skill selection (#658): a declared list
+// persists under the skills key with its order intact, and an undeclared
+// selection is absent from the wire so absence and an empty list are the same
+// lane on read.
+func TestSkillsWire(t *testing.T) {
+	spec := LaneProfileSpec{
+		Skills: []string{"simple-english", "repo-tour"},
+	}
+	raw, err := json.Marshal(&spec)
+	if err != nil {
+		t.Fatalf("marshal spec: %v", err)
+	}
+	var wire map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatalf("unmarshal spec: %v", err)
+	}
+	skillsRaw, ok := wire["skills"]
+	if !ok {
+		t.Fatalf("spec missing skills: %s", raw)
+	}
+	var got []string
+	if err := json.Unmarshal(skillsRaw, &got); err != nil {
+		t.Fatalf("unmarshal skills: %v", err)
+	}
+	if len(got) != 2 || got[0] != "simple-english" || got[1] != "repo-tour" {
+		t.Fatalf("skills = %#v, want the declared order preserved on the wire", got)
+	}
+	bare, err := json.Marshal(&LaneProfileSpec{})
+	if err != nil {
+		t.Fatalf("marshal bare spec: %v", err)
+	}
+	if strings.Contains(string(bare), "skills") {
+		t.Fatalf("bare spec serializes skills: %s", bare)
+	}
+}
+
+// TestCRDManifestSkillsSchema pins the generated LaneProfile CRD to the
+// skill-selection bounds (#658): at most sixteen approved logical names, each
+// a DNS-1123 label of at most 63 characters, so a lane can never carry a URL
+// or path where the registry expects a name.
+func TestCRDManifestSkillsSchema(t *testing.T) {
+	manifest, err := os.ReadFile("../../charts/courier/crd-manifests/courier.misospace.dev_laneprofiles.yaml")
+	if err != nil {
+		t.Fatalf("read CRD manifest: %v", err)
+	}
+	lines := strings.Split(string(manifest), "\n")
+	var block []string
+	inSkills := false
+	indent := ""
+	for _, line := range lines {
+		if !inSkills {
+			if i := strings.Index(line, "skills:"); i >= 0 {
+				inSkills = true
+				indent = line[:i]
+			}
+			continue
+		}
+		// A sibling key at the same indent ends the skills block.
+		if strings.HasPrefix(line, indent) && len(line) > len(indent) && line[len(indent)] != ' ' {
+			break
+		}
+		block = append(block, line)
+	}
+	if !inSkills {
+		t.Fatal("CRD manifest has no spec.skills schema")
+	}
+	text := strings.Join(block, "\n")
+	for _, want := range []string{"maxItems: 16", "maxLength: 63", "pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", "x-kubernetes-list-type: atomic"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("spec.skills schema missing %q:\n%s", want, text)
+		}
+	}
+}
+
 // TestLaneProfileCIRepairPolicyDeepCopyIndependence pins that a copied lane
 // owns its repair policy: the check names of a copy must not be shared with
 // the lane it was copied from, or a policy edit would rewrite the checks of

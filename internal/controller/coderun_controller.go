@@ -26,6 +26,7 @@ import (
 	"github.com/misospace/courier/internal/broker"
 	"github.com/misospace/courier/internal/executor"
 	courierlog "github.com/misospace/courier/internal/log"
+	"github.com/misospace/courier/internal/skills"
 	"github.com/misospace/courier/internal/source"
 	"github.com/misospace/courier/internal/status"
 	"github.com/misospace/courier/internal/topology"
@@ -753,6 +754,25 @@ func (r *CoderRunReconciler) resumeClaimed(ctx context.Context, run *courierv1al
 			"remaining", remaining.String())
 		return ctrl.Result{RequeueAfter: remaining}, nil
 	}
+	// Every relaunch path funnels through this Claimed-phase resume: infra
+	// loss and broken-topology relaunches both charge the run back to
+	// Claimed, so the persisted skill pin re-verifies here exactly where the
+	// Pending path resolves it — a registry that dropped or drifted a pinned
+	// identity fails closed before any topology is re-provisioned, and a run
+	// retained from before the pin contract keeps its legacy no-skill state:
+	// it was admitted before lanes could select skills, so a post-admission
+	// lane edit cannot add skills to it. A run whose
+	// crash interrupted admission before the policy persisted finishes the
+	// admission here, the same partially-completed work this function exists
+	// to resume.
+	if r.Secure != nil {
+		if err := r.resolvePersistSecurePolicy(ctx, run); err != nil {
+			if permanent := (*SecureNeedsHumanError)(nil); errors.As(err, &permanent) {
+				return r.Secure.transitionNeedsHuman(ctx, run, permanent.Detail)
+			}
+			return ctrl.Result{}, err
+		}
+	}
 	l := log.FromContext(ctx)
 	adapter, item, err := r.adapterAndWorkItem(run)
 	if err != nil {
@@ -830,7 +850,27 @@ func (r *CoderRunReconciler) resumeClaimed(ctx context.Context, run *courierv1al
 // resolvePersistSecurePolicy resolves the run's immutable publication policy
 // once and persists it set-once. A persisted policy is never rewritten: a
 // later reconcile re-verifies it against the live run incarnation instead.
+// The lane's skill selection shares the policy's set-once lifecycle (#658):
+// the pin resolved at admission persists beside the policy in the same status
+// write, and a run whose pin already exists re-verifies it against the
+// deployment registry instead of re-reading the lane.
 func (r *CoderRunReconciler) resolvePersistSecurePolicy(ctx context.Context, run *courierv1alpha1.CoderRun) error {
+	// A pinned skill set re-verifies like every other policy field: a
+	// registry that dropped a pinned name or changed a pinned bundle's
+	// digest means the run's pinned identity is no longer materializable,
+	// and substituting newer content silently would rewrite what the run was
+	// admitted to load. The pin is authoritative, so the lane is never
+	// re-read here: a lane edit after admission never alters a retained
+	// run's resolved skills.
+	if run.Status.SkillPins != nil {
+		pins := make([]skills.Pin, 0, len(run.Status.SkillPins))
+		for _, pin := range run.Status.SkillPins {
+			pins = append(pins, skills.Pin{Name: pin.Name, Digest: pin.Digest})
+		}
+		if err := skills.Verify(r.Secure.Config.Skills, pins); err != nil {
+			return secureNeedsHuman("SkillPinConflict", "%v", err)
+		}
+	}
 	if run.Status.PublicationPolicy != nil {
 		policy, err := VerifyPersistedPolicy(run)
 		if err != nil {
@@ -850,18 +890,62 @@ func (r *CoderRunReconciler) resolvePersistSecurePolicy(ctx context.Context, run
 		if _, _, err := broker.CriterionSetFromPolicy(policy); err != nil {
 			return secureNeedsHuman("PolicyCorrupt", "%v", err)
 		}
+		// A run retained from before the pin contract carries a policy but
+		// no pin: it was admitted before lanes could select skills, so it
+		// keeps that legacy no-skill state. Re-resolving from the live lane
+		// here would let a post-admission lane edit add skills to a run
+		// that never carried any, so nil is preserved, never backfilled.
 		return nil
+	}
+	pins, err := r.resolveLaneSkillPins(ctx, run)
+	if err != nil {
+		return err
 	}
 	_, policy, err := r.Secure.ResolveAdmission(ctx, run)
 	if err != nil {
 		return err
 	}
+	// Policy and pin persist in one status write: a crash mid-admission must
+	// never leave one set-once field persisted without the other, because
+	// their lifecycles are one contract — a run with a policy but no pin
+	// would re-resolve skills from a lane that may since have been edited.
 	before := run.DeepCopy()
 	run.Status.PublicationPolicy = policy
+	run.Status.SkillPins = statusSkillPins(pins)
 	if err := r.patchStatus(ctx, before, run); err != nil {
 		return err
 	}
 	return nil
+}
+
+// resolveLaneSkillPins resolves the run's lane-selected skill names into
+// per-run pins against the deployment registry. An unknown, malformed, or
+// duplicate selection is a permanent lane misconfiguration, so it fails
+// closed NeedsHuman (LaneConfig) rather than resolving to fewer skills than
+// the lane asked for; a lane read failure stays a transient error, retried
+// like every other launch-pass read.
+func (r *CoderRunReconciler) resolveLaneSkillPins(ctx context.Context, run *courierv1alpha1.CoderRun) ([]skills.Pin, error) {
+	var lane courierv1alpha1.LaneProfile
+	if err := r.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.Lane}, &lane); err != nil {
+		return nil, err
+	}
+	pins, err := skills.Select(r.Secure.Config.Skills, lane.Spec.Skills)
+	if err != nil {
+		return nil, secureNeedsHuman(laneConfigReason, "lane %q skill selection: %v", lane.Name, err)
+	}
+	return pins, nil
+}
+
+// statusSkillPins converts resolved pins into their persisted status shape.
+// The conversion keeps an empty selection non-nil, so an empty set persists
+// as the explicit empty pin the status field's contract documents rather
+// than collapsing into "no pin resolved".
+func statusSkillPins(pins []skills.Pin) []courierv1alpha1.SkillPin {
+	out := make([]courierv1alpha1.SkillPin, 0, len(pins))
+	for _, pin := range pins {
+		out = append(out, courierv1alpha1.SkillPin{Name: pin.Name, Digest: pin.Digest})
+	}
+	return out
 }
 
 // SetupWithManager registers the controller with the manager.
@@ -2216,6 +2300,15 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 	// mutated in-memory copy.
 	if before.Status.PublicationPolicy == nil && after.Status.PublicationPolicy != nil {
 		fields.PublicationPolicy = after.Status.PublicationPolicy
+	}
+	// SkillPins is set-once like PublicationPolicy: emitted only on the
+	// nil-to-set transition (#658), so a persisted pin can never be rewritten
+	// or cleared by a later patch. The pointer-to-slice keeps an empty pin
+	// set expressible: a plain slice's omitempty would drop it, and an
+	// omitted key leaves the pre-pin state standing instead of the pin.
+	if before.Status.SkillPins == nil && after.Status.SkillPins != nil {
+		pins := after.Status.SkillPins
+		fields.SkillPins = &pins
 	}
 	if before.Status.TerminalDiagnostic == nil && after.Status.TerminalDiagnostic != nil {
 		fields.TerminalDiagnostic = after.Status.TerminalDiagnostic

@@ -199,6 +199,14 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 	if err := lane.Spec.ValidateResources(); err != nil {
 		return secureNeedsHuman(laneConfigReason, "lane profile %q: %v", lane.Name, err)
 	}
+	// A lane selecting skills requires the secure path, which resolves and
+	// pins them against the deployment registry (#658); the legacy
+	// coordinator has no registry seam, so honoring the selection here would
+	// silently launch skillless work. Fail closed as a permanent lane
+	// misconfiguration rather than running without what the lane asked for.
+	if len(lane.Spec.Skills) > 0 {
+		return secureNeedsHuman(laneConfigReason, "lane %q selects skills (%s); legacy mode cannot honor a skill selection — skills require secure mode", lane.Name, strings.Join(lane.Spec.Skills, ", "))
+	}
 	// The nonce is minted here, per build, because the pod UID does not
 	// exist until the API server assigns it after create: the intake needs a
 	// per-incarnation secret before the pod exists, so it cannot be derived

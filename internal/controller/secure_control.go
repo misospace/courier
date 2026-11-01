@@ -23,6 +23,7 @@ import (
 	"github.com/misospace/courier/internal/broker"
 	"github.com/misospace/courier/internal/forge"
 	"github.com/misospace/courier/internal/protocol"
+	"github.com/misospace/courier/internal/skills"
 	"github.com/misospace/courier/internal/topology"
 )
 
@@ -190,6 +191,10 @@ type SecureConfig struct {
 	// the historical default. The chart renders the ClusterRole under the
 	// same configured name.
 	TokenReviewClusterRole string
+	// Skills is the loaded deployment skill bundle registry (#658). Nil means
+	// the deployment registers no skill bundles, so any lane selecting
+	// skills fails closed at admission rather than resolving to nothing.
+	Skills *skills.Registry
 	// Now supports deterministic tests.
 	Now func() time.Time
 }

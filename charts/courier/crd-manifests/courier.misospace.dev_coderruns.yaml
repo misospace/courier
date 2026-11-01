@@ -924,6 +924,40 @@ spec:
                   RunDuration is the human-readable time between StartedAt and FinishedAt,
                   in Go duration format. Written once when FinishedAt is recorded.
                 type: string
+              skillPins:
+                description: |-
+                  SkillPins is the per-run pin of the lane's selected skill bundles,
+                  resolved at admission against the deployment registry (#658). Nil means
+                  the run was admitted before the pin contract: it keeps its legacy
+                  no-skill state — it never acquires a pin and never loads skills, so a
+                  post-admission lane edit cannot add skills to it. A non-nil list,
+                  including an empty one, is the immutable set: relaunch re-verifies each
+                  pin against the registry and fails closed on a missing name or changed
+                  digest rather than substituting newer content. Names are unique and
+                  sorted for deterministic comparison.
+                items:
+                  description: |-
+                    SkillPin is one run's pinned skill-bundle identity: the approved logical
+                    name and the immutable content digest resolved at admission (#658).
+                  properties:
+                    digest:
+                      description: Digest is the bundle's immutable content identity
+                        at admission.
+                      pattern: ^sha256:[0-9a-f]{64}$
+                      type: string
+                    name:
+                      description: Name is the approved logical name in the deployment
+                        skill registry.
+                      maxLength: 63
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                  required:
+                  - digest
+                  - name
+                  type: object
+                maxItems: 16
+                type: array
+                x-kubernetes-list-type: atomic
               sourceReceipt:
                 description: SourceReceipt is sensitive source-issued claim fencing
                   data.

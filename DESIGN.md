@@ -2541,8 +2541,33 @@ materialized tree, hashed in sorted relative-path order with per-file
 lengths so equal bytes in different locations digest identically and any
 content change, addition, or rename changes the digest. Registration grants
 no shell, forge, or Kubernetes authority: skill bytes are untrusted data
-exposed to workers later, and lane-profile selection and harness loading are
-future work (#658/#659).
+exposed to workers later (#659).
+
+Lane selection and per-run pinning (#658): a lane's `spec.skills` names
+approved logical names only, never URLs or paths. On the secure path,
+admission resolves the selection against the deployment registry and pins
+name+digest per run into `CoderRunStatus.SkillPins` — set-once beside the
+publication policy in one status write, so a crash never persists one without
+the other. An empty selection pins as an empty (non-nil) set; nil means a
+pre-contract run, which keeps its legacy no-skill state — it was admitted
+before lanes could select skills, so it never acquires a pin and a
+post-admission lane edit cannot add skills to it.
+Relaunch re-verifies every pin against the registry and fails closed
+(`SkillPinConflict`) on a dropped name or changed digest — substituting newer
+content would silently rewrite what the run was admitted to load — and the
+verify path never re-reads the lane, so a lane edit never alters a retained
+run's resolved skills. An unknown or malformed selection fails admission
+closed (`LaneConfig`); a deployment registering no bundles fails closed on
+any lane selecting skills. The pinned set travels to the control pod as
+`COURIER_SKILLS_JSON` (name+digest pairs from run status, never the live
+lane). A registered bundle shadows a same-named repository-local skill —
+deployment-owned configuration wins deterministically; `skills.Overlay` is
+the tested precedence rule the #659 loader applies, and it names the
+shadowed skills so precedence is visible rather than silent. Registry
+content is
+deployment-controlled and never fed from CoderRun, source, or model data.
+The legacy launcher has no registry seam and rejects a skill-selecting lane
+outright (`LaneConfig`). Harness loading of the pinned bundles is #659.
 
 Resolution contract: the registered source may be a symlink (kubelet
 ConfigMap/Secret projections place per-key symlinks and a `..data` ->

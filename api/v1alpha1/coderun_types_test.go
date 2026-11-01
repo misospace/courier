@@ -247,6 +247,65 @@ func TestCRDManifestCIRepairStatusSchema(t *testing.T) {
 	}
 }
 
+// TestSkillPinWire pins the persisted pin schema (#658): a pin always
+// carries both its identity halves — the approved logical name and the
+// content digest — with neither omitempty, so a pin can never persist
+// half-specified and a relaunch verification always has both to check.
+func TestSkillPinWire(t *testing.T) {
+	pin := SkillPin{Name: "simple-english", Digest: "sha256:" + strings.Repeat("a", 64)}
+	raw, err := json.Marshal(pin)
+	if err != nil {
+		t.Fatalf("marshal pin: %v", err)
+	}
+	var wire map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatalf("unmarshal pin: %v", err)
+	}
+	for _, key := range []string{"name", "digest"} {
+		if _, ok := wire[key]; !ok {
+			t.Fatalf("pin missing %s: %s", key, raw)
+		}
+	}
+}
+
+// TestCRDManifestSkillPinsSchema pins the generated CoderRun CRD to the
+// per-run pin bounds (#658): at most sixteen atomic pins, each carrying a
+// DNS-1123 label name and a sha256 content digest, so a relaunch verification
+// always compares against a well-formed immutable identity.
+func TestCRDManifestSkillPinsSchema(t *testing.T) {
+	manifest, err := os.ReadFile("../../charts/courier/crd-manifests/courier.misospace.dev_coderruns.yaml")
+	if err != nil {
+		t.Fatalf("read CRD manifest: %v", err)
+	}
+	lines := strings.Split(string(manifest), "\n")
+	var block []string
+	inPins := false
+	indent := ""
+	for _, line := range lines {
+		if !inPins {
+			if i := strings.Index(line, "skillPins:"); i >= 0 {
+				inPins = true
+				indent = line[:i]
+			}
+			continue
+		}
+		// A sibling key at the same indent ends the skillPins block.
+		if strings.HasPrefix(line, indent) && len(line) > len(indent) && line[len(indent)] != ' ' {
+			break
+		}
+		block = append(block, line)
+	}
+	if !inPins {
+		t.Fatal("CRD manifest has no status.skillPins schema")
+	}
+	text := strings.Join(block, "\n")
+	for _, want := range []string{"maxItems: 16", "maxLength: 63", "pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", "pattern: ^sha256:[0-9a-f]{64}$", "x-kubernetes-list-type: atomic"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("status.skillPins schema missing %q:\n%s", want, text)
+		}
+	}
+}
+
 // TestNativeResultReasonContract pins the durable-reason contract (#127):
 // every trusted kind carries a fixed, non-empty, code-owned reason within the
 // shared MaxNativeResultReasonBytes bound, an unknown kind carries none, and

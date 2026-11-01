@@ -31,6 +31,9 @@ const (
 	maxCIRepairObservationWindowSeconds = 21600
 	// defaultCIRepairObservationWindowSeconds mirrors the CRD default.
 	defaultCIRepairObservationWindowSeconds = 1800
+	// maxLaneSkills is the largest skill selection one lane may name,
+	// mirroring the CRD's own MaxItems on spec.skills.
+	maxLaneSkills = 16
 )
 
 // Profile is the bootstrap-config form of a deployment-managed LaneProfile.
@@ -54,6 +57,12 @@ type Profile struct {
 	// means the lane repairs nothing and every run on it behaves exactly as
 	// it does without a policy. Same bounds as the CRD field it mirrors.
 	CIRepair *courierv1alpha1.CIRepairPolicy `json:"ciRepair,omitempty"`
+	// Skills names the deployment-approved skill bundles native runs on this
+	// lane load (#658). Same bounds and shadowing rule as the CRD field it
+	// mirrors: approved logical names only, resolved against the
+	// deployment's skill registry at admission and pinned per run; a
+	// registered bundle shadows a repository-local skill sharing its name.
+	Skills []string `json:"skills,omitempty"`
 }
 
 // Parse reads a bootstrap config document: a top-level profiles list of
@@ -62,7 +71,10 @@ type Profile struct {
 // trimmed. Framing is free-text prompt content and is not trimmed. A missing
 // or zero concurrency is coerced to 1; negative concurrency is rejected. A
 // declared context policy is validated against the CRD bounds, with the
-// CRD's compactAtPercent default mirrored at the policy level.
+// CRD's compactAtPercent default mirrored at the policy level. Skill names
+// are trimmed, must be valid DNS-1123 labels, must be unique after trimming,
+// and are capped at the CRD's own MaxItems; an empty selection is stored as
+// nil so the desired spec stays equal to a lane that declares no skills.
 func Parse(data []byte) ([]Profile, error) {
 	var document struct {
 		Profiles []Profile `json:"profiles"`
@@ -124,6 +136,30 @@ func Parse(data []byte) ([]Profile, error) {
 				return nil, err
 			}
 		}
+		if len(profile.Skills) > maxLaneSkills {
+			return nil, fmt.Errorf("bootstrap profile %q: skills must contain at most %d entries", name, maxLaneSkills)
+		}
+		var skills []string
+		seenSkills := make(map[string]bool, len(profile.Skills))
+		for _, skill := range profile.Skills {
+			trimmed := strings.TrimSpace(skill)
+			if trimmed == "" {
+				return nil, fmt.Errorf("bootstrap profile %q: skill name must not be empty", name)
+			}
+			if labelErrs := utilvalidation.IsDNS1123Label(trimmed); len(labelErrs) > 0 {
+				return nil, fmt.Errorf("bootstrap profile %q: skill name %q must be a valid DNS-1123 label (lowercase alphanumeric or '-', starting and ending with an alphanumeric); got: %s", name, trimmed, strings.Join(labelErrs, ", "))
+			}
+			if seenSkills[trimmed] {
+				return nil, fmt.Errorf("bootstrap profile %q: duplicate skill %q after trimming whitespace", name, trimmed)
+			}
+			seenSkills[trimmed] = true
+			skills = append(skills, trimmed)
+		}
+		// Nil when nothing was selected: a lane that omits skills and a lane
+		// that declares an empty list are the same lane, and the desired spec
+		// must stay equal to the server-decoded nil so the reconciler does
+		// not rewrite an unchanged LaneProfile every pass.
+		profile.Skills = skills
 		profiles = append(profiles, profile)
 	}
 	return profiles, nil

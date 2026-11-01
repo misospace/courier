@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -82,6 +83,13 @@ type Invocation struct {
 	// incarnation and never mid-incarnation. A coordinator may read the
 	// policy but can never author it.
 	Context *courierv1alpha1.ContextPolicy
+	// Skills is the bounded JSON envelope of the run's pinned skill bundles
+	// (#658): name and digest pairs resolved at admission against the
+	// deployment registry. Empty when the run pins no skills. The value is
+	// operator-authored persisted status; the coordinator may read it but
+	// can never author it. Loading is the native harness's job (#659); this
+	// carries the pin.
+	Skills string
 }
 
 // Command is a process command with no shell interpolation.
@@ -189,6 +197,7 @@ var (
 	ErrMissingNamespace           = errors.New("executor: run namespace is required")
 	ErrMissingWorkspace           = errors.New("executor: workspace path is required")
 	ErrInvalidContextPolicy       = errors.New("executor: COURIER_CONTEXT_JSON is not a valid context policy")
+	ErrInvalidSkills              = errors.New("executor: COURIER_SKILLS_JSON is not valid skill pins")
 	ErrMissingCommandName         = errors.New("executor: command name is required")
 )
 
@@ -617,6 +626,14 @@ func RunContextEnvironment(inv Invocation) []EnvVar {
 	if strings.TrimSpace(inv.Criteria) != "" {
 		values = append(values, EnvVar{Name: EnvCriteria, Value: inv.Criteria})
 	}
+	// The pinned skill envelope travels beside the run context it belongs to
+	// (#658), but only when the run pins skills: a skillless run carries no
+	// envelope, so absence is meaningful to the reconstruction boundary
+	// rather than an empty stand-in. Like the criteria above, the value is
+	// operator-authored persisted status.
+	if inv.Skills != "" {
+		values = append(values, EnvVar{Name: EnvSkills, Value: inv.Skills})
+	}
 	return values
 }
 
@@ -639,6 +656,16 @@ const EnvCriteria = "COURIER_CRITERIA"
 // them against gateway-verified limits, and a worker or model can never set
 // it.
 const EnvContextPolicy = "COURIER_CONTEXT_JSON"
+
+// EnvSkills is the trusted environment key carrying the run's pinned skill
+// bundles to a coordinator (#658): the name and digest pairs resolved at
+// admission against the deployment registry, operator-authored from the
+// run's persisted status. Exported so the operator's pod rendering
+// (RunContextEnvironment) and the native control's reconstruction
+// (InvocationFromEnv) name the same variable and cannot drift. The value
+// names what the run may load; loading itself is the native harness's job
+// (#659), and a worker or model can never set it.
+const EnvSkills = "COURIER_SKILLS_JSON"
 
 // Default git identity names used when a deployment configures none. A fresh
 // clone has no git identity, so the coordinator environment must always carry
@@ -800,6 +827,11 @@ type EnvVar struct {
 	Value string
 }
 
+// skillPinDigestShape is the skill envelope's light validation bound (#658):
+// a pin whose digest is not a sha256 hex identity is a malformed envelope,
+// the same failure class as unparsable JSON.
+var skillPinDigestShape = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
 // InvocationFromEnv reconstructs an Invocation from the run-context
 // environment contract written by RunContextEnvironment. It is the adapter
 // seam the native harness control binary uses: the operator renders one
@@ -859,6 +891,33 @@ func InvocationFromEnv(get func(string) string) (Invocation, error) {
 			return Invocation{}, fmt.Errorf("%w: %v", ErrInvalidContextPolicy, err)
 		}
 		inv.Context = &policy
+	}
+	// The run's pinned skill envelope reconstructs like the context policy
+	// it rides beside (#658): present means parse-or-fail — a malformed
+	// envelope must fail closed, never a session that silently runs
+	// skillless while claiming pins — and absent means the run pins no
+	// skills. Validation stays light on purpose: the envelope is
+	// operator-authored persisted status, the name+digest pair is the whole
+	// contract, and resolving the pins against the registry is the harness's
+	// job (#659).
+	skillsJSON := get(EnvSkills)
+	if strings.TrimSpace(skillsJSON) != "" {
+		var pins []struct {
+			Name   string `json:"name"`
+			Digest string `json:"digest"`
+		}
+		if err := json.Unmarshal([]byte(skillsJSON), &pins); err != nil {
+			return Invocation{}, fmt.Errorf("%w: %v", ErrInvalidSkills, err)
+		}
+		for _, pin := range pins {
+			if pin.Name == "" {
+				return Invocation{}, fmt.Errorf("%w: a pin names no skill", ErrInvalidSkills)
+			}
+			if !skillPinDigestShape.MatchString(pin.Digest) {
+				return Invocation{}, fmt.Errorf("%w: skill %q digest %q is not a sha256 content identity", ErrInvalidSkills, pin.Name, pin.Digest)
+			}
+		}
+		inv.Skills = strings.TrimSpace(skillsJSON)
 	}
 	switch {
 	case inv.RunName == "":

@@ -1497,6 +1497,12 @@ policy takes effect at the next control incarnation and never
 mid-incarnation, while a restarted pod reconstructs the identical pinned
 policy for its incarnation.
 
+Skill pins travel the same seam (#658): the native control receives
+`COURIER_SKILLS_JSON`, the name+digest pairs resolved at admission and carried
+in the run's persisted status — never re-read from the live lane. Loading the
+pinned bundles, with a registered deployment bundle shadowing a same-named
+repository-local skill, lands in #659; this phase carries the pin only.
+
 Production verification reads two signals: the capability table's
 `context-budget:<role>` state (`healthy` = gateway-verified and enforced,
 `configured` = declared ceiling in use without verification) identifies which

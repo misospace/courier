@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -446,6 +447,66 @@ func TestOperatorWriterCarriesPublicationPolicy(t *testing.T) {
 	}
 	if document.Status.PublicationPolicy == nil || document.Status.PublicationPolicy.ProviderConfigRef != "github" {
 		t.Fatalf("patched policy = %+v", document.Status.PublicationPolicy)
+	}
+}
+
+// TestOperatorWriterCarriesSkillPins pins that the skill-pin patch carries a
+// set — including the empty set, which is a legitimate pin (#658): omitempty
+// on a plain slice would drop it, so the pointer-to-slice keeps an empty
+// selection expressible while a nil pointer stays omitted.
+func TestOperatorWriterCarriesSkillPins(t *testing.T) {
+	patcher := &fakePatcher{}
+	writer := NewOperatorWriter(patcher)
+	pins := []courierv1alpha1.SkillPin{{Name: "repo-tour", Digest: "sha256:" + strings.Repeat("b", 64)}}
+	empty := []courierv1alpha1.SkillPin{}
+	err := writer.Patch(context.Background(), types.NamespacedName{Namespace: "ns", Name: "run"}, OperatorPatch{SkillPins: &pins})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = writer.Patch(context.Background(), types.NamespacedName{Namespace: "ns", Name: "run"}, OperatorPatch{SkillPins: &empty})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = writer.Patch(context.Background(), types.NamespacedName{Namespace: "ns", Name: "run"}, OperatorPatch{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(patcher.patches) != 3 {
+		t.Fatalf("patches = %d", len(patcher.patches))
+	}
+	var payload struct {
+		Status map[string]json.RawMessage `json:"status"`
+	}
+	if err := json.Unmarshal(patcher.patches[0].patch, &payload); err != nil {
+		t.Fatal(err)
+	}
+	var got []courierv1alpha1.SkillPin
+	if err := json.Unmarshal(payload.Status["skillPins"], &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Name != "repo-tour" {
+		t.Fatalf("patched pins = %+v", got)
+	}
+	// The empty set persists as an explicit empty array, not an omitted key.
+	var emptyPayload struct {
+		Status map[string]json.RawMessage `json:"status"`
+	}
+	if err := json.Unmarshal(patcher.patches[1].patch, &emptyPayload); err != nil {
+		t.Fatal(err)
+	}
+	raw, ok := emptyPayload.Status["skillPins"]
+	if !ok || strings.TrimSpace(string(raw)) != "[]" {
+		t.Fatalf("empty pin set patch = %s, want an explicit empty skillPins array", patcher.patches[1].patch)
+	}
+	// An unset patch omits the key entirely, never a null that would clear.
+	var unsetPayload struct {
+		Status map[string]json.RawMessage `json:"status"`
+	}
+	if err := json.Unmarshal(patcher.patches[2].patch, &unsetPayload); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := unsetPayload.Status["skillPins"]; ok {
+		t.Fatalf("unset patch carries skillPins: %s", patcher.patches[2].patch)
 	}
 }
 
