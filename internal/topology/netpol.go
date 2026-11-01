@@ -21,7 +21,13 @@ import (
 //     egress to cluster DNS and TCP 443 (the API server and the configured
 //     forge/git endpoints). The broker is trusted code that pins destinations
 //     itself; the policy bounds the blast radius of an unexpected compromise
-//     and excludes link-local metadata addresses.
+//     and excludes link-local metadata addresses. The TCP 443 ipBlock rule
+//     admits internet and in-cluster pod IPs under IP-based CNIs, but
+//     identity-based CNIs such as Cilium classify API-server traffic by a
+//     reserved identity that vanilla ipBlock rules cannot match; such
+//     clusters need a companion CNI-specific policy (for example a
+//     CiliumNetworkPolicy granting toEntities: kube-apiserver) for the
+//     broker pod.
 //
 // Policies are applied before any workload pod is created.
 func NetworkPolicies(run *courier.CoderRun, cache *CachePin, gateway *GatewayPin) []*networkingv1.NetworkPolicy {

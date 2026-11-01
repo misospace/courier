@@ -36,6 +36,18 @@ const (
 // trusted control from the brief ID — never from the worker.
 const ResultRefPrefix = "refs/courier/briefs/"
 
+// The artifact budget bounds the enforcement path reads. They are variables,
+// not constants, so an in-process test can shrink them: production never
+// reassigns them, and the exported constants above remain the documented
+// production defaults and the single source of truth these are initialized
+// from.
+var (
+	artifactMaxObjects       = MaxArtifactObjects
+	artifactMaxUnpackedBytes = int64(MaxArtifactUnpackedBytes)
+	artifactMaxBlobBytes     = int64(MaxArtifactBlobBytes)
+	artifactMaxBundleBytes   = MaxArtifactBundleBytes
+)
+
 // ArtifactRejectedError reports one fixed, safe rejection category. Worker-
 // or bundle-supplied strings never appear in the category: the artifact is
 // untrusted data, and its content must not enter trusted error strings that
@@ -70,9 +82,9 @@ func rejected(category string) error {
 // never derived from model or worker input.
 func artifactObjectLimits() couriergit.ObjectLimits {
 	return couriergit.ObjectLimits{
-		MaxObjects:     MaxArtifactObjects,
-		MaxTotalBytes:  MaxArtifactUnpackedBytes,
-		MaxObjectBytes: MaxArtifactBlobBytes,
+		MaxObjects:     artifactMaxObjects,
+		MaxTotalBytes:  artifactMaxUnpackedBytes,
+		MaxObjectBytes: artifactMaxBlobBytes,
 	}
 }
 
@@ -173,7 +185,7 @@ func validateAndImportArtifact(ctx context.Context, tree *Integrator, briefID, d
 	if len(bundle) == 0 {
 		return "", rejected(rejectMalformed)
 	}
-	if len(bundle) > MaxArtifactBundleBytes {
+	if len(bundle) > artifactMaxBundleBytes {
 		return "", rejected(rejectBundleSize)
 	}
 	workDir, err := tree.scratchDir()
@@ -217,13 +229,13 @@ func validateAndImportArtifact(ctx context.Context, tree *Integrator, briefID, d
 	// numbers once the inventory is complete. The bounded cases never reach
 	// these checks; they exist so a future accounting change cannot widen
 	// the envelope unnoticed.
-	if inventory.Count > MaxArtifactObjects {
+	if inventory.Count > artifactMaxObjects {
 		return "", rejected(rejectObjects)
 	}
-	if inventory.TotalBytes > MaxArtifactUnpackedBytes {
+	if inventory.TotalBytes > artifactMaxUnpackedBytes {
 		return "", rejected(rejectUnpacked)
 	}
-	if inventory.MaxBlobBytes > MaxArtifactBlobBytes {
+	if inventory.MaxBlobBytes > artifactMaxBlobBytes {
 		return "", rejected(rejectBlob)
 	}
 	// 3. Ref-set equality: the bundle advertises exactly the expected result

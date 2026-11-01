@@ -868,6 +868,7 @@ func TestBootstrapUnverifiedTerminationIsNotABlocker(t *testing.T) {
 			defer cleanupWorker()
 			worker.hangStage = tc.stage
 			worker.bootstrapResults = tc.bootstrapResults
+			var inFlight <-chan struct{}
 			switch tc.variant {
 			case "reconcile-fails":
 				// The cancellation lands, but the reconcile cannot observe
@@ -876,10 +877,11 @@ func TestBootstrapUnverifiedTerminationIsNotABlocker(t *testing.T) {
 			case "live-descendants":
 				// The cancellation lands, and the reconcile observes work
 				// still live in the task tree: the observation proves no
-				// termination. The operation's poll stays in flight past
-				// the stage's bound, so the poll-failure path — not the
-				// poll wait — is the one that reconciles.
-				worker.scriptUnobservedTermination(3, 750*time.Millisecond)
+				// termination. The operation's poll hangs until the test
+				// aborts it, so the poll-failure path — not the poll wait —
+				// is the one that reconciles.
+				worker.scriptHangingPoll()
+				inFlight = worker.scriptUnobservedTermination(3)
 			default:
 				t.Fatalf("unknown variant %q", tc.variant)
 			}
@@ -900,15 +902,39 @@ func TestBootstrapUnverifiedTerminationIsNotABlocker(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			restored := bootstrapBound
-			// The bound outlives the dispatch, so the case reaches the
-			// operation it scripts; the live-descendants variant's poll
-			// delay outlives the bound, so the bound expires while that poll
-			// is in flight.
-			bootstrapBound = 250 * time.Millisecond
-			defer func() { bootstrapBound = restored }()
+			if tc.variant == "reconcile-fails" {
+				// The stage's own liveness bound is the trigger of the
+				// reconcile-fails variant: the operation never terminates,
+				// so the bound expires and the reconcile cannot verify the
+				// termination. The bound is test-owned and short. The
+				// live-descendants variant aborts its in-flight poll at a
+				// moment the test chooses instead, so its bound never
+				// decides the outcome.
+				restored := bootstrapBound
+				bootstrapBound = 250 * time.Millisecond
+				defer func() { bootstrapBound = restored }()
+			}
 
-			err = coordinator.bootstrapWorkspace(context.Background(), "b1", testBaseOID)
+			// The caller's context: the live-descendants variant aborts the
+			// in-flight poll at a moment the test chooses, so no wall clock
+			// decides when the poll fails.
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if inFlight != nil {
+				go func() {
+					select {
+					case <-inFlight:
+						cancel()
+					case <-ctx.Done():
+					case <-time.After(hangingPollCeiling):
+						// Failure ceiling only: the case asserts that
+						// the hanging poll actually engaged.
+						cancel()
+					}
+				}()
+			}
+
+			err = coordinator.bootstrapWorkspace(ctx, "b1", testBaseOID)
 
 			// The error carries the unverified-termination fact.
 			if !errors.Is(err, ErrTerminationUnverified) {
@@ -946,6 +972,13 @@ func TestBootstrapUnverifiedTerminationIsNotABlocker(t *testing.T) {
 			// Only the hung stage reached the worker.
 			if got := worker.dispatchCount(); got != tc.wantDrops {
 				t.Fatalf("worker dispatches = %d, want %d", got, tc.wantDrops)
+			}
+			if inFlight != nil {
+				// The poll really hung and was aborted: the poll-failure
+				// path reconciled, not the poll wait.
+				if got := worker.hangingPolls(); got != 1 {
+					t.Fatalf("hanging polls = %d, want 1 — the case must exercise the poll-failure path", got)
+				}
 			}
 			// The worker fence rejects the next dispatch without any
 			// further task reaching the worker.

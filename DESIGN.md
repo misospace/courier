@@ -486,6 +486,95 @@ through the same crashloop-bounded path pod loss uses, handing the run to a
 human at the ceiling with the terminated pod preserved as the ending's
 evidence.
 
+### Tracked check receipts
+
+Coordinator validation runs through a dedicated `check` tool on the same
+trusted execution surface as `shell`: the command dispatches over the signed
+protocol to the untrusted worker, and the result is the worker's own exit
+status and bounded output tails — never a summary grep, a shell pipeline
+masking the test exit, or a process-name observation. Each check is tracked
+by a receipt whose identity at the registry is the exact command bytes plus
+the snapshot tip. Commands are keyed verbatim, never by a tokenized form: the
+task executes as `sh -c <command>`, and a quote-resolved identity aliases
+distinct programs — `echo "$HOME"` and `echo '$HOME'` tokenize alike but
+expand differently — so only identical bytes guarantee an identical program,
+and collapsing cosmetic whitespace is not worth that aliasing risk. The
+applied bootstrap environment is deliberately outside the registry key: it is
+settled only by the destructive materialization that also produces the
+workspace, so keying on it pre-materialization would force every caller,
+including a joining waiter, to re-materialize the workspace underneath the
+in-flight check. Instead each receipt records the environment digest (for
+observability) and the snapshot generation it ran against — the
+coordinator-local count of successful materializations, whose bump
+witnesses each mutating flow: a control shell or fresh check materializes
+per run, and a delegate brief materializes once for its whole epoch. The registry key's claim strictly precedes the destructive
+snapshot materialization: a caller that joins an in-flight equivalent check
+performs no upload-unpack and cannot mutate the workspace the running check
+validates.
+
+The generation guard is what keeps a served receipt honest. Every
+coordinator-driven workspace mutation is witnessed by a generation bump.
+The one worker-side mutation a bump does not witness — files the completed
+check itself leaves behind, gitignored outputs included — needs no witness:
+the reuse path executes nothing, and every later evidence producer
+dispatches only after the materialization that resets the workspace first
+(`git reset --hard` plus `git clean -qfdx`), so one task's writes can never
+reach a later task's observation. A fresh dispatch at the same key would
+itself re-materialize before running, so a served receipt describes exactly
+what a fresh dispatch would have measured; the only nondeterminism reuse
+inherits is the command's own, the same class any test cache carries. "No
+materialization since the receipt's run" is therefore exactly "no evidence
+has run against any workspace state the receipt does not describe": a
+receipt is servable only while no re-materialization has happened since its
+run, and a receipt from an older generation describes a state that no
+longer exists, so the guard refuses it
+(both on the reuse path and for a waiter whose in-flight dispatch completed
+after an intervening materialization) and the request reruns. This narrows
+reuse honestly: any intervening control shell run, delegate brief
+materialization, or other check dispatch makes stored receipts unservable,
+while back-to-back identical check requests with nothing in between still
+reuse — the deduplication goal. The guard's keystone is that `check` is
+coordinator-only and the coordinator pump executes tool calls serially: a
+delegate epoch can never overlap a check receipt's lifetime, so no receipt
+exists inside an epoch whose mutations it does not describe. A completed
+plain `shell` run of the exact
+command against the same state additionally drops the matching receipt
+outright, so a later check cannot serve evidence older than the run the
+coordinator just performed. The identity is complete because the workspace a
+check runs against is a pure function of the tip on the materialization
+path: a worktree change that does not change the tip cannot exist on the
+materialized workspace, because worker-side edits never survive the next
+unpack, and every relevant change reaches it through artifact integration,
+which advances the tip. A repeat request against unchanged state is served
+from the saved receipt instead of re-executing; any state change, a lost
+receipt, or a concrete concern reruns. A completed run is
+evidence whether it passed or failed: the worker reports a nonzero exit as
+`ResultFailed`, so a failing suite is reprinted on repeat rather than rerun
+forever. A cancelled dispatch and a run that never produced its own exit
+status (`ResultFailed` carrying the sentinel exit code `-1`: never started,
+or died to a signal) are never reusable as evidence. Concrete concerns have
+two explicit invalidation paths: `check` accepts `refresh:true`, which
+ignores and replaces the saved receipt with a fresh dispatch, and a completed
+plain `shell` run — pass or fail — of the exact command against the same
+state drops the matching receipt, so a later check cannot serve evidence
+older than the run the coordinator just performed. Invalidation matches the
+exact command bytes; an equivalent command spelled differently keeps its own
+identity.
+
+While an equivalent check is in flight, a duplicate request waits on that
+dispatch instead of launching a second one. Receipts are bounded (evicted
+least-recently tracked first) and live only in the coordinator incarnation.
+That scoping is deliberate, not a missing persistence layer: a restart
+relaunches the incarnation from scratch — the session is in-memory and
+rebuilds nothing from a prior transcript — and a relaunched incarnation has
+no session memory of earlier requests, starts a fresh generation counter,
+and must materialize before its first dispatch, so a cross-restart receipt
+would be refused by the generation guard even if it had been persisted: the
+workspace it describes no longer exists. Receipt persistence beyond the
+incarnation would record nothing a rerun could not safely reproduce; a
+restart simply reruns. The tool is coordinator-only — sub-agents keep plain
+shell.
+
 ### Coordinator pod process lifetime
 
 The legacy pod runs the executor directly as PID 1 — the pod sets `Command`,
@@ -716,6 +805,20 @@ to die.
   `needs-human` with the counter left at the ceiling, rather than one further
   relaunch. This is the one counter that matters, and it is death-detection, not
   work-retry.
+- A secure round whose **broker** dies while its control is still young defers
+  the fence for a bounded window (90s from the coordinator container's start):
+  the broker's death is exactly the condition the control's startup capability
+  gate turns into a needs-human termination handoff, so letting that verdict
+  land terminalizes a deterministic environment failure in one round instead of
+  spending the crashloop ceiling on rounds that all reach the same conclusion
+  (#680). The supervisor stays alive for the whole window, so the fence
+  invariant — nothing outlives its supervisor — holds throughout; a control
+  whose start time is zero or past the window, or a simultaneous worker loss,
+  fences immediately as before. The secure relaunch path also preserves a
+  control pod whose live read shows a valid termination handoff (fencing the
+  round without charging a relaunch), so a verdict the cached observation had
+  not yet caught up with is never deleted before the exit-code mapping reads
+  it.
 - A pod's **disappearance** — no coordinator pod **object** at all — is
   infrastructure loss on its own terms, detected without any heartbeat,
   because there is no pod left to heartbeat from. A pod whose coordinator exit
@@ -2244,7 +2347,7 @@ Requeueing cannot change a permanently invalid spec, so the rejection is caught
 where it happens and the run stops rather than cycling claim, preflight, and
 release on every reconcile. The secure path's dry-run proof is the primary
 catch: it admits
-the control, worker, and broker pods, and the probe pod too on the passes that
+the control, worker, and broker pods, and the probe pods too on the passes that
 create probes live, so no pass creates a spec it has not proved. The secure
 workload creates behind that proof return ordinary errors and rely on it; the two
 creates a dry run cannot stand in for — the live probe create and the legacy
@@ -2271,6 +2374,22 @@ not name. No retry can change what the request names, so the run stops and
 names the request instead of launching against an unverified base. A transient
 forge read that never completed is not that verdict: it proves nothing about
 the base, so the claim is released and the run is retried.
+The live probe phase proves the worker's deny paths and, on passes that
+create probes, one allow path the broker itself requires: a broker-labeled
+probe pod per eligible node carries the broker's component label, so the
+broker's own NetworkPolicy — not an exception — is what the probe
+exercises, and it dials the API server service on 443. The broker must
+reach the API server by design (`read own pod` adopts the run binding
+from the owner chain), so a deny there is the `BrokerEgress` verdict:
+the environment's CNI classifies API-server traffic by a reserved
+identity that vanilla NetworkPolicy `ipBlock` rules cannot match —
+Cilium does this, and an explicit ClusterIP `ipBlock` entry drops the
+same way — so the run namespace needs a companion CNI policy (for
+example a `CiliumNetworkPolicy` granting `toEntities: kube-apiserver`
+to the run's broker pod). Under kube-proxy networking the same
+probe passes, which is why envtest and the deny probes never caught the
+gap: the data path is environment-dependent, and the probe proves the
+request at the request's scope.
 Every other preflight verdict keeps the claim/release requeue, because
 each of them clears on a later pass — a live probe can outrun the dataplane
 programming of the NetworkPolicy the same reconcile just wrote, and an access
@@ -2281,7 +2400,8 @@ The claim/release requeue a permanent-class verdict keeps is rate-bounded. A
 verdict outside the terminal classes — the broker's own grants
 (`BrokerRBAC`), the operator's own grants (`OperatorRBAC`), the run
 namespace's Pod Security label (`PodSecurity`), the admission proofs
-(`AdmissionBroken`, `IsolationBroken`), and the provider and policy verdicts
+(`AdmissionBroken`, `IsolationBroken`), the broker's own API-server
+allow path (`BrokerEgress`), and the provider and policy verdicts
 the launch path raises (`ProviderSelection`, `PolicyConflict`) — requeued as
 fast as the API server allowed would churn the run through Pending and Claimed
 several times a second, the retry churn #644 required to stop. The operator
@@ -3308,9 +3428,13 @@ only informs.
   material distinguishes it. Control-to-worker tasks use signed
   run/incarnation-bound envelopes; the worker has no secret, service-account
   token, or signing key. Worker network access is limited to the dedicated Go
-  module/checksum cache and no DNS, never broker or forge. Enforced
-  network policy, live deny probes, and secure preflight fail closed before
-  workload exposure; the preflight separates static admission/spec checks from
+   module/checksum cache and no DNS, never broker or forge. Enforced
+   network policy, live deny probes, and secure preflight fail closed before
+   workload exposure; the broker's own API-server allow path is probed the
+   same way, and on identity-based CNIs such as Cilium the deployment must
+   supply a companion policy granting the run's broker pod
+   `toEntities: kube-apiserver`, because vanilla NetworkPolicy cannot express
+   it (#680). The preflight separates static admission/spec checks from
   live probes, and neither proves a privileged cluster actor cannot create or
   mutate pods outside those controls — a stated residual risk, not a closed
   hole. [HARNESS.md](./HARNESS.md) specifies the contract; the isolation wiring

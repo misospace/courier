@@ -145,6 +145,14 @@ secure:
   enabled: false
   # -- The namespace dedicated to secure runs. Required when enabled.
   runNamespace: ""
+  # CNI note: every run's broker must reach the Kubernetes API server on
+  # 443. Under identity-based CNIs such as Cilium the API server carries a
+  # reserved identity that vanilla NetworkPolicy ipBlock rules cannot match,
+  # so the run namespace needs a companion CNI policy for the run's broker
+  # pod — on Cilium, a CiliumNetworkPolicy granting
+  # `toEntities: [kube-apiserver]`. Without it preflight stops each run with
+  # the BrokerEgress verdict instead of launching a broker that cannot reach
+  # the API server. IP-based CNIs (kube-proxy) need nothing extra.
   # -- Registry of forge provider registrations. Each entry: name, type
   #    (github), endpoint (https API base), optional gitEndpoint template
   #    (one %s), optional gitUsername, credentials (purpose forge-api, and

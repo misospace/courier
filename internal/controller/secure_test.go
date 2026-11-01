@@ -1975,10 +1975,17 @@ func TestProbeCoverageIsIncompleteWithoutEveryNode(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Two eligible nodes; only node-a produced a complete result set (two
-	// checks), node-b's probe crashed without a readable result.
+	// checks), node-b's probe crashed without a readable result. Both nodes'
+	// broker probes report complete results, so the refusal is about the
+	// worker probe alone.
 	for _, node := range []string{"node-a", "node-b"} {
-		if err := c.Create(context.Background(), topology.ProbePod(run, node, "busybox:test", "true")); err != nil {
-			t.Fatal(err)
+		for _, pod := range []*corev1.Pod{
+			topology.ProbePod(run, node, "busybox:test", "true"),
+			topology.BrokerProbePod(run, node, "busybox:test", "true"),
+		} {
+			if err := c.Create(context.Background(), pod); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 	a := topology.ProbePod(run, "node-a", "busybox:test", "true")
@@ -1999,7 +2006,18 @@ func TestProbeCoverageIsIncompleteWithoutEveryNode(t *testing.T) {
 	if err := c.Status().Update(context.Background(), b); err != nil {
 		t.Fatal(err)
 	}
-	_, pending, err := control.collectProbeResults(context.Background(), run, []string{"node-a", "node-b"}, 2)
+	for _, node := range []string{"node-a", "node-b"} {
+		broker := topology.BrokerProbePod(run, node, "busybox:test", "true")
+		broker.Status.Phase = corev1.PodSucceeded
+		broker.Status.ContainerStatuses = []corev1.ContainerStatus{{
+			Name:  "probe",
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Message: brokerResult("allow")}},
+		}}
+		if err := c.Status().Update(context.Background(), broker); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, pending, err := control.collectProbeResults(context.Background(), run, []string{"node-a", "node-b"}, 2, 1)
 	if err == nil {
 		t.Fatal("incomplete probe coverage must not be treated as evidence")
 	}
@@ -2044,17 +2062,25 @@ func denyResults(checks ...string) string {
 	return out.String()
 }
 
+// brokerResult renders the broker probe's single outcome line for the API
+// server check.
+func brokerResult(got string) string {
+	return fmt.Sprintf("{\"name\":%q,\"got\":%q}\n", "broker-api-server", got)
+}
+
 // stampProbeCreates stands in for the kubelet: every probe pod the live pass
-// creates comes back terminal carrying the results keyed by the node it was
-// pinned to, so the pass reads exactly what its own pods reported. It returns
-// the probe pod name each node's create produced.
-func stampProbeCreates(t *testing.T, control *SecureControl, results map[string]string) map[string]string {
+// creates comes back terminal carrying the results keyed by the component the
+// pod exercises and the node it was pinned to, so the pass reads exactly what
+// its own pods reported. It returns the probe pod names each node's creates
+// produced, one per probe kind.
+func stampProbeCreates(t *testing.T, control *SecureControl, results map[string]string) map[string][]string {
 	t.Helper()
 	watcher, ok := control.Client.(client.WithWatch)
 	if !ok {
 		t.Fatal("the fake client does not support watch")
 	}
-	created := map[string]string{}
+	created := map[string][]string{}
+	probed := map[string]bool{}
 	control.Client = interceptor.NewClient(watcher, interceptor.Funcs{
 		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 			if err := c.Create(ctx, obj, opts...); err != nil {
@@ -2064,17 +2090,18 @@ func stampProbeCreates(t *testing.T, control *SecureControl, results map[string]
 			if !isProbe || pod.Labels[topology.LabelProbe] != "true" {
 				return nil
 			}
-			node := pod.Spec.NodeName
-			if _, twice := created[node]; twice {
-				t.Errorf("node %q was probed twice in one pass", node)
+			key := pod.Labels["courier.misospace.dev/component"] + "/" + pod.Spec.NodeName
+			if probed[key] {
+				t.Errorf("node %q was probed twice in one pass for component %q", pod.Spec.NodeName, pod.Labels["courier.misospace.dev/component"])
 			}
-			created[node] = pod.Name
+			probed[key] = true
+			created[pod.Spec.NodeName] = append(created[pod.Spec.NodeName], pod.Name)
 			stamped := pod.DeepCopy()
 			stamped.Status.Phase = corev1.PodSucceeded
 			stamped.Status.ContainerStatuses = []corev1.ContainerStatus{{
 				Name: "probe",
 				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
-					Message: results[node],
+					Message: results[key],
 				}},
 			}}
 			return c.Status().Update(ctx, stamped)
@@ -2103,28 +2130,31 @@ func TestLiveProbePodsStaySeparatePerNode(t *testing.T) {
 		run := secureRun("probe-per-node")
 		eligibleProbeCluster(t, c, run, first, second)
 		created := stampProbeCreates(t, control, map[string]string{
-			first:  denyResults(checks...),
-			second: denyResults(checks...),
+			"worker/" + first:  denyResults(checks...),
+			"worker/" + second: denyResults(checks...),
+			"broker/" + first:  brokerResult("allow"),
+			"broker/" + second: brokerResult("allow"),
 		})
 
 		if err := control.runLiveProbes(context.Background(), run, nil); err != nil {
 			t.Fatalf("runLiveProbes: %v", err)
 		}
-		if len(created) != 2 {
-			t.Fatalf("the pass probed %v, want one probe each for %q and %q", created, first, second)
-		}
-		if created[first] == created[second] {
-			t.Fatalf("nodes %q and %q shared probe pod %q", first, second, created[first])
-		}
 		for _, node := range []string{first, second} {
-			want := topology.ProbePod(run, node, control.Config.ProbeImage, "true").Name
-			if created[node] != want {
-				t.Errorf("node %q got probe pod %q, want the one its own name derives: %q", node, created[node], want)
+			if len(created[node]) != 2 {
+				t.Fatalf("the pass probed node %q with %v, want one worker probe and one broker probe", node, created[node])
 			}
-			pod := &corev1.Pod{}
-			err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: created[node]}, pod)
-			if !apierrors.IsNotFound(err) {
-				t.Errorf("probe pod for node %q outlived the pass: %v", node, err)
+			wantWorker := topology.ProbePod(run, node, control.Config.ProbeImage, "true").Name
+			wantBroker := topology.BrokerProbePod(run, node, control.Config.ProbeImage, "true").Name
+			got := map[string]bool{created[node][0]: true, created[node][1]: true}
+			if !got[wantWorker] || !got[wantBroker] {
+				t.Errorf("node %q got probe pods %v, want its own %q and %q", node, created[node], wantWorker, wantBroker)
+			}
+			for _, name := range []string{wantWorker, wantBroker} {
+				pod := &corev1.Pod{}
+				err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: name}, pod)
+				if !apierrors.IsNotFound(err) {
+					t.Errorf("probe pod %q outlived the pass: %v", name, err)
+				}
 			}
 		}
 	})
@@ -2137,8 +2167,10 @@ func TestLiveProbePodsStaySeparatePerNode(t *testing.T) {
 		// Under one shared probe name the surviving pod is the second's
 		// complete result set, read for both nodes, and the pass would pass.
 		stampProbeCreates(t, control, map[string]string{
-			first:  denyResults(checks[:3]...),
-			second: denyResults(checks...),
+			"worker/" + first:  denyResults(checks[:3]...),
+			"worker/" + second: denyResults(checks...),
+			"broker/" + first:  brokerResult("allow"),
+			"broker/" + second: brokerResult("allow"),
 		})
 
 		err := control.runLiveProbes(context.Background(), run, nil)
@@ -2147,6 +2179,93 @@ func TestLiveProbePodsStaySeparatePerNode(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), first) || !strings.Contains(err.Error(), "3 of 4") {
 			t.Fatalf("error = %v, want it to name node %q and its incomplete coverage", err, first)
+		}
+	})
+}
+
+// TestBrokerProbeVerdictsPinsTheBrokerToAPIAllowPath drives the live-probe
+// pass's broker-labeled probe (#680): a complete worker probe set plus a
+// broker probe reporting allow passes; a broker probe observing deny on the
+// API server is the environment's identity-based-CNI misconfiguration and
+// must be a named SecureNeedsHumanError verdict, not a transient requeue; and
+// a crashed or truncated broker probe proves nothing, so it stays an ordinary
+// transient error.
+func TestBrokerProbeVerdictsPinsTheBrokerToAPIAllowPath(t *testing.T) {
+	checks := []string{"api-server", "cluster-dns", "cloud-metadata", "broker-service"}
+
+	t.Run("broker allow completes the pass", func(t *testing.T) {
+		control, c := secureControl(t)
+		run := secureRun("broker-probe-allow")
+		eligibleProbeCluster(t, c, run, "node-a")
+		stampProbeCreates(t, control, map[string]string{
+			"worker/node-a": denyResults(checks...),
+			"broker/node-a": brokerResult("allow"),
+		})
+		if err := control.runLiveProbes(context.Background(), run, nil); err != nil {
+			t.Fatalf("runLiveProbes: %v", err)
+		}
+		// The cleanup loop deleted both probe kinds.
+		pods := &corev1.PodList{}
+		if err := c.List(context.Background(), pods, client.InNamespace(run.Namespace)); err != nil {
+			t.Fatal(err)
+		}
+		if len(pods.Items) != 0 {
+			t.Fatalf("probe pods outlived the pass: %v", pods.Items)
+		}
+	})
+
+	t.Run("broker deny is the BrokerEgress verdict", func(t *testing.T) {
+		control, c := secureControl(t)
+		run := secureRun("broker-probe-deny")
+		eligibleProbeCluster(t, c, run, "node-a")
+		created := stampProbeCreates(t, control, map[string]string{
+			"worker/node-a": denyResults(checks...),
+			"broker/node-a": brokerResult("deny"),
+		})
+
+		err := control.runLiveProbes(context.Background(), run, nil)
+		var verdict *SecureNeedsHumanError
+		if !errors.As(err, &verdict) || verdict.Reason != "BrokerEgress" {
+			t.Fatalf("error = %v, want a *SecureNeedsHumanError with reason BrokerEgress", err)
+		}
+		for _, fragment := range []string{"broker-api-server", "Cilium", "reserved identity", "companion CNI policy"} {
+			if !strings.Contains(verdict.Detail, fragment) {
+				t.Errorf("verdict detail %q does not name %q", verdict.Detail, fragment)
+			}
+		}
+		// No relaunch churn: exactly one worker probe and one broker probe per
+		// node in the pass, and the pass cleaned both up before judging.
+		if len(created["node-a"]) != 2 {
+			t.Fatalf("the pass probed node-a with %v, want one worker probe and one broker probe", created["node-a"])
+		}
+		pods := &corev1.PodList{}
+		if err := c.List(context.Background(), pods, client.InNamespace(run.Namespace)); err != nil {
+			t.Fatal(err)
+		}
+		if len(pods.Items) != 0 {
+			t.Fatalf("probe pods outlived the verdict pass: %v", pods.Items)
+		}
+	})
+
+	t.Run("truncated broker probe is a transient error", func(t *testing.T) {
+		control, c := secureControl(t)
+		run := secureRun("broker-probe-truncated")
+		eligibleProbeCluster(t, c, run, "node-a")
+		stampProbeCreates(t, control, map[string]string{
+			"worker/node-a": denyResults(checks...),
+			"broker/node-a": "",
+		})
+
+		err := control.runLiveProbes(context.Background(), run, nil)
+		if err == nil {
+			t.Fatal("a truncated broker probe must not pass the pass")
+		}
+		var verdict *SecureNeedsHumanError
+		if errors.As(err, &verdict) {
+			t.Fatalf("error = %v, want an ordinary transient error, not the %q verdict", err, verdict.Reason)
+		}
+		if !strings.Contains(err.Error(), "coverage is incomplete") {
+			t.Fatalf("error = %v, want the incomplete-coverage transient error", err)
 		}
 	})
 }
@@ -2180,7 +2299,7 @@ func TestProbeResultsRefuseAnotherNodesPod(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	outcomes, pending, err := control.collectProbeResults(context.Background(), run, []string{"node-a"}, 2)
+	outcomes, pending, err := control.collectProbeResults(context.Background(), run, []string{"node-a"}, 2, 1)
 	if err == nil {
 		t.Fatal("a probe running on another node must not be counted as this node's result")
 	}
@@ -3690,6 +3809,271 @@ func TestSecureBrokenTopologyJudgesCeilingFromLiveRun(t *testing.T) {
 				updated.Status.Phase, updated.Status.Restarts)
 		}
 	})
+}
+
+// secureControlPod returns the fixture's control pod carrying the
+// coordinator container's live status with the given start time: the shape
+// the broker-verdict grace judges (#680). A zero start keeps the running
+// container but fails the grace closed, standing in for a pod the kubelet
+// has not stamped yet.
+func secureControlPod(runName string, startedAt time.Time) *corev1.Pod {
+	controlPod := healthyPod(runName, topology.ComponentCoordinator)
+	controlPod.Spec.Containers[0].Name = topology.ControlContainerName
+	controlPod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name:  topology.ControlContainerName,
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(startedAt)}},
+	}}
+	return controlPod
+}
+
+// brokenBrokerSecureRound stands up a Running secure round whose broker has
+// definitively failed and whose control pod carries a live coordinator
+// container started at the given time — the fixture the broker-verdict grace
+// and the verdict-preservation guard are charged from. The broker's ingress
+// Service exists so a fence's ordered teardown is observable.
+func brokenBrokerSecureRound(t *testing.T, name string, controlStartedAt time.Time) (*SecureControl, client.Client, *courier.CoderRun) {
+	t.Helper()
+	control, c := secureControl(t)
+	run := secureRun(name)
+	run.Status.Phase = courier.PhaseRunning
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	controlPod := secureControlPod(run.Name, controlStartedAt)
+	workerPod := healthyPod(run.Name, topology.ComponentWorker)
+	brokerPod := healthyPod(run.Name, topology.ComponentBroker)
+	for _, pod := range []*corev1.Pod{controlPod, workerPod, brokerPod} {
+		if err := c.Create(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.Create(context.Background(), topology.BrokerService(run)); err != nil {
+		t.Fatal(err)
+	}
+	brokerPod.Status.Phase = corev1.PodFailed
+	if err := c.Status().Update(context.Background(), brokerPod); err != nil {
+		t.Fatal(err)
+	}
+	return control, c, run
+}
+
+// TestObserveTopologyDefersBrokenBrokerForYoungControl pins #680's grace: a
+// broken broker while the control's coordinator is still inside
+// brokerVerdictGrace of its start defers the fence, because the control's
+// startup capability gate may be seconds from converting exactly this broker
+// death into a needs-human termination handoff. Nothing is torn down, no
+// relaunch is charged, and the run stays Running for the deferred requeue.
+// The fence arms pin the grace's boundaries: a simultaneous worker loss is
+// plain infrastructure failure and a vanished broker is a nil observation —
+// both fail closed into the destructive path even for a young control.
+func TestObserveTopologyDefersBrokenBrokerForYoungControl(t *testing.T) {
+	t.Run("BrokenBrokerAloneDefers", func(t *testing.T) {
+		ctx := context.Background()
+		control, c, run := brokenBrokerSecureRound(t, "secure-broker-grace", time.Now().Add(-30*time.Second))
+
+		result, handled, err := control.ObserveTopology(ctx, run, listRunPods(t, c, run))
+		if err != nil || !handled {
+			t.Fatalf("handled=%v err=%v, want the broker-verdict grace to defer the round", handled, err)
+		}
+		if result.RequeueAfter != secureRequeueDelay || result.Requeue {
+			t.Fatalf("result = %+v, want the deferred requeue without an immediate relaunch", result)
+		}
+		var updated courier.CoderRun
+		if err := c.Get(ctx, client.ObjectKeyFromObject(run), &updated); err != nil {
+			t.Fatal(err)
+		}
+		if updated.Status.Phase != courier.PhaseRunning || updated.Status.Restarts != 0 {
+			t.Fatalf("state = phase %q restarts %d, want Running/0; a deferred fence charges nothing",
+				updated.Status.Phase, updated.Status.Restarts)
+		}
+		var got corev1.Pod
+		if err := c.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &got); err != nil {
+			t.Fatalf("worker must survive the grace window: %v", err)
+		}
+		if err := c.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerPodName(run.Name)}, &got); err != nil {
+			t.Fatalf("broker pod must survive the grace window: %v", err)
+		}
+		var service corev1.Service
+		if err := c.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, &service); err != nil {
+			t.Fatalf("broker ingress must survive the grace window: %v", err)
+		}
+	})
+	t.Run("SimultaneousWorkerLossFencesImmediately", func(t *testing.T) {
+		ctx := context.Background()
+		control, c, run := brokenBrokerSecureRound(t, "secure-broker-grace-worker-loss", time.Now().Add(-30*time.Second))
+		// A simultaneous worker loss is plain infrastructure failure the
+		// grace never covers, even for a young control: the fence and the
+		// relaunch charge take the round exactly as before the grace existed.
+		var worker corev1.Pod
+		if err := c.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &worker); err != nil {
+			t.Fatal(err)
+		}
+		worker.Status.Phase = corev1.PodFailed
+		if err := c.Status().Update(ctx, &worker); err != nil {
+			t.Fatal(err)
+		}
+
+		result, handled, err := control.ObserveTopology(ctx, run, listRunPods(t, c, run))
+		if err != nil || !handled {
+			t.Fatalf("handled=%v err=%v, want the worker loss fenced", handled, err)
+		}
+		if !result.Requeue || result.RequeueAfter != 0 {
+			t.Fatalf("result = %+v, want an immediate relaunch, not the grace deferral", result)
+		}
+		assertRoundFencedAndCharged(t, c, run)
+	})
+	t.Run("VanishedBrokerFencesImmediately", func(t *testing.T) {
+		ctx := context.Background()
+		control, c, run := brokenBrokerSecureRound(t, "secure-broker-grace-vanished", time.Now().Add(-30*time.Second))
+		// The observation's pod list no longer holds the broker: the grace
+		// requires the broken broker it defers on, so a nil observation fails
+		// closed into the vanished-component fence, never a deferral.
+		observed := listRunPods(t, c, run)
+		pods := make([]corev1.Pod, 0, len(observed))
+		for _, pod := range observed {
+			if pod.Labels["courier.misospace.dev/component"] != topology.ComponentBroker {
+				pods = append(pods, pod)
+			}
+		}
+
+		result, handled, err := control.ObserveTopology(ctx, run, pods)
+		if err != nil || !handled {
+			t.Fatalf("handled=%v err=%v, want the vanished broker fenced", handled, err)
+		}
+		if !result.Requeue || result.RequeueAfter != 0 {
+			t.Fatalf("result = %+v, want an immediate relaunch, not the grace deferral", result)
+		}
+		assertRoundFencedAndCharged(t, c, run)
+	})
+}
+
+// TestObserveTopologyFencesBrokenBrokerPastGrace pins the grace's two
+// fail-closed arms: a control whose coordinator started beyond
+// brokerVerdictGrace, and a control whose running coordinator never recorded
+// a start. Both fall through to the destructive path exactly as before the
+// grace existed — fenced and charged against the crashloop ceiling.
+func TestObserveTopologyFencesBrokenBrokerPastGrace(t *testing.T) {
+	t.Run("StartedAtBeyondGrace", func(t *testing.T) {
+		assertBrokenBrokerFenced(t, "secure-broker-grace-expired", time.Now().Add(-5*time.Minute))
+	})
+	t.Run("ZeroStartedAtFailsClosed", func(t *testing.T) {
+		assertBrokenBrokerFenced(t, "secure-broker-grace-zero", time.Time{})
+	})
+}
+
+func assertBrokenBrokerFenced(t *testing.T, name string, controlStartedAt time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	control, c, run := brokenBrokerSecureRound(t, name, controlStartedAt)
+	control.APIReader = c
+
+	result, handled, err := control.ObserveTopology(ctx, run, listRunPods(t, c, run))
+	if err != nil || !handled {
+		t.Fatalf("handled=%v err=%v, want the broken broker fenced", handled, err)
+	}
+	if !result.Requeue || result.RequeueAfter != 0 {
+		t.Fatalf("result = %+v, want an immediate relaunch below the ceiling", result)
+	}
+	assertRoundFencedAndCharged(t, c, run)
+}
+
+// assertRoundFencedAndCharged pins the destructive fenceAndRelaunch outcome
+// for a round below the ceiling: the whole topology torn down — control pod
+// included, its deterministic name freed for the replacement — and exactly
+// one relaunch charged.
+func assertRoundFencedAndCharged(t *testing.T, c client.Client, run *courier.CoderRun) {
+	t.Helper()
+	ctx := context.Background()
+	var updated courier.CoderRun
+	if err := c.Get(ctx, client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseClaimed || updated.Status.Restarts != 1 {
+		t.Fatalf("state = phase %q restarts %d, want Claimed/1 charged for the infrastructure loss",
+			updated.Status.Phase, updated.Status.Restarts)
+	}
+	var got corev1.Pod
+	if err := c.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.ControlPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("the recoverable control pod must be deleted for the relaunch, got %v", err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("worker must be fenced, got %v", err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker pod must be fenced, got %v", err)
+	}
+	var service corev1.Service
+	if err := c.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, &service); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker ingress must be fenced, got %v", err)
+	}
+}
+
+// TestObserveTopologyPreservesControlWithVerdictHandoff pins #680's
+// verdict-preservation guard: the cached pod list still shows the control
+// live, but the live re-read inside the relaunch finds the coordinator
+// terminated with a validated needs-human handoff — the cache-vs-live race
+// a broken broker produces. Deleting that pod would destroy the evidence the
+// exit-code mapping needs to terminalize the run, so the guard preserves it,
+// fences the round, and charges nothing.
+func TestObserveTopologyPreservesControlWithVerdictHandoff(t *testing.T) {
+	ctx := context.Background()
+	// The control started well past the grace, so the observation proceeds
+	// to the relaunch path instead of deferring.
+	control, c, run := brokenBrokerSecureRound(t, "secure-verdict-preserved", time.Now().Add(-10*time.Minute))
+
+	// The pod list this reconcile collected still shows the control live.
+	pods := listRunPods(t, c, run)
+
+	// By the time the relaunch's live re-read runs, the control pod has
+	// terminated with its validated needs-human handoff recorded.
+	controlKey := types.NamespacedName{Namespace: run.Namespace, Name: topology.ControlPodName(run.Name)}
+	var controlPod corev1.Pod
+	if err := c.Get(ctx, controlKey, &controlPod); err != nil {
+		t.Fatal(err)
+	}
+	controlPod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: topology.ControlContainerName,
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			ExitCode: exitNeedsHuman,
+			Message:  `COURIER_TERMINATION {"phase":"NeedsHuman","result":"needs-human","exit_code":2}`,
+		}},
+	}}
+	if err := c.Status().Update(ctx, &controlPod); err != nil {
+		t.Fatal(err)
+	}
+
+	result, handled, err := control.ObserveTopology(ctx, run, pods)
+	if err != nil || !handled {
+		t.Fatalf("handled=%v err=%v, want the verdict-bearing control preserved and handled", handled, err)
+	}
+	if result.RequeueAfter != secureRequeueDelay || result.Requeue {
+		t.Fatalf("result = %+v, want the deferred requeue; a preserved verdict is never a relaunch", result)
+	}
+	var updated courier.CoderRun
+	if err := c.Get(ctx, client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseRunning || updated.Status.Restarts != 0 {
+		t.Fatalf("state = phase %q restarts %d, want Running/0; preserving the verdict charges nothing",
+			updated.Status.Phase, updated.Status.Restarts)
+	}
+	var got corev1.Pod
+	if err := c.Get(ctx, controlKey, &got); err != nil {
+		t.Fatalf("the verdict-bearing control pod must survive for the exit-code mapping: %v", err)
+	}
+	if got.DeletionTimestamp != nil {
+		t.Fatal("the verdict-bearing control pod carries a deletion; preservation must not race the fence")
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("worker must be fenced while the verdict is preserved, got %v", err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker pod must be fenced while the verdict is preserved, got %v", err)
+	}
+	var service corev1.Service
+	if err := c.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, &service); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker ingress must be fenced while the verdict is preserved, got %v", err)
+	}
 }
 
 // The admission matrix of external contributions, driven through the shared

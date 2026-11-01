@@ -30,6 +30,7 @@ type ForgeOps interface {
 // no publish and no merge tool: publication is not model-influenced.
 const (
 	toolShell       = "shell"
+	toolCheck       = "check"
 	toolDelegate    = "delegate"
 	toolCancelBrief = "cancel_brief"
 	toolForge       = "forge"
@@ -49,10 +50,18 @@ type Coordinator struct {
 	snapshotMu    sync.Mutex
 	snapshotReady bool
 	snapshotTip   string
+	// snapshotGen is the coordinator-local witness that the shared worker
+	// workspace was re-established (wiping all worker-side mutation) at the
+	// moment of a materialization: every successful destructive
+	// materialization advances it, so a check receipt recorded against one
+	// generation describes a workspace that no longer exists once any later
+	// materialization has run.
+	snapshotGen uint64
 
 	publisher Publisher
 	activity  ActivitySink
 	briefs    *BriefRegistry
+	checks    *checkRegistry
 	status    *StatusReporter
 	control   *ControlWatcher
 	// budgets is the context policy resolved per role at startup; a role
@@ -270,6 +279,7 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 		compactions:             config.Compactions,
 		bootstrapReceipts:       config.BootstrapReceipts,
 		briefs:                  NewBriefRegistry(),
+		checks:                  newCheckRegistry(),
 		status:                  config.Status,
 		control:                 config.Control,
 		workRefBeyondAnchor:     config.WorkRefBeyondAnchor,
@@ -704,6 +714,21 @@ func shellTool() ToolDef {
 	}
 }
 
+func checkTool() ToolDef {
+	return ToolDef{
+		Name:        toolCheck,
+		Description: "Run one shell command on the sandbox worker as a tracked check. An identical command (exact bytes) against unchanged state (snapshot tip, bootstrap environment) returns the saved receipt; state changes invalidate it. refresh:true forces a fresh dispatch; a completed plain shell run of the exact same command also invalidates the receipt.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"command": map[string]any{"type": "string", "description": "The shell command to run as a tracked check."},
+				"refresh": map[string]any{"type": "boolean", "description": "Dispatch fresh, replacing any saved receipt."},
+			},
+			"required": []string{"command"},
+		},
+	}
+}
+
 func forgeTool() ToolDef {
 	return ToolDef{
 		Name:        toolForge,
@@ -723,7 +748,7 @@ func forgeTool() ToolDef {
 // offered: worker shell, delegation, cancellation, and — when the forge seam
 // is wired — broker forge reads. Publication is never a tool.
 func (c *Coordinator) coordinatorTools() []ToolDef {
-	tools := []ToolDef{shellTool()}
+	tools := []ToolDef{shellTool(), checkTool()}
 	tools = append(tools,
 		ToolDef{
 			Name:        toolDelegate,
@@ -780,6 +805,13 @@ func (c *Coordinator) runTool(ctx context.Context, call ToolCall, briefID string
 	switch call.Name {
 	case toolShell:
 		return c.runShell(ctx, call, briefID, result)
+	case toolCheck:
+		if subagent {
+			result.IsError = true
+			result.Content = "tracked checks are not available to sub-agents"
+			return result
+		}
+		return c.runCheck(ctx, call, briefID, result)
 	case toolDelegate:
 		if subagent {
 			result.IsError = true
@@ -839,8 +871,9 @@ func (c *Coordinator) runShell(ctx context.Context, call ToolCall, briefID strin
 		return result
 	}
 	var err error
+	var tip string
 	if briefID == "control" {
-		_, err = c.prepareSnapshot(ctx, briefID)
+		tip, err = c.prepareSnapshot(ctx, briefID)
 	} else {
 		err = c.ensureSnapshot(ctx)
 	}
@@ -852,12 +885,36 @@ func (c *Coordinator) runShell(ctx context.Context, call ToolCall, briefID strin
 	// Only model-influenced tasks carry the applied bootstrap environment
 	// delta (#414): fixed control scripts (unpack, pack) run under the
 	// worker's own environment.
-	task := protocol.Task{Command: []string{"sh", "-c", args.Command}, ArtifactPath: args.ArtifactPath, Env: c.currentBootstrapEnv()}
+	env := c.currentBootstrapEnv()
+	task := protocol.Task{Command: []string{"sh", "-c", args.Command}, ArtifactPath: args.ArtifactPath, Env: env}
 	workerResult, err := c.dispatchAndAwait(ctx, newOpID("shell", briefID), briefID, task)
 	if err != nil {
 		result.IsError = true
 		result.Content = safeToolError(err)
 		return result
+	}
+	// A completed control shell run is fresh evidence against the exact
+	// command-and-state identity the tracked checks use: the shell path's
+	// own prepare just re-materialized the workspace at the current tip, so
+	// the workspace no longer holds the state ANY receipt for this
+	// command-and-tip identity describes — whether or not the re-captured
+	// bootstrap environment matches the one a stored receipt recorded. Drop
+	// the matching receipt regardless of environment: an env-mismatched
+	// receipt was already unservable under the checks' serve-time guard,
+	// and dropping it is strictly conservative. Only a completed run counts
+	// (completedRun): a failing exit is fresh failing evidence —
+	// the worker reports a nonzero exit as ResultFailed — while a
+	// cancelled dispatch or a run that never produced an exit status
+	// produced no evidence and leaves the registry untouched, and an
+	// unrelated command leaves every receipt in place. The match is exact
+	// on the command bytes; an equivalent command spelled differently
+	// leaves the receipt to its own identity. If an in-flight check for
+	// the same identity completes after this run, its receipt is equally
+	// fresh evidence only when its dispatch postdates this run's
+	// re-materialization; otherwise the tracked checks' generation guard
+	// refuses it as evidence from an older workspace generation.
+	if briefID == "control" && completedRun(workerResult.Status, workerResult.ExitCode) {
+		c.checks.invalidate(checkStateKey(args.Command, tip))
 	}
 	return workerResultToTool(workerResult, result)
 }
@@ -1411,12 +1468,16 @@ func (c *Coordinator) closeOperation(ctx context.Context, opID string, completed
 // and published work (see prepareSnapshot).
 func (c *Coordinator) ensureSnapshot(ctx context.Context) error {
 	c.snapshotMu.Lock()
-	defer c.snapshotMu.Unlock()
 	if c.snapshotReady {
+		c.snapshotMu.Unlock()
 		return nil
 	}
-	_, err := c.prepareSnapshotLocked(ctx, "control")
-	return err
+	c.snapshotMu.Unlock()
+	snap, err := c.renderSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+	return c.materializeSnapshot(ctx, "control", snap)
 }
 
 // prepareSnapshot renders the sanitized snapshot, uploads it to the worker,
@@ -1427,24 +1488,66 @@ func (c *Coordinator) ensureSnapshot(ctx context.Context) error {
 // carry every integrated-but-possibly-unpublished brief — and coordinator shell commands also prepare fresh snapshots so publication
 // base resyncs cannot leave validation on a stale worker workspace.
 func (c *Coordinator) prepareSnapshot(ctx context.Context, briefID string) (string, error) {
-	c.snapshotMu.Lock()
-	defer c.snapshotMu.Unlock()
-	return c.prepareSnapshotLocked(ctx, briefID)
-}
-
-func (c *Coordinator) prepareSnapshotLocked(ctx context.Context, briefID string) (string, error) {
-	if c.worker == nil {
-		return "", errors.New("no worker is configured in this build")
-	}
-	if c.snapshot == nil {
-		return "", errors.New("no snapshot provider is configured in this build")
-	}
-	snap, err := c.snapshot(ctx)
+	snap, err := c.renderSnapshot(ctx)
 	if err != nil {
 		return "", err
 	}
-	if err := c.worker.client.UploadSnapshot(ctx, snap.Data); err != nil {
+	if err := c.materializeSnapshot(ctx, briefID, snap); err != nil {
 		return "", err
+	}
+	return snap.Tip, nil
+}
+
+// currentSnapshotGen returns the current snapshot generation: the count of
+// successful destructive materializations this incarnation has performed.
+func (c *Coordinator) currentSnapshotGen() uint64 {
+	c.snapshotMu.Lock()
+	defer c.snapshotMu.Unlock()
+	return c.snapshotGen
+}
+
+// renderSnapshot re-renders the sanitized snapshot bundle from the
+// integration head and returns it. It is purely local control-side work — no
+// mutex and no worker interaction — and in particular nothing destructive:
+// the bundle is rendered from trusted state and nothing is dispatched. The
+// destructive half (the upload and the workspace-resetting unpack) lives in
+// materializeSnapshot, so a caller that only needs the snapshot tip to
+// classify a request — the tracked checks' registry key — never touches the
+// shared worker workspace.
+//
+// Because rendering runs outside the mutex, two concurrent prepares may
+// render before either materializes, and their materializations may run in
+// either order. The last writer settles snapshotReady, snapshotTip, and the
+// generation consistently with the workspace it materialized, and the
+// production tool pump executes tool calls serially, so no consumer currently
+// depends on render/materialize ordering across callers.
+func (c *Coordinator) renderSnapshot(ctx context.Context) (Snapshot, error) {
+	if c.snapshot == nil {
+		return Snapshot{}, errors.New("no snapshot provider is configured in this build")
+	}
+	return c.snapshot(ctx)
+}
+
+// materializeSnapshot uploads the rendered snapshot bundle to the worker and
+// dispatches the fixed unpack task that materializes the worker's ephemeral
+// workspace at the snapshot tip, then settles the applied bootstrap
+// environment the workspace now holds. This is the destructive step: the
+// unpack resets and cleans the shared worker workspace, so it must run only
+// after any registry claim that guards a check against the workspace state.
+// Each full success bumps the snapshot generation — the coordinator-local
+// witness that the workspace was re-established, wiping all worker-side
+// mutation, at the moment of this materialization. As with renderSnapshot,
+// concurrent prepares may materialize in either order; the last writer
+// settles the tip, readiness, and generation consistently with the workspace
+// it materialized.
+func (c *Coordinator) materializeSnapshot(ctx context.Context, briefID string, snap Snapshot) error {
+	c.snapshotMu.Lock()
+	defer c.snapshotMu.Unlock()
+	if c.worker == nil {
+		return errors.New("no worker is configured in this build")
+	}
+	if err := c.worker.client.UploadSnapshot(ctx, snap.Data); err != nil {
+		return err
 	}
 	// The unpack is trusted control's own fixed script: it materializes the
 	// snapshot bundle into the worker's ephemeral workspace at the snapshot
@@ -1453,17 +1556,17 @@ func (c *Coordinator) prepareSnapshotLocked(ctx context.Context, briefID string)
 	task := protocol.Task{Command: []string{"sh", "-c", workerUnpackScript()}}
 	result, err := c.dispatchAndAwait(ctx, newOpID("snapshot", briefID), briefID, task)
 	if err != nil {
-		return "", err
+		return err
 	}
 	if result.ExitCode != 0 {
-		return "", errors.New("workspace snapshot unpack failed")
+		return errors.New("workspace snapshot unpack failed")
 	}
 	// The unpack echoes the tip it materialized. On the honest path it must
 	// equal the dispatched tip; a mismatch means the workspace does not hold
 	// the snapshot control dispatched, and nothing may be dispatched
 	// against it.
 	if strings.TrimSpace(result.StdoutTail) != snap.Tip {
-		return "", errors.New("worker workspace does not match the dispatched snapshot tip")
+		return errors.New("worker workspace does not match the dispatched snapshot tip")
 	}
 	// The workspace is materialized at the dispatched tip: if the approved
 	// development-bootstrap contract applies (#414), it runs now, after
@@ -1479,7 +1582,7 @@ func (c *Coordinator) prepareSnapshotLocked(ctx context.Context, briefID string)
 			if errors.As(err, &blocker) {
 				c.recordBootstrapBlocker(blocker)
 			}
-			return "", err
+			return err
 		}
 	case devenv.StateAbsent, devenv.StateModified:
 		// Nothing to apply: the contract was never approved, or the work
@@ -1495,7 +1598,8 @@ func (c *Coordinator) prepareSnapshotLocked(ctx context.Context, briefID string)
 	}
 	c.snapshotReady = true
 	c.snapshotTip = snap.Tip
-	return snap.Tip, nil
+	c.snapshotGen++
+	return nil
 }
 
 // bootstrapBlockerReasonPrefix is the fixed prefix every bootstrap

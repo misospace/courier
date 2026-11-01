@@ -194,8 +194,10 @@ type ActivitySink interface {
 // operator's crashloop backstop takes over, which is where stuckness belongs.
 const maxStreamRetries = 3
 
-// retryBackoff spaces out in-process infra retries.
-const retryBackoff = 250 * time.Millisecond
+// retryBackoff spaces out in-process infra retries. It is a variable, not a
+// constant, so an in-process test can shrink it. Production never
+// reassigns it: the backoff is the production spacing between retries.
+var retryBackoff = 250 * time.Millisecond
 
 // maxInProcessRetryAfter bounds how long a single incarnation honors an
 // authoritative Retry-After hint before handing the run back to the source.

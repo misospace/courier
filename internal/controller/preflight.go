@@ -27,16 +27,23 @@ import (
 const defaultProbeTimeout = 2 * time.Minute
 
 // preflightProbesImageNote documents the probe contract: probe pods carry the
-// worker's labels so the worker's own NetworkPolicy is what the probes
-// exercise. Allowed control-to-broker/worker paths are proven post-launch by
-// the control binary's capability health; the preflight probes prove the deny
-// paths and the worker-to-cache allow path.
+// component label of the workload whose NetworkPolicy they exercise — the
+// worker's for the deny-path probes, the broker's for the broker probe that
+// proves the broker-to-API-server allow path against the broker's own
+// NetworkPolicy egress. Allowed control-to-broker/worker paths are proven
+// post-launch by the control binary's capability health; the preflight probes
+// prove the deny paths and the worker-to-cache and broker-to-API-server allow
+// paths.
 
 type probeCheck struct {
 	Name   string `json:"name"`
 	IP     string `json:"ip"`
 	Port   int32  `json:"port"`
 	Expect string `json:"expect"` // "deny" or "allow"
+	// Broker marks a check run by the broker-labeled probe pod rather than
+	// the worker-labeled one, so its outcome is judged against the broker's
+	// NetworkPolicy, not the worker's.
+	Broker bool `json:"-"`
 }
 
 type probeOutcome struct {
@@ -441,6 +448,10 @@ func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun,
 		// normalizes and digests whatever the node is named, so the name
 		// is DNS-safe either way.
 		pods = append(pods, topology.ProbePod(run, "dry-run-node", s.Config.ProbeImage, "true"))
+		// The broker probe joins the proof for the same reason: the live pass
+		// below creates one per eligible node, so this pass must prove the
+		// spec it will create.
+		pods = append(pods, topology.BrokerProbePod(run, "dry-run-node", s.Config.ProbeImage, "true"))
 	}
 
 	for _, pod := range pods {
@@ -548,8 +559,10 @@ func (s *SecureControl) renderedWorkerPublicKey(ctx context.Context, run *courie
 }
 
 // runLiveProbes executes the multi-node live deny/allow probe phase. Probe
-// pods carry the worker's labels, so the worker's own NetworkPolicy — not an
-// exception — is what the probes exercise. A probe's sizing is fixed rather than
+// pods carry the component label of the workload whose NetworkPolicy they
+// exercise — the worker's for the deny/allow checks, the broker's for the
+// broker-to-API-server allow check — so each policy under test is that
+// workload's own, not an exception. A probe's sizing is fixed rather than
 // lane-following, so no lane sizing is resolved or passed in here.
 func (s *SecureControl) runLiveProbes(ctx context.Context, run *courier.CoderRun, cache *topology.CachePin) error {
 	nodes := &corev1.NodeList{}
@@ -583,8 +596,18 @@ func (s *SecureControl) runLiveProbes(ctx context.Context, run *courier.CoderRun
 	if cache != nil && cache.IP != "" {
 		checks = append(checks, probeCheck{Name: "dependency-cache", IP: cache.IP, Port: cache.Port, Expect: "allow"})
 	}
+	// The broker probe proves the allow path the broker's own egress policy
+	// must admit: the broker reaching the API server on TCP 443. Under
+	// IP-based CNIs the shared 0.0.0.0/0 rule admits it; under identity-based
+	// CNIs such as Cilium the API server is a reserved identity the vanilla
+	// ipBlock rule cannot match, so this probe observes deny — a real
+	// environment misconfiguration, reported as a verdict below.
+	brokerChecks := []probeCheck{
+		{Name: "broker-api-server", IP: apiIP, Port: 443, Expect: "allow", Broker: true},
+	}
 
 	script := probeScript(checks)
+	brokerScript := probeScript(brokerChecks)
 	timeout := s.Config.ProbeTimeout
 	if timeout <= 0 {
 		timeout = defaultProbeTimeout
@@ -593,44 +616,67 @@ func (s *SecureControl) runLiveProbes(ctx context.Context, run *courier.CoderRun
 	defer cancel()
 
 	for _, node := range eligible {
-		pod := topology.ProbePod(run, node, s.Config.ProbeImage, script)
-		if err := s.Client.Delete(ctx, pod); err == nil {
-			// A leftover probe from an earlier attempt: wait for its
-			// termination below instead of failing on a name conflict.
-		}
-		if err := s.Client.Create(ctx, pod); err != nil && !apierrors.IsAlreadyExists(err) {
-			if apierrors.IsInvalid(err) {
-				// The dry-run proof already covers this spec, so an
-				// Invalid here means the live create hit something the
-				// dry run could not: permanent, and requeueing cannot
-				// change it. A Forbidden or quota denial stays an
-				// ordinary error — a quota or an RBAC grant can be
-				// raised later, so a requeue is the right answer there.
-				return secureNeedsHuman("PodAdmission",
-					"the API server rejected the live probe pod on node %s: %v", node, err)
+		for _, pod := range []*corev1.Pod{
+			topology.ProbePod(run, node, s.Config.ProbeImage, script),
+			topology.BrokerProbePod(run, node, s.Config.ProbeImage, brokerScript),
+		} {
+			if err := s.Client.Delete(ctx, pod); err == nil {
+				// A leftover probe from an earlier attempt: wait for its
+				// termination below instead of failing on a name conflict.
 			}
-			return fmt.Errorf("secure preflight: create probe pod on %s: %w", node, err)
+			if err := s.Client.Create(ctx, pod); err != nil && !apierrors.IsAlreadyExists(err) {
+				if apierrors.IsInvalid(err) {
+					// The dry-run proof already covers this spec, so an
+					// Invalid here means the live create hit something the
+					// dry run could not: permanent, and requeueing cannot
+					// change it. A Forbidden or quota denial stays an
+					// ordinary error — a quota or an RBAC grant can be
+					// raised later, so a requeue is the right answer there.
+					return secureNeedsHuman("PodAdmission",
+						"the API server rejected the live probe pod on node %s: %v", node, err)
+				}
+				return fmt.Errorf("secure preflight: create probe pod on %s: %w", node, err)
+			}
 		}
 	}
 
 	deadline := time.Now().Add(timeout)
 	for {
-		outcomes, pending, err := s.collectProbeResults(ctx, run, eligible, len(checks))
+		outcomes, pending, err := s.collectProbeResults(ctx, run, eligible, len(checks), len(brokerChecks))
 		if err != nil {
 			return err
 		}
 		if !pending {
 			for _, node := range eligible {
-				pod := topology.ProbePod(run, node, s.Config.ProbeImage, "")
-				_ = ctrlclient.IgnoreNotFound(s.Client.Delete(ctx, pod))
+				for _, pod := range []*corev1.Pod{
+					topology.ProbePod(run, node, s.Config.ProbeImage, ""),
+					topology.BrokerProbePod(run, node, s.Config.ProbeImage, ""),
+				} {
+					_ = ctrlclient.IgnoreNotFound(s.Client.Delete(ctx, pod))
+				}
 			}
 			for _, outcome := range outcomes {
 				check := findCheck(checks, outcome.Name)
+				if check == nil {
+					check = findCheck(brokerChecks, outcome.Name)
+				}
 				if check == nil {
 					return fmt.Errorf("secure preflight: probe reported unknown check %q", outcome.Name)
 				}
 				if outcome.Got != check.Expect {
 					if check.Expect == "allow" {
+						if check.Broker && outcome.Got == "deny" {
+							// The broker probe's deny is the environment's
+							// identity-based-CNI misconfiguration (#680): the
+							// API server's reserved identity is not matchable
+							// by the vanilla ipBlock rule, so the run
+							// namespace needs a companion CNI policy. That is
+							// a permanent deployment fact, so it is a verdict,
+							// not a transient dependency failure.
+							return secureNeedsHuman("BrokerEgress",
+								"live broker probe %q expected allow but observed deny: the broker cannot reach the API server at %s:443; identity-based CNIs such as Cilium classify API-server traffic by a reserved identity vanilla NetworkPolicy ipBlock rules cannot match, so the run namespace needs a companion CNI policy (for example a CiliumNetworkPolicy granting toEntities: kube-apiserver) for the run's broker pod",
+								check.Name, check.IP)
+						}
 						// An unreachable allowed path is a transient
 						// dependency failure, not broken isolation.
 						return fmt.Errorf("secure preflight: probe %q expected %s but observed %s",
@@ -663,69 +709,87 @@ func findCheck(checks []probeCheck, name string) *probeCheck {
 	return nil
 }
 
-// collectProbeResults reads every probe pod's termination message. It returns
-// the outcomes and whether any probe is still pending. The probe pod name is
-// deterministic and independent of sizing, so the lookup renders nothing but
-// the name.
-func (s *SecureControl) collectProbeResults(ctx context.Context, run *courier.CoderRun, nodes []string, checkCount int) ([]probeOutcome, bool, error) {
+// collectProbeResults reads every probe pod's termination message — the
+// worker-labeled probe and the broker-labeled probe on each node — and returns
+// the outcomes and whether any probe is still pending. Each node must report
+// the worker probe's full check count and the broker probe's full check count:
+// a crashed or truncated probe of either kind proves nothing about the node.
+// The probe pod names are deterministic and independent of sizing, so the
+// lookups render nothing but the names.
+func (s *SecureControl) collectProbeResults(ctx context.Context, run *courier.CoderRun, nodes []string, checkCount, brokerCheckCount int) ([]probeOutcome, bool, error) {
 	var outcomes []probeOutcome
 	pending := false
 	for _, node := range nodes {
-		pod := &corev1.Pod{}
-		name := topology.ProbePod(run, node, s.Config.ProbeImage, "").Name
-		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: name}, pod); err != nil {
-			if apierrors.IsNotFound(err) {
-				pending = true
-				continue
-			}
-			return nil, false, fmt.Errorf("secure preflight: read probe pod on %s: %w", node, err)
+		var err error
+		outcomes, pending, err = s.readNodeProbe(ctx, run, node,
+			topology.ProbePod(run, node, s.Config.ProbeImage, "").Name, checkCount, outcomes)
+		if err != nil || pending {
+			return outcomes, pending, err
 		}
-		if pod.Spec.NodeName != node {
-			// The name says node, the schedule says otherwise: whatever this
-			// pod observed is not evidence about the node under test. The
-			// mismatch's persistent causes outlast a requeue — a digest
-			// collision in the probe tag re-pins the one shared pod to the
-			// last node probed on every pass, and a foreign pod holding the
-			// name may be recreated — and this read cannot tell them from a
-			// stray pod the next pass's delete-and-create would clear. Refuse
-			// terminally rather than cycling probe phases around an identity
-			// the run cannot vouch for, naming the probe and both nodes.
-			return nil, false, secureNeedsHuman("ProbeIdentity",
-				"probe %s is scheduled on node %s, not %s; refusing the result",
-				pod.Name, pod.Spec.NodeName, node)
-		}
-		if pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
-			pending = true
-			continue
-		}
-		message := ""
-		for _, cs := range pod.Status.ContainerStatuses {
-			if cs.Name == "probe" && cs.State.Terminated != nil {
-				message = cs.State.Terminated.Message
-			}
-		}
-		nodeOutcomes := 0
-		for _, line := range strings.Split(strings.TrimSpace(message), "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			var outcome probeOutcome
-			if err := json.Unmarshal([]byte(line), &outcome); err != nil {
-				return nil, false, fmt.Errorf("secure preflight: probe on %s produced an unreadable result: %w", node, err)
-			}
-			outcomes = append(outcomes, outcome)
-			nodeOutcomes++
-		}
-		if nodeOutcomes < checkCount {
-			// A crashed or truncated probe proves nothing about this node:
-			// requeue rather than pass on partial coverage.
-			return nil, false, fmt.Errorf("secure preflight: probe on node %s reported %d of %d checks; coverage is incomplete",
-				node, nodeOutcomes, checkCount)
+		outcomes, pending, err = s.readNodeProbe(ctx, run, node,
+			topology.BrokerProbePod(run, node, s.Config.ProbeImage, "").Name, brokerCheckCount, outcomes)
+		if err != nil || pending {
+			return outcomes, pending, err
 		}
 	}
 	sort.Slice(outcomes, func(i, j int) bool { return outcomes[i].Name < outcomes[j].Name })
 	return outcomes, pending, nil
+}
+
+// readNodeProbe reads one probe pod pinned to a node and appends its outcomes.
+// The second return reports whether the probe is still pending — not found, or
+// not yet terminal — and must be retried on a later pass.
+func (s *SecureControl) readNodeProbe(ctx context.Context, run *courier.CoderRun, node, name string, checkCount int, outcomes []probeOutcome) ([]probeOutcome, bool, error) {
+	pod := &corev1.Pod{}
+	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: name}, pod); err != nil {
+		if apierrors.IsNotFound(err) {
+			return outcomes, true, nil
+		}
+		return nil, false, fmt.Errorf("secure preflight: read probe pod on %s: %w", node, err)
+	}
+	if pod.Spec.NodeName != node {
+		// The name says node, the schedule says otherwise: whatever this
+		// pod observed is not evidence about the node under test. The
+		// mismatch's persistent causes outlast a requeue — a digest
+		// collision in the probe tag re-pins the one shared pod to the
+		// last node probed on every pass, and a foreign pod holding the
+		// name may be recreated — and this read cannot tell them from a
+		// stray pod the next pass's delete-and-create would clear. Refuse
+		// terminally rather than cycling probe phases around an identity
+		// the run cannot vouch for, naming the probe and both nodes.
+		return nil, false, secureNeedsHuman("ProbeIdentity",
+			"probe %s is scheduled on node %s, not %s; refusing the result",
+			pod.Name, pod.Spec.NodeName, node)
+	}
+	if pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
+		return outcomes, true, nil
+	}
+	message := ""
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.Name == "probe" && cs.State.Terminated != nil {
+			message = cs.State.Terminated.Message
+		}
+	}
+	nodeOutcomes := 0
+	for _, line := range strings.Split(strings.TrimSpace(message), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var outcome probeOutcome
+		if err := json.Unmarshal([]byte(line), &outcome); err != nil {
+			return nil, false, fmt.Errorf("secure preflight: probe on %s produced an unreadable result: %w", node, err)
+		}
+		outcomes = append(outcomes, outcome)
+		nodeOutcomes++
+	}
+	if nodeOutcomes < checkCount {
+		// A crashed or truncated probe proves nothing about this node:
+		// requeue rather than pass on partial coverage.
+		return nil, false, fmt.Errorf("secure preflight: probe on node %s reported %d of %d checks; coverage is incomplete",
+			node, nodeOutcomes, checkCount)
+	}
+	return outcomes, false, nil
 }
 
 func (s *SecureControl) serviceClusterIP(ctx context.Context, namespace, name string) (string, error) {
