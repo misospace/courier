@@ -2439,7 +2439,10 @@ closed (`LaneConfig`); a deployment registering no bundles fails closed on
 any lane selecting skills. The pinned set travels to the control pod as
 `COURIER_SKILLS_JSON` (name+digest pairs from run status, never the live
 lane). A registered bundle shadows a same-named repository-local skill —
-deployment-owned configuration wins deterministically. Registry content is
+deployment-owned configuration wins deterministically; `skills.Overlay` is
+the tested precedence rule the #659 loader applies, and it names the
+shadowed skills so precedence is visible rather than silent. Registry
+content is
 deployment-controlled and never fed from CoderRun, source, or model data.
 The legacy launcher has no registry seam and rejects a skill-selecting lane
 outright (`LaneConfig`). Harness loading of the pinned bundles is #659.
