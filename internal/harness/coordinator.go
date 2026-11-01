@@ -34,6 +34,14 @@ const (
 	toolDelegate    = "delegate"
 	toolCancelBrief = "cancel_brief"
 	toolForge       = "forge"
+	// toolSkill is the model's name for the trusted skill-loading tool
+	// (#659): the one deterministic path every role — coordinator and
+	// delegated sub-agent alike — reads skill instructions through.
+	// Trusted control renders the pinned skill's verified SKILL.md body as
+	// tool data. The tool executes nothing and dispatches nothing; skill
+	// content is untrusted data, and any script a skill ships runs only as
+	// ordinary untrusted worker shell.
+	toolSkill = "skill"
 )
 
 // Coordinator is the native harness: the trusted control pod's model client
@@ -78,6 +86,9 @@ type Coordinator struct {
 	// observation, never from a model declaration.
 	workRefBeyondAnchor     func(context.Context) (bool, error)
 	capacityWorkspaceSafety func(context.Context) (executor.WorkspaceSafetyEvidence, error)
+	// skills is the run's loaded, verified skill view (#659); nil is a
+	// skillless run.
+	skills *SkillSet
 
 	// deferredAvailability carries a sub-agent stream failure classified as
 	// deferred model-provider availability (#320) from the delegation
@@ -244,6 +255,11 @@ type CoordinatorConfig struct {
 	// mise diagnostics — no secret values, no raw worker output. Emission
 	// is best-effort and observability only, like the compaction sink.
 	BootstrapReceipts BootstrapReceiptSink
+	// Skills is the run's loaded, verified skill view (#659): the bounded
+	// index pinned into every role's system message and the one trusted
+	// path — the skill tool — full instructions are served through. Nil is
+	// a skillless run: no section, no tool, no behavior change.
+	Skills *SkillSet
 }
 
 // NewCoordinator fails closed on an unusable model configuration: without a
@@ -284,6 +300,7 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 		control:                 config.Control,
 		workRefBeyondAnchor:     config.WorkRefBeyondAnchor,
 		capacityWorkspaceSafety: config.CapacityWorkspaceSafety,
+		skills:                  config.Skills,
 	}, nil
 }
 
@@ -331,6 +348,13 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 	session.Pin(Message{Role: "system", Content: strings.TrimSpace(inv.Goal) + "\n\n" + harnessFraming})
 	if strings.TrimSpace(inv.Framing) != "" {
 		session.Pin(Message{Role: "system", Content: inv.Framing})
+	}
+	// The run's pinned skills (#659) ride the same pinned boundary as the
+	// framing: composed once from the loader's verified view, bounded by
+	// the loader's and the set's own limits, so the index can never grow
+	// with the deployment registry mid-incarnation.
+	if c.skills != nil {
+		session.Pin(Message{Role: "system", Content: c.skills.Section()})
 	}
 
 	clarifications := 0
@@ -781,6 +805,9 @@ func (c *Coordinator) coordinatorTools() []ToolDef {
 	if c.forge != nil {
 		tools = append(tools, forgeTool())
 	}
+	if c.skills != nil {
+		tools = append(tools, skillTool())
+	}
 	return tools
 }
 
@@ -789,7 +816,14 @@ func (c *Coordinator) coordinatorTools() []ToolDef {
 // coordinator-only capabilities; a sub-agent's results return to trusted
 // control, and it can never publish.
 func (c *Coordinator) subagentTools() []ToolDef {
-	return []ToolDef{shellTool()}
+	tools := []ToolDef{shellTool()}
+	// The skill tool is a delegated role's only skill path (#659): trusted
+	// control serves the verified instructions as data, and the sub-agent
+	// can no more execute skill content locally than it can shell locally.
+	if c.skills != nil {
+		tools = append(tools, skillTool())
+	}
+	return tools
 }
 
 // runTool routes one tool request through its trusted implementation.
@@ -833,6 +867,10 @@ func (c *Coordinator) runTool(ctx context.Context, call ToolCall, briefID string
 			return result
 		}
 		return c.runForge(ctx, call, result)
+	case toolSkill:
+		// The one trusted skill path (#659), coordinator and sub-agent
+		// alike: verified instructions as data, nothing executed.
+		return c.runSkill(call, result)
 	default:
 		result.IsError = true
 		result.Content = fmt.Sprintf("unknown tool %q", call.Name)
@@ -1116,6 +1154,12 @@ func (c *Coordinator) runBrief(ctx context.Context, brief Brief) (summary string
 		return safeToolError(err), false, nil
 	}
 	session.Pin(Message{Role: "system", Content: briefText(brief) + "\n\n" + subagentFraming})
+	// Delegated roles load the same pinned skills through the same trusted
+	// tool (#659): the index is identical to the coordinator's, so a brief
+	// that needs a skill does not depend on the coordinator's transcript.
+	if c.skills != nil {
+		session.Pin(Message{Role: "system", Content: c.skills.Section()})
+	}
 	// The brief's settled state is re-injected verbatim into every digest:
 	// a delegate that loses its decisions mid-brief must not re-derive them.
 	session.Settle(settledStateBlock(brief))

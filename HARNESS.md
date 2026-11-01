@@ -1500,8 +1500,60 @@ policy for its incarnation.
 Skill pins travel the same seam (#658): the native control receives
 `COURIER_SKILLS_JSON`, the name+digest pairs resolved at admission and carried
 in the run's persisted status — never re-read from the live lane. Loading the
-pinned bundles, with a registered deployment bundle shadowing a same-named
-repository-local skill, lands in #659; this phase carries the pin only.
+pinned bundles is #659's harness behavior:
+
+- **One deterministic loader.** At control startup, after the capability gate,
+  a pinned run resolves its pins against the deployment-mounted bundle config
+  (`COURIER_SKILL_BUNDLES_FILE`, the same `bundles.yaml` the manager
+  registered from, mounted at `executor.SkillBundlesConfigPath`), re-resolves
+  each pinned bundle's content, and requires the recomputed digest to equal
+  the pinned digest. Missing config, an unregistered pin, drifted content,
+  a missing or empty `SKILL.md`, a frontmatter name that disagrees with the
+  pinned logical name, or oversized instructions fail closed before the
+  coordinator's first model request, declared as a `skills` capability
+  failure (`NeedsHuman`) — never an omitted skill.
+- **Collision precedence.** Repository-local skills are discovered under
+  `<checkout>/.agents/skills/<name>/SKILL.md` of the integration tree —
+  seeded first, so discovery sees the world at incarnation start. A
+  repository-local document that is not a plain regular file (checked-out
+  symlinks included), is oversized, or contradicts its own name is
+  quarantined and reported, never loaded and never run-ending: third-party
+  repository content must not park a pinned run. `skills.Overlay` decides
+  visibility: a pinned bundle shadows a same-named repository-local skill,
+  and the shadowed names are reported rather than silently dropped. The
+  visible set is bounded (32 skills, 16 repository-local), as is each
+  skill's rendered material (16 KiB instructions, 1 KiB description), so
+  loading cannot grow the context without limit.
+- **One trusted skill tool.** Roles see a bounded index — names, origins,
+  deployment-authored descriptions for bundle skills, and the shadowed and
+  quarantined reports — pinned into the coordinator's and every delegated
+  brief's system message. Repository-local entries appear as untrusted
+  content without their descriptions; their text reaches roles only through
+  the tool. Full instructions arrive only through the trusted `skill` tool,
+  which serves the verified SKILL.md body and a bounded asset listing as
+  data and executes nothing. Control never executes skill content: a
+  skill's scripts run only as ordinary untrusted worker shell through the
+  existing boundaries. A skillless run pins no section and offers no tool —
+  absence is meaningful.
+- **Worker boundary.** The worker receives no new credential, identity, or
+  writable path into the skill source. Skill assets are exposed to the
+  worker as read-only deployment mounts of the same bundle content at the
+  same registered absolute paths the loader resolved; the skill tool's
+  result names those paths. Executing a skill-provided script is normal
+  untrusted worker execution under the existing worker, network, and tool
+  boundaries. Mounting run-pod skill content is a deployment responsibility
+  (BOOTSTRAP.md carries the concrete contract); a deployment that does not
+  provide it fails pinned runs closed rather than silently skillless.
+- **Telemetry.** The loaded view — each visible skill's name, origin, digest,
+  bounded description, and asset counts, plus the shadowed and quarantined
+  names — emits as the `skills.loaded` run event at info level. Content
+  identities are inspectable; instruction bodies are not logged.
+- **Restart/resume.** Every incarnation re-resolves and re-verifies exactly
+  the run's pinned identities from persisted status; the same pinned bytes
+  produce the same rendered material, and drift fails closed.
+  Repository-local skills are not pinned identities: their discovered set
+  reflects each incarnation's seeded world, which is the collision
+  contract's own semantics.
 
 Production verification reads two signals: the capability table's
 `context-budget:<role>` state (`healthy` = gateway-verified and enforced,

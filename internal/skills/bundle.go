@@ -131,5 +131,6 @@ func Resolve(spec bundleSpec) (Bundle, error) {
 		Path:   root,
 		Files:  nfiles,
 		Bytes:  bytes,
+		files:  files,
 	}, nil
 }

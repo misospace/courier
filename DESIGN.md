@@ -2567,7 +2567,25 @@ shadowed skills so precedence is visible rather than silent. Registry
 content is
 deployment-controlled and never fed from CoderRun, source, or model data.
 The legacy launcher has no registry seam and rejects a skill-selecting lane
-outright (`LaneConfig`). Harness loading of the pinned bundles is #659.
+outright (`LaneConfig`). Harness loading of the pinned bundles (#659): the
+control pod re-resolves each pin against the deployment-mounted bundle config
+(`COURIER_SKILL_BUNDLES_FILE` at `executor.SkillBundlesConfigPath` — a
+deployment whose lanes select skills mounts the same config and content into
+its run pods, the same operator-owned mounting the registry itself relies on)
+and requires the recomputed digest to match, failing closed before the
+coordinator's first model request on a missing, drifted, or oversized mount.
+Repository-local skills discovered under `.agents/skills/<name>/SKILL.md` of
+the integration checkout compose with the pins through `skills.Overlay`;
+malformed repository-local documents are quarantined and reported, never
+run-ending, because repository content must not park a pinned run. The
+visible set and each skill's rendered material are bounded. Roles see a
+bounded index pinned into their system messages and load full instructions
+only through the trusted `skill` tool, which serves verified content as data
+and executes nothing — a skill's scripts run only as ordinary untrusted
+worker shell, with assets exposed to the worker as read-only mounts at the
+same registered paths. The loaded view emits as the `skills.loaded` run
+event; every incarnation re-verifies the same pinned identities, so restart
+and resume load identical pinned content.
 
 Resolution contract: the registered source may be a symlink (kubelet
 ConfigMap/Secret projections place per-key symlinks and a `..data` ->

@@ -458,3 +458,25 @@ Registration is deployment-controlled setup: CoderRun, source, issue,
 pull-request, and model data can never register a bundle. Skill content is
 untrusted data exposed to workers later (#658/#659); registration grants no
 shell, forge, or Kubernetes authority.
+
+A run whose lane selects skills loads its pinned bundles in the control pod
+(#659). The chart renders the run pods from the operator's CoderRun objects
+and cannot mount your bundle content there itself, so mounting into run pods
+is a deployment responsibility, mirroring how the manager's own content
+mount is operator-provided:
+
+- Mount `bundles.yaml` at `/etc/courier/skill-bundles-config/bundles.yaml`
+  into the run's control pod — the path the operator renders as
+  `COURIER_SKILL_BUNDLES_FILE` whenever the run carries pins. A non-chart
+  install that points the manager's `--skill-bundles-file` elsewhere must
+  still mount the config at this run-pod path (or re-register with the
+  documented path).
+- Mount each pinned bundle's content at the same absolute `source` path the
+  manager registered, into the control pod and — read-only — into the worker
+  pod, so a skill's supporting assets are readable where the worker executes
+  its scripts.
+
+A run with no pinned skills requires none of this: the mount contract exists
+only for pinned runs, and a missing, drifted, or oversized mount fails the
+run closed with a named capability error before the coordinator's first
+model request.

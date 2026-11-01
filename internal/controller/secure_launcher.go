@@ -295,6 +295,12 @@ func (s *SecureControl) controlInvocation(ctx context.Context, run *courier.Code
 			return executor.Invocation{}, fmt.Errorf("secure topology: encode skill pins: %w", err)
 		}
 		invocation.Skills = string(encoded)
+		// The bundle config the pins resolve against (#659) rides the same
+		// condition: the deployment mounts the registered bundles.yaml into
+		// the run's pods at the documented path, and a run without pins
+		// requires no mount. The loader fails closed pre-model when the
+		// mount is missing or its content has drifted.
+		invocation.SkillBundlesFile = executor.SkillBundlesConfigPath
 	}
 	return invocation, nil
 }

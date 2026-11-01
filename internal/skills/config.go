@@ -34,6 +34,14 @@ type Bundle struct {
 	Files int
 	// Bytes counts file content bytes; SKILL.md included.
 	Bytes int64
+
+	// files holds the exact bytes the digest was computed over, keyed by
+	// relative slash path. The harness loader (#659) renders skill content
+	// from these bytes rather than re-reading the mount, so what a role sees
+	// is exactly what the pin verified — no re-read window between digest
+	// verification and rendering. Unexported: content travels with the
+	// resolved bundle inside this package only.
+	files []bundleFile
 }
 
 // bundleSpec is one config entry: a stable logical name and the mounted

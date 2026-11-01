@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	"github.com/misospace/courier/internal/harness"
 	courierlog "github.com/misospace/courier/internal/log"
 	"github.com/misospace/courier/internal/protocol"
+	"github.com/misospace/courier/internal/skills"
 	"github.com/misospace/courier/internal/topology"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -594,5 +596,62 @@ func TestPersistTerminalResultKeepsModelTextOutOfDurableReason(t *testing.T) {
 				t.Fatalf("fencing = %#v, want the incarnation UID and a timestamp", result)
 			}
 		})
+	}
+}
+
+// The skills capability failure (#659) is a named, required capability row:
+// the operator sees the loader's precise error, not a generic control failure.
+func TestSkillLoadErrorCapabilityNamesTheFailure(t *testing.T) {
+	skillsErr := &skillLoadError{err: errors.New(`skill "alpha" content digest "sha256:01" does not match the run's pinned digest`)}
+	capability := skillsErr.capability()
+	if capability.Name != "skills" || capability.State != harness.StateUnavailable || !capability.Required {
+		t.Fatalf("capability = %#v, want a required unavailable skills row", capability)
+	}
+	if !strings.Contains(capability.Detail, "does not match the run's pinned digest") {
+		t.Fatalf("detail = %q, want the loader's precise error", capability.Detail)
+	}
+	if !strings.Contains(skillsErr.reason(), "failed to load") {
+		t.Fatalf("reason = %q, want the fail-closed class", skillsErr.reason())
+	}
+}
+
+// The skills.loaded event carries the loaded identities at info level
+// (Verbose): names, origins, digests, bounded descriptions, and asset counts
+// reach the log store on every pinned run — never instruction bodies.
+func TestEmitSkillsLoadedCarriesIdentitiesAtInfoLevel(t *testing.T) {
+	var out strings.Builder
+	loaded := skills.LoadedSkills{
+		Visible: []skills.SkillView{
+			{
+				Name:        "alpha",
+				Origin:      skills.OriginBundle,
+				Digest:      "sha256:" + strings.Repeat("a", 64),
+				Description: "does alpha things",
+				Files:       []string{"scripts/run.sh"},
+				FilesBytes:  20,
+			},
+			{
+				Name:        "repo-guide",
+				Origin:      skills.OriginRepository,
+				Description: "untrusted content",
+			},
+		},
+		Shadowed: []string{"twin"},
+		Rejected: []skills.RejectedSkill{{Name: "broken", Reason: "SKILL.md carries no instructions"}},
+	}
+	emitSkillsLoaded(executor.Invocation{
+		RunName: "run-1", Repo: "acme/widgets", Ref: 7, Mode: courierv1alpha1.ModeResolveIssue,
+	}, loaded, courierlog.NewEmitter(&out, courierlog.LevelInfo), io.Discard)
+	line := out.String()
+	if !strings.Contains(line, `"skills.loaded"`) {
+		t.Fatalf("emitted = %s, want a skills.loaded event", line)
+	}
+	for _, want := range []string{`"name":"alpha"`, `"origin":"bundle"`, `"digest":"sha256:`, "does alpha things", "twin", "broken"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("emitted detail missing %q:\n%s", want, line)
+		}
+	}
+	if strings.Contains(line, "alpha instructions") {
+		t.Fatal("skill instruction bodies must never reach telemetry")
 	}
 }

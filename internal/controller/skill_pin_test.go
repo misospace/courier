@@ -521,6 +521,12 @@ func TestControlInvocationCarriesPinnedSkills(t *testing.T) {
 	if invocation.Skills != want {
 		t.Fatalf("invocation skills = %q, want the pinned envelope %q", invocation.Skills, want)
 	}
+	// The pins' bundle config rides the same condition (#659): the pinned
+	// run's control pod resolves against the deployment-mounted config at the
+	// documented path.
+	if invocation.SkillBundlesFile != executor.SkillBundlesConfigPath {
+		t.Fatalf("invocation SkillBundlesFile = %q, want %q", invocation.SkillBundlesFile, executor.SkillBundlesConfigPath)
+	}
 
 	// An empty pin set is still a pin, but it carries no envelope: absence
 	// stays meaningful to the reconstruction boundary.
@@ -538,6 +544,9 @@ func TestControlInvocationCarriesPinnedSkills(t *testing.T) {
 	}
 	if invocation.Skills != "" {
 		t.Fatalf("a skillless run's invocation carries skills %q, want empty", invocation.Skills)
+	}
+	if invocation.SkillBundlesFile != "" {
+		t.Fatalf("a skillless run's invocation carries a bundle config path %q, want empty — absence is the no-mount contract", invocation.SkillBundlesFile)
 	}
 }
 

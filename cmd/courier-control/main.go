@@ -30,6 +30,7 @@ import (
 	"github.com/misospace/courier/internal/harness"
 	courierlog "github.com/misospace/courier/internal/log"
 	"github.com/misospace/courier/internal/protocol"
+	"github.com/misospace/courier/internal/skills"
 	"github.com/misospace/courier/internal/topology"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -240,6 +241,23 @@ func runArgs(args []string) error {
 		return fmt.Errorf("courier-control: publication engine: %w", err)
 	}
 
+	// Skill loading (#659): a pinned run resolves and verifies its pinned
+	// skill identities against the deployment-mounted bundle config before
+	// any model work starts. Missing, drifted, or oversized content is a
+	// clear pre-model failure — never an omitted skill — and the loaded
+	// identities are the only skill view every harness role sees for this
+	// incarnation. A load failure declares NeedsHuman with the skills
+	// capability; a seed failure for repository-local discovery is
+	// infrastructure the relaunch owns.
+	skillSet, err := loadRunSkills(ctx, invocation, engine)
+	if err != nil {
+		var skillsErr *skillLoadError
+		if errors.As(err, &skillsErr) {
+			return declareNeedsHuman(skillsErr.reason(), append(caps, skillsErr.capability()), reporter, identity)
+		}
+		return fmt.Errorf("courier-control: skills: %w", err)
+	}
+
 	// The coordinator loop. It is interrupted by pod termination (context),
 	// not by any wall-clock run limit.
 	//
@@ -289,6 +307,7 @@ func runArgs(args []string) error {
 			stderr:     os.Stderr,
 			invocation: invocation,
 		},
+		Skills: skillSet,
 	})
 	if err != nil {
 		return fmt.Errorf("courier-control: %w", err)
@@ -451,6 +470,109 @@ func (s bootstrapReceiptSink) BootstrapRecorded(receipt harness.BootstrapReceipt
 	})
 	if err != nil {
 		fmt.Fprintf(s.stderr, "courier-control: dropped %s event: %v\n", courierlog.EventWorkspaceBootstrap, err)
+	}
+}
+
+// skillLoadError marks a pinned skill set that failed to load (#659): a
+// pre-model, fail-closed condition the run declares as NeedsHuman with the
+// skills capability, never an omitted skill.
+type skillLoadError struct {
+	err error
+}
+
+func (e *skillLoadError) Error() string { return e.err.Error() }
+
+func (e *skillLoadError) Unwrap() error { return e.err }
+
+func (e *skillLoadError) reason() string {
+	return "the run's pinned skill bundles failed to load: " + e.err.Error()
+}
+
+func (e *skillLoadError) capability() harness.Capability {
+	return harness.Capability{
+		Name:     "skills",
+		State:    harness.StateUnavailable,
+		Detail:   boundReason(e.err.Error()),
+		Required: true,
+	}
+}
+
+// loadRunSkills resolves the run's pinned skill identities into the harness
+// skill set (#659). A skillless run loads nothing and requires no mount. A
+// pinned run seeds the integration checkout first — the world at incarnation
+// start is the deterministic state repository-local skills are discovered
+// against, and every run needs that seed before its first dispatch anyway —
+// then loads through skills.LoadForRun, which verifies each pin against the
+// deployment-mounted bundle content and fails closed on any gap. The
+// composed set is bounded by the loader's and SkillSet's own limits.
+func loadRunSkills(ctx context.Context, invocation executor.Invocation, engine *harness.PublicationEngine) (*harness.SkillSet, error) {
+	pins, err := executor.SkillPins(invocation)
+	if err != nil {
+		// Unreachable through the reconstruction boundary, but a hand-built
+		// invocation must fail in the same class as every other skill
+		// failure: pre-model, named by the capability table.
+		return nil, &skillLoadError{err: fmt.Errorf("skill pins: %w", err)}
+	}
+	if len(pins) == 0 {
+		return nil, nil
+	}
+	if _, err := engine.PrepareSnapshot(ctx); err != nil {
+		return nil, fmt.Errorf("integration seed for skill discovery: %w", err)
+	}
+	loaded, err := skills.LoadForRun(pins, invocation.SkillBundlesFile,
+		filepath.Join(topology.ControlWorkspacePath, "integration"))
+	if err != nil {
+		return nil, &skillLoadError{err: err}
+	}
+	set, err := harness.NewSkillSet(loaded)
+	if err != nil {
+		return nil, &skillLoadError{err: err}
+	}
+	emitSkillsLoaded(invocation, loaded,
+		courierlog.NewEmitter(os.Stdout, courierlog.ParseLevel(os.Getenv("COURIER_LOG_LEVEL"))), os.Stderr)
+	return set, nil
+}
+
+// emitSkillsLoaded records the run's loaded skill view on the structured
+// event log (#659): each visible skill's name, origin, content digest,
+// bounded description, and asset counts, plus the shadowed and quarantined
+// names — the identities an operator inspects, never instruction bodies.
+// The event is Verbose so the identities reach the log store at info level
+// on every pinned run, not only on debug runs. Emission is best-effort: a
+// dropped event is noted on stderr and the run continues, because losing an
+// observability line must never change what the harness does next.
+func emitSkillsLoaded(invocation executor.Invocation, loaded skills.LoadedSkills, emitter *courierlog.Emitter, stderr io.Writer) {
+	type skillIdentity struct {
+		Name        string `json:"name"`
+		Origin      string `json:"origin"`
+		Digest      string `json:"digest,omitempty"`
+		Description string `json:"description,omitempty"`
+		Files       int    `json:"files"`
+		Bytes       int64  `json:"bytes"`
+	}
+	identities := make([]skillIdentity, 0, len(loaded.Visible))
+	for _, view := range loaded.Visible {
+		identities = append(identities, skillIdentity{
+			Name:        view.Name,
+			Origin:      string(view.Origin),
+			Digest:      view.Digest,
+			Description: view.Description,
+			Files:       len(view.Files),
+			Bytes:       view.FilesBytes,
+		})
+	}
+	err := emitter.Emit(courierlog.Event{
+		Type:    courierlog.EventSkillsLoaded,
+		RunID:   invocation.RunName,
+		Repo:    invocation.Repo,
+		Ref:     invocation.Ref,
+		Mode:    string(invocation.Mode),
+		Status:  courierlog.StatusOK,
+		Detail:  map[string]any{"skills": identities, "shadowed": loaded.Shadowed, "rejected": loaded.Rejected},
+		Verbose: true,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "courier-control: dropped %s event: %v\n", courierlog.EventSkillsLoaded, err)
 	}
 }
 
