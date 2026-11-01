@@ -1,6 +1,9 @@
 package harness
 
 import (
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -216,5 +219,163 @@ func TestRunSkillBoundsTheAssetListing(t *testing.T) {
 	}
 	if !strings.Contains(result.Content, "listing truncated") {
 		t.Fatalf("a truncated listing must state the truncation: %s", result.Content[len(result.Content)-200:])
+	}
+}
+
+// materializeBundle lays out the operator's projection of one bundle into a
+// mount root: the bundle's files land at their relative paths, the way the
+// kubelet projects the run's content ConfigMap into the pods.
+func materializeBundle(t *testing.T, files map[string]string) string {
+	t.Helper()
+	mount := t.TempDir()
+	for rel, content := range files {
+		full := filepath.Join(mount, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return mount
+}
+
+// materializedSkillSet loads one bundle through the form the operator
+// materializes: the rendered per-run config document plus the mounted
+// files, resolved against the pin the deployment registry selected. It
+// returns the skill set, the mount path the operator registered, and the
+// pinned digest.
+func materializedSkillSet(t *testing.T, name string, files map[string]string) (*SkillSet, string, string) {
+	t.Helper()
+	paths := make([]string, 0, len(files))
+	for rel := range files {
+		paths = append(paths, rel)
+	}
+	sort.Strings(paths)
+	mount := materializeBundle(t, files)
+	document, err := skills.RenderRunConfig([]skills.MaterializedBundle{{
+		Name:   name,
+		Source: mount,
+		Files:  paths,
+	}})
+	if err != nil {
+		t.Fatalf("RenderRunConfig: %v", err)
+	}
+	configPath := filepath.Join(t.TempDir(), "bundles.yaml")
+	if err := os.WriteFile(configPath, document, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The deployment registry selects the pin: the tree and the projection
+	// carry the same bytes, so the pin the operator wrote is the one the
+	// control pod verifies.
+	tree := materializeBundle(t, files)
+	treeConfig := filepath.Join(t.TempDir(), "bundles.yaml")
+	if err := os.WriteFile(treeConfig, []byte("bundles:\n  - name: "+name+"\n    source: "+tree+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := skills.Load(treeConfig)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	pins, err := skills.Select(registry, []string{name})
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	loaded, err := skills.LoadForRun(pins, configPath, t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadForRun against the materialized bundle: %v", err)
+	}
+	set, err := NewSkillSet(loaded)
+	if err != nil {
+		t.Fatalf("NewSkillSet: %v", err)
+	}
+	return set, mount, pins[0].Digest
+}
+
+// TestSkillToolServesMaterializedBundle proves the harness works against
+// what the operator actually materializes, not only against a hand-built
+// view: a bundle loaded through the rendered per-run config document and
+// the mounted files yields a skill set whose tool result serves the
+// verified instructions and the asset listing, and the asset paths it names
+// are the paths the worker's mount carries.
+func TestSkillToolServesMaterializedBundle(t *testing.T) {
+	const body = "Alpha body with `$(rm -rf /)` stays data."
+	set, mount, _ := materializedSkillSet(t, "alpha", map[string]string{
+		"SKILL.md":            "---\nname: alpha\ndescription: does alpha things\n---\n" + body + "\n",
+		"assets/checklist.md": "check\n",
+	})
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
+		Bindings: testBindings(),
+		Skills:   set,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := coordinator.runTool(nil, ToolCall{ID: "c1", Name: toolSkill, Arguments: `{"name":"alpha"}`}, "")
+	if result.IsError {
+		t.Fatalf("skill result = %+v", result)
+	}
+	if !strings.Contains(result.Content, body) {
+		t.Fatalf("the tool result must serve the verified instructions: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, mount+"/assets/checklist.md") {
+		t.Fatalf("the tool result must name the mounted asset path: %s", result.Content)
+	}
+	// The index is the discovery surface: it names the skill and carries
+	// the deployment-authored description, never the instruction body.
+	index := set.Index()
+	if !strings.Contains(index, "- alpha (bundle): does alpha things") {
+		t.Fatalf("index = %q, want the bundle's name and description", index)
+	}
+	if strings.Contains(index, body) {
+		t.Fatal("the index must not carry the instruction body")
+	}
+	// The roles' system message is the index plus the contract for using
+	// it; the instructions still arrive only through the tool.
+	section := set.Section()
+	if !strings.Contains(section, index) {
+		t.Fatalf("section = %q, want it to carry the index", section)
+	}
+	if strings.Contains(section, body) {
+		t.Fatal("the roles' system message must not carry the instruction body")
+	}
+	skill, ok := set.Lookup("alpha")
+	if !ok {
+		t.Fatal("the materialized skill is not reachable through the harness")
+	}
+	if skill.Source != mount {
+		t.Fatalf("skill source = %q, want the mounted path %q", skill.Source, mount)
+	}
+}
+
+// TestSkillToolServesScriptContentAsData proves executable content in a
+// skill reaches the model as data and runs nowhere: the skill tool's result
+// carries the script text verbatim, and the marker the script would have
+// written is absent after the call — the control side never executes a
+// skill's script.
+func TestSkillToolServesScriptContentAsData(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "marker")
+	script := "#!/bin/sh\ntouch " + marker
+	set, _, _ := materializedSkillSet(t, "alpha", map[string]string{
+		"SKILL.md": "---\nname: alpha\ndescription: does alpha things\n---\nRun the helper:\n\n" + script + "\n",
+	})
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
+		Bindings: testBindings(),
+		Skills:   set,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := coordinator.runTool(nil, ToolCall{ID: "c1", Name: toolSkill, Arguments: `{"name":"alpha"}`}, "")
+	if result.IsError {
+		t.Fatalf("skill result = %+v", result)
+	}
+	if !strings.Contains(result.Content, script) {
+		t.Fatalf("the tool result must carry the script as data: %s", result.Content)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the skill's script was executed by the control side")
 	}
 }

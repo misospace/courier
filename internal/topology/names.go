@@ -199,6 +199,26 @@ func PolicySecretName(runName string) string { return resourceName(runName, "-br
 
 func CredentialsSecretName(runName string) string { return resourceName(runName, "-provider-creds") }
 
+// SkillContentConfigMapName is the per-run ConfigMap carrying one pinned
+// skill bundle's materialized content. The skill's logical name is part of
+// the name, so one run's bundles never share a ConfigMap and a run's
+// materialization is garbage-collected per bundle.
+//
+// Skill content is deployment-approved prompt and asset material the run
+// deliberately exposes to its pods, not credential material, so it travels
+// in a ConfigMap rather than a Secret.
+func SkillContentConfigMapName(runName, skillName string) string {
+	return resourceName(runName, "-skill-"+skillName)
+}
+
+// SkillBundlesConfigMapName is the per-run ConfigMap carrying the rendered
+// skill bundle config the control pod resolves its pinned skills against. It
+// is mounted into the control pod only; the worker reads the bundle content
+// itself and never the config.
+func SkillBundlesConfigMapName(runName string) string {
+	return resourceName(runName, "-skill-bundles")
+}
+
 func BrokerRoleName(runName string) string { return resourceName(runName, "-broker") }
 
 func BrokerRoleBindingName(runName string) string { return resourceName(runName, "-broker") }

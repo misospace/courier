@@ -94,7 +94,12 @@ type LoadedSkills struct {
 // fails closed — before the coordinator's first model request, never an
 // omitted skill — when the bundle config is absent, a pin names no
 // registered bundle, or a bundle's content no longer matches its pinned
-// digest. Repository-local skills are discovered under
+// digest. A pinned bundle is resolved in the form its config entry
+// declares: a materialization block names the exact files the operator
+// projected into the run's pods and the content is read from that
+// projection; without one the registered source is walked as a directory
+// tree. Both forms share one digest, so a pin verifies either way.
+// Repository-local skills are discovered under
 // <checkoutDir>/.agents/skills/<name>/SKILL.md and follow the same collision
 // contract as everywhere else — a pinned bundle shadows a same-named
 // repository-local skill — but a malformed repository-local document is
@@ -125,7 +130,7 @@ func LoadForRun(pins []Pin, bundlesFile, checkoutDir string) (LoadedSkills, erro
 		if !ok {
 			return LoadedSkills{}, fmt.Errorf("skill %q is not registered in the deployment skill registry; the run's pinned skill identity is no longer materializable", pin.Name)
 		}
-		bundle, err := Resolve(spec)
+		bundle, err := resolveBundle(spec)
 		if err != nil {
 			return LoadedSkills{}, fmt.Errorf("skill %q: %w", pin.Name, err)
 		}

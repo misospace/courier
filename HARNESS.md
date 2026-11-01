@@ -1503,15 +1503,16 @@ in the run's persisted status — never re-read from the live lane. Loading the
 pinned bundles is #659's harness behavior:
 
 - **One deterministic loader.** At control startup, after the capability gate,
-  a pinned run resolves its pins against the deployment-mounted bundle config
-  (`COURIER_SKILL_BUNDLES_FILE`, the same `bundles.yaml` the manager
-  registered from, mounted at `executor.SkillBundlesConfigPath`), re-resolves
-  each pinned bundle's content, and requires the recomputed digest to equal
-  the pinned digest. Missing config, an unregistered pin, drifted content,
-  a missing or empty `SKILL.md`, a frontmatter name that disagrees with the
-  pinned logical name, or oversized instructions fail closed before the
-  coordinator's first model request, declared as a `skills` capability
-  failure (`NeedsHuman`) — never an omitted skill.
+  a pinned run resolves its pins against the bundle config the operator
+  materialized for the run (`COURIER_SKILL_BUNDLES_FILE`, mounted at
+  `executor.SkillBundlesConfigPath`), re-resolves each pinned bundle's
+  content through the mount the operator rendered, and requires the
+  recomputed digest to equal the pinned digest. Missing config, an
+  unregistered pin, drifted content, a missing or empty `SKILL.md`, a
+  frontmatter name that disagrees with the pinned logical name, or oversized
+  instructions fail closed before the coordinator's first model request,
+  declared as a `skills` capability failure (`NeedsHuman`) — never an
+  omitted skill.
 - **Collision precedence.** Repository-local skills are discovered under
   `<checkout>/.agents/skills/<name>/SKILL.md` of the integration tree —
   seeded first, so discovery sees the world at incarnation start. A
@@ -1536,21 +1537,25 @@ pinned bundles is #659's harness behavior:
   existing boundaries. A skillless run pins no section and offers no tool —
   absence is meaningful.
 - **Worker boundary.** The worker receives no new credential, identity, or
-  writable path into the skill source. Skill assets are exposed to the
-  worker as read-only deployment mounts of the same bundle content at the
-  same registered absolute paths the loader resolved; the skill tool's
-  result names those paths. Executing a skill-provided script is normal
-  untrusted worker execution under the existing worker, network, and tool
-  boundaries. Mounting run-pod skill content is a deployment responsibility
-  (BOOTSTRAP.md carries the concrete contract); a deployment that does not
-  provide it fails pinned runs closed rather than silently skillless.
+  writable path into the skill source. The operator materializes each pinned
+  bundle into a per-run ConfigMap and mounts it read-only into the worker
+  pod at the same registered absolute path the loader resolved; the skill
+  tool's result names those paths. Executing a skill-provided script is
+  normal untrusted worker execution under the existing worker, network, and
+  tool boundaries. The material travels in a ConfigMap, never a Secret, so a
+  pinned run adds no identity material to the worker: the only difference
+  between a skillless and a pinned worker is one read-only content mount.
+  A pinned bundle above the ConfigMap size limit fails the run closed
+  rather than silently skillless.
 - **Telemetry.** The loaded view — each visible skill's name, origin, digest,
   bounded description, and asset counts, plus the shadowed and quarantined
   names — emits as the `skills.loaded` run event at info level. Content
   identities are inspectable; instruction bodies are not logged.
 - **Restart/resume.** Every incarnation re-resolves and re-verifies exactly
-  the run's pinned identities from persisted status; the same pinned bytes
-  produce the same rendered material, and drift fails closed.
+  the run's pinned identities from persisted status; the operator's
+  materialization is deterministic, so a relaunch carries the same bytes
+  into the same pods, and the same pinned bytes produce the same rendered
+  material. Drift fails closed.
   Repository-local skills are not pinned identities: their discovered set
   reflects each incarnation's seeded world, which is the collision
   contract's own semantics.

@@ -78,6 +78,145 @@ func TestParseTrimsNameAndSource(t *testing.T) {
 	}
 }
 
+func TestParseAcceptsMaterializationBlock(t *testing.T) {
+	specs, err := Parse([]byte("bundles:\n  - name: repo-tour\n    source: /etc/courier/skill-bundles/repo-tour\n    materialization:\n      files:\n      - SKILL.md\n      - assets/checklist.md\n"))
+	if err != nil {
+		t.Fatalf("Parse rejected a materialization block: %v", err)
+	}
+	if len(specs) != 1 {
+		t.Fatalf("unexpected specs: %#v", specs)
+	}
+	if specs[0].Materialization == nil {
+		t.Fatalf("materialization block lost: %#v", specs[0])
+	}
+	if got := specs[0].Materialization.Files; len(got) != 2 || got[0] != "SKILL.md" || got[1] != "assets/checklist.md" {
+		t.Fatalf("materialization files = %#v", got)
+	}
+}
+
+func TestParseRejectsInvalidMaterializationPaths(t *testing.T) {
+	cases := map[string]string{
+		"absolute":      `"/etc/passwd"`,
+		"parent":        `"../escape.md"`,
+		"nested parent": `"assets/../../escape.md"`,
+		"current":       `"./SKILL.md"`,
+		"empty":         `""`,
+		"nul byte":      `"SKILL.md\0"`,
+		"backslash":     `'assets\checklist.md'`,
+	}
+	for name, quoted := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := Parse([]byte("bundles:\n  - name: repo-tour\n    source: /etc/courier/skill-bundles/repo-tour\n    materialization:\n      files:\n      - " + quoted + "\n"))
+			if err == nil {
+				t.Fatal("expected the invalid materialized path to be rejected")
+			}
+			if !strings.Contains(err.Error(), "materialization file") || !strings.Contains(err.Error(), "repo-tour") {
+				t.Fatalf("error = %v, want the skill and the offending path named", err)
+			}
+		})
+	}
+}
+
+func TestRenderRunConfigRoundTripsThroughParse(t *testing.T) {
+	files := map[string]string{
+		"SKILL.md":            "---\nname: repo-tour\ndescription: demo\n---\nBody.\n",
+		"assets/checklist.md": "check\n",
+	}
+	tree := resolveOK(t, bundleSpec{Name: "repo-tour", Source: materialize(t, files)})
+	rendered, err := RenderRunConfig([]MaterializedBundle{{
+		Name:   "repo-tour",
+		Source: writeProjection(t, files),
+		Files:  []string{"SKILL.md", "assets/checklist.md"},
+	}})
+	if err != nil {
+		t.Fatalf("RenderRunConfig rejected a valid bundle: %v", err)
+	}
+	specs, err := Parse(rendered)
+	if err != nil {
+		t.Fatalf("Parse rejected the rendered run config: %v", err)
+	}
+	if len(specs) != 1 || specs[0].Materialization == nil {
+		t.Fatalf("rendered config lost its materialization block: %#v", specs)
+	}
+	if specs[0].Name != "repo-tour" || specs[0].Materialization.Files[0] != "SKILL.md" {
+		t.Fatalf("rendered config lost its entry: %#v", specs[0])
+	}
+	bundle, err := resolveBundle(specs[0])
+	if err != nil {
+		t.Fatalf("resolve rejected the rendered run config: %v", err)
+	}
+	if bundle.Digest != tree.Digest {
+		t.Fatalf("rendered config resolves to digest %s, want the tree digest %s", bundle.Digest, tree.Digest)
+	}
+}
+
+func TestRenderRunConfigSortsEntriesByName(t *testing.T) {
+	rendered, err := RenderRunConfig([]MaterializedBundle{
+		{Name: "zeta", Source: "/etc/zeta", Files: []string{"SKILL.md"}},
+		{Name: "alpha", Source: "/etc/alpha", Files: []string{"SKILL.md"}},
+	})
+	if err != nil {
+		t.Fatalf("RenderRunConfig rejected valid bundles: %v", err)
+	}
+	specs, err := Parse(rendered)
+	if err != nil {
+		t.Fatalf("Parse rejected the rendered run config: %v", err)
+	}
+	if len(specs) != 2 || specs[0].Name != "alpha" || specs[1].Name != "zeta" {
+		t.Fatalf("rendered entries are not sorted by name: %#v", specs)
+	}
+}
+
+func TestRenderRunConfigRejectsMalformedEntries(t *testing.T) {
+	cases := map[string]struct {
+		bundles []MaterializedBundle
+		want    string
+	}{
+		"empty name": {
+			bundles: []MaterializedBundle{{Name: "", Source: "/etc/a", Files: []string{"SKILL.md"}}},
+			want:    "name is required",
+		},
+		"invalid name": {
+			bundles: []MaterializedBundle{{Name: "Not_A_Label", Source: "/etc/a", Files: []string{"SKILL.md"}}},
+			want:    "DNS-1123",
+		},
+		"duplicate name": {
+			bundles: []MaterializedBundle{
+				{Name: "alpha", Source: "/etc/a", Files: []string{"SKILL.md"}},
+				{Name: "alpha", Source: "/etc/b", Files: []string{"SKILL.md"}},
+			},
+			want: "duplicate name",
+		},
+		"relative source": {
+			bundles: []MaterializedBundle{{Name: "alpha", Source: "etc/a", Files: []string{"SKILL.md"}}},
+			want:    "absolute path",
+		},
+		"empty file list": {
+			bundles: []MaterializedBundle{{Name: "alpha", Source: "/etc/a"}},
+			want:    "must not be empty",
+		},
+		"invalid file path": {
+			bundles: []MaterializedBundle{{Name: "alpha", Source: "/etc/a", Files: []string{"../escape.md"}}},
+			want:    "materialization file",
+		},
+		"nul byte file path": {
+			bundles: []MaterializedBundle{{Name: "alpha", Source: "/etc/a", Files: []string{"SKILL.md\x00"}}},
+			want:    "NUL byte",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := RenderRunConfig(tc.bundles)
+			if err == nil {
+				t.Fatal("expected the malformed entry to be rejected")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want it to mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoadReadErrorMentionsPath(t *testing.T) {
 	_, err := Load(filepath.Join(t.TempDir(), "absent.yaml"))
 	if err == nil || !strings.Contains(err.Error(), "read skill bundle config ") {
@@ -108,5 +247,46 @@ func TestLoadResolvesEverySpec(t *testing.T) {
 	bundle, ok := registry.Lookup("simple-english")
 	if !ok || bundle.Files != 1 || bundle.Bytes != int64(len("# skill\n")) || bundle.Path != root {
 		t.Fatalf("unexpected bundle: %#v (ok=%v)", bundle, ok)
+	}
+}
+
+// TestParseRejectsNULBytePaths pins the NUL-byte rule at the parse
+// boundary: a bundle config whose name or source carries a NUL byte never
+// parses into a usable entry. A literal NUL is not a legal YAML character
+// at all, and an escaped one in a name is not a valid DNS-1123 label, so
+// both are rejected while the document is parsed — never carried into a
+// registration.
+func TestParseRejectsNULBytePaths(t *testing.T) {
+	cases := map[string]string{
+		"literal NUL in name":   "bundles:\n  - name: \"bad\x00name\"\n    source: /a\n",
+		"literal NUL in source": "bundles:\n  - name: a\n    source: \"/etc/\x00\"\n",
+		"escaped NUL in name":   "bundles:\n  - name: \"bad\\0name\"\n    source: /a\n",
+		"escaped NUL in source": "bundles:\n  - name: a\n    source: \"/etc/\\0\"\n",
+	}
+	for name, document := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Parse([]byte(document)); err == nil {
+				t.Fatal("a NUL byte in the config must fail closed")
+			}
+		})
+	}
+}
+
+// TestLoadRejectsNULByteSource pins the NUL-byte rule at the registration
+// boundary: a source path carrying a NUL byte is not a path the operating
+// system can open, so the bundle never registers and the deployment's
+// startup fails explicitly — the registry never silently omits or degrades
+// an entry. The document is rejected while it parses, before any path is
+// opened.
+func TestLoadRejectsNULByteSource(t *testing.T) {
+	dir := t.TempDir()
+	config := filepath.Join(dir, "bundles.yaml")
+	if err := os.WriteFile(config, []byte("bundles:\n  - name: alpha\n    source: \"/etc/\\0\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(config); err == nil {
+		t.Fatal("a source carrying a NUL byte must fail the registration")
+	} else if !strings.Contains(err.Error(), "NUL byte") {
+		t.Fatalf("error = %v, want the offending source named", err)
 	}
 }

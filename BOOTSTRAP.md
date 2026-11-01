@@ -460,23 +460,48 @@ untrusted data exposed to workers later (#658/#659); registration grants no
 shell, forge, or Kubernetes authority.
 
 A run whose lane selects skills loads its pinned bundles in the control pod
-(#659). The chart renders the run pods from the operator's CoderRun objects
-and cannot mount your bundle content there itself, so mounting into run pods
-is a deployment responsibility, mirroring how the manager's own content
-mount is operator-provided:
+(#659). The operator renders the run's control and worker pods, so you cannot
+mount bundle content into them. The operator does it for you: for each
+pinned bundle it copies the registered bytes into a per-run ConfigMap and
+mounts that ConfigMap read-only into the control pod and into the worker
+pod, at the absolute `source` path the manager registered. The operator also
+writes the run's bundle config into a per-run ConfigMap and mounts it at
+`/etc/courier/skill-bundles-config/bundles.yaml`, the path it renders as
+`COURIER_SKILL_BUNDLES_FILE` whenever the run carries pins.
 
-- Mount `bundles.yaml` at `/etc/courier/skill-bundles-config/bundles.yaml`
-  into the run's control pod — the path the operator renders as
-  `COURIER_SKILL_BUNDLES_FILE` whenever the run carries pins. A non-chart
-  install that points the manager's `--skill-bundles-file` elsewhere must
-  still mount the config at this run-pod path (or re-register with the
-  documented path).
-- Mount each pinned bundle's content at the same absolute `source` path the
-  manager registered, into the control pod and — read-only — into the worker
-  pod, so a skill's supporting assets are readable where the worker executes
-  its scripts.
+Your part of the contract does not change. Mount the bundle content into the
+manager pod at the absolute `source` path you registered. The manager reads
+those bytes at startup, digests them, and hands the same bytes to the run.
 
-A run with no pinned skills requires none of this: the mount contract exists
-only for pinned runs, and a missing, drifted, or oversized mount fails the
-run closed with a named capability error before the coordinator's first
-model request.
+One bound applies. A ConfigMap holds at most 1 MiB of data. A pinned bundle
+above that size fails the run closed with a named capability error before
+the coordinator's first model request. The registry accepts a bundle of up to
+8 MiB, so a bundle above 1 MiB registers but cannot run.
+
+A run with no pinned skills needs none of this. The operator writes no
+ConfigMap and mounts nothing extra.
+
+### Canary a skill bundle
+
+Use this procedure to prove that a deployment-provided skill loads and runs
+on a live cluster. You need a cluster with the chart installed, one lane that
+selects the skill, and one run on that lane.
+
+1. Write a test bundle in the manager pod at a path you control. Give it a
+   `SKILL.md` that names the skill and carries one instruction the run must
+   follow. Add one supporting file, such as `assets/checklist.md`.
+2. Register the bundle in `skillBundles` and mount its content into the
+   manager pod at the registered `source` path. Reload the manager.
+3. Set the lane's `skills` list to the bundle's name.
+4. Start one run on that lane.
+5. Read the control pod's log. The `skills.loaded` event names each visible
+   skill, its origin, its digest, and its asset count. The event is at info
+   level.
+6. Read the run transcript. The role's system message carries the skill
+   index, and the `skill` tool call returns the bundle's instructions.
+7. Read the worker log. The model reads the supporting file at the path the
+   tool named.
+
+If the run fails with the `skills` capability, the operator's message names
+the reason, such as a missing ConfigMap or a digest that does not match the
+pin.

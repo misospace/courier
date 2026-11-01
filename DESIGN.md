@@ -2568,12 +2568,16 @@ content is
 deployment-controlled and never fed from CoderRun, source, or model data.
 The legacy launcher has no registry seam and rejects a skill-selecting lane
 outright (`LaneConfig`). Harness loading of the pinned bundles (#659): the
-control pod re-resolves each pin against the deployment-mounted bundle config
-(`COURIER_SKILL_BUNDLES_FILE` at `executor.SkillBundlesConfigPath` — a
-deployment whose lanes select skills mounts the same config and content into
-its run pods, the same operator-owned mounting the registry itself relies on)
-and requires the recomputed digest to match, failing closed before the
-coordinator's first model request on a missing, drifted, or oversized mount.
+operator materializes each pinned bundle into a per-run ConfigMap and mounts
+it read-only into the run's control and worker pods at the registered
+absolute source path, and writes the run's bundle config into a second
+per-run ConfigMap mounted at `executor.SkillBundlesConfigPath` (the path the
+operator renders as `COURIER_SKILL_BUNDLES_FILE`). The control pod
+re-resolves each pin against that config, reads the bundle's files through
+the mount, and requires the recomputed digest to match, failing closed
+before the coordinator's first model request on a missing, drifted, or
+oversized mount. The operator owns the materialization because it renders
+the run's pods: a deployment cannot mount content into them.
 Repository-local skills discovered under `.agents/skills/<name>/SKILL.md` of
 the integration checkout compose with the pins through `skills.Overlay`;
 malformed repository-local documents are quarantined and reported, never

@@ -38,6 +38,7 @@ const secureRequeueDelay = 2 * time.Second
 const brokerVerdictGrace = 90 * time.Second
 
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=create;delete;get;list
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=create;delete;get;list
 // +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=create;delete;get;list
 // +kubebuilder:rbac:groups="",resources=services,verbs=create;delete;get;list
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list
@@ -158,6 +159,10 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 		return ctrl.Result{RequeueAfter: secureRequeueDelay}, nil
 	}
 	workerCreated := false
+	var (
+		skillMounts           []topology.SkillMount
+		skillBundlesConfigMap string
+	)
 	if workerPod == nil {
 		if controlPod != nil {
 			// A control pod without its paired worker is a broken round:
@@ -168,6 +173,16 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 			return ctrl.Result{RequeueAfter: secureRequeueDelay}, nil
 		}
 		if err := s.rotateSigningKey(ctx, run); err != nil {
+			return ctrl.Result{}, err
+		}
+		// The pinned skill bundles are materialized into per-run ConfigMaps
+		// before either pod is created: the control and the worker both
+		// mount the content, so the ConfigMaps must exist before the first
+		// pod of the round starts. A pin that cannot be materialized fails
+		// the launch — a pod without the full pinned content is never
+		// brought up.
+		skillMounts, skillBundlesConfigMap, err = s.materializeRunSkills(ctx, run)
+		if err != nil {
 			return ctrl.Result{}, err
 		}
 		incarnation, err := mintIncarnation()
@@ -182,7 +197,7 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		workerPod, err = topology.WorkerPod(run, spec.workerImage, incarnation, publicKey, cache, spec.resources)
+		workerPod, err = topology.WorkerPod(run, spec.workerImage, incarnation, publicKey, cache, spec.resources, skillMounts)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -242,6 +257,8 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 			BrokerURL:             "https://" + topology.BrokerServiceDNS(run.Namespace, run.Name) + ":8443",
 			BrokerStatusURL:       "https://" + topology.BrokerServiceDNS(run.Namespace, run.Name) + ":8444",
 			Resources:             spec.resources,
+			Skills:                skillMounts,
+			SkillBundlesConfigMap: skillBundlesConfigMap,
 		})
 		if err != nil {
 			return ctrl.Result{}, err
@@ -787,6 +804,12 @@ func (s *SecureControl) Revoke(ctx context.Context, run *courier.CoderRun) (bool
 		secretObject(namespace, topology.PolicySecretName(runName)),
 		secretObject(namespace, topology.CredentialsSecretName(runName)),
 		secretObject(namespace, topology.GatewaySecretName(runName)),
+		// The materialized skill material is per-run content: the config
+		// the control pod resolved its pins against, and one content
+		// ConfigMap per pinned bundle. The bundle names come from the
+		// run's persisted pins, which are the run's own record of what it
+		// pinned, so the teardown removes exactly what was created.
+		configMapObject(namespace, topology.SkillBundlesConfigMapName(runName)),
 		topology.WorkerService(run),
 		saObject(namespace, topology.ControlSAName(runName)),
 		saObject(namespace, topology.BrokerSAName(runName)),
@@ -794,6 +817,9 @@ func (s *SecureControl) Revoke(ctx context.Context, run *courier.CoderRun) (bool
 		topology.BrokerRole(run),
 		topology.BrokerRoleBinding(run),
 		topology.BrokerTokenReviewBinding(run, s.tokenReviewClusterRole()),
+	}
+	for _, pin := range run.Status.SkillPins {
+		objects = append(objects, configMapObject(namespace, topology.SkillContentConfigMapName(runName, pin.Name)))
 	}
 	for _, object := range objects {
 		if err := s.Client.Delete(ctx, object); client.IgnoreNotFound(err) != nil {
@@ -1191,6 +1217,10 @@ func (s *SecureControl) transitionNeedsHuman(ctx context.Context, run *courier.C
 
 func secretObject(namespace, name string) *corev1.Secret {
 	return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}
+}
+
+func configMapObject(namespace, name string) *corev1.ConfigMap {
+	return &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}
 }
 
 func saObject(namespace, name string) *corev1.ServiceAccount {

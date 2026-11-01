@@ -57,6 +57,7 @@ func TestUncachedReadObjectsCoverNoWatchKinds(t *testing.T) {
 	// cluster-wide informer and wedges, so each must appear here.
 	wantUncached := map[string]bool{
 		"Secret":         false,
+		"ConfigMap":      false,
 		"Service":        false,
 		"ServiceAccount": false,
 		"Namespace":      false,

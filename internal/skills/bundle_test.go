@@ -33,11 +33,53 @@ func materialize(t *testing.T, files map[string]string) string {
 	return dir
 }
 
+// writeProjection lays out a kubelet-style projection: the mount root
+// carries a ..data directory with the real content plus one symlink per
+// projected file pointing into it, the way kubelet materializes a Secret
+// into a pod.
+func writeProjection(t *testing.T, files map[string]string) string {
+	t.Helper()
+	mount := t.TempDir()
+	data := filepath.Join(mount, "..data")
+	for rel, content := range files {
+		full := filepath.Join(data, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("mkdir for %s: %v", rel, err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+	for rel := range files {
+		link := filepath.Join(mount, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+			t.Fatalf("mkdir for %s: %v", rel, err)
+		}
+		target, err := filepath.Rel(filepath.Dir(link), filepath.Join(data, filepath.FromSlash(rel)))
+		if err != nil {
+			t.Fatalf("relative target for %s: %v", rel, err)
+		}
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatalf("symlink %s: %v", rel, err)
+		}
+	}
+	return mount
+}
+
 func resolveOK(t *testing.T, spec bundleSpec) Bundle {
 	t.Helper()
 	bundle, err := Resolve(spec)
 	if err != nil {
 		t.Fatalf("Resolve rejected a valid bundle: %v", err)
+	}
+	return bundle
+}
+
+func resolveMaterializedOK(t *testing.T, spec bundleSpec) Bundle {
+	t.Helper()
+	bundle, err := resolveMaterialized(spec)
+	if err != nil {
+		t.Fatalf("resolveMaterialized rejected a valid bundle: %v", err)
 	}
 	return bundle
 }
@@ -299,5 +341,161 @@ func TestRegistryLookupBundlesNames(t *testing.T) {
 	bundles[0].Name = "mutated"
 	if again, _ := registry.Lookup("alpha"); again.Name != "alpha" {
 		t.Fatal("Bundles() exposed registry-internal state")
+	}
+}
+
+func TestMaterializedAndTreeFormsDigestIdentically(t *testing.T) {
+	files := map[string]string{
+		"SKILL.md":            "---\nname: b\ndescription: demo\n---\nBody.\n",
+		"assets/checklist.md": "check\n",
+	}
+	tree := resolveOK(t, bundleSpec{Name: "b", Source: materialize(t, files)})
+	projected := resolveMaterializedOK(t, bundleSpec{
+		Name:   "b",
+		Source: writeProjection(t, files),
+		Materialization: &materializationSpec{
+			Files: []string{"SKILL.md", "assets/checklist.md"},
+		},
+	})
+	// The two forms carry the same content, so they must carry the same
+	// content identity: a digest pinned over the deployment's mount has to
+	// verify against the projection the run's pods were handed.
+	if tree.Digest != projected.Digest {
+		t.Fatalf("materialized digest %s does not match the tree digest %s for the same content", projected.Digest, tree.Digest)
+	}
+	if projected.Files != tree.Files || projected.Bytes != tree.Bytes {
+		t.Fatalf("materialized counts = files %d bytes %d, want files %d bytes %d", projected.Files, projected.Bytes, tree.Files, tree.Bytes)
+	}
+	if projected.Name != "b" {
+		t.Fatalf("materialized name = %q, want b", projected.Name)
+	}
+}
+
+func TestMaterializedDigestIgnoresListOrder(t *testing.T) {
+	files := map[string]string{"SKILL.md": "# skill\n", "assets/a.txt": "a\n"}
+	mount := writeProjection(t, files)
+	forward := resolveMaterializedOK(t, bundleSpec{
+		Name:            "b",
+		Source:          mount,
+		Materialization: &materializationSpec{Files: []string{"SKILL.md", "assets/a.txt"}},
+	})
+	reverse := resolveMaterializedOK(t, bundleSpec{
+		Name:            "b",
+		Source:          mount,
+		Materialization: &materializationSpec{Files: []string{"assets/a.txt", "SKILL.md"}},
+	})
+	if forward.Digest != reverse.Digest {
+		t.Fatalf("list order changed the digest: %s vs %s", forward.Digest, reverse.Digest)
+	}
+}
+
+func TestMaterializedListIsAuthoritative(t *testing.T) {
+	mount := writeProjection(t, map[string]string{
+		"SKILL.md": "# skill\n",
+		"extra.md": "not listed\n",
+	})
+	bundle := resolveMaterializedOK(t, bundleSpec{
+		Name:            "b",
+		Source:          mount,
+		Materialization: &materializationSpec{Files: []string{"SKILL.md"}},
+	})
+	// The projection carries a file the list omits; the loader never walks
+	// the mount, so that file is not part of the bundle's content.
+	if bundle.Files != 1 || bundle.Bytes != int64(len("# skill\n")) {
+		t.Fatalf("counts = files %d bytes %d, want only the listed file", bundle.Files, bundle.Bytes)
+	}
+	tree := resolveOK(t, bundleSpec{Name: "b", Source: materialize(t, map[string]string{"SKILL.md": "# skill\n"})})
+	if tree.Digest != bundle.Digest {
+		t.Fatalf("digest %s covers more than the listed files (tree digest of the listed file only is %s)", bundle.Digest, tree.Digest)
+	}
+}
+
+func TestMaterializedRejectsInvalidRelativePaths(t *testing.T) {
+	mount := writeProjection(t, map[string]string{"SKILL.md": "# skill\n"})
+	cases := map[string]string{
+		"absolute":      "/etc/passwd",
+		"parent":        "../escape.md",
+		"nested parent": "assets/../../escape.md",
+		"current":       "./SKILL.md",
+		"empty":         "",
+		"nul byte":      "SKILL.md\x00",
+		"backslash":     `assets\checklist.md`,
+	}
+	for name, rel := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := resolveMaterialized(bundleSpec{
+				Name:            "b",
+				Source:          mount,
+				Materialization: &materializationSpec{Files: []string{rel}},
+			})
+			if err == nil || !strings.Contains(err.Error(), "materialization file") {
+				t.Fatalf("path %q: expected fail-closed rejection, got %v", rel, err)
+			}
+		})
+	}
+}
+
+func TestMaterializedRejectsSymlinkEscape(t *testing.T) {
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("credential material\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mount := t.TempDir()
+	if err := os.Symlink(filepath.Join(outside, "secret.txt"), filepath.Join(mount, "SKILL.md")); err != nil {
+		t.Fatal(err)
+	}
+	_, err := resolveMaterialized(bundleSpec{
+		Name:            "b",
+		Source:          mount,
+		Materialization: &materializationSpec{Files: []string{"SKILL.md"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "resolves outside the bundle mount") {
+		t.Fatalf("expected escape rejection, got %v", err)
+	}
+}
+
+func TestMaterializedRequiresNonEmptySKILLMD(t *testing.T) {
+	mount := writeProjection(t, map[string]string{"assets/a.txt": "a\n"})
+	_, err := resolveMaterialized(bundleSpec{
+		Name:            "b",
+		Source:          mount,
+		Materialization: &materializationSpec{Files: []string{"assets/a.txt"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "SKILL.md is required") {
+		t.Fatalf("expected missing-SKILL.md rejection, got %v", err)
+	}
+	empty := writeProjection(t, map[string]string{"SKILL.md": ""})
+	_, err = resolveMaterialized(bundleSpec{
+		Name:            "b",
+		Source:          empty,
+		Materialization: &materializationSpec{Files: []string{"SKILL.md"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "SKILL.md is empty") {
+		t.Fatalf("expected empty-SKILL.md rejection, got %v", err)
+	}
+}
+
+func TestMaterializedFilesReturnsRegisteredContentAsCopy(t *testing.T) {
+	bundle := resolveOK(t, bundleSpec{Name: "b", Source: materialize(t, map[string]string{
+		"SKILL.md": "# skill\n",
+		"a.txt":    "a\n",
+	})})
+	files := bundle.MaterializedFiles()
+	if len(files) != 2 {
+		t.Fatalf("files = %d entries, want 2", len(files))
+	}
+	if files[0].Path != "SKILL.md" || string(files[0].Content) != "# skill\n" {
+		t.Fatalf("files[0] = %#v, want SKILL.md with its exact bytes", files[0])
+	}
+	if files[1].Path != "a.txt" || string(files[1].Content) != "a\n" {
+		t.Fatalf("files[1] = %#v, want a.txt with its exact bytes", files[1])
+	}
+	// The accessor hands out copies: a caller that mutates them must not
+	// reach the registry's bytes.
+	files[0].Content[0] = 'X'
+	files[1].Path = "mutated"
+	again := bundle.MaterializedFiles()
+	if string(again[0].Content) != "# skill\n" || again[1].Path != "a.txt" {
+		t.Fatalf("MaterializedFiles() exposed the bundle's own bytes: %#v", again)
 	}
 }

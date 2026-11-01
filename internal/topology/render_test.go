@@ -1,8 +1,10 @@
 package topology
 
 import (
+	"bytes"
 	"crypto/x509"
 	"encoding/pem"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -70,7 +72,7 @@ func TestWorkerPodHasNoIdentityMaterial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pod, err := WorkerPod(run, "harness:test", "incarnation-1", pub, nil, courier.DefaultPodResources())
+	pod, err := WorkerPod(run, "harness:test", "incarnation-1", pub, nil, courier.DefaultPodResources(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +118,7 @@ func TestWorkerPodHasNoIdentityMaterial(t *testing.T) {
 func TestWorkerPodCachePin(t *testing.T) {
 	run := testRun("worker-cache")
 	pub, _, _ := protocol.GenerateKey()
-	pod, err := WorkerPod(run, "harness:test", "incarnation-1", pub, &CachePin{IP: "10.0.0.42", Port: 5120}, courier.DefaultPodResources())
+	pod, err := WorkerPod(run, "harness:test", "incarnation-1", pub, &CachePin{IP: "10.0.0.42", Port: 5120}, courier.DefaultPodResources(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +142,7 @@ func TestWorkerPodCachePin(t *testing.T) {
 func TestWorkerPodToolchainCacheContract(t *testing.T) {
 	run := testRun("worker-toolchain")
 	pub, _, _ := protocol.GenerateKey()
-	pod, err := WorkerPod(run, "toolchain:test", "incarnation-1", pub, nil, courier.DefaultPodResources())
+	pod, err := WorkerPod(run, "toolchain:test", "incarnation-1", pub, nil, courier.DefaultPodResources(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +328,7 @@ func renderEveryPod(t *testing.T, run *courier.CoderRun, resources corev1.Resour
 	if err != nil {
 		t.Fatal(err)
 	}
-	worker, err := WorkerPod(run, "harness:test", "incarnation-1", pub, nil, resources)
+	worker, err := WorkerPod(run, "harness:test", "incarnation-1", pub, nil, resources, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -989,6 +991,368 @@ func TestRenderedSelectorsAgreeWithLabels(t *testing.T) {
 					}
 				}
 			}
+		}
+	}
+}
+
+// skillMountFixture is one materialized skill bundle: the ConfigMap carrying
+// its content and the key-to-path items its projection carries. The keys are
+// the encoded ones the operator writes, and the paths are the bundle's own
+// relative paths, so the mounted projection carries the bundle's layout.
+func skillMountFixture(name, source string) SkillMount {
+	return SkillMount{
+		Name:          name,
+		ConfigMapName: SkillContentConfigMapName("run", name),
+		Source:        source,
+		Items: []corev1.KeyToPath{
+			{Key: "f0", Path: "SKILL.md"},
+			{Key: "f1", Path: "assets/checklist.md"},
+		},
+	}
+}
+
+// skillConfigMapVolumeOf returns the pod volume projecting the given
+// ConfigMap.
+func skillConfigMapVolumeOf(pod *corev1.Pod, configMapName string) *corev1.Volume {
+	for i := range pod.Spec.Volumes {
+		if pod.Spec.Volumes[i].ConfigMap != nil && pod.Spec.Volumes[i].ConfigMap.Name == configMapName {
+			return &pod.Spec.Volumes[i]
+		}
+	}
+	return nil
+}
+
+// mountOf returns the container mount of one volume.
+func mountOf(pod *corev1.Pod, volumeName string) (corev1.VolumeMount, bool) {
+	for _, mount := range pod.Spec.Containers[0].VolumeMounts {
+		if mount.Name == volumeName {
+			return mount, true
+		}
+	}
+	return corev1.VolumeMount{}, false
+}
+
+// TestControlPodRendersPinnedSkillMounts pins the control pod's half of the
+// materialization contract: a pinned bundle is projected from its per-run
+// content ConfigMap with the key-to-path items the operator wrote, and
+// mounted read-only at the source path the deployment registered — so the pod
+// reads the bundle exactly where the registration says it is, and never
+// writes to it.
+func TestControlPodRendersPinnedSkillMounts(t *testing.T) {
+	run := testRun("control-skills")
+	mount := skillMountFixture("repo-tour", "/opt/courier/skills/repo-tour")
+	pod, err := ControlPod(run, ControlInputs{
+		Image:                 "harness:test",
+		ControlSAUID:          "sa-uid",
+		WorkerPodUID:          "worker-uid",
+		ControlIncarnationUID: "incarnation-1",
+		WorkerURL:             "http://r-worker.ns.svc.cluster.local:8080",
+		BrokerURL:             "https://r-broker.ns.svc.cluster.local:8443",
+		Skills:                []SkillMount{mount},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	volume := skillConfigMapVolumeOf(pod, mount.ConfigMapName)
+	if volume == nil {
+		t.Fatalf("control pod carries no volume projecting %q", mount.ConfigMapName)
+	}
+	if volume.Secret != nil || volume.Projected != nil {
+		t.Fatalf("control pod skill volume = %+v, want a ConfigMap projection", volume.VolumeSource)
+	}
+	if !reflect.DeepEqual(volume.ConfigMap.Items, mount.Items) {
+		t.Fatalf("control pod skill volume items = %+v, want %+v", volume.ConfigMap.Items, mount.Items)
+	}
+	skillMount, ok := mountOf(pod, volume.Name)
+	if !ok {
+		t.Fatalf("control pod mounts no volume %q", volume.Name)
+	}
+	if skillMount.MountPath != mount.Source {
+		t.Fatalf("control pod skill mount path = %q, want the registered source %q", skillMount.MountPath, mount.Source)
+	}
+	if !skillMount.ReadOnly {
+		t.Fatal("control pod skill mount must be read-only")
+	}
+}
+
+// TestWorkerPodRendersPinnedSkillMounts pins the worker pod's half: the
+// bundle content is mounted read-only from a ConfigMap at the same registered
+// source path, so a skill's supporting assets are readable where the worker's
+// shell runs.
+func TestWorkerPodRendersPinnedSkillMounts(t *testing.T) {
+	run := testRun("worker-skills")
+	pub, _, _ := protocol.GenerateKey()
+	mount := skillMountFixture("repo-tour", "/opt/courier/skills/repo-tour")
+	pod, err := WorkerPod(run, "harness:test", "incarnation-1", pub, nil, courier.DefaultPodResources(), []SkillMount{mount})
+	if err != nil {
+		t.Fatal(err)
+	}
+	volume := skillConfigMapVolumeOf(pod, mount.ConfigMapName)
+	if volume == nil {
+		t.Fatalf("worker pod carries no volume projecting %q", mount.ConfigMapName)
+	}
+	if volume.Secret != nil || volume.Projected != nil {
+		t.Fatalf("worker pod skill volume = %+v, want a ConfigMap projection", volume.VolumeSource)
+	}
+	if !reflect.DeepEqual(volume.ConfigMap.Items, mount.Items) {
+		t.Fatalf("worker pod skill volume items = %+v, want %+v", volume.ConfigMap.Items, mount.Items)
+	}
+	skillMount, ok := mountOf(pod, volume.Name)
+	if !ok {
+		t.Fatalf("worker pod mounts no volume %q", volume.Name)
+	}
+	if skillMount.MountPath != mount.Source {
+		t.Fatalf("worker pod skill mount path = %q, want the registered source %q", skillMount.MountPath, mount.Source)
+	}
+	if !skillMount.ReadOnly {
+		t.Fatal("worker pod skill mount must be read-only")
+	}
+}
+
+// TestWorkerPodWithPinnedSkillMountsNoIdentityMaterial pins the worker's
+// identity posture against a PINNED run: the bundle content is deployment
+// approved skill material, not credential material, so the only volume it
+// adds is a read-only ConfigMap. The worker still mounts no Secret, no
+// projected volume, and no service account token — the invariant the
+// skillless worker holds, unchanged by a pin.
+func TestWorkerPodWithPinnedSkillMountsNoIdentityMaterial(t *testing.T) {
+	run := testRun("worker-pinned-clean")
+	pub, _, _ := protocol.GenerateKey()
+	mount := skillMountFixture("repo-tour", "/opt/courier/skills/repo-tour")
+	pod, err := WorkerPod(run, "harness:test", "incarnation-1", pub, nil, courier.DefaultPodResources(), []SkillMount{mount})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vols := secretVolumes(pod); len(vols) != 0 {
+		t.Fatalf("a pinned worker must mount no secret, token, or projected volume: %v", vols)
+	}
+	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
+		t.Fatal("a pinned worker must not automount a service account token")
+	}
+	for _, env := range pod.Spec.Containers[0].Env {
+		if env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil {
+			t.Fatalf("a pinned worker's env %q references a Secret", env.Name)
+		}
+	}
+	var configMaps []string
+	for _, volume := range pod.Spec.Volumes {
+		switch {
+		case volume.ConfigMap != nil:
+			configMaps = append(configMaps, volume.ConfigMap.Name)
+		case volume.EmptyDir == nil:
+			t.Fatalf("a pinned worker volume %q must be an emptyDir or the skill ConfigMap", volume.Name)
+		}
+	}
+	if len(configMaps) != 1 || configMaps[0] != mount.ConfigMapName {
+		t.Fatalf("a pinned worker carries ConfigMap volumes %v, want only %q", configMaps, mount.ConfigMapName)
+	}
+	skillMount, ok := mountOf(pod, skillVolumeName(mount.Name))
+	if !ok {
+		t.Fatalf("a pinned worker mounts no volume %q", skillVolumeName(mount.Name))
+	}
+	if !skillMount.ReadOnly {
+		t.Fatal("a pinned worker's skill mount must be read-only")
+	}
+}
+
+// TestSkillContentConfigMapCarriesExactBytes pins the materialization
+// contract of the content object: the bundle's bytes ride the ConfigMap's
+// binary data, exactly — including a file that is not valid UTF-8, which the
+// string form could not carry at all.
+func TestSkillContentConfigMapCarriesExactBytes(t *testing.T) {
+	run := testRun("skill-content-bytes")
+	content := map[string][]byte{
+		"f0": []byte("tour the repository first."),
+		"f1": {0xff, 0xfe, 0x00, 0x80},
+	}
+	configMap := SkillContentConfigMap(run, "repo-tour", content)
+	if configMap.Name != SkillContentConfigMapName(run.Name, "repo-tour") {
+		t.Fatalf("content ConfigMap name = %q, want %q", configMap.Name, SkillContentConfigMapName(run.Name, "repo-tour"))
+	}
+	if len(configMap.Data) != 0 {
+		t.Fatalf("content ConfigMap carries string data %v, want the bytes in binary data only", configMap.Data)
+	}
+	for key, want := range content {
+		got, ok := configMap.BinaryData[key]
+		if !ok {
+			t.Fatalf("content ConfigMap carries no binary key %q", key)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("content ConfigMap key %q = %v, want %v", key, got, want)
+		}
+	}
+}
+
+// TestSkillBundlesConfigMapCarriesTheDocument pins the config object: the
+// rendered document rides the ConfigMap's binary data under the documented
+// key, so the control pod's mount carries exactly those bytes.
+func TestSkillBundlesConfigMapCarriesTheDocument(t *testing.T) {
+	run := testRun("skill-config-document")
+	document := []byte("bundles:\n- name: repo-tour\n")
+	configMap := SkillBundlesConfigMap(run, document)
+	if configMap.Name != SkillBundlesConfigMapName(run.Name) {
+		t.Fatalf("config ConfigMap name = %q, want %q", configMap.Name, SkillBundlesConfigMapName(run.Name))
+	}
+	if got := configMap.BinaryData[SkillBundlesConfigKey]; !bytes.Equal(got, document) {
+		t.Fatalf("config ConfigMap document = %q, want %q", got, document)
+	}
+}
+
+// TestControlPodRendersSkillConfigAtTheDocumentedPath pins where the bundle
+// config lands: the control pod mounts the per-run config ConfigMap at the
+// directory that places the file exactly at executor.SkillBundlesConfigPath,
+// which is the path the pod's own loader reads. A mount one directory off
+// would leave the loader without the config it fails closed on.
+func TestControlPodRendersSkillConfigAtTheDocumentedPath(t *testing.T) {
+	run := testRun("control-skill-config")
+	pod, err := ControlPod(run, ControlInputs{
+		Image:                 "harness:test",
+		ControlSAUID:          "sa-uid",
+		WorkerPodUID:          "worker-uid",
+		ControlIncarnationUID: "incarnation-1",
+		WorkerURL:             "http://r-worker.ns.svc.cluster.local:8080",
+		BrokerURL:             "https://r-broker.ns.svc.cluster.local:8443",
+		SkillBundlesConfigMap: SkillBundlesConfigMapName(run.Name),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	volume := skillConfigMapVolumeOf(pod, SkillBundlesConfigMapName(run.Name))
+	if volume == nil {
+		t.Fatalf("control pod carries no volume projecting the config ConfigMap %q", SkillBundlesConfigMapName(run.Name))
+	}
+	configMount, ok := mountOf(pod, volume.Name)
+	if !ok {
+		t.Fatalf("control pod mounts no config volume %q", volume.Name)
+	}
+	if configMount.MountPath != filepath.Dir(executor.SkillBundlesConfigPath) {
+		t.Fatalf("config mount path = %q, want %q", configMount.MountPath, filepath.Dir(executor.SkillBundlesConfigPath))
+	}
+	if !configMount.ReadOnly {
+		t.Fatal("config mount must be read-only")
+	}
+	if len(volume.ConfigMap.Items) != 1 || volume.ConfigMap.Items[0].Path != SkillBundlesConfigKey {
+		t.Fatalf("config volume items = %+v, want the single %q file", volume.ConfigMap.Items, SkillBundlesConfigKey)
+	}
+	if got := filepath.Join(configMount.MountPath, SkillBundlesConfigKey); got != executor.SkillBundlesConfigPath {
+		t.Fatalf("the config file lands at %q, want the documented %q", got, executor.SkillBundlesConfigPath)
+	}
+}
+
+// TestSkilllessRunRendersNoSkillMaterial pins the absence contract: a run
+// that pins no skill renders no skill volume, no skill mount, and no config
+// mount, so a skillless pod never carries an empty bundle projection.
+func TestSkilllessRunRendersNoSkillMaterial(t *testing.T) {
+	run := testRun("skillless")
+	pub, _, _ := protocol.GenerateKey()
+	worker, err := WorkerPod(run, "harness:test", "incarnation-1", pub, nil, courier.DefaultPodResources(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	control, err := ControlPod(run, ControlInputs{
+		Image:                 "harness:test",
+		ControlSAUID:          "sa-uid",
+		WorkerPodUID:          "worker-uid",
+		ControlIncarnationUID: "incarnation-1",
+		WorkerURL:             "http://r-worker.ns.svc.cluster.local:8080",
+		BrokerURL:             "https://r-broker.ns.svc.cluster.local:8443",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pod := range []*corev1.Pod{worker, control} {
+		for _, volume := range pod.Spec.Volumes {
+			if strings.HasPrefix(volume.Name, "skill-") {
+				t.Fatalf("%s pod renders skill volume %q for a skillless run", pod.Name, volume.Name)
+			}
+		}
+		for _, mount := range pod.Spec.Containers[0].VolumeMounts {
+			if strings.HasPrefix(mount.Name, "skill-") {
+				t.Fatalf("%s pod renders skill mount %q for a skillless run", pod.Name, mount.Name)
+			}
+			if mount.MountPath == filepath.Dir(executor.SkillBundlesConfigPath) {
+				t.Fatalf("%s pod renders a bundle config mount for a skillless run", pod.Name)
+			}
+		}
+	}
+}
+
+// TestWorkerPodGainsOnlyAReadOnlySkillMount pins the worker's posture against
+// a pinned run: the skill mount is the only difference from a skillless
+// worker. The volume it adds is a read-only ConfigMap — no Secret volume, no
+// projected volume, no environment value, no service account, and no writable
+// path comes with it — so the worker may read the bundle content and nothing
+// else changes about what it holds.
+func TestWorkerPodGainsOnlyAReadOnlySkillMount(t *testing.T) {
+	run := testRun("worker-skill-posture")
+	pub, _, _ := protocol.GenerateKey()
+	base, err := WorkerPod(run, "harness:test", "incarnation-1", pub, nil, courier.DefaultPodResources(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mount := skillMountFixture("repo-tour", "/opt/courier/skills/repo-tour")
+	pinned, err := WorkerPod(run, "harness:test", "incarnation-1", pub, nil, courier.DefaultPodResources(), []SkillMount{mount})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pinned.Spec.Volumes) != len(base.Spec.Volumes)+1 {
+		t.Fatalf("pinned worker carries %d volumes, want one more than the skillless worker's %d", len(pinned.Spec.Volumes), len(base.Spec.Volumes))
+	}
+	if len(pinned.Spec.Containers[0].VolumeMounts) != len(base.Spec.Containers[0].VolumeMounts)+1 {
+		t.Fatalf("pinned worker carries %d mounts, want one more than the skillless worker's %d", len(pinned.Spec.Containers[0].VolumeMounts), len(base.Spec.Containers[0].VolumeMounts))
+	}
+	if !reflect.DeepEqual(pinned.Spec.Containers[0].Env, base.Spec.Containers[0].Env) {
+		t.Fatalf("pinned worker env = %+v, want the skillless worker's %+v", pinned.Spec.Containers[0].Env, base.Spec.Containers[0].Env)
+	}
+	if pinned.Spec.ServiceAccountName != base.Spec.ServiceAccountName {
+		t.Fatalf("pinned worker service account = %q, want %q", pinned.Spec.ServiceAccountName, base.Spec.ServiceAccountName)
+	}
+	if !reflect.DeepEqual(pinned.Spec.AutomountServiceAccountToken, base.Spec.AutomountServiceAccountToken) {
+		t.Fatal("pinned worker automount changed")
+	}
+	baseMounts := map[string]corev1.VolumeMount{}
+	for _, m := range base.Spec.Containers[0].VolumeMounts {
+		baseMounts[m.Name+"\x00"+m.MountPath] = m
+	}
+	for _, m := range pinned.Spec.Containers[0].VolumeMounts {
+		previous, ok := baseMounts[m.Name+"\x00"+m.MountPath]
+		if !ok {
+			if !m.ReadOnly {
+				t.Fatalf("pinned worker gained a writable mount %q at %q", m.Name, m.MountPath)
+			}
+			continue
+		}
+		if !reflect.DeepEqual(m, previous) {
+			t.Fatalf("pinned worker changed mount %q: %+v, want %+v", m.Name, m, previous)
+		}
+	}
+	// The one volume the pin adds projects the bundle's ConfigMap.
+	volume := skillConfigMapVolumeOf(pinned, mount.ConfigMapName)
+	if volume == nil {
+		t.Fatalf("a pinned worker carries no volume projecting %q", mount.ConfigMapName)
+	}
+	if volume.Secret != nil || volume.Projected != nil {
+		t.Fatalf("the gained worker volume = %+v, want a ConfigMap projection", volume.VolumeSource)
+	}
+}
+
+// TestSkillVolumeNamesAreUniqueAndLabelSafe pins that two pinned bundles
+// never share a pod volume — their contents would shadow each other — and
+// that the derived name is always a DNS label.
+func TestSkillVolumeNamesAreUniqueAndLabelSafe(t *testing.T) {
+	names := []string{"repo-tour", "simple-english", "a", strings.Repeat("a", 63)}
+	seen := map[string]string{}
+	for _, name := range names {
+		volume := skillVolumeName(name)
+		if errs := validation.IsDNS1123Label(volume); len(errs) > 0 {
+			t.Errorf("skill volume name for %q = %q: %v", name, volume, errs)
+		}
+		if other, clash := seen[volume]; clash {
+			t.Errorf("skills %q and %q render the same volume name %q", other, name, volume)
+		}
+		seen[volume] = name
+		if again := skillVolumeName(name); again != volume {
+			t.Errorf("skill volume name for %q is not stable: %q then %q", name, volume, again)
 		}
 	}
 }

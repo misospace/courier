@@ -41,6 +41,27 @@ func writeLoaderConfig(t *testing.T, dir string, specs map[string]string) string
 	return path
 }
 
+// writeMaterializedConfig writes a run config whose bundle reads its
+// content from a projection: the source is the mount root and the file
+// list names the exact files the operator projected into the run's pods.
+func writeMaterializedConfig(t *testing.T, dir, name, source string, files ...string) string {
+	t.Helper()
+	var b strings.Builder
+	b.WriteString("bundles:\n")
+	b.WriteString("- name: " + name + "\n")
+	b.WriteString("  source: " + source + "\n")
+	b.WriteString("  materialization:\n")
+	b.WriteString("    files:\n")
+	for _, file := range files {
+		b.WriteString("    - " + file + "\n")
+	}
+	path := filepath.Join(dir, "bundles.yaml")
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return path
+}
+
 // resolvePinned resolves the named bundles through the production loader and
 // returns their pins, so tests exercise the registry→pin→load chain the run
 // actually executes rather than hand-built digests.
@@ -443,5 +464,248 @@ func TestLoadForRunSymlinkBundleRootResolves(t *testing.T) {
 	// root symlink; the worker mounts content at the registered path.
 	if want := filepath.Join(dir, "alpha"); loaded.Visible[0].Source != want {
 		t.Fatalf("source = %q, want the registered path %q", loaded.Visible[0].Source, want)
+	}
+}
+
+func TestLoadForRunLoadsMaterializedBundle(t *testing.T) {
+	dir := t.TempDir()
+	mount := writeProjection(t, map[string]string{
+		"SKILL.md":            "---\nname: alpha\ndescription: does things\n---\nBody with `$(rm -rf /)` stays data.\n",
+		"assets/checklist.md": "check\n",
+	})
+	config := writeMaterializedConfig(t, dir, "alpha", mount, "SKILL.md", "assets/checklist.md")
+	pins := resolvePinned(t, config, "alpha")
+	loaded, err := LoadForRun(pins, config, dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(loaded.Visible) != 1 {
+		t.Fatalf("visible = %d entries, want 1", len(loaded.Visible))
+	}
+	view := loaded.Visible[0]
+	if view.Name != "alpha" || view.Origin != OriginBundle || view.Digest != pins[0].Digest {
+		t.Fatalf("view identity = %#v", view)
+	}
+	// Source stays the registered mount path: the run's pods mount the
+	// projection there.
+	if view.Source != mount {
+		t.Fatalf("source = %q, want the registered mount %q", view.Source, mount)
+	}
+	if view.Description != "does things" || !strings.Contains(view.Instructions, "$(rm -rf /)") {
+		t.Fatalf("rendered material = %#v", view)
+	}
+	if len(view.Files) != 1 || view.Files[0] != "assets/checklist.md" {
+		t.Fatalf("files = %#v, want the projected asset without SKILL.md", view.Files)
+	}
+	if view.FilesBytes != int64(len("check\n")) {
+		t.Fatalf("filesBytes = %d", view.FilesBytes)
+	}
+}
+
+func TestLoadForRunMaterializedDigestDriftFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	mount := writeProjection(t, map[string]string{
+		"SKILL.md": "---\nname: alpha\ndescription: demo\n---\nBody.\n",
+	})
+	config := writeMaterializedConfig(t, dir, "alpha", mount, "SKILL.md")
+	pins := resolvePinned(t, config, "alpha")
+	// The projected content changes under the run: the recomputed digest no
+	// longer matches the pin, so the run must fail closed like the tree form.
+	if err := os.WriteFile(filepath.Join(mount, "..data", "SKILL.md"), []byte("---\nname: alpha\ndescription: changed\n---\nBody.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadForRun(pins, config, dir); err == nil || !strings.Contains(err.Error(), "pinned digest") {
+		t.Fatalf("error = %v, want digest drift failure", err)
+	}
+}
+
+func TestLoadForRunMaterializedInvalidPathFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	mount := writeProjection(t, map[string]string{"SKILL.md": "# skill\n"})
+	config := writeMaterializedConfig(t, dir, "alpha", mount, "../escape.md")
+	pins := []Pin{{Name: "alpha", Digest: "sha256:" + strings.Repeat("a", 64)}}
+	_, err := LoadForRun(pins, config, dir)
+	if err == nil {
+		t.Fatal("expected a materialized path that escapes the mount to fail the run")
+	}
+	if !strings.Contains(err.Error(), "materialization file") {
+		t.Fatalf("error = %v, want the offending path named", err)
+	}
+}
+
+// writeQuotedMaterializedConfig writes a run config whose bundle reads its
+// content from a projection, with the file list quoted so a path carrying
+// a control character reaches the loader's own validation instead of the
+// YAML reader's.
+func writeQuotedMaterializedConfig(t *testing.T, dir, name, source string, quoted ...string) string {
+	t.Helper()
+	var b strings.Builder
+	b.WriteString("bundles:\n")
+	b.WriteString("- name: " + name + "\n")
+	b.WriteString("  source: " + source + "\n")
+	b.WriteString("  materialization:\n")
+	b.WriteString("    files:\n")
+	for _, file := range quoted {
+		b.WriteString("    - " + file + "\n")
+	}
+	path := filepath.Join(dir, "bundles.yaml")
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return path
+}
+
+// TestLoadForRunRejectsInvalidMaterializationPaths pins the resolution rule
+// for a materialized file list: a path carrying a NUL byte, an absolute
+// path, a ".." element, or a backslash can never resolve, so the run fails
+// closed before the loader reads anything that could sit outside the mount.
+func TestLoadForRunRejectsInvalidMaterializationPaths(t *testing.T) {
+	cases := map[string]struct {
+		path   string
+		quoted string
+	}{
+		"nul byte":  {path: "SKILL.md\x00", quoted: `"SKILL.md\0"`},
+		"absolute":  {path: "/etc/passwd", quoted: `"/etc/passwd"`},
+		"parent":    {path: "../escape.md", quoted: `"../escape.md"`},
+		"backslash": {path: `assets\checklist.md`, quoted: `'assets\checklist.md'`},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			mount := writeProjection(t, map[string]string{"SKILL.md": "# skill\n"})
+			// The resolution itself refuses the path...
+			spec := bundleSpec{
+				Name:            "alpha",
+				Source:          mount,
+				Materialization: &materializationSpec{Files: []string{tc.path}},
+			}
+			if _, err := resolveMaterialized(spec); err == nil {
+				t.Fatalf("path %q: expected the resolution to fail closed", tc.path)
+			}
+			// ...and so does the whole load.
+			config := writeQuotedMaterializedConfig(t, dir, "alpha", mount, tc.quoted)
+			pins := []Pin{{Name: "alpha", Digest: "sha256:" + strings.Repeat("a", 64)}}
+			if _, err := LoadForRun(pins, config, dir); err == nil {
+				t.Fatalf("path %q: expected the load to fail closed", tc.path)
+			}
+		})
+	}
+}
+
+// TestLoadForRunRejectsNULByteConfigPath pins the NUL-byte rule at the
+// config-file boundary: a bundle config path carrying a NUL byte is not a
+// path the operating system can open, so the run fails closed with an
+// explicit error instead of loading anything.
+func TestLoadForRunRejectsNULByteConfigPath(t *testing.T) {
+	pins := []Pin{{Name: "alpha", Digest: "sha256:" + strings.Repeat("a", 64)}}
+	_, err := LoadForRun(pins, "/etc/courier/skill-bundles-config/\x00bundles.yaml", t.TempDir())
+	if err == nil {
+		t.Fatal("a config path carrying a NUL byte must fail closed")
+	}
+	if !strings.Contains(err.Error(), "read skill bundle config") {
+		t.Fatalf("error = %v, want the config read failure named", err)
+	}
+}
+
+// TestLoadForRunRejectsSymlinkedMaterializedFiles pins the projection
+// rule: a materialized file that is a symlink out of the mount, or a
+// symlink to a directory, is rejected — the loader never follows a link the
+// projection could use to steer a read.
+func TestLoadForRunRejectsSymlinkedMaterializedFiles(t *testing.T) {
+	t.Run("escaping the mount", func(t *testing.T) {
+		dir := t.TempDir()
+		outside := t.TempDir()
+		if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("credential material\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mount := t.TempDir()
+		if err := os.Symlink(filepath.Join(outside, "secret.txt"), filepath.Join(mount, "SKILL.md")); err != nil {
+			t.Fatal(err)
+		}
+		config := writeMaterializedConfig(t, dir, "alpha", mount, "SKILL.md")
+		pins := []Pin{{Name: "alpha", Digest: "sha256:" + strings.Repeat("a", 64)}}
+		_, err := LoadForRun(pins, config, dir)
+		if err == nil || !strings.Contains(err.Error(), "resolves outside the bundle mount") {
+			t.Fatalf("error = %v, want the escape rejected", err)
+		}
+	})
+
+	t.Run("pointing at a directory", func(t *testing.T) {
+		dir := t.TempDir()
+		mount := writeProjection(t, map[string]string{"SKILL.md": "# skill\n"})
+		if err := os.MkdirAll(filepath.Join(mount, "sub"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(mount, "sub"), filepath.Join(mount, "assets")); err != nil {
+			t.Fatal(err)
+		}
+		config := writeMaterializedConfig(t, dir, "alpha", mount, "SKILL.md", "assets")
+		pins := []Pin{{Name: "alpha", Digest: "sha256:" + strings.Repeat("a", 64)}}
+		_, err := LoadForRun(pins, config, dir)
+		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Fatalf("error = %v, want the directory symlink rejected", err)
+		}
+	})
+}
+
+// TestLoadForRunRejectsBundleWithInteriorSymlink pins the plain-tree rule
+// at the load boundary: a bundle source carrying an interior symlink never
+// resolves, so the pinned content can never come from a tree that points
+// out of itself.
+func TestLoadForRunRejectsBundleWithInteriorSymlink(t *testing.T) {
+	dir := t.TempDir()
+	writeLoaderTree(t, dir, map[string]string{
+		"alpha/SKILL.md": "# skill\n",
+	})
+	if err := os.Symlink(filepath.Join(dir, "alpha", "SKILL.md"), filepath.Join(dir, "alpha", "alias.md")); err != nil {
+		t.Fatal(err)
+	}
+	config := writeLoaderConfig(t, dir, map[string]string{"alpha": "alpha"})
+	pins := []Pin{{Name: "alpha", Digest: "sha256:" + strings.Repeat("a", 64)}}
+	_, err := LoadForRun(pins, config, dir)
+	if err == nil || !strings.Contains(err.Error(), "plain directory trees") {
+		t.Fatalf("error = %v, want the interior symlink rejected", err)
+	}
+}
+
+// TestLoadForRunQuarantinesSymlinkedRepositorySkill pins the
+// repository-local rule: a SKILL.md that is a symlink is quarantined and
+// reported, and its target's content never reaches the visible view —
+// untrusted repository content can neither park a pinned run nor smuggle
+// content into it.
+func TestLoadForRunQuarantinesSymlinkedRepositorySkill(t *testing.T) {
+	dir := t.TempDir()
+	writeLoaderTree(t, dir, map[string]string{
+		"alpha/SKILL.md": "bundle body\n",
+	})
+	if err := os.MkdirAll(filepath.Join(dir, ".agents/skills/leak"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(dir, "secret.txt")
+	if err := os.WriteFile(secret, []byte("credential material\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(dir, ".agents/skills/leak/SKILL.md")); err != nil {
+		t.Fatal(err)
+	}
+	config := writeLoaderConfig(t, dir, map[string]string{"alpha": "alpha"})
+	pins := resolvePinned(t, config, "alpha")
+	loaded, err := LoadForRun(pins, config, dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(loaded.Visible) != 1 || loaded.Visible[0].Name != "alpha" {
+		t.Fatalf("visible = %#v, want only the pinned bundle", loaded.Visible)
+	}
+	if len(loaded.Rejected) != 1 || loaded.Rejected[0].Name != "leak" {
+		t.Fatalf("rejected = %#v, want one quarantine report for the symlinked skill", loaded.Rejected)
+	}
+	if !strings.Contains(loaded.Rejected[0].Reason, "not a regular file") {
+		t.Fatalf("quarantine reason = %q, want the non-regular-file rule named", loaded.Rejected[0].Reason)
+	}
+	for _, view := range loaded.Visible {
+		if strings.Contains(view.Instructions, "credential material") {
+			t.Fatal("the symlinked repository content was loaded")
+		}
 	}
 }

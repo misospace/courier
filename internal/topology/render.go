@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -42,6 +43,34 @@ type CachePin struct {
 type GatewayPin struct {
 	CIDR string
 	Port int32
+}
+
+// SkillBundlesConfigKey is the key of the per-run skill bundle config
+// ConfigMap: the rendered config document the control pod resolves its
+// pinned skills against. It is the file name inside the config mount, so the
+// document lands at exactly executor.SkillBundlesConfigPath.
+const SkillBundlesConfigKey = "bundles.yaml"
+
+// SkillMount describes one materialized skill bundle mounted into a run pod:
+// the ConfigMap carrying the bundle's content, the absolute path the
+// deployment registered for it, and the projection's key-to-path items.
+//
+// Skill content is deployment-approved prompt and asset material the run
+// deliberately exposes to its pods, never credential material, so it travels
+// in a ConfigMap. A ConfigMap volume is neither a Secret nor a projected
+// volume, so the worker's no-identity-material posture is untouched.
+type SkillMount struct {
+	// Name is the bundle's registered logical name.
+	Name string
+	// ConfigMapName is the per-run ConfigMap carrying the bundle's content.
+	ConfigMapName string
+	// Source is the absolute path the deployment registered for the
+	// bundle. The projection is mounted exactly there, so the bundle's
+	// files are readable where the registration says they are.
+	Source string
+	// Items maps the ConfigMap's data keys to the bundle's relative paths,
+	// so the mounted projection carries the bundle's own file layout.
+	Items []corev1.KeyToPath
 }
 
 // CredentialsSecretKeys is the fixed key contract of the per-run credential
@@ -372,6 +401,106 @@ func WorkerService(run *courier.CoderRun) *corev1.Service {
 	}
 }
 
+// SkillContentConfigMap renders the per-run ConfigMap carrying one pinned
+// skill bundle's materialized content. The data keys are encoded (f0, f1,
+// ...) in sorted relative-path order because a ConfigMap's key names must
+// match [-._a-zA-Z0-9]+ while a bundle's file paths may not; the key-to-path
+// mapping rides the pod's volume projection, which places every file at its
+// relative path inside the mount.
+//
+// The content rides binaryData: a bundle file is arbitrary bytes, and only
+// the binary form carries them exactly.
+func SkillContentConfigMap(run *courier.CoderRun, skillName string, data map[string][]byte) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		ObjectMeta: objectMeta(run, SkillContentConfigMapName(run.Name, skillName), ComponentCoordinator),
+		BinaryData: data,
+	}
+}
+
+// SkillBundlesConfigMap renders the per-run ConfigMap carrying the rendered
+// skill bundle config the control pod resolves its pinned skills against.
+func SkillBundlesConfigMap(run *courier.CoderRun, document []byte) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		ObjectMeta: objectMeta(run, SkillBundlesConfigMapName(run.Name), ComponentCoordinator),
+		BinaryData: map[string][]byte{SkillBundlesConfigKey: document},
+	}
+}
+
+// renderSkillVolumes renders the pod volumes and volume mounts for one run's
+// materialized skill bundles: one ConfigMap projection per bundle, mounted
+// read-only at the bundle's registered source path. The mounts are read-only
+// because bundle content is operator-authored data the pods read and never
+// write — the worker must not be able to alter what a pinned skill says.
+//
+// A ConfigMap volume is not a Secret volume and not a projected volume, so
+// a pinned bundle adds no credential, no token, and no identity material to
+// the pod that mounts it.
+func renderSkillVolumes(mounts []SkillMount) ([]corev1.Volume, []corev1.VolumeMount) {
+	volumes := make([]corev1.Volume, 0, len(mounts))
+	volumeMounts := make([]corev1.VolumeMount, 0, len(mounts))
+	for _, mount := range mounts {
+		name := skillVolumeName(mount.Name)
+		volumes = append(volumes, corev1.Volume{
+			Name: name,
+			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: mount.ConfigMapName},
+				Items:                mount.Items,
+			}},
+		})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      name,
+			MountPath: mount.Source,
+			ReadOnly:  true,
+		})
+	}
+	return volumes, volumeMounts
+}
+
+// renderSkillConfigVolume renders the control pod's bundle config volume:
+// the per-run ConfigMap carrying the rendered config, mounted read-only at
+// the directory that places the file exactly at
+// executor.SkillBundlesConfigPath. The worker needs no config — it reads
+// the bundle content, never the pins.
+func renderSkillConfigVolume(configMapName string) (corev1.Volume, corev1.VolumeMount) {
+	const volumeName = "skill-bundles-config"
+	return corev1.Volume{
+		Name: volumeName,
+		VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+			LocalObjectReference: corev1.LocalObjectReference{Name: configMapName},
+			Items:                []corev1.KeyToPath{{Key: SkillBundlesConfigKey, Path: SkillBundlesConfigKey}},
+		}},
+	}, corev1.VolumeMount{
+		Name:      volumeName,
+		MountPath: filepath.Dir(executor.SkillBundlesConfigPath),
+		ReadOnly:  true,
+	}
+}
+
+// skillVolumeName derives the pod volume name of one materialized skill
+// bundle. A volume name is a DNS label, so it is bounded to a short
+// lowercase prefix of the skill's name with an 8-hex digest of that name
+// always following it: two distinct skill names can never render the same
+// volume, whatever prefix they share.
+func skillVolumeName(skillName string) string {
+	const budget = 16
+	prefix := strings.Trim(strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r + ('a' - 'A')
+		default:
+			return -1
+		}
+	}, skillName), "-")
+	sum := sha256.Sum256([]byte(skillName))
+	digest := hex.EncodeToString(sum[:])[:8]
+	if len(prefix) > budget-len(digest) {
+		prefix = prefix[:budget-len(digest)]
+	}
+	return "skill-" + prefix + digest
+}
+
 // WorkerPod renders the untrusted sandbox worker: no secret, certificate,
 // token, or signing key; a dedicated unbound service account with token
 // automount off; restartPolicy Never so replay state cannot silently reset.
@@ -384,12 +513,22 @@ func WorkerService(run *courier.CoderRun) *corev1.Service {
 // resources is the lane-configured sizing; the zero value renders the
 // built-in default rather than a BestEffort pod.
 //
+// skills are the run's materialized skill bundles: each is mounted read-only
+// at the bundle's registered source path, so a skill's supporting assets are
+// readable where the worker's shell runs. They add no Secret reference, no
+// token, no projected volume, no environment value, no service account, and
+// no writable path — a bundle is read-only content the worker may read and
+// never alter. The content itself is deployment-approved prompt and asset
+// material the run deliberately exposes, not credential material, so it
+// travels in a read-only ConfigMap volume: the worker's volumes stay free of
+// anything that could identify it.
+//
 // image is the caller-resolved worker runtime: the deployment harness image
 // by default, or the lane's RuntimeImage. Whatever it names must carry
 // /usr/local/bin/courier-worker; the mounts below cannot shadow baked tool
 // installations because tools install outside the toolchain cache paths
 // (/usr/local/go, /usr/local/bin) — the contract the Dockerfile pins.
-func WorkerPod(run *courier.CoderRun, image string, controlIncarnationUID string, publicKey ed25519.PublicKey, cache *CachePin, resources corev1.ResourceRequirements) (*corev1.Pod, error) {
+func WorkerPod(run *courier.CoderRun, image string, controlIncarnationUID string, publicKey ed25519.PublicKey, cache *CachePin, resources corev1.ResourceRequirements, skills []SkillMount) (*corev1.Pod, error) {
 	if controlIncarnationUID == "" {
 		return nil, errors.New("topology: worker pod requires the control incarnation identifier")
 	}
@@ -411,6 +550,31 @@ func WorkerPod(run *courier.CoderRun, image string, controlIncarnationUID string
 			corev1.EnvVar{Name: EnvGoSumDB, Value: "off"},
 		)
 	}
+	volumes := []corev1.Volume{{
+		Name:         "workspace",
+		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+	}, {
+		// Per-pod scratch caches (GOMODCACHE, GOCACHE): recreated with
+		// the pod, writable through the pod's fsGroup identity, and
+		// read-only at the reference twin. Durable shared writable
+		// storage is deliberately out of scope (#415).
+		Name:         "toolchain-cache",
+		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+	}}
+	mounts := []corev1.VolumeMount{{
+		Name:      "workspace",
+		MountPath: workerWorkspacePath,
+	}, {
+		Name:      "toolchain-cache",
+		MountPath: executor.ToolchainCachePath,
+	}, {
+		Name:      "toolchain-cache",
+		MountPath: executor.ToolchainReferencePath,
+		ReadOnly:  true,
+	}}
+	skillVolumes, skillMounts := renderSkillVolumes(skills)
+	volumes = append(volumes, skillVolumes...)
+	mounts = append(mounts, skillMounts...)
 	return &corev1.Pod{
 		ObjectMeta: objectMeta(run, WorkerPodName(run.Name), ComponentWorker),
 		Spec: corev1.PodSpec{
@@ -418,17 +582,7 @@ func WorkerPod(run *courier.CoderRun, image string, controlIncarnationUID string
 			AutomountServiceAccountToken: boolPtr(false),
 			RestartPolicy:                corev1.RestartPolicyNever,
 			SecurityContext:              podSecurityContext(),
-			Volumes: []corev1.Volume{{
-				Name:         "workspace",
-				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
-			}, {
-				// Per-pod scratch caches (GOMODCACHE, GOCACHE): recreated with
-				// the pod, writable through the pod's fsGroup identity, and
-				// read-only at the reference twin. Durable shared writable
-				// storage is deliberately out of scope (#415).
-				Name:         "toolchain-cache",
-				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
-			}},
+			Volumes:                      volumes,
 			Containers: []corev1.Container{{
 				Name:    WorkerContainerName,
 				Image:   image,
@@ -440,17 +594,7 @@ func WorkerPod(run *courier.CoderRun, image string, controlIncarnationUID string
 					ContainerPort: WorkerPort,
 					Protocol:      corev1.ProtocolTCP,
 				}},
-				VolumeMounts: []corev1.VolumeMount{{
-					Name:      "workspace",
-					MountPath: workerWorkspacePath,
-				}, {
-					Name:      "toolchain-cache",
-					MountPath: executor.ToolchainCachePath,
-				}, {
-					Name:      "toolchain-cache",
-					MountPath: executor.ToolchainReferencePath,
-					ReadOnly:  true,
-				}},
+				VolumeMounts:    mounts,
 				Resources:       podResources(resources),
 				SecurityContext: containerSecurityContext(),
 			}},
@@ -569,6 +713,11 @@ func BrokerPod(run *courier.CoderRun, image string, projection forge.Projection,
 // GatewayKeyMounted reports whether that Secret was provisioned. Resources is
 // the lane-configured sizing; the zero value renders the built-in default
 // rather than a BestEffort pod.
+//
+// Skills are the run's materialized skill bundles, and SkillBundlesConfigMap
+// is the per-run ConfigMap carrying the bundle config the pod resolves its
+// pins against. Both are empty for a skillless run, which then renders no
+// skill volume, no skill mount, and no config mount at all.
 type ControlInputs struct {
 	Image                 string
 	Run                   executor.Invocation
@@ -581,6 +730,8 @@ type ControlInputs struct {
 	BrokerURL             string
 	BrokerStatusURL       string
 	Resources             corev1.ResourceRequirements
+	Skills                []SkillMount
+	SkillBundlesConfigMap string
 }
 
 // ControlPod renders the trusted control pod. Its container is named
@@ -674,6 +825,19 @@ func ControlPod(run *courier.CoderRun, in ControlInputs) (*corev1.Pod, error) {
 	}
 	for _, runEnv := range executor.RunContextEnvironment(in.Run) {
 		env = append(env, corev1.EnvVar{Name: runEnv.Name, Value: runEnv.Value})
+	}
+	// The run's materialized skill bundles and the config the pod resolves
+	// its pins against are mounted read-only from ConfigMaps: the bundle
+	// content is operator-authored data the pod reads, and the config is
+	// the same document the operator rendered from the deployment
+	// registry.
+	skillVolumes, skillMounts := renderSkillVolumes(in.Skills)
+	volumes = append(volumes, skillVolumes...)
+	mounts = append(mounts, skillMounts...)
+	if in.SkillBundlesConfigMap != "" {
+		configVolume, configMount := renderSkillConfigVolume(in.SkillBundlesConfigMap)
+		volumes = append(volumes, configVolume)
+		mounts = append(mounts, configMount)
 	}
 	return &corev1.Pod{
 		ObjectMeta: objectMeta(run, ControlPodName(run.Name), ComponentCoordinator),
