@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -40,6 +41,16 @@ const (
 	exitError = 1
 	exitUsage = 2
 )
+
+// defaultAdmissionTimeout bounds one admission's cluster round trips so a
+// stalled API server (or network path) that accepts the connection but
+// never answers produces an exit-1 error instead of hanging the CLI with
+// no output, in a context where callers script around the exit codes
+// (#684). It matches the repo's own inbound-request bound precedent, the
+// Dispatch client's defaultTimeout (internal/source/dispatch/client.go).
+// The deadline covers the whole admission — the adapter's Get and Create,
+// including client-go's own retries — rather than one HTTP request.
+const defaultAdmissionTimeout = 30 * time.Second
 
 // contributeUsage is the full help text for the contribute subcommand.
 // The AUTHORITY section is part of the issue's done-when: a contributor
@@ -99,6 +110,12 @@ Flags:
                           lookup applies (KUBECONFIG, default locations,
                           in-cluster).
 
+Timeout:
+
+  The admission is bounded by a 30-second deadline covering its cluster
+  round trips. A stalled API server or network path fails with exit 1
+  naming the timeout instead of hanging.
+
 Exit codes:
 
   0  the CoderRun was created or an existing one was resumed
@@ -124,6 +141,12 @@ type contributeOptions struct {
 	namespace     string
 	debug         bool
 	kubeconfig    string
+	// timeout bounds the admission's cluster round trips; zero selects
+	// defaultAdmissionTimeout. It carries no flag: the bound is fixed
+	// CLI behavior documented in contributeUsage, and the field exists
+	// so tests can exercise a stalled cluster without waiting out the
+	// real deadline.
+	timeout time.Duration
 }
 
 // newContributeClient builds the Kubernetes client one admission goes
@@ -261,9 +284,22 @@ func runContribute(ctx context.Context, opts contributeOptions, kubeClient clien
 		}
 		admission.IdempotencyKey = key
 	}
+	timeout := opts.timeout
+	if timeout <= 0 {
+		timeout = defaultAdmissionTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	admitted, err := adhoc.New(kubeClient, nil).Admit(ctx, admission)
 	if err != nil {
 		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			// Named before the generic branch so a stalled API server
+			// reads as the timeout it is, not an opaque cluster error
+			// (#684). Still exit 1: the caller cannot fix it without a
+			// reachable cluster.
+			fmt.Fprintf(stderr, "courierctl contribute: admission timed out after %s; the API server did not answer within the bound\n", timeout)
+			return exitError
 		case errors.Is(err, adhoc.ErrInvalidAdmission):
 			fmt.Fprintf(stderr, "courierctl contribute: %v\n", err)
 			return exitUsage

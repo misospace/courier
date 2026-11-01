@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -402,6 +403,9 @@ func TestContributeHelpGoesToStdout(t *testing.T) {
 	if !strings.Contains(out, "--fresh") {
 		t.Errorf("help text %q does not document --fresh", out)
 	}
+	if !strings.Contains(out, "30-second deadline") {
+		t.Errorf("help text %q does not document the admission deadline", out)
+	}
 	if stderr.Len() != 0 {
 		t.Errorf("stderr = %q; help must not write to stderr", stderr.String())
 	}
@@ -457,6 +461,45 @@ func TestContributeSchemeRegistersCourier(t *testing.T) {
 	scheme := contributeScheme()
 	if _, err := scheme.New(courierv1alpha1.GroupVersion.WithKind("CoderRun")); err != nil {
 		t.Errorf("scheme cannot build a CoderRun: %v", err)
+	}
+}
+
+// stalledCluster wraps a client whose every read and write blocks until
+// the caller's context is done and then reports the context error — the
+// fake equivalent of an API server (or network path) that accepts the
+// connection and never answers (#684).
+type stalledCluster struct {
+	client.Client
+}
+
+func (s stalledCluster) Get(ctx context.Context, _ types.NamespacedName, _ client.Object, _ ...client.GetOption) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (s stalledCluster) Create(ctx context.Context, _ client.Object, _ ...client.CreateOption) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestContributeDeadlineBoundsAdmission is the #684 regression: against a
+// cluster that never answers, the admission must return exit 1 naming the
+// timeout instead of hanging. Without the bound the CLI would pass a
+// deadline-free context to the stalled client and this call would never
+// return, so the test itself is the proof the deadline is wired in.
+func TestContributeDeadlineBoundsAdmission(t *testing.T) {
+	opts := validOptions()
+	opts.timeout = 10 * time.Millisecond
+
+	code, stdout, stderr := runOptions(t, opts, stalledCluster{newTestClient(t)})
+	if code != exitError {
+		t.Fatalf("exit code = %d, stderr %q; want %d", code, stderr, exitError)
+	}
+	if !strings.Contains(stderr, "timed out") {
+		t.Errorf("stderr %q; want the timeout wording", stderr)
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q; a timed-out admission prints nothing", stdout)
 	}
 }
 
