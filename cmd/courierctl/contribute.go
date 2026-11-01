@@ -296,9 +296,10 @@ func runContribute(ctx context.Context, opts contributeOptions, kubeClient clien
 		case errors.Is(err, context.DeadlineExceeded):
 			// Named before the generic branch so a stalled API server
 			// reads as the timeout it is, not an opaque cluster error
-			// (#684). Still exit 1: the caller cannot fix it without a
-			// reachable cluster.
-			fmt.Fprintf(stderr, "courierctl contribute: admission timed out after %s; the API server did not answer within the bound\n", timeout)
+			// (#684), with the adapter's underlying detail (which call
+			// stalled) kept for diagnosis. Still exit 1: the caller
+			// cannot fix it without a reachable cluster.
+			fmt.Fprintf(stderr, "courierctl contribute: admission timed out after %s; the API server did not answer within the bound: %v\n", timeout, err)
 			return exitError
 		case errors.Is(err, adhoc.ErrInvalidAdmission):
 			fmt.Fprintf(stderr, "courierctl contribute: %v\n", err)

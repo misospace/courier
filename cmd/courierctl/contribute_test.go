@@ -503,6 +503,15 @@ func TestContributeDeadlineBoundsAdmission(t *testing.T) {
 	}
 }
 
+// TestDefaultAdmissionTimeoutMatchesHelp pins the bound contributeUsage
+// documents to the constant the CLI applies, so changing one without the
+// other fails here instead of leaving the help text silently lying.
+func TestDefaultAdmissionTimeoutMatchesHelp(t *testing.T) {
+	if defaultAdmissionTimeout != 30*time.Second {
+		t.Errorf("defaultAdmissionTimeout = %s; contributeUsage documents a 30-second deadline", defaultAdmissionTimeout)
+	}
+}
+
 // TestMintFreshKeyIsShapedAndDistinct pins the fresh key mint: it matches
 // the adapter's key shape, and successive mints never collide (the whole
 // reason --fresh exists).
