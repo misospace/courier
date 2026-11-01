@@ -217,6 +217,13 @@ func TestTrustedStatusListenerCarriesInboundBounds(t *testing.T) {
 			t.Fatalf("status listener %s = %v, want the API listener's %v", name, bound, want[name])
 		}
 	}
+	// The write bound must also stay above the trusted status handler's own
+	// budget: the handler spends that budget on its TokenReview, live reads,
+	// and forge read before it writes the answer, so a deadline that ended
+	// the request first would cut off a healthy status write.
+	if broker.InboundWriteTimeout <= broker.StatusRequestBudget {
+		t.Fatalf("status listener write bound %v must exceed the trusted status handler's request budget %v", broker.InboundWriteTimeout, broker.StatusRequestBudget)
+	}
 }
 
 // TestStatusListenerReclaimsIdleConnection: the trusted status listener must

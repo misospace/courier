@@ -366,22 +366,30 @@ func (s *Server) updatePR(w http.ResponseWriter, r *http.Request) {
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
-	if r.URL.RawQuery != "" || r.ContentLength == 0 {
-		http.Error(w, "invalid request", http.StatusBadRequest)
-		return false
-	}
-	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(target); err != nil {
-		http.Error(w, "invalid request", http.StatusBadRequest)
-		return false
-	}
-	var extra any
-	if err := dec.Decode(&extra); err != io.EOF {
+	if err := decodeJSONBody(r, target); err != nil {
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return false
 	}
 	return true
+}
+
+// decodeJSONBody reads one JSON body into target. The caller decides how a
+// failed read is answered: a malformed body and a body that could not be read
+// in time are different answers.
+func decodeJSONBody(r *http.Request, target any) error {
+	if r.URL.RawQuery != "" || r.ContentLength == 0 {
+		return errors.New("invalid request")
+	}
+	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(target); err != nil {
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return errors.New("invalid request")
+	}
+	return nil
 }
 
 func respond(w http.ResponseWriter, value any, err error) {
