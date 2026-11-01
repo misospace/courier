@@ -528,12 +528,20 @@ func skillVolumeName(skillName string) string {
 // /usr/local/bin/courier-worker; the mounts below cannot shadow baked tool
 // installations because tools install outside the toolchain cache paths
 // (/usr/local/go, /usr/local/bin) — the contract the Dockerfile pins.
+//
+// A bundle's registered source path may not collide with a path the
+// operator's own pods own, and no two bundles may share one: the render
+// rejects such a registration before the pod is created, so the worker never
+// comes up with a shadowed or duplicated mount.
 func WorkerPod(run *courier.CoderRun, image string, controlIncarnationUID string, publicKey ed25519.PublicKey, cache *CachePin, resources corev1.ResourceRequirements, skills []SkillMount) (*corev1.Pod, error) {
 	if controlIncarnationUID == "" {
 		return nil, errors.New("topology: worker pod requires the control incarnation identifier")
 	}
 	if len(publicKey) != ed25519.PublicKeySize {
 		return nil, errors.New("topology: worker public key has the wrong size")
+	}
+	if err := ValidateSkillMounts(skills); err != nil {
+		return nil, err
 	}
 	env := []corev1.EnvVar{
 		{Name: EnvRunUID, Value: string(run.UID)},
@@ -748,6 +756,9 @@ func ControlPod(run *courier.CoderRun, in ControlInputs) (*corev1.Pod, error) {
 	if in.GatewayURL == "" && in.GatewayKeyMounted {
 		return nil, errors.New("topology: control pod renders a gateway key Secret without a gateway URL")
 	}
+	if err := ValidateSkillMounts(in.Skills); err != nil {
+		return nil, err
+	}
 	volumes := []corev1.Volume{
 		{
 			Name:         "workspace",
@@ -830,7 +841,9 @@ func ControlPod(run *courier.CoderRun, in ControlInputs) (*corev1.Pod, error) {
 	// its pins against are mounted read-only from ConfigMaps: the bundle
 	// content is operator-authored data the pod reads, and the config is
 	// the same document the operator rendered from the deployment
-	// registry.
+	// registry. A bundle's registered source path may not collide with a
+	// path the operator's own pods own, and no two bundles may share one:
+	// the render rejects such a registration before the pod is created.
 	skillVolumes, skillMounts := renderSkillVolumes(in.Skills)
 	volumes = append(volumes, skillVolumes...)
 	mounts = append(mounts, skillMounts...)

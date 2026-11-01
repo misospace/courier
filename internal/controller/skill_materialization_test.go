@@ -357,6 +357,76 @@ func TestMaterializeRunSkillsFailsClosedOnUnknownPin(t *testing.T) {
 	}
 }
 
+// collidingMaterializationRegistry registers several bundles at one source
+// path and returns the registry with each bundle's digest. Two bundles at one
+// path are a registration the operator cannot mount: the run's pods would
+// render two volumes at one mount path.
+func collidingMaterializationRegistry(t *testing.T, names []string) (*skills.Registry, map[string]string) {
+	t.Helper()
+	root := t.TempDir()
+	source := filepath.Join(root, "shared")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "SKILL.md"), []byte("tour the repository first."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	entries := &strings.Builder{}
+	for _, name := range names {
+		fmt.Fprintf(entries, "  - name: %s\n    source: %s\n", name, source)
+	}
+	path := filepath.Join(root, "bundles.yaml")
+	if err := os.WriteFile(path, []byte("bundles:\n"+entries.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := skills.Load(path)
+	if err != nil {
+		t.Fatalf("load registry: %v", err)
+	}
+	digests := make(map[string]string, len(names))
+	for _, name := range names {
+		bundle, ok := registry.Lookup(name)
+		if !ok {
+			t.Fatalf("bundle %q did not register", name)
+		}
+		digests[name] = bundle.Digest
+	}
+	return registry, digests
+}
+
+// TestMaterializeRunSkillsFailsClosedOnCollidingSources pins the mount-path
+// invariant at the materialization boundary: two bundles registered at one
+// source path would render two volumes at one mount path, so the run fails
+// closed before any ConfigMap is written.
+func TestMaterializeRunSkillsFailsClosedOnCollidingSources(t *testing.T) {
+	registry, digests := collidingMaterializationRegistry(t, []string{"repo-tour", "repo-tour-copy"})
+	control, c := secureControl(t)
+	control.Config.Skills = registry
+	run := secureRun("colliding")
+	run.Status.SkillPins = []courier.SkillPin{
+		{Name: "repo-tour", Digest: digests["repo-tour"]},
+		{Name: "repo-tour-copy", Digest: digests["repo-tour-copy"]},
+	}
+
+	mounts, configMap, err := control.materializeRunSkills(context.Background(), run)
+	if err == nil {
+		t.Fatal("two bundles at one source path must fail closed")
+	}
+	if !strings.Contains(err.Error(), "repo-tour-copy") {
+		t.Fatalf("error = %v, want it to name the colliding bundles", err)
+	}
+	if mounts != nil || configMap != "" {
+		t.Fatalf("a failed materialization returned mounts %+v and config %q, want none", mounts, configMap)
+	}
+	configMaps := &corev1.ConfigMapList{}
+	if err := c.List(context.Background(), configMaps, client.InNamespace(run.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	if len(configMaps.Items) != 0 {
+		t.Fatalf("a failed materialization created %d ConfigMaps, want none", len(configMaps.Items))
+	}
+}
+
 // TestMaterializeRunSkillsLeavesSkilllessRunsAlone pins the absence
 // contract: a run that pins no skill materializes nothing and asks for no
 // mount, so a skillless run never carries an empty bundle projection.

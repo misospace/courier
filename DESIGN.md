@@ -2578,6 +2578,16 @@ the mount, and requires the recomputed digest to match, failing closed
 before the coordinator's first model request on a missing, drifted, or
 oversized mount. The operator owns the materialization because it renders
 the run's pods: a deployment cannot mount content into them.
+The registered source path is the mount path inside the run's pods, so it
+has to be mountable. The path must be a clean absolute path, no two bundles
+may share or nest one path, and no bundle may sit at a path the operator's
+own pods own: the workspaces, the control runtime, the toolchain cache and
+its read-only reference, the control's credential mounts, or the bundle
+config directory. A bundle at one of those paths would shadow the operator's
+volume, and a bundle at a path above one would shadow it too. A colliding
+registration fails manager startup explicitly, and the materialization and
+the pod render reject the same configuration, so a run never comes up with a
+shadowed or duplicated mount.
 Repository-local skills discovered under `.agents/skills/<name>/SKILL.md` of
 the integration checkout compose with the pins through `skills.Overlay`;
 malformed repository-local documents are quarantined and reported, never

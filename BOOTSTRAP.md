@@ -473,6 +473,18 @@ Your part of the contract does not change. Mount the bundle content into the
 manager pod at the absolute `source` path you registered. The manager reads
 those bytes at startup, digests them, and hands the same bytes to the run.
 
+The `source` path is also the absolute path the operator mounts the bundle at
+inside the run's control and worker pods, so it has to be mountable. Do not
+use a path the operator's own pods own: `/workspace`, `/courier-runtime`,
+`/courier-toolchain`, `/courier-toolchain-cache`,
+`/var/run/courier/signing`, `/var/run/courier/broker`,
+`/var/run/courier/gateway`, `/var/run/secrets/tokens`, or
+`/etc/courier/skill-bundles-config`. Do not use a path above one of those
+either, and do not give two bundles the same `source`. A bundle at one of
+those paths would shadow what the operator mounts, and two bundles at one path
+would mount twice. A colliding source fails manager startup with an explicit
+error.
+
 One bound applies. A ConfigMap holds at most 1 MiB of data. A pinned bundle
 above that size fails the run closed with a named capability error before
 the coordinator's first model request. The registry accepts a bundle of up to

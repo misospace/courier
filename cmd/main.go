@@ -293,6 +293,14 @@ func main() {
 			setupLog.Error(err, "unable load skill bundles")
 			os.Exit(1)
 		}
+		// The registered source is the mount path the run's pods use, so a
+		// source that could not be mounted — a duplicate path, or a path the
+		// operator's own pods own — fails startup explicitly instead of
+		// failing every run that selects the bundle.
+		if err := topology.ValidateSkillSources(skillBundleSources(registry)); err != nil {
+			setupLog.Error(err, "unable register skill bundles")
+			os.Exit(1)
+		}
 		skillRegistry = registry
 		setupLog.Info("skill bundles registered", "bundles", len(registry.Names()))
 		for _, bundle := range registry.Bundles() {
@@ -1125,6 +1133,19 @@ func loadForgeRegistry(path string) (*forge.Registry, error) {
 		return nil, fmt.Errorf("read forge providers file: %w", err)
 	}
 	return forge.Load(data, "github")
+}
+
+// skillBundleSources projects the registered bundles into the name and source
+// pairs the topology validates: a bundle's registered source is the absolute
+// path its content is mounted at inside a run's pods, so the registration has
+// to be mountable before any run selects it.
+func skillBundleSources(registry *skills.Registry) []topology.SkillSource {
+	bundles := registry.Bundles()
+	sources := make([]topology.SkillSource, 0, len(bundles))
+	for _, bundle := range bundles {
+		sources = append(sources, topology.SkillSource{Name: bundle.Name, Source: bundle.Source})
+	}
+	return sources
 }
 
 // buildSecureControl validates the provider registry (preloaded by main, or

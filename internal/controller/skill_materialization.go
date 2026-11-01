@@ -158,6 +158,14 @@ func (s *SecureControl) resolveRunSkills(run *courier.CoderRun) (*skillMaterial,
 			Files:  paths,
 		})
 	}
+	// The registered source path is the mount path in the run's pods, so it
+	// has to be mountable: two bundles may not share one, and no bundle may
+	// sit at a path the operator's own pods own. The check runs here, before
+	// any ConfigMap is written, so a colliding registration fails the run
+	// closed with nothing created.
+	if err := topology.ValidateSkillMounts(material.mounts); err != nil {
+		return nil, fmt.Errorf("secure topology: materialize run skills: %w", err)
+	}
 	document, err := skills.RenderRunConfig(bundles)
 	if err != nil {
 		return nil, fmt.Errorf("secure topology: materialize run skills: %w", err)
