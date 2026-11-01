@@ -199,6 +199,56 @@ func TestPreContractRunKeepsLegacyNoSkillState(t *testing.T) {
 	}
 }
 
+// TestPreContractRunIgnoresLaneSkillEdits pins that a pre-contract retained
+// run never reads its lane for skills: even a post-admission lane edit to an
+// unregistered name cannot fail or alter the run, because the nil pin is the
+// legacy no-skill state and is preserved without re-resolution.
+func TestPreContractRunIgnoresLaneSkillEdits(t *testing.T) {
+	registry, _ := skillBundleRegistry(t, "simple-english", "write plainly.")
+	lane := skillSelectionLane("simple-english")
+	reconciler, c, _ := skillPinReconciler(t, registry, lane)
+	run := secureRun("pre-contract-edit")
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.resolvePersistSecurePolicy(context.Background(), run); err != nil {
+		t.Fatalf("resolvePersistSecurePolicy: %v", err)
+	}
+	var persisted courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &persisted); err != nil {
+		t.Fatal(err)
+	}
+	persisted.Status.SkillPins = nil
+	if err := c.Status().Update(context.Background(), &persisted); err != nil {
+		t.Fatal(err)
+	}
+	// Edit the lane to an unregistered name: a re-resolution that read the
+	// lane would fail this run closed as LaneConfig, but a pre-contract run
+	// must be unreachable by any lane edit.
+	var live courier.LaneProfile
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(lane), &live); err != nil {
+		t.Fatal(err)
+	}
+	live.Spec.Skills = []string{"ghost-skill"}
+	if err := c.Update(context.Background(), &live); err != nil {
+		t.Fatal(err)
+	}
+	var retained courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &retained); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.resolvePersistSecurePolicy(context.Background(), &retained); err != nil {
+		t.Fatalf("resolvePersistSecurePolicy on a pre-contract run after a lane edit: %v", err)
+	}
+	var after courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &after); err != nil {
+		t.Fatal(err)
+	}
+	if after.Status.SkillPins != nil {
+		t.Fatalf("pre-contract run acquired pins %+v after a lane edit, want the legacy nil pin preserved", after.Status.SkillPins)
+	}
+}
+
 func equalityPolicy(a, b *courier.PublicationPolicy) bool {
 	if a == nil || b == nil {
 		return a == b
