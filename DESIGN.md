@@ -486,6 +486,95 @@ through the same crashloop-bounded path pod loss uses, handing the run to a
 human at the ceiling with the terminated pod preserved as the ending's
 evidence.
 
+### Tracked check receipts
+
+Coordinator validation runs through a dedicated `check` tool on the same
+trusted execution surface as `shell`: the command dispatches over the signed
+protocol to the untrusted worker, and the result is the worker's own exit
+status and bounded output tails — never a summary grep, a shell pipeline
+masking the test exit, or a process-name observation. Each check is tracked
+by a receipt whose identity at the registry is the exact command bytes plus
+the snapshot tip. Commands are keyed verbatim, never by a tokenized form: the
+task executes as `sh -c <command>`, and a quote-resolved identity aliases
+distinct programs — `echo "$HOME"` and `echo '$HOME'` tokenize alike but
+expand differently — so only identical bytes guarantee an identical program,
+and collapsing cosmetic whitespace is not worth that aliasing risk. The
+applied bootstrap environment is deliberately outside the registry key: it is
+settled only by the destructive materialization that also produces the
+workspace, so keying on it pre-materialization would force every caller,
+including a joining waiter, to re-materialize the workspace underneath the
+in-flight check. Instead each receipt records the environment digest (for
+observability) and the snapshot generation it ran against — the
+coordinator-local count of successful materializations, whose bump
+witnesses each mutating flow: a control shell or fresh check materializes
+per run, and a delegate brief materializes once for its whole epoch. The registry key's claim strictly precedes the destructive
+snapshot materialization: a caller that joins an in-flight equivalent check
+performs no upload-unpack and cannot mutate the workspace the running check
+validates.
+
+The generation guard is what keeps a served receipt honest. Every
+coordinator-driven workspace mutation is witnessed by a generation bump.
+The one worker-side mutation a bump does not witness — files the completed
+check itself leaves behind, gitignored outputs included — needs no witness:
+the reuse path executes nothing, and every later evidence producer
+dispatches only after the materialization that resets the workspace first
+(`git reset --hard` plus `git clean -qfdx`), so one task's writes can never
+reach a later task's observation. A fresh dispatch at the same key would
+itself re-materialize before running, so a served receipt describes exactly
+what a fresh dispatch would have measured; the only nondeterminism reuse
+inherits is the command's own, the same class any test cache carries. "No
+materialization since the receipt's run" is therefore exactly "no evidence
+has run against any workspace state the receipt does not describe": a
+receipt is servable only while no re-materialization has happened since its
+run, and a receipt from an older generation describes a state that no
+longer exists, so the guard refuses it
+(both on the reuse path and for a waiter whose in-flight dispatch completed
+after an intervening materialization) and the request reruns. This narrows
+reuse honestly: any intervening control shell run, delegate brief
+materialization, or other check dispatch makes stored receipts unservable,
+while back-to-back identical check requests with nothing in between still
+reuse — the deduplication goal. The guard's keystone is that `check` is
+coordinator-only and the coordinator pump executes tool calls serially: a
+delegate epoch can never overlap a check receipt's lifetime, so no receipt
+exists inside an epoch whose mutations it does not describe. A completed
+plain `shell` run of the exact
+command against the same state additionally drops the matching receipt
+outright, so a later check cannot serve evidence older than the run the
+coordinator just performed. The identity is complete because the workspace a
+check runs against is a pure function of the tip on the materialization
+path: a worktree change that does not change the tip cannot exist on the
+materialized workspace, because worker-side edits never survive the next
+unpack, and every relevant change reaches it through artifact integration,
+which advances the tip. A repeat request against unchanged state is served
+from the saved receipt instead of re-executing; any state change, a lost
+receipt, or a concrete concern reruns. A completed run is
+evidence whether it passed or failed: the worker reports a nonzero exit as
+`ResultFailed`, so a failing suite is reprinted on repeat rather than rerun
+forever. A cancelled dispatch and a run that never produced its own exit
+status (`ResultFailed` carrying the sentinel exit code `-1`: never started,
+or died to a signal) are never reusable as evidence. Concrete concerns have
+two explicit invalidation paths: `check` accepts `refresh:true`, which
+ignores and replaces the saved receipt with a fresh dispatch, and a completed
+plain `shell` run — pass or fail — of the exact command against the same
+state drops the matching receipt, so a later check cannot serve evidence
+older than the run the coordinator just performed. Invalidation matches the
+exact command bytes; an equivalent command spelled differently keeps its own
+identity.
+
+While an equivalent check is in flight, a duplicate request waits on that
+dispatch instead of launching a second one. Receipts are bounded (evicted
+least-recently tracked first) and live only in the coordinator incarnation.
+That scoping is deliberate, not a missing persistence layer: a restart
+relaunches the incarnation from scratch — the session is in-memory and
+rebuilds nothing from a prior transcript — and a relaunched incarnation has
+no session memory of earlier requests, starts a fresh generation counter,
+and must materialize before its first dispatch, so a cross-restart receipt
+would be refused by the generation guard even if it had been persisted: the
+workspace it describes no longer exists. Receipt persistence beyond the
+incarnation would record nothing a rerun could not safely reproduce; a
+restart simply reruns. The tool is coordinator-only — sub-agents keep plain
+shell.
+
 ### Coordinator pod process lifetime
 
 The legacy pod runs the executor directly as PID 1 — the pod sets `Command`,

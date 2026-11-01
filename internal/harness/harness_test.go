@@ -178,10 +178,21 @@ type mockWorker struct {
 	// tombstones the op.
 	hangResults bool
 	// hangStage makes only the operations of one bootstrap stage
-	// ("bootstrap" or "capture") stay running the same way, standing in
-	// for a worker whose bootstrap task or whose environment-capture task
+	// ("bootstrap" or "capture") stay running same way, standing in
+	// for worker whose bootstrap task or whose environment-capture task
 	// — but not both — never terminates.
 	hangStage string
+	// hangKinds makes only the dispatched operations whose op-ID kind
+	// prefix matches (e.g. "check") stay running same way: additive to
+	// hangResults, so tests hang one operation kind without touching
+	// others.
+	hangKinds []string
+	// cancelGate, when non-nil, holds every cancel request's response
+	// until closed: the tombstone is recorded first, so a gated
+	// reconciliation still observes the cancellation once the gate opens.
+	// It lets a test keep dispatcher's failed launch in flight while it
+	// arranges waiter's claim on the same entry.
+	cancelGate chan struct{}
 	// reconcileFails makes the result poll for a tombstoned operation fail
 	// with 503: the cancellation landed and the worker tombstoned the op,
 	// but the reconcile cannot observe what happened to the task afterward.
@@ -212,6 +223,28 @@ type mockWorker struct {
 	// tombstoned operation answers the verified cancellation instead of
 	// hanging — the reconcile must be able to observe it.
 	tombstones map[string]bool
+	// unpackDuringCheck counts unpack dispatches that executed while a
+	// check-kind operation was still in flight (its result state still
+	// "running" and not tombstoned). That is exactly the hazard the
+	// tracked checks' claim ordering must prevent: an unpack resets and
+	// cleans the shared workspace a running check validates. The mock only
+	// records the count; the test asserts it from the outside, so a
+	// regression fails with a clear message instead of from inside the
+	// worker's goroutine.
+	unpackDuringCheck int
+	// dirtyWorkspace models worker-side files a model-controlled task
+	// leaves in the shared workspace: a terminal shell- or check-kind task
+	// sets it, and only the unpack's reset (the materialization) clears
+	// it. This is the reviewer's scenario made concrete: a completed
+	// check's own writes changing the workspace its receipt describes.
+	dirtyWorkspace bool
+	// dirtyAtDispatch records, per shell/check-kind dispatch in order, the
+	// dirty-workspace state that task started against. The evidence
+	// semantics require every dispatched task to start clean — its
+	// materialization wiped earlier tasks' writes — so a test asserting
+	// all-false pins that no task's writes ever leak into a later task's
+	// observation.
+	dirtyAtDispatch []bool
 }
 
 // hangingPollCeiling bounds how long a test waits for a scripted hanging
@@ -244,6 +277,18 @@ func isWorkerBootstrapTask(task protocol.Task) bool {
 func isWorkerEnvCaptureTask(task protocol.Task) bool {
 	return len(task.Command) == 3 && task.Command[0] == "sh" && task.Command[1] == "-c" &&
 		strings.Contains(task.Command[2], "mise x -- env -0")
+}
+
+// opIDKindOf reports whether opID's kind prefix (the segment before its
+// first dot, per newOpID) matches any of the hung kinds.
+func opIDKindOf(opID string, kinds []string) bool {
+	kind, _, _ := strings.Cut(opID, ".")
+	for _, want := range kinds {
+		if kind == want {
+			return true
+		}
+	}
+	return false
 }
 
 func isWorkerUnpackTask(task protocol.Task) bool {
@@ -302,15 +347,34 @@ func (m *mockWorker) handleDispatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m.dispatches = append(m.dispatches, dispatchRecord{envelope: req.Envelope, task: task})
+	// A model-controlled dispatch records the dirty-workspace state it
+	// starts against: the evidence semantics require it to be clean, its
+	// own materialization having wiped earlier tasks' writes.
+	if opIDKindOf(req.Envelope.OpID, []string{"shell", "check"}) {
+		m.dirtyAtDispatch = append(m.dirtyAtDispatch, m.dirtyWorkspace)
+	}
 	if m.results == nil {
 		m.results = map[string]protocol.ResultState{}
+	}
+	// An unpack that executes while a check-kind operation is still in
+	// flight is the tracked-checks hazard: the unpack resets and cleans
+	// the shared workspace the running check validates. Record it for the
+	// test to assert — never fail here, inside the worker's goroutine.
+	if isWorkerUnpackTask(task) {
+		for opID, state := range m.results {
+			if state.Status == "running" && !m.tombstones[opID] && opIDKindOf(opID, []string{"check"}) {
+				m.unpackDuringCheck++
+				break
+			}
+		}
 	}
 	// A hung operation stays running: like the real worker, its result
 	// polls answer "running" immediately until a cancellation tombstones
 	// the op — the mock never emulates a hang by blocking the poll request.
 	running := m.hangResults ||
 		(m.hangStage == "bootstrap" && isWorkerBootstrapTask(task)) ||
-		(m.hangStage == "capture" && isWorkerEnvCaptureTask(task))
+		(m.hangStage == "capture" && isWorkerEnvCaptureTask(task)) ||
+		opIDKindOf(req.Envelope.OpID, m.hangKinds)
 	if running {
 		m.results[req.Envelope.OpID] = protocol.ResultState{Status: "running"}
 	}
@@ -369,19 +433,34 @@ func (m *mockWorker) handleDispatch(w http.ResponseWriter, r *http.Request) {
 			},
 		}
 	}
+	// Model the workspace's dirty state the way the real worker behaves:
+	// the unpack's reset cleans everything a previous task left behind,
+	// fixed control tasks change nothing the receipts vouch for, and a
+	// terminally completed model-controlled task may leave files behind.
+	if !running {
+		switch {
+		case isWorkerUnpackTask(task):
+			m.dirtyWorkspace = false
+		case isWorkerPackTask(task), isWorkerBootstrapTask(task), isWorkerEnvCaptureTask(task):
+		default:
+			m.dirtyWorkspace = true
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, `{"status":"running"}`)
 }
 
 func (m *mockWorker) handleCancel(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	gate := m.cancelGate
 	var req workerSignedRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		m.mu.Unlock()
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
 	}
 	if err := req.Envelope.Verify(m.key, req.Signature); err != nil {
+		m.mu.Unlock()
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
 	}
@@ -390,6 +469,17 @@ func (m *mockWorker) handleCancel(w http.ResponseWriter, r *http.Request) {
 		m.tombstones = map[string]bool{}
 	}
 	m.tombstones[req.Envelope.OpID] = true
+	m.mu.Unlock()
+	if gate != nil {
+		// Hold the response until the gate opens: the tombstone is already
+		// recorded, so the reconciling caller's result poll answers the
+		// verified cancellation either way.
+		select {
+		case <-gate:
+		case <-r.Context().Done():
+			return
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, `{"status":"cancelled"}`)
 }
@@ -478,6 +568,15 @@ func (m *mockWorker) cancelCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.cancels)
+}
+
+// unpackDuringCheckCount reports how many unpack dispatches executed while a
+// check-kind operation was still in flight — the destructive-materialization
+// hazard the tracked checks' claim ordering must prevent.
+func (m *mockWorker) unpackDuringCheckCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.unpackDuringCheck
 }
 
 // scriptUnobservedTermination scripts the worker whose cancellation lands
