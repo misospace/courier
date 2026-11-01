@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -482,21 +483,34 @@ func TestArtifactRejectsOversizedBundleFile(t *testing.T) {
 }
 
 func TestArtifactRejectsObjectCountBound(t *testing.T) {
+	// The budget is test-owned: the fixture only has to cross the bound it
+	// was handed, not the production-scale one. The production bounds are
+	// restored when the test ends.
+	const objectBound = 1000
+	injectArtifactBudget(t, artifactBudget{objects: objectBound, unpacked: 1 << 20, blobBytes: MaxArtifactBlobBytes})
 	w := newArtifactWorld(t, nil)
 	before := capturePrivateTree(t, w)
-	bundle := w.simulateWorker("b1", func(dir string) {
+	workspace := w.simulateWorkerWorkspace("b1", func(dir string) {
 		// One commit with more objects than the bound allows: 1-byte files
 		// keep the unpacked total under its own bound so the count is what
 		// trips. The content is unique so git cannot deduplicate.
 		if err := os.MkdirAll(filepath.Join(dir, "many"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		for i := 0; i < MaxArtifactObjects+10; i++ {
+		for i := 0; i < objectBound+10; i++ {
 			writeFile(t, filepath.Join(dir, "many", pad(i)+".txt"), "x"+pad(i))
 		}
-		gitCmd(t, dir, "add", "-A")
-		gitCommit(t, dir, "many objects")
 	})
+	bundle := renderWorkerBundle(t, "b1", workspace)
+	// The fixture proves which bound it crosses: more objects than the
+	// count bound, and fewer unpacked bytes than the size bound.
+	count, unpacked := deliveredObjects(t, workspace, ResultRefPrefix+"b1")
+	if count <= objectBound {
+		t.Fatalf("fixture delivers %d objects, want more than the %d count bound", count, objectBound)
+	}
+	if unpacked >= artifactMaxUnpackedBytes {
+		t.Fatalf("fixture unpacks %d bytes, want fewer than the %d size bound: the count must be what trips", unpacked, artifactMaxUnpackedBytes)
+	}
 	_, err := w.integrate("b1", bundle, "summary")
 	requireRejected(t, err, rejectObjects)
 	// The excess object set was refused early: nothing was imported into
@@ -505,23 +519,108 @@ func TestArtifactRejectsObjectCountBound(t *testing.T) {
 }
 
 func TestArtifactRejectsUnpackedSizeBound(t *testing.T) {
+	// The budget is test-owned: the fixture only has to cross the bound it
+	// was handed, not the production-scale one.
+	const unpackedBound = 64 << 10
+	const objectBound = 1000
+	injectArtifactBudget(t, artifactBudget{objects: objectBound, unpacked: unpackedBound, blobBytes: MaxArtifactBlobBytes})
 	w := newArtifactWorld(t, nil)
 	// Many small unique blobs: the count stays under its bound while the
-	// total unpacked size exceeds 64 MiB. The content must differ per blob,
-	// or git would deduplicate them into one object.
+	// total unpacked size exceeds the size bound. The content must differ
+	// per blob, or git would deduplicate them into one object.
 	blob := strings.Repeat("x", 1023) + "\n"
-	bundle := w.simulateWorker("b1", func(dir string) {
+	files := int(unpackedBound)/1024 + 10
+	workspace := w.simulateWorkerWorkspace("b1", func(dir string) {
 		if err := os.MkdirAll(filepath.Join(dir, "bulk"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		for i := 0; i < 66000; i++ {
+		for i := 0; i < files; i++ {
 			writeFile(t, filepath.Join(dir, "bulk", pad(i)+".bin"), blob+pad(i))
 		}
-		gitCmd(t, dir, "add", "-A")
-		gitCommit(t, dir, "bulk")
 	})
+	bundle := renderWorkerBundle(t, "b1", workspace)
+	// The fixture proves which bound it crosses: more unpacked bytes than
+	// the size bound, and fewer objects than the count bound.
+	count, unpacked := deliveredObjects(t, workspace, ResultRefPrefix+"b1")
+	if unpacked <= unpackedBound {
+		t.Fatalf("fixture unpacks %d bytes, want more than the %d size bound", unpacked, unpackedBound)
+	}
+	if count >= objectBound {
+		t.Fatalf("fixture delivers %d objects, want fewer than the %d count bound: the size must be what trips", count, objectBound)
+	}
 	_, err := w.integrate("b1", bundle, "summary")
 	requireRejected(t, err, rejectUnpacked)
+}
+
+// artifactBudget is one test-owned artifact budget: the bounds the
+// enforcement path reads while the test runs. The production bounds are
+// restored when the test ends.
+type artifactBudget struct {
+	objects   int
+	unpacked  int64
+	blobBytes int64
+}
+
+// injectArtifactBudget hands the enforcement path a test-owned budget.
+func injectArtifactBudget(t *testing.T, budget artifactBudget) {
+	t.Helper()
+	objects, unpacked, blob := artifactMaxObjects, artifactMaxUnpackedBytes, artifactMaxBlobBytes
+	artifactMaxObjects = budget.objects
+	artifactMaxUnpackedBytes = budget.unpacked
+	artifactMaxBlobBytes = budget.blobBytes
+	t.Cleanup(func() {
+		artifactMaxObjects, artifactMaxUnpackedBytes, artifactMaxBlobBytes = objects, unpacked, blob
+	})
+}
+
+// renderWorkerBundle commits the workspace's mutation and renders the bundle
+// the fixed pack task would deliver for the brief.
+func renderWorkerBundle(t *testing.T, briefID, workspace string) []byte {
+	t.Helper()
+	gitCmd(t, workspace, "add", "-A")
+	gitCommit(t, workspace, "worker work")
+	ref := ResultRefPrefix + briefID
+	gitCmd(t, workspace, "update-ref", ref, "HEAD")
+	bundlePath := filepath.Join(workspace, "artifact."+briefID+".bundle")
+	if err := couriergit.BundleCreate(context.Background(), workspace, bundlePath, ref); err != nil {
+		t.Fatalf("worker bundle render: %v", err)
+	}
+	data, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// deliveredObjects reports how many objects the bundle at ref delivers and
+// their total unpacked size, so a fixture can prove which bound it crosses.
+func deliveredObjects(t *testing.T, dir, ref string) (count int, totalBytes int64) {
+	t.Helper()
+	delivered := map[string]bool{}
+	for _, line := range strings.Split(gitRev(t, dir, "rev-list", "--objects", ref), "\n") {
+		if line == "" {
+			continue
+		}
+		oid, _, _ := strings.Cut(line, " ")
+		delivered[oid] = true
+	}
+	sizes := gitRev(t, dir, "cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objectsize)")
+	for _, line := range strings.Split(sizes, "\n") {
+		if line == "" {
+			continue
+		}
+		oid, size, ok := strings.Cut(line, " ")
+		if !ok || !delivered[oid] {
+			continue
+		}
+		count++
+		parsed, err := strconv.ParseInt(size, 10, 64)
+		if err != nil {
+			t.Fatalf("object size %q: %v", size, err)
+		}
+		totalBytes += parsed
+	}
+	return count, totalBytes
 }
 
 func TestArtifactPathScopeEnforced(t *testing.T) {

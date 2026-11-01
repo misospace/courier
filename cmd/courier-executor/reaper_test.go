@@ -433,18 +433,11 @@ func readPID(t *testing.T, path string) int {
 func TestExecutorReapsAdoptedOrphansAndStillReportsExit(t *testing.T) {
 	root := t.TempDir()
 
-	// Build into the scratch temp dir, never into the repo.
-	execBin := filepath.Join(root, "executor")
-	build := exec.Command("go", "build", "-buildvcs=false", "-o", execBin, "./cmd/courier-executor")
-	_, thisFile, _, _ := runtime.Caller(0)
-	build.Dir = filepath.Join(filepath.Dir(thisFile), "..", "..")
-	build.Env = withGoBin(os.Environ())
-	var buildOut bytes.Buffer
-	build.Stdout = &buildOut
-	build.Stderr = &buildOut
-	if err := build.Run(); err != nil {
-		t.Skipf("cannot build the executor for a subprocess test, skipping: %v (%s)", err, buildOut.String())
-	}
+	// The executor is this test binary re-entered in helper mode: the
+	// package's own main(), so the subprocess behaves like the shipped
+	// binary (same reaper, same run flow) without building a second copy of
+	// it inside the test.
+	execBin := executorHelperPath(t)
 
 	remote := remoteWithExistingBranch(t, root)
 	workspace := filepath.Join(root, "workspace")
@@ -492,6 +485,7 @@ exit 0
 		"COURIER_REF":                    "7",
 		"COURIER_RUN_NAME":               "coderrun-it-7",
 		"COURIER_RESUME_BACKOFF_SECONDS": "0",
+		executorHelperProcessEnv:         "1",
 	})
 
 	var out, errOut bytes.Buffer

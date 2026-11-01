@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -731,16 +730,27 @@ exit 0
 }
 
 // TestEvidenceDeadlineStopsAttempts proves the operation deadline bounds the
-// delivery loop: with evidenceOperationDeadline shrunk to a second and an
-// intake that sleeps past it before answering, the first POST attempt is
-// aborted by the deadline and the loop's pre-attempt context check stops a
-// second attempt — the intake saw exactly one request start, the run records
-// a "lost" outcome, and the terminal handoff is identical to the same run
-// with capture unconfigured, so a stalled intake never changes the ending.
+// delivery loop: with the bounds shrunk to test-owned values and an intake
+// that holds the request open until the client aborts it, the first POST
+// attempt is aborted by the deadline and the loop's pre-attempt context check
+// stops a second attempt — the intake saw exactly one request start, the
+// intake saw the client abort, the run records a "lost" outcome, and the
+// terminal handoff is identical to the same run with capture unconfigured, so
+// a stalled intake never changes the ending.
+//
+// The bounds are the test's own: the operation bound covers the capture and
+// the delivery together, the degraded bound covers the manifest-only delivery
+// that follows a missed operation bound, and both are shrunk to a quarter of
+// a second so the proof costs milliseconds instead of the production scale.
 func TestEvidenceDeadlineStopsAttempts(t *testing.T) {
-	prev := evidenceOperationDeadline
-	evidenceOperationDeadline = time.Second
-	t.Cleanup(func() { evidenceOperationDeadline = prev })
+	prevOperation := evidenceOperationDeadline
+	prevDegraded := evidenceDegradedDeliveryDeadline
+	evidenceOperationDeadline = 250 * time.Millisecond
+	evidenceDegradedDeliveryDeadline = 250 * time.Millisecond
+	t.Cleanup(func() {
+		evidenceOperationDeadline = prevOperation
+		evidenceDegradedDeliveryDeadline = prevDegraded
+	})
 
 	// runDirty plays the TestEvidenceDirtyTerminalCaptures scenario — the
 	// fake leaves an uncommitted file and declares changes, so the run ends
@@ -773,20 +783,28 @@ printf '{"outcome":"changes"}' > "$COURIER_SCRATCH_DIR/outcome.json"
 		return code, output.String()
 	}
 
-	// The intake records each request start, then sleeps past the shrunk
-	// deadline before answering the first one, so the client aborts the
-	// in-flight attempt and the delivery loop's pre-attempt context check
-	// must stop the second one.
+	// The intake records each request start, then holds the request open
+	// until the client aborts it: the deadline is the client's, so the
+	// attempt must end on the client going away rather than on an answer the
+	// intake chose to give. The body is drained first, because the server
+	// only watches the connection for a disconnect once the request body has
+	// been read; without that the abort would go unnoticed. The bounded
+	// fallback only keeps a bug from hanging the server's shutdown, and the
+	// observed abort is what proves the deadline (not a server-side timeout)
+	// ended the attempt.
 	var mu sync.Mutex
 	var starts int
+	abortSeen := make(chan struct{}, 1)
 	intake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
+		_, _ = io.Copy(io.Discard, r.Body)
 		mu.Lock()
-		first := starts == 0
 		starts++
 		mu.Unlock()
-		if first {
-			time.Sleep(5 * time.Second)
+		select {
+		case <-r.Context().Done():
+			abortSeen <- struct{}{}
+		case <-time.After(5 * time.Second):
 		}
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -799,11 +817,18 @@ printf '{"outcome":"changes"}' > "$COURIER_SCRATCH_DIR/outcome.json"
 	if !strings.Contains(armedOut, `"phase":"Failed"`) {
 		t.Fatalf("armed run should end failed: %q", armedOut)
 	}
+	// The abort is what proves the deadline ended the attempt, so wait for
+	// the intake to observe it instead of racing its goroutine.
+	select {
+	case <-abortSeen:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the intake never saw the client abort the request: the attempt must end on the deadline, not on an answer the intake gave")
+	}
 	mu.Lock()
 	startsCount := starts
 	mu.Unlock()
 	if startsCount != 1 {
-		t.Fatalf("intake saw %d request starts, want 1 (the deadline must stop the second attempt)", startsCount)
+		t.Fatalf("intake saw %d request starts, want 1: the delivery must be attempted once and then stopped by the deadline", startsCount)
 	}
 	events := parseEvents(t, bytes.NewBufferString(armedOut))
 	if n := countEvents(t, events, "evidence.capture"); n != 1 {
@@ -882,18 +907,13 @@ func TestEvidenceSIGTERMKillsProcessGroupAndCaptures(t *testing.T) {
 			t.Fatalf("archive members = %v, want partial.txt", rec.archiveFiles)
 		}
 
-		// The group SIGKILL must have reaped the grandchild: probe it with
-		// signal 0 for up to ~15s; if it survives, that is a failure.
-		deadline := time.Now().Add(15 * time.Second)
-		for processRunning(t, res.grandchildPid) {
-			if time.Now().After(deadline) {
-				break
-			}
-			time.Sleep(200 * time.Millisecond)
-		}
-		if processRunning(t, res.grandchildPid) {
+		// The group SIGKILL must have reaped the grandchild: wait for the
+		// process to exit rather than polling for it. The wait is bounded
+		// only as a failure ceiling.
+		gone, method := waitProcessExitEvent(t, res.grandchildPid, 15*time.Second)
+		if !gone {
 			bestEffortSignal("KILL", res.grandchildPid)
-			t.Errorf("process-group kill failed: grandchild %d survived the SIGTERM cascade", res.grandchildPid)
+			t.Errorf("process-group kill failed: grandchild %d survived the SIGTERM cascade (%s)", res.grandchildPid, method)
 		}
 
 		// The cancellation path ends Failed in the termination file.
@@ -964,19 +984,11 @@ func signalKillScenario(t *testing.T, sig string, waitLimit time.Duration) signa
 	t.Helper()
 	root := t.TempDir()
 
-	// 1. Build the executor once, into the scratch temp dir (never into the
-	//    repo). Skip when the toolchain is unavailable or the build fails.
-	execBin := filepath.Join(root, "executor")
-	build := exec.Command("go", "build", "-buildvcs=false", "-o", execBin, "./cmd/courier-executor")
-	_, thisFile, _, _ := runtime.Caller(0)
-	build.Dir = filepath.Join(filepath.Dir(thisFile), "..", "..")
-	build.Env = withGoBin(os.Environ())
-	var buildOut bytes.Buffer
-	build.Stdout = &buildOut
-	build.Stderr = &buildOut
-	if err := build.Run(); err != nil {
-		t.Skipf("cannot build the executor for a subprocess test, skipping: %v (%s)", err, buildOut.String())
-	}
+	// 1. The executor is this test binary re-entered in helper mode: the
+	//    package's own main(), so the subprocess behaves like the shipped
+	//    binary (same signal handling, same reaper, same run flow) without
+	//    building a second copy of it inside the test.
+	execBin := executorHelperPath(t)
 
 	// 2. Scenario layout, all under the scratch temp dir.
 	remote := remoteWithExistingBranch(t, root)
@@ -1019,6 +1031,7 @@ wait
 		"GITHUB_TOKEN":             "github-api-token",
 		"COURIER_EVIDENCE_URL":     intake.URL,
 		"COURIER_EVIDENCE_TOKEN":   "ev-token-1",
+		executorHelperProcessEnv:   "1",
 	})
 
 	// 4. Start the executor as a real subprocess and drain its streams into
@@ -1045,6 +1058,9 @@ wait
 
 	// 5. Poll up to ~20s for the grandchild to appear and the dirty work to be
 	//    written, proving the run reached the model-child launch and is blocked.
+	//    A file's creation has no portable notification, so this stays a poll,
+	//    kept tight so the scenario spends its time waiting on the run rather
+	//    than on the poll.
 	partialPath := filepath.Join(workspace, "partial.txt")
 	gcPidPath := filepath.Join(scratch, "grandchild.pid")
 	end := time.Now().Add(20 * time.Second)
@@ -1058,7 +1074,7 @@ wait
 			_ = cmd.Process.Kill()
 			t.Fatalf("did not observe the grandchild pid and dirty work within 20s; stdout=%q stderr=%q", out.String(), errOut.String())
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
 	rawPid := mustRead(t, gcPidPath)
 	if _, err := fmt.Sscanf(string(rawPid), "%d", &grandchildPid); err != nil || grandchildPid <= 0 {
@@ -1093,28 +1109,6 @@ wait
 		grandchildPid: grandchildPid,
 		termination:   termination,
 	}
-}
-
-// withGoBin returns env with the scratch Go toolchain's bin directory placed
-// at the front of PATH so `go` resolves for the build step even when the test
-// process was started without it.
-func withGoBin(env []string) []string {
-	const bin = "/var/tmp/courier-scratch/go/bin"
-	out := make([]string, 0, len(env)+1)
-	path := ""
-	for _, kv := range env {
-		name, value, ok := strings.Cut(kv, "=")
-		if !ok {
-			continue
-		}
-		if name == "PATH" {
-			path = value
-			continue
-		}
-		out = append(out, kv)
-	}
-	out = append(out, "PATH="+bin+string(os.PathListSeparator)+path)
-	return out
 }
 
 // subprocessEnv returns the environment for the executor subprocess: the

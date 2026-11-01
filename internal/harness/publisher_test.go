@@ -684,6 +684,7 @@ func TestPublicationBaseAdvanceResync(t *testing.T) {
 // A broker that keeps refusing is classified: a definite denial is blocked,
 // transport failure is transient after the bounded retries.
 func TestPublicationDenialClassification(t *testing.T) {
+	shrinkRetryDelays(t)
 	t.Run("definite denial", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			http.Error(w, "operation denied", http.StatusUnprocessableEntity)
@@ -761,6 +762,7 @@ func denialEngine(t *testing.T, server *httptest.Server) *PublicationEngine {
 // temporary broker outage during crash-after-push recovery never sends the
 // run to NeedsHuman.
 func TestPublicationSeedTipConfirmClassification(t *testing.T) {
+	shrinkRetryDelays(t)
 	t.Run("definite denial is blocked", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			http.Error(w, "operation denied", http.StatusUnprocessableEntity)
