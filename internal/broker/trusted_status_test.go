@@ -1,16 +1,21 @@
 package broker
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,7 +35,9 @@ type trustedTestAuthenticator struct {
 func (a *trustedTestAuthenticator) Authenticate(_ context.Context, token string) (Identity, error) {
 	a.calls++
 	if token != "trusted-token" {
-		return Identity{}, context.Canceled
+		// A refusal, not a context failure: the handler tells a refused
+		// credential apart from a request that ended before it was answered.
+		return Identity{}, errors.New("token is unauthenticated")
 	}
 	return a.identity, a.err
 }
@@ -251,7 +258,7 @@ func TestTrustedStatusConflictIsTransientClassifies(t *testing.T) {
 
 // trustedHandlerWithValidator builds a handler whose validator returns the
 // given error, on the standard fixture identity.
-func trustedHandlerWithValidator(t *testing.T, c client.Client, identity StatusIdentity, validate StatusValidator) http.Handler {
+func trustedHandlerWithValidator(t *testing.T, c client.Client, identity StatusIdentity, validate StatusValidator) *trustedStatusHandler {
 	t.Helper()
 	writer, err := NewStatusWriter(c, c, testNamespace, testRunName)
 	if err != nil {
@@ -265,7 +272,7 @@ func trustedHandlerWithValidator(t *testing.T, c client.Client, identity StatusI
 	if err != nil {
 		t.Fatal(err)
 	}
-	return handler
+	return handler.(*trustedStatusHandler)
 }
 
 func postStatusPatch(t *testing.T, handler http.Handler, identity StatusIdentity, patch HarnessPatch) int {
@@ -320,6 +327,182 @@ func TestTrustedStatusDefiniteMismatchIsNonRetryable(t *testing.T) {
 }
 
 func stringPtr(v string) *string { return &v }
+
+// stalledValidator stands in for the live forge read a lastCommit
+// confirmation depends on: it answers only when the handler's budget ends,
+// and it reports the failure the way the production validator does — as
+// availability, so the answer stays retryable. The fallback keeps a
+// regression from hanging the test: without a budget the validator reports
+// that it never saw one.
+func stalledValidator(ctx context.Context, _ *courier.CoderRun, _ *corev1.Pod, _ HarnessPatch) error {
+	select {
+	case <-ctx.Done():
+		return &StatusUnavailableError{Err: fmt.Errorf("live work ref read failed: %w", ctx.Err())}
+	case <-time.After(2 * time.Second):
+		return errors.New("stalled backend never observed the handler budget")
+	}
+}
+
+// TestTrustedStatusBudgetFitsInsideWriteDeadline pins the budget the trusted
+// status handler spends on its own work. The listener's write deadline starts
+// when the request headers are read, so the handler's budget must sit inside
+// that deadline with the response reserve in between: a healthy status write
+// can then never be cut off by the write bound, and a request that exhausts
+// its budget answers a retryable 503 instead of a truncated response.
+func TestTrustedStatusBudgetFitsInsideWriteDeadline(t *testing.T) {
+	if StatusRequestBudget <= 0 || StatusResponseReserve <= 0 {
+		t.Fatalf("budget = %v, reserve = %v; both must be positive", StatusRequestBudget, StatusResponseReserve)
+	}
+	if StatusRequestBudget+StatusResponseReserve != InboundWriteTimeout {
+		t.Fatalf("budget %v + reserve %v = %v, want the listener's write bound %v", StatusRequestBudget, StatusResponseReserve, StatusRequestBudget+StatusResponseReserve, InboundWriteTimeout)
+	}
+	if StatusRequestBudget >= InboundWriteTimeout {
+		t.Fatalf("budget = %v, want strictly inside the write bound %v", StatusRequestBudget, InboundWriteTimeout)
+	}
+	// The handler must spend that budget: a handler built with a different
+	// one would let the write deadline end a healthy status write.
+	writer, _, _ := statusFixture(t)
+	handler, err := NewTrustedStatusHandler(&trustedTestAuthenticator{}, writer, func(context.Context, *courier.CoderRun, *corev1.Pod, HarnessPatch) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := handler.(*trustedStatusHandler).budget; got != StatusRequestBudget {
+		t.Fatalf("handler budget = %v, want the exported %v", got, StatusRequestBudget)
+	}
+}
+
+// TestTrustedStatusBudgetExhaustionIsRetryable: a backend that cannot answer
+// inside the handler's budget ends the request with a complete, retryable
+// answer, so the caller's retry machinery retries the write instead of
+// treating an unproven update as a definite denial.
+func TestTrustedStatusBudgetExhaustionIsRetryable(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		validate StatusValidator
+	}{
+		// The production shape: the live forge read failed without an
+		// answer, so the validator reports availability.
+		{name: "typed-availability", validate: stalledValidator},
+		// A validator that reports the ended request as a bare context
+		// error must not turn it into a definite denial either.
+		{name: "bare-context-error", validate: func(ctx context.Context, _ *courier.CoderRun, _ *corev1.Pod, _ HarnessPatch) error {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(2 * time.Second):
+				return errors.New("stalled backend never observed the handler budget")
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, c, identity := statusFixture(t)
+			handler := trustedHandlerWithValidator(t, c, identity, test.validate)
+			handler.budget = 100 * time.Millisecond
+			code := postStatusPatch(t, handler, identity, HarnessPatch{LastCommit: stringPtr("published-sha")})
+			if code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503; an exhausted budget is availability, not denial", code)
+			}
+			run := &courier.CoderRun{}
+			if err := c.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: testRunName}, run); err != nil {
+				t.Fatal(err)
+			}
+			if run.Status.LastCommit != "" {
+				t.Fatalf("an unproven update was persisted: %#v", run.Status)
+			}
+		})
+	}
+}
+
+// TestTrustedStatusAnswersBeforeWriteDeadline proves the property the
+// listener's write bound depends on: the handler's own budget ends the
+// request before the server's write deadline, so the caller receives a whole
+// answer. The window is scaled down from production, but the shape is the
+// production one: the budget ends the work, the reserve covers the answer.
+func TestTrustedStatusAnswersBeforeWriteDeadline(t *testing.T) {
+	_, c, identity := statusFixture(t)
+	handler := trustedHandlerWithValidator(t, c, identity, stalledValidator)
+	handler.budget = 200 * time.Millisecond
+	server := httptest.NewUnstartedServer(handler)
+	server.Config.WriteTimeout = handler.budget + 100*time.Millisecond
+	server.Start()
+	defer server.Close()
+
+	body, err := json.Marshal(HarnessPatch{LastCommit: stringPtr("published-sha")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodPost, server.URL+PathTrustedStatus, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer trusted-token")
+	started := time.Now()
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatalf("status request failed: %v", err)
+	}
+	defer response.Body.Close()
+	payload, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; an exhausted budget is availability, not denial", response.StatusCode)
+	}
+	if string(payload) != "status update unavailable\n" {
+		t.Fatalf("body = %q, want the whole retryable answer", payload)
+	}
+	if elapsed := time.Since(started); elapsed >= server.Config.WriteTimeout {
+		t.Fatalf("answer took %v, want the handler's budget to end the request inside the %v write deadline", elapsed, server.Config.WriteTimeout)
+	}
+}
+
+// TestTrustedStatusStalledBodyCannotOutliveWriteDeadline pins the body read
+// inside the same budget: a client that sends its headers and then stalls its
+// body must not hold the request past the listener's write deadline, because
+// the answer would be written into an expired deadline and the caller would
+// see a truncated response instead of the retryable answer.
+func TestTrustedStatusStalledBodyCannotOutliveWriteDeadline(t *testing.T) {
+	_, c, identity := statusFixture(t)
+	handler := trustedHandlerWithValidator(t, c, identity, func(context.Context, *courier.CoderRun, *corev1.Pod, HarnessPatch) error { return nil })
+	handler.budget = 200 * time.Millisecond
+	server := httptest.NewUnstartedServer(handler)
+	server.Config.WriteTimeout = handler.budget + 100*time.Millisecond
+	server.Start()
+	defer server.Close()
+
+	conn, err := net.Dial("tcp", server.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	// The headers arrive; the body never does.
+	if _, err := conn.Write([]byte("POST " + PathTrustedStatus + " HTTP/1.1\r\nHost: broker.test\r\nAuthorization: Bearer trusted-token\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodPost, server.URL+PathTrustedStatus, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(conn), request)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer response.Body.Close()
+	payload, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; an unreadable body is an incomplete request, not a denial", response.StatusCode)
+	}
+	if string(payload) != "status update unavailable\n" {
+		t.Fatalf("body = %q, want the whole retryable answer", payload)
+	}
+}
 
 // TestStatusWriterBackendReadFailureIsTyped pins the writer-level split: an
 // API-server read that fails without an answer is StatusUnavailableError
