@@ -22,7 +22,6 @@ import (
 	"github.com/misospace/courier/internal/skills"
 	"github.com/misospace/courier/internal/source/cron"
 	"github.com/misospace/courier/internal/source/dispatch"
-	"github.com/misospace/courier/internal/topology"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -1367,7 +1366,7 @@ func TestSkillBundleSourcesGateTheStartup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load registry: %v", err)
 	}
-	if err := topology.ValidateSkillSources(skillBundleSources(registry)); err == nil {
+	if err := validateSkillBundleRegistration(registry); err == nil {
 		t.Fatal("two bundles at one source path must fail startup")
 	}
 
@@ -1388,7 +1387,7 @@ func TestSkillBundleSourcesGateTheStartup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load registry: %v", err)
 	}
-	if err := topology.ValidateSkillSources(skillBundleSources(registry)); err != nil {
+	if err := validateSkillBundleRegistration(registry); err != nil {
 		t.Fatalf("a distinct bundle source must pass the startup gate: %v", err)
 	}
 }

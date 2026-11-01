@@ -67,10 +67,12 @@ type materializationSpec struct {
 
 // Parse reads a skill bundle config document: a top-level bundles list of
 // bundleSpec entries. Unknown fields are rejected. Names are trimmed and
-// must be valid DNS-1123 labels. Sources are trimmed and must be absolute
-// paths — the deployment config points at mounted paths, so a relative
-// source is a config bug. Duplicate names are rejected. An empty bundles
-// list is allowed: a registry with zero bundles.
+// must be valid DNS-1123 labels. Sources are trimmed, must be absolute paths
+// — the deployment config points at mounted paths, so a relative source is a
+// config bug — and are normalized, so one location has one spelling in the
+// registry, in the pod mount, and in the rendered run config. Duplicate names
+// are rejected. An empty bundles list is allowed: a registry with zero
+// bundles.
 //
 // An entry may carry a materialization block naming the exact relative
 // files its bundle carries: the per-run config the operator renders for a
@@ -99,15 +101,9 @@ func Parse(data []byte) ([]bundleSpec, error) {
 			return nil, fmt.Errorf("skill bundle %d: duplicate name %q, first defined at bundle %d", i, name, first)
 		}
 		seen[name] = i
-		source := strings.TrimSpace(spec.Source)
-		if source == "" {
-			return nil, fmt.Errorf("skill bundle %d: source is required", i)
-		}
-		if !filepath.IsAbs(source) {
-			return nil, fmt.Errorf("skill bundle %d: source %q must be an absolute path", i, source)
-		}
-		if strings.ContainsRune(source, 0) {
-			return nil, fmt.Errorf("skill bundle %d: source carries a NUL byte", i)
+		source, err := normalizeSource(spec.Source)
+		if err != nil {
+			return nil, fmt.Errorf("skill bundle %d: %w", i, err)
 		}
 		if spec.Materialization != nil {
 			for _, rel := range spec.Materialization.Files {
@@ -138,7 +134,9 @@ type MaterializedBundle struct {
 // bytes, and the renderer fails closed on any entry that could not be
 // materialized safely — a name that is not a valid DNS-1123 label, a
 // duplicate name, a relative source, an empty file list, or a path that
-// could escape the mount.
+// could escape the mount. The source is normalized the same way Parse
+// normalizes it, so the rendered document carries the same spelling of a path
+// the registry holds.
 func RenderRunConfig(bundles []MaterializedBundle) ([]byte, error) {
 	sorted := make([]MaterializedBundle, len(bundles))
 	copy(sorted, bundles)
@@ -157,12 +155,9 @@ func RenderRunConfig(bundles []MaterializedBundle) ([]byte, error) {
 			return nil, fmt.Errorf("skill bundle %q: duplicate name", name)
 		}
 		seen[name] = true
-		source := strings.TrimSpace(bundle.Source)
-		if source == "" {
-			return nil, fmt.Errorf("skill bundle %q: source is required", name)
-		}
-		if !filepath.IsAbs(source) {
-			return nil, fmt.Errorf("skill bundle %q: source %q must be an absolute path", name, source)
+		source, err := normalizeSource(bundle.Source)
+		if err != nil {
+			return nil, fmt.Errorf("skill bundle %q: %w", name, err)
 		}
 		if len(bundle.Files) == 0 {
 			return nil, fmt.Errorf("skill bundle %q: materialization file list must not be empty", name)
@@ -212,6 +207,37 @@ func validateRelativePath(rel string) error {
 		}
 	}
 	return nil
+}
+
+// normalizeSource validates one bundle's registered source path and returns
+// its normalized spelling.
+//
+// The source is also the mount path inside a run's pods, so it must be an
+// absolute path that carries no control character, and it is normalized once
+// here: a trailing separator or a "." element names the same location, and
+// the registry, the pod mount, and the rendered run config must agree on one
+// spelling of it. Normalizing at the boundary keeps one spelling of a path
+// from reaching the pod spec in two forms.
+func normalizeSource(source string) (string, error) {
+	trimmed := strings.TrimSpace(source)
+	switch {
+	case trimmed == "":
+		return "", fmt.Errorf("source is required")
+	case !filepath.IsAbs(trimmed):
+		return "", fmt.Errorf("source %q must be an absolute path", trimmed)
+	case strings.ContainsRune(trimmed, 0):
+		return "", fmt.Errorf("source carries a NUL byte")
+	case strings.IndexFunc(trimmed, isControlRune) >= 0:
+		return "", fmt.Errorf("source carries a control character")
+	}
+	return filepath.Clean(trimmed), nil
+}
+
+// isControlRune reports whether r is an ASCII control character. A path
+// carrying one is not a path an operator can read in a log line or a manifest,
+// so it is rejected rather than mounted.
+func isControlRune(r rune) bool {
+	return r < 0x20 || r == 0x7f
 }
 
 // Registry is the resolved, deployment-approved bundle set, sorted by name

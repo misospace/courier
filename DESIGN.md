@@ -2582,12 +2582,15 @@ The registered source path is the mount path inside the run's pods, so it
 has to be mountable. The path must be a clean absolute path, no two bundles
 may share or nest one path, and no bundle may sit at a path the operator's
 own pods own: the workspaces, the control runtime, the toolchain cache and
-its read-only reference, the control's credential mounts, or the bundle
-config directory. A bundle at one of those paths would shadow the operator's
-volume, and a bundle at a path above one would shadow it too. A colliding
-registration fails manager startup explicitly, and the materialization and
-the pod render reject the same configuration, so a run never comes up with a
-shadowed or duplicated mount.
+its read-only reference, the control's credential mounts, the bundle config
+directory, and the image-owned toolchain and entrypoint directories a bundle
+mount would hide. A bundle at one of those paths would shadow the operator's
+volume, and a bundle at a path above one would shadow it too. The source is
+normalized once at the registration boundary, so one location has one
+spelling in the registry, in the pod mount, and in the rendered run config. A
+colliding registration fails manager startup explicitly, and the
+materialization and the pod render reject the same configuration, so a run
+never comes up with a shadowed or duplicated mount.
 Repository-local skills discovered under `.agents/skills/<name>/SKILL.md` of
 the integration checkout compose with the pins through `skills.Overlay`;
 malformed repository-local documents are quarantined and reported, never

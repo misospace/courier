@@ -478,12 +478,16 @@ inside the run's control and worker pods, so it has to be mountable. Do not
 use a path the operator's own pods own: `/workspace`, `/courier-runtime`,
 `/courier-toolchain`, `/courier-toolchain-cache`,
 `/var/run/courier/signing`, `/var/run/courier/broker`,
-`/var/run/courier/gateway`, `/var/run/secrets/tokens`, or
-`/etc/courier/skill-bundles-config`. Do not use a path above one of those
-either, and do not give two bundles the same `source`. A bundle at one of
-those paths would shadow what the operator mounts, and two bundles at one path
-would mount twice. A colliding source fails manager startup with an explicit
-error.
+`/var/run/courier/gateway`, `/var/run/secrets/tokens`,
+`/etc/courier/skill-bundles-config`, `/usr/local/bin`, or `/usr/local/go`.
+Do not use a path inside one of those, or a path above one of those, either,
+and do not give two bundles the same `source`. A bundle at one of those paths
+would shadow what the operator mounts, two bundles at one path would mount
+twice, and a bundle over the image's tool directories would hide the binary
+the pod runs. A colliding source fails manager startup with an explicit error.
+
+The manager normalizes the path it registers, so a trailing separator or a `.`
+element names one location in one spelling.
 
 One bound applies. A ConfigMap holds at most 1 MiB of data. A pinned bundle
 above that size fails the run closed with a named capability error before

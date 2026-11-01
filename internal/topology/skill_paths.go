@@ -8,6 +8,15 @@ import (
 	"github.com/misospace/courier/internal/executor"
 )
 
+// The image-owned directories the run pods bake their toolchain and their
+// entrypoint binaries into. A bundle mounted there would hide the binary the
+// pod runs or the tools the run depends on, so they are reserved like the
+// operator's own volumes.
+const (
+	imageToolBinPath = "/usr/local/bin"
+	imageToolGoPath  = "/usr/local/go"
+)
+
 // SkillSource is one registered bundle's logical name and the absolute path
 // its content is mounted at inside a run's pods. The path is deployment
 // registered, so it is deployment trusted — but it still has to be mountable:
@@ -20,14 +29,16 @@ type SkillSource struct {
 	Source string
 }
 
-// ReservedSkillMountPaths returns the absolute mount paths the operator's own
-// pod volumes occupy in the control and worker pods: the two workspaces, the
-// control runtime, the toolchain cache and its read-only reference, the
-// control's credential mounts, and the skill bundle config directory.
+// ReservedSkillPaths returns the absolute paths a skill bundle may not be
+// mounted at in the run's control and worker pods: the paths the operator's
+// own pod volumes occupy — the workspaces, the control runtime, the toolchain
+// cache and its read-only reference, the control's credential mounts, and the
+// skill bundle config directory — and the image-owned tool directories a
+// bundle mount would hide.
 //
 // The credential mounts are derived from the file paths inside them, so the
 // list stays in step with the mounts the pods actually render.
-func ReservedSkillMountPaths() []string {
+func ReservedSkillPaths() []string {
 	return []string{
 		controlWorkspacePath,
 		controlRuntimePath,
@@ -38,6 +49,8 @@ func ReservedSkillMountPaths() []string {
 		filepath.Dir(controlGatewayKeyPath),
 		filepath.Dir(controlTokenPath),
 		filepath.Dir(executor.SkillBundlesConfigPath),
+		imageToolBinPath,
+		imageToolGoPath,
 	}
 }
 
@@ -64,11 +77,11 @@ func ValidateSkillSources(sources []SkillSource) error {
 			}
 		}
 	}
-	reserved := ReservedSkillMountPaths()
+	reserved := ReservedSkillPaths()
 	for _, source := range sources {
 		for _, path := range reserved {
 			if skillPathsOverlap(source.Source, path) {
-				return fmt.Errorf("topology: skill %q source %q collides with the pod-owned mount path %q", source.Name, source.Source, path)
+				return fmt.Errorf("topology: skill %q source %q collides with the reserved path %q", source.Name, source.Source, path)
 			}
 		}
 	}
@@ -88,9 +101,10 @@ func ValidateSkillMounts(mounts []SkillMount) error {
 }
 
 // validateSkillSource rejects one malformed source path. The path must be
-// absolute and clean: a relative path cannot be a mount point, and a path
+// absolute and clean: a relative path cannot be a mount point, a path
 // carrying "." or ".." elements names a location other than the one the
-// deployment registered.
+// deployment registered, and a path carrying a control character is not a
+// path an operator can read.
 func validateSkillSource(source SkillSource) error {
 	switch {
 	case strings.TrimSpace(source.Source) == "":
@@ -99,10 +113,17 @@ func validateSkillSource(source SkillSource) error {
 		return fmt.Errorf("topology: skill %q source %q must be an absolute path", source.Name, source.Source)
 	case strings.ContainsRune(source.Source, 0):
 		return fmt.Errorf("topology: skill %q source carries a NUL byte", source.Name)
+	case strings.IndexFunc(source.Source, isControlRune) >= 0:
+		return fmt.Errorf("topology: skill %q source carries a control character", source.Name)
 	case filepath.Clean(source.Source) != source.Source:
 		return fmt.Errorf("topology: skill %q source %q must be a clean absolute path", source.Name, source.Source)
 	}
 	return nil
+}
+
+// isControlRune reports whether r is an ASCII control character.
+func isControlRune(r rune) bool {
+	return r < 0x20 || r == 0x7f
 }
 
 // skillPathsOverlap reports whether two absolute paths are the same path or

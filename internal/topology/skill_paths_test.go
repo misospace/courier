@@ -7,6 +7,8 @@ import (
 
 	"github.com/misospace/courier/internal/protocol"
 
+	corev1 "k8s.io/api/core/v1"
+
 	courier "github.com/misospace/courier/api/v1alpha1"
 )
 
@@ -16,7 +18,7 @@ import (
 // one. Both would shadow the operator's volume, so both fail closed before a
 // pod is rendered.
 func TestValidateSkillSourcesRejectsPodOwnedPaths(t *testing.T) {
-	for _, reserved := range ReservedSkillMountPaths() {
+	for _, reserved := range ReservedSkillPaths() {
 		cases := map[string]string{
 			"the path itself": reserved,
 			"an ancestor":     filepath.Dir(reserved),
@@ -91,6 +93,41 @@ func TestValidateSkillSourcesAcceptsDistinctMountPaths(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("distinct mount paths must be accepted: %v", err)
+	}
+}
+
+// TestReservedSkillPathsCoverEveryRenderedMount pins the reserved list
+// against the pods themselves: every path the operator's own pods mount — in
+// the control pod and in the worker pod — must be rejected as a bundle
+// source, or a bundle could shadow an operator volume.
+func TestReservedSkillPathsCoverEveryRenderedMount(t *testing.T) {
+	run := testRun("reserved-paths")
+	pub, _, _ := protocol.GenerateKey()
+	control, err := ControlPod(run, ControlInputs{
+		Image:                 "harness:test",
+		ControlSAUID:          "sa-uid",
+		WorkerPodUID:          "worker-uid",
+		ControlIncarnationUID: "incarnation-1",
+		WorkerURL:             "http://r-worker.ns.svc.cluster.local:8080",
+		BrokerURL:             "https://r-broker.ns.svc.cluster.local:8443",
+		GatewayURL:            "https://gateway.test",
+		GatewayKeyMounted:     true,
+		SkillBundlesConfigMap: "skill-bundles-config",
+	})
+	if err != nil {
+		t.Fatalf("render control pod: %v", err)
+	}
+	worker, err := WorkerPod(run, "harness:test", "incarnation-1", pub, nil, courier.DefaultPodResources(), nil)
+	if err != nil {
+		t.Fatalf("render worker pod: %v", err)
+	}
+	for _, pod := range []*corev1.Pod{control, worker} {
+		for _, mount := range pod.Spec.Containers[0].VolumeMounts {
+			err := ValidateSkillSources([]SkillSource{{Name: "repo-tour", Source: mount.MountPath}})
+			if err == nil {
+				t.Fatalf("the operator's own mount path %q must be reserved", mount.MountPath)
+			}
+		}
 	}
 }
 

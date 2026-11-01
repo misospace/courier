@@ -78,6 +78,38 @@ func TestParseTrimsNameAndSource(t *testing.T) {
 	}
 }
 
+// TestParseNormalizesTheSourcePath pins the normalization rule: a source that
+// names one location in a second spelling is normalized once, so the
+// registry, the pod mount, and the rendered run config carry one spelling of
+// the path. A trailing separator is the ordinary case — it names the same
+// directory — and it must not become a mount path the pod cannot mount.
+func TestParseNormalizesTheSourcePath(t *testing.T) {
+	cases := map[string]string{
+		"a trailing separator": "/etc/courier/skill-bundles/simple-english/",
+		"a doubled separator":  "/etc//courier/skill-bundles/simple-english",
+		"a dot element":        "/etc/courier/./skill-bundles/simple-english",
+	}
+	for kind, source := range cases {
+		specs, err := Parse([]byte("bundles:\n  - name: simple-english\n    source: " + source + "\n"))
+		if err != nil {
+			t.Fatalf("Parse rejected a source with %s: %v", kind, err)
+		}
+		if specs[0].Source != "/etc/courier/skill-bundles/simple-english" {
+			t.Fatalf("source with %s = %q, want the normalized path", kind, specs[0].Source)
+		}
+	}
+}
+
+// TestParseRejectsControlCharacterSource pins the control-character rule: a
+// source carrying one is not a path an operator can read in a log line or a
+// manifest, so it never reaches a mount.
+func TestParseRejectsControlCharacterSource(t *testing.T) {
+	_, err := Parse([]byte("bundles:\n  - name: simple-english\n    source: \"/etc/courier/skills/simple\\nenglish\"\n"))
+	if err == nil || !strings.Contains(err.Error(), "control character") {
+		t.Fatalf("expected control-character rejection, got %v", err)
+	}
+}
+
 func TestParseAcceptsMaterializationBlock(t *testing.T) {
 	specs, err := Parse([]byte("bundles:\n  - name: repo-tour\n    source: /etc/courier/skill-bundles/repo-tour\n    materialization:\n      files:\n      - SKILL.md\n      - assets/checklist.md\n"))
 	if err != nil {
