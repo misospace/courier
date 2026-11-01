@@ -150,11 +150,15 @@ func TestSkillPinsPersistBesidePolicy(t *testing.T) {
 	}
 }
 
-// TestPreContractRunPinsFromLiveLane covers the retained-run shape: a run
-// with a persisted policy but no pin (admitted before #658) resolves the pin
-// from its live lane and patches it alone, leaving the policy untouched.
-func TestPreContractRunPinsFromLiveLane(t *testing.T) {
-	registry, digest := skillBundleRegistry(t, "simple-english", "write plainly.")
+// TestPreContractRunKeepsLegacyNoSkillState covers the retained-run shape:
+// a run with a persisted policy but no pin (admitted before #658) was
+// admitted before lanes could select skills, so it keeps that legacy
+// no-skill state — re-resolution never reads the lane and never backfills a
+// pin, so a post-admission lane edit cannot add skills to it.
+func TestPreContractRunKeepsLegacyNoSkillState(t *testing.T) {
+	registry, _ := skillBundleRegistry(t, "simple-english", "write plainly.")
+	// The lane already selects a registered bundle: even then, the retained
+	// run must not acquire the skill it never carried.
 	lane := skillSelectionLane("simple-english")
 	reconciler, c, _ := skillPinReconciler(t, registry, lane)
 	run := secureRun("pre-contract")
@@ -187,11 +191,11 @@ func TestPreContractRunPinsFromLiveLane(t *testing.T) {
 	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &after); err != nil {
 		t.Fatal(err)
 	}
-	if len(after.Status.SkillPins) != 1 || after.Status.SkillPins[0].Name != "simple-english" || after.Status.SkillPins[0].Digest != digest {
-		t.Fatalf("backfilled pins = %+v, want simple-english at digest %q", after.Status.SkillPins, digest)
+	if after.Status.SkillPins != nil {
+		t.Fatalf("pre-contract run acquired pins %+v from a post-admission lane, want the legacy nil pin preserved", after.Status.SkillPins)
 	}
 	if after.Status.PublicationPolicy == nil || !equalityPolicy(policy, after.Status.PublicationPolicy) {
-		t.Fatalf("backfill rewrote the persisted policy:\n got %+v\nwant %+v", after.Status.PublicationPolicy, policy)
+		t.Fatalf("re-resolve rewrote the persisted policy:\n got %+v\nwant %+v", after.Status.PublicationPolicy, policy)
 	}
 }
 
@@ -357,8 +361,9 @@ func TestLaneEditAfterPinDoesNotChangePins(t *testing.T) {
 
 // TestRelaunchFunnelVerifiesSkillPins pins the funnel: every secure
 // relaunch re-enters through resumeClaimed (infra loss and broken topology
-// both charge a run back to Claimed), so pin verification and pre-contract
-// backfill must fire there — not only on the Pending admission path.
+// both charge a run back to Claimed), so pin verification and the
+// pre-contract legacy no-skill preservation must fire there — not only on
+// the Pending admission path.
 func TestRelaunchFunnelVerifiesSkillPins(t *testing.T) {
 	t.Run("drifted registry fails closed on relaunch", func(t *testing.T) {
 		registry, _ := skillBundleRegistry(t, "repo-tour", "tour the repository first.")
@@ -400,12 +405,12 @@ func TestRelaunchFunnelVerifiesSkillPins(t *testing.T) {
 		t.Fatal("no SecurePreflightFailed condition carries the pin-drift failure detail")
 	})
 
-	t.Run("pre-contract run backfills its pin on relaunch", func(t *testing.T) {
-		registry, digest := skillBundleRegistry(t, "repo-tour", "tour the repository first.")
+	t.Run("pre-contract run keeps its legacy no-skill state on relaunch", func(t *testing.T) {
+		registry, _ := skillBundleRegistry(t, "repo-tour", "tour the repository first.")
 		lane := skillSelectionLane("repo-tour")
 		reconciler, c, _ := skillPinReconciler(t, registry, lane)
 		reconciler.Sources = NewSourceRegistry(map[string]source.Adapter{"manual": manual.New(nil)})
-		run := secureRun("funnel-backfill")
+		run := secureRun("funnel-legacy")
 		if err := c.Create(context.Background(), run); err != nil {
 			t.Fatal(err)
 		}
@@ -424,9 +429,11 @@ func TestRelaunchFunnelVerifiesSkillPins(t *testing.T) {
 		if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &retained); err != nil {
 			t.Fatal(err)
 		}
-		// The funnel backfills the missing pin from the live lane; the run
-		// then proceeds toward launch and stops cleanly at the nil legacy
-		// launcher seam this fixture carries.
+		// The funnel preserves the pre-contract run's nil pin — the run was
+		// admitted before lanes could select skills, so it resumes skillless
+		// even though its lane now names a registered bundle — and proceeds
+		// toward launch, stopping cleanly at the nil legacy launcher seam
+		// this fixture carries.
 		if _, err := reconciler.resumeClaimed(context.Background(), &retained); err != nil {
 			t.Fatalf("resumeClaimed() on a pre-contract run: %v", err)
 		}
@@ -434,8 +441,8 @@ func TestRelaunchFunnelVerifiesSkillPins(t *testing.T) {
 		if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &after); err != nil {
 			t.Fatal(err)
 		}
-		if len(after.Status.SkillPins) != 1 || after.Status.SkillPins[0].Name != "repo-tour" || after.Status.SkillPins[0].Digest != digest {
-			t.Fatalf("backfilled pins = %+v, want repo-tour at digest %q", after.Status.SkillPins, digest)
+		if after.Status.SkillPins != nil {
+			t.Fatalf("relaunched pre-contract run acquired pins %+v from its lane, want the legacy nil pin preserved", after.Status.SkillPins)
 		}
 	})
 }

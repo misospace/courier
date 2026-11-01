@@ -759,8 +759,9 @@ func (r *CoderRunReconciler) resumeClaimed(ctx context.Context, run *courierv1al
 	// Claimed, so the persisted skill pin re-verifies here exactly where the
 	// Pending path resolves it — a registry that dropped or drifted a pinned
 	// identity fails closed before any topology is re-provisioned, and a run
-	// retained from before the pin contract backfills its pin from the live
-	// lane on its next relaunch rather than resuming skillless. A run whose
+	// retained from before the pin contract keeps its legacy no-skill state:
+	// it was admitted before lanes could select skills, so a post-admission
+	// lane edit cannot add skills to it. A run whose
 	// crash interrupted admission before the policy persisted finishes the
 	// admission here, the same partially-completed work this function exists
 	// to resume.
@@ -889,19 +890,12 @@ func (r *CoderRunReconciler) resolvePersistSecurePolicy(ctx context.Context, run
 		if _, _, err := broker.CriterionSetFromPolicy(policy); err != nil {
 			return secureNeedsHuman("PolicyCorrupt", "%v", err)
 		}
-		if run.Status.SkillPins != nil {
-			return nil
-		}
-		// A run retained from before the pin contract carries a policy but no
-		// pin: resolve it from the live lane now and patch it alone, leaving
-		// the persisted policy untouched.
-		pins, err := r.resolveLaneSkillPins(ctx, run)
-		if err != nil {
-			return err
-		}
-		before := run.DeepCopy()
-		run.Status.SkillPins = statusSkillPins(pins)
-		return r.patchStatus(ctx, before, run)
+		// A run retained from before the pin contract carries a policy but
+		// no pin: it was admitted before lanes could select skills, so it
+		// keeps that legacy no-skill state. Re-resolving from the live lane
+		// here would let a post-admission lane edit add skills to a run
+		// that never carried any, so nil is preserved, never backfilled.
+		return nil
 	}
 	pins, err := r.resolveLaneSkillPins(ctx, run)
 	if err != nil {

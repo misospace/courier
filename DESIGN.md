@@ -2549,7 +2549,9 @@ admission resolves the selection against the deployment registry and pins
 name+digest per run into `CoderRunStatus.SkillPins` — set-once beside the
 publication policy in one status write, so a crash never persists one without
 the other. An empty selection pins as an empty (non-nil) set; nil means a
-pre-contract run, which resolves afresh from its lane at the next launch.
+pre-contract run, which keeps its legacy no-skill state — it was admitted
+before lanes could select skills, so it never acquires a pin and a
+post-admission lane edit cannot add skills to it.
 Relaunch re-verifies every pin against the registry and fails closed
 (`SkillPinConflict`) on a dropped name or changed digest — substituting newer
 content would silently rewrite what the run was admitted to load — and the

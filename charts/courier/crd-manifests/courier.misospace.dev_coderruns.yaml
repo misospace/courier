@@ -928,8 +928,9 @@ spec:
                 description: |-
                   SkillPins is the per-run pin of the lane's selected skill bundles,
                   resolved at admission against the deployment registry (#658). Nil means
-                  no pin exists — runs admitted before the pin contract, which resolve
-                  afresh at their next launch like every pre-contract run. A non-nil list,
+                  the run was admitted before the pin contract: it keeps its legacy
+                  no-skill state — it never acquires a pin and never loads skills, so a
+                  post-admission lane edit cannot add skills to it. A non-nil list,
                   including an empty one, is the immutable set: relaunch re-verifies each
                   pin against the registry and fails closed on a missing name or changed
                   digest rather than substituting newer content. Names are unique and
