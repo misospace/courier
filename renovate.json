@@ -3,6 +3,20 @@
   "extends": [
     "local>misospace/renovate-config"
   ],
+  "customManagers": [
+    {
+      "description": "The manager default in cmd/main.go must name the same digest-pinned busybox as the chart's secure.probeImage (TestDefaultProbeImageMatchesChartValue fails the build when they drift); the built-in helm-values manager already owns the chart side, this moves the Go side in the same PR",
+      "customType": "regex",
+      "fileMatch": [
+        "^cmd/main\\.go$"
+      ],
+      "matchStrings": [
+        "busybox:(?<currentValue>[^@\\s\"]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "depNameTemplate": "busybox",
+      "datasourceTemplate": "docker"
+    }
+  ],
   "packageRules": [
     {
       "description": "Keep GitHub Actions pinned to readable semver tags, not SHA digests (overrides the shared preset's pinDigests rule)",
