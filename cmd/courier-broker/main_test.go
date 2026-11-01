@@ -1,14 +1,18 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/broker"
@@ -183,5 +187,110 @@ func TestPolicyMatchesDetectsDrift(t *testing.T) {
 	resolved.WorkRef = "moved"
 	if err := policyMatches(resolved, persisted); err == nil {
 		t.Fatal("drifted work ref must be refused")
+	}
+}
+
+// TestTrustedStatusListenerCarriesInboundBounds: the trusted status listener
+// must apply the broker's shared inbound HTTP bounds. Without them a client
+// that completes the header read and then stalls, or that leaves an
+// established connection idle, pins its connection, goroutine, and file
+// descriptor for the broker pod's entire lifetime.
+func TestTrustedStatusListenerCarriesInboundBounds(t *testing.T) {
+	srv := newStatusServer("127.0.0.1:0", http.NotFoundHandler())
+	got := map[string]time.Duration{
+		"ReadHeaderTimeout": srv.ReadHeaderTimeout,
+		"ReadTimeout":       srv.ReadTimeout,
+		"WriteTimeout":      srv.WriteTimeout,
+		"IdleTimeout":       srv.IdleTimeout,
+	}
+	want := map[string]time.Duration{
+		"ReadHeaderTimeout": broker.InboundReadHeaderTimeout,
+		"ReadTimeout":       broker.InboundReadTimeout,
+		"WriteTimeout":      broker.InboundWriteTimeout,
+		"IdleTimeout":       broker.InboundIdleTimeout,
+	}
+	for name, bound := range got {
+		if bound <= 0 {
+			t.Fatalf("status listener %s = %v, want a finite inbound bound", name, bound)
+		}
+		if bound != want[name] {
+			t.Fatalf("status listener %s = %v, want the API listener's %v", name, bound, want[name])
+		}
+	}
+	// The write bound must also stay above the trusted status handler's own
+	// budget: the handler spends that budget on its TokenReview, live reads,
+	// and forge read before it writes the answer, so a deadline that ended
+	// the request first would cut off a healthy status write.
+	if broker.InboundWriteTimeout <= broker.StatusRequestBudget {
+		t.Fatalf("status listener write bound %v must exceed the trusted status handler's request budget %v", broker.InboundWriteTimeout, broker.StatusRequestBudget)
+	}
+}
+
+// TestStatusListenerReclaimsIdleConnection: the trusted status listener must
+// close an idle connection instead of holding its file descriptor and
+// goroutine for the broker pod's lifetime. The inbound bounds are
+// transport-level, so the plain listener below exercises the same server
+// configuration production serves over TLS.
+func TestStatusListenerReclaimsIdleConnection(t *testing.T) {
+	srv := newStatusServer("127.0.0.1:0", http.NotFoundHandler())
+	// The production wiring must carry the bound this test then compresses:
+	// without it the listener would hold every idle connection open.
+	if srv.IdleTimeout != broker.InboundIdleTimeout {
+		t.Fatalf("status listener IdleTimeout = %v, want the API listener's %v", srv.IdleTimeout, broker.InboundIdleTimeout)
+	}
+	// Compress the idle bound so the regression does not wait a production window.
+	bound := 500 * time.Millisecond
+	srv.IdleTimeout = bound
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(ln) }()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("Serve() = %v", err)
+		}
+	})
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	request, err := http.NewRequest(http.MethodGet, "http://"+ln.Addr().String()+"/status", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write([]byte("GET /status HTTP/1.1\r\nHost: broker.test\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, request)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	resp.Body.Close()
+
+	// The connection is now idle: the server must close it at the idle bound
+	// rather than hold it open. The read deadline is a test guard, not
+	// evidence of closure: hitting it fails the test, because it means the
+	// server left the connection open past the deadline.
+	if err := conn.SetReadDeadline(time.Now().Add(bound + 10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if _, err := reader.ReadByte(); err == nil {
+		t.Fatal("idle connection was not closed by the idle bound")
+	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatalf("idle connection was never closed: read hit the test deadline after %v", time.Since(start))
+	}
+	// The close must be the idle bound firing, not an unrelated early close.
+	if elapsed := time.Since(start); elapsed < bound/2 {
+		t.Fatalf("connection closed after %v, before the %v idle bound could fire", elapsed, bound)
 	}
 }

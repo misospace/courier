@@ -1748,6 +1748,16 @@ run ending. The reconciliation retry revalidates the recorded OID against
 the live work ref; a persistent failure is an infrastructure failure for
 the operator to relaunch, which resumes remote-first.
 
+**Status write answers.** The broker's trusted status route answers `204` for
+an applied patch, `422` for a definite refusal — a credential it will not
+accept, a foreign run incarnation, a live-world mismatch — and `503` for a
+request it could not answer: status contention, an unavailable backend, or a
+request that exhausted the broker's own status budget. `503` is retryable, so
+the harness's existing retry budget covers it; `422` is not retried. The
+broker spends its status budget inside the listener's write deadline, so that
+deadline never truncates an answer: a request that runs out of budget answers
+`503` in full, and the update it could not complete stays unproven.
+
 **Heartbeat.** The harness writes the activity heartbeat only on successful
 model-stream activity and verified tool boundaries, coalescing writes to at
 most one patch per cadence. Failed attempts, retries, and raw stdout are

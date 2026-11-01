@@ -125,15 +125,17 @@ func NewServer(config ServerConfig) (*Server, error) {
 // Handler exposes the typed HTTP API for embedding and tests; production serves it only over TLS.
 func (s *Server) Handler() http.Handler { return s.handler }
 
-// Inbound HTTP bounds for the model-facing API, matching the evidence intake's
-// treatment of the same bounded-bundle workload: they reclaim stalled and idle
-// connections, and sit far above what a healthy 65 MiB import or snapshot read
-// costs in-cluster.
+// Inbound HTTP bounds for every TLS listener the broker serves, matching the
+// evidence intake's treatment of the same bounded-bundle workload: they
+// reclaim stalled and idle connections, and sit far above what a healthy
+// 65 MiB import or snapshot read costs in-cluster. They are exported so the
+// broker's trusted status listener applies the same budgets as the
+// model-facing API listener.
 const (
-	apiReadHeaderTimeout = 10 * time.Second
-	apiReadTimeout       = 60 * time.Second
-	apiWriteTimeout      = 30 * time.Second
-	apiIdleTimeout       = 120 * time.Second
+	InboundReadHeaderTimeout = 10 * time.Second
+	InboundReadTimeout       = 60 * time.Second
+	InboundWriteTimeout      = 30 * time.Second
+	InboundIdleTimeout       = 120 * time.Second
 )
 
 func (s *Server) ServeTLS(addr string, certFile, keyFile string) error {
@@ -148,10 +150,10 @@ func (s *Server) newHTTPServer(addr string) *http.Server {
 		Addr:              addr,
 		Handler:           s.handler,
 		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS13},
-		ReadHeaderTimeout: apiReadHeaderTimeout,
-		ReadTimeout:       apiReadTimeout,
-		WriteTimeout:      apiWriteTimeout,
-		IdleTimeout:       apiIdleTimeout,
+		ReadHeaderTimeout: InboundReadHeaderTimeout,
+		ReadTimeout:       InboundReadTimeout,
+		WriteTimeout:      InboundWriteTimeout,
+		IdleTimeout:       InboundIdleTimeout,
 	}
 }
 
@@ -364,22 +366,30 @@ func (s *Server) updatePR(w http.ResponseWriter, r *http.Request) {
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
-	if r.URL.RawQuery != "" || r.ContentLength == 0 {
-		http.Error(w, "invalid request", http.StatusBadRequest)
-		return false
-	}
-	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(target); err != nil {
-		http.Error(w, "invalid request", http.StatusBadRequest)
-		return false
-	}
-	var extra any
-	if err := dec.Decode(&extra); err != io.EOF {
+	if err := decodeJSONBody(r, target); err != nil {
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return false
 	}
 	return true
+}
+
+// decodeJSONBody reads one JSON body into target. The caller decides how a
+// failed read is answered: a malformed body and a body that could not be read
+// in time are different answers.
+func decodeJSONBody(r *http.Request, target any) error {
+	if r.URL.RawQuery != "" || r.ContentLength == 0 {
+		return errors.New("invalid request")
+	}
+	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(target); err != nil {
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return errors.New("invalid request")
+	}
+	return nil
 }
 
 func respond(w http.ResponseWriter, value any, err error) {

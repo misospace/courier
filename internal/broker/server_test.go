@@ -390,6 +390,22 @@ func mustJSON(t *testing.T, value string) string {
 	return string(b)
 }
 
+// TestServerUsesSharedInboundBounds: the model-facing API listener must
+// apply the broker's shared inbound bounds, so it and the trusted status
+// listener are provably bounded the same way and cannot drift apart.
+func TestServerUsesSharedInboundBounds(t *testing.T) {
+	s, _ := serverForTest(t)
+	srv := s.newHTTPServer("127.0.0.1:0")
+	if srv.ReadHeaderTimeout != InboundReadHeaderTimeout ||
+		srv.ReadTimeout != InboundReadTimeout ||
+		srv.WriteTimeout != InboundWriteTimeout ||
+		srv.IdleTimeout != InboundIdleTimeout {
+		t.Fatalf("API listener bounds = %+v, want the shared inbound bounds %+v", srv, []time.Duration{
+			InboundReadHeaderTimeout, InboundReadTimeout, InboundWriteTimeout, InboundIdleTimeout,
+		})
+	}
+}
+
 // TestServeTLSBoundsStalledClient: the model-facing API server must bound
 // inbound reads, so a client that completes the TLS handshake and stalls
 // mid-headers is dropped by the header-read bound instead of pinning the
