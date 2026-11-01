@@ -759,6 +759,18 @@ type Criterion struct {
 	Digest string `json:"digest"`
 }
 
+// SkillPin is one run's pinned skill-bundle identity: the approved logical
+// name and the immutable content digest resolved at admission (#658).
+type SkillPin struct {
+	// Name is the approved logical name in the deployment skill registry.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	// +kubebuilder:validation:MaxLength=63
+	Name string `json:"name"`
+	// Digest is the bundle's immutable content identity at admission.
+	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
+	Digest string `json:"digest"`
+}
+
 // PublicationPolicy is the operator-resolved destination for one run. It is
 // bound to the CoderRun UID and must not be reconstructed from mutable status.
 type PublicationPolicy struct {
@@ -840,6 +852,19 @@ type CoderRunStatus struct {
 	// before launch. Its RunUID must match this object's current UID.
 	// +optional
 	PublicationPolicy *PublicationPolicy `json:"publicationPolicy,omitempty"`
+
+	// SkillPins is the per-run pin of the lane's selected skill bundles,
+	// resolved at admission against the deployment registry (#658). Nil means
+	// no pin exists — runs admitted before the pin contract, which resolve
+	// afresh at their next launch like every pre-contract run. A non-nil list,
+	// including an empty one, is the immutable set: relaunch re-verifies each
+	// pin against the registry and fails closed on a missing name or changed
+	// digest rather than substituting newer content. Names are unique and
+	// sorted for deterministic comparison.
+	// +optional
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=16
+	SkillPins []SkillPin `json:"skillPins,omitempty"`
 
 	// Branch is the observed work branch. Resolve-issue runs derive it from the
 	// repository and issue; fix-pr runs adopt the branch attached to the PR.

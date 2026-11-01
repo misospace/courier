@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -270,6 +271,19 @@ func (s *SecureControl) controlInvocation(ctx context.Context, run *courier.Code
 		return executor.Invocation{}, err
 	}
 	invocation.Criteria = criteria
+	// The pinned skill envelope travels from the run's persisted status,
+	// never the live lane (#658): the pin resolved at admission is
+	// authoritative, and a lane edit must never reshape what a running or
+	// relaunched control was admitted to load. A nil or empty pin set leaves
+	// the envelope empty, so absence stays meaningful to the reconstruction
+	// boundary.
+	if len(run.Status.SkillPins) > 0 {
+		encoded, err := json.Marshal(run.Status.SkillPins)
+		if err != nil {
+			return executor.Invocation{}, fmt.Errorf("secure topology: encode skill pins: %w", err)
+		}
+		invocation.Skills = string(encoded)
+	}
 	return invocation, nil
 }
 

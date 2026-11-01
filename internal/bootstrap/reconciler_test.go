@@ -540,6 +540,58 @@ func TestReconcileAllDoesNotChurnDefaultedContext(t *testing.T) {
 	}
 }
 
+// TestReconcileAllCarriesSkillsOntoSpec pins the mirror direction for the
+// skill selection (#658): what a profile configures is what the managed
+// LaneProfile carries, and a profile with no skills produces a nil spec list
+// so the reconciler never rewrites an unchanged lane over absence.
+func TestReconcileAllCarriesSkillsOntoSpec(t *testing.T) {
+	kubeClient := newBootstrapClient(t)
+	provider := &staticProvider{profiles: []Profile{
+		{
+			Name:   "local",
+			Roles:  map[string]string{"coordinator": "claude-sonnet-4-5"},
+			Skills: []string{"simple-english", "repo-tour"},
+		},
+		{
+			Name:  "bare",
+			Roles: map[string]string{"coordinator": "claude-sonnet-4-5"},
+		},
+	}}
+	r := &Reconciler{Client: kubeClient, Namespace: "courier", Provider: provider}
+	if err := r.ReconcileAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var got courierv1alpha1.LaneProfile
+	if err := kubeClient.Get(context.Background(), client.ObjectKey{Namespace: "courier", Name: "local"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Spec.Skills) != 2 || got.Spec.Skills[0] != "simple-english" || got.Spec.Skills[1] != "repo-tour" {
+		t.Fatalf("spec.skills = %#v, want the declared selection carried verbatim", got.Spec.Skills)
+	}
+	var bare courierv1alpha1.LaneProfile
+	if err := kubeClient.Get(context.Background(), client.ObjectKey{Namespace: "courier", Name: "bare"}, &bare); err != nil {
+		t.Fatal(err)
+	}
+	if bare.Spec.Skills != nil {
+		t.Fatalf("bare spec.skills = %#v, want nil when the profile declares none", bare.Spec.Skills)
+	}
+	// Steady state must not rewrite the managed lane: nil skills on both
+	// sides of the DeepEqual.
+	var first, second courierv1alpha1.LaneProfile
+	if err := kubeClient.Get(context.Background(), client.ObjectKey{Namespace: "courier", Name: "bare"}, &first); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ReconcileAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Get(context.Background(), client.ObjectKey{Namespace: "courier", Name: "bare"}, &second); err != nil {
+		t.Fatal(err)
+	}
+	if second.ResourceVersion != first.ResourceVersion {
+		t.Fatalf("resourceVersion changed %s -> %s, want no write on steady state", first.ResourceVersion, second.ResourceVersion)
+	}
+}
+
 type staticProvider struct {
 	profiles []Profile
 	err      error

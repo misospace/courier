@@ -217,6 +217,10 @@ func desiredSpec(profile *Profile) courierv1alpha1.LaneProfileSpec {
 		// DeepCopy for the same reason: the managed object must never share
 		// provider-owned policy with the cached profile.
 		CIRepair: profile.CIRepair.DeepCopy(),
+		// Skills is stored trimmed and nil-when-empty by Parse, so the
+		// desired spec stays equal to a server-decoded lane with no skills
+		// and the reconciler never churns on absence.
+		Skills: profile.Skills,
 	}
 }
 

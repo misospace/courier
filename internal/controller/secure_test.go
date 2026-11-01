@@ -2237,7 +2237,14 @@ func TestPublicationPolicyPersistsEmptyToSetOnly(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&courier.CoderRun{}).Build()
+	// The pin resolution reads the run's lane through the same client the
+	// reconciler patches with; the fixture lane selects no skills, so the
+	// run pins an empty set beside its policy (#658).
+	lane := &courier.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Namespace: secureTestNamespace, Name: "local"},
+		Spec:       courier.LaneProfileSpec{Roles: map[string]string{"coordinator": "test/coordinator"}},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&courier.CoderRun{}).WithObjects(lane).Build()
 	control, _ := secureControl(t)
 	reconciler := &CoderRunReconciler{
 		Client:       c,

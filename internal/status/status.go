@@ -118,6 +118,14 @@ type OperatorPatch struct {
 	// status has no policy yet, and never mutates a persisted one.
 	// +optional
 	PublicationPolicy *courierv1alpha1.PublicationPolicy `json:"publicationPolicy,omitempty"`
+	// SkillPins is the run's pinned skill-bundle set (#658), persisted once
+	// at secure admission beside the publication policy. The caller enforces
+	// set-once semantics like PublicationPolicy's. It is a pointer to a
+	// slice because an empty selection is a legitimate pin: omitempty on a
+	// plain slice would drop an empty set instead of persisting it, and a
+	// pin that can vanish is no pin at all.
+	// +optional
+	SkillPins *[]courierv1alpha1.SkillPin `json:"skillPins,omitempty"`
 	// Telemetry is the compact per-run summary the operator persists from
 	// the coordinator's termination handoff (#172). Pointer so it is emitted
 	// only when set and cleared only by an explicit write.

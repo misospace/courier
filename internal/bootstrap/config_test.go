@@ -327,6 +327,129 @@ func assertResources(t *testing.T, got courierv1alpha1.PodResources, cpuReq, mem
 	}
 }
 
+func TestParseAcceptsSkillsAndStoresTrimmedNames(t *testing.T) {
+	data := []byte(`profiles:
+  - name: local
+    roles:
+      coder: gpt-5
+    skills:
+      - simple-english
+      - " repo-tour "
+`)
+	profiles, err := Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := profiles[0].Skills
+	if len(got) != 2 || got[0] != "simple-english" || got[1] != "repo-tour" {
+		t.Fatalf("skills = %#v, want the trimmed selection in declared order", got)
+	}
+}
+
+func TestParseSkillsAbsentStaysNil(t *testing.T) {
+	data := []byte(`profiles:
+  - name: local
+    roles:
+      coder: gpt-5
+`)
+	profiles, err := Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profiles[0].Skills != nil {
+		t.Fatalf("skills = %#v, want nil when the config declares none", profiles[0].Skills)
+	}
+}
+
+func TestParseEmptySkillsListNormalizesToNil(t *testing.T) {
+	data := []byte(`profiles:
+  - name: local
+    roles:
+      coder: gpt-5
+    skills: []
+`)
+	profiles, err := Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profiles[0].Skills != nil {
+		t.Fatalf("skills = %#v, want an empty list normalized to nil so the reconciler does not churn", profiles[0].Skills)
+	}
+}
+
+func TestParseRejectsEmptySkillName(t *testing.T) {
+	data := []byte(`profiles:
+  - name: local
+    roles:
+      coder: gpt-5
+    skills:
+      - "   "
+`)
+	_, err := Parse(data)
+	if err == nil || !strings.Contains(err.Error(), "skill name must not be empty") {
+		t.Fatalf("expected empty-skill rejection, got %v", err)
+	}
+}
+
+func TestParseRejectsDuplicateSkillsAfterTrim(t *testing.T) {
+	data := []byte(`profiles:
+  - name: local
+    roles:
+      coder: gpt-5
+    skills:
+      - simple-english
+      - " simple-english "
+`)
+	_, err := Parse(data)
+	if err == nil || !strings.Contains(err.Error(), `duplicate skill "simple-english" after trimming whitespace`) {
+		t.Fatalf("expected duplicate-skill rejection, got %v", err)
+	}
+}
+
+func TestParseRejectsInvalidSkillLabels(t *testing.T) {
+	for _, name := range []string{"UPPER", "has_underscore", "-leading", "trailing-", "has.dot", "a b"} {
+		data := []byte(`profiles:
+  - name: local
+    roles:
+      coder: gpt-5
+    skills:
+      - ` + name + `
+`)
+		_, err := Parse(data)
+		if err == nil || !strings.Contains(err.Error(), "must be a valid DNS-1123 label") {
+			t.Fatalf("skill %q: expected DNS-1123 rejection, got %v", name, err)
+		}
+	}
+}
+
+func TestParseRejectsMoreThanSixteenSkills(t *testing.T) {
+	skills := make([]string, 17)
+	for i := range skills {
+		skills[i] = "skill-" + string(rune('a'+i))
+	}
+	data := "profiles:\n  - name: local\n    roles:\n      coder: gpt-5\n    skills:\n"
+	for _, skill := range skills {
+		data += "      - " + skill + "\n"
+	}
+	_, err := Parse([]byte(data))
+	if err == nil || !strings.Contains(err.Error(), "skills must contain at most 16 entries") {
+		t.Fatalf("expected over-cap rejection, got %v", err)
+	}
+	// Sixteen entries sit exactly at the cap and are accepted.
+	skills = skills[:16]
+	data = "profiles:\n  - name: local\n    roles:\n      coder: gpt-5\n    skills:\n"
+	for _, skill := range skills {
+		data += "      - " + skill + "\n"
+	}
+	profiles, err := Parse([]byte(data))
+	if err != nil {
+		t.Fatalf("Parse rejected a full sixteen-entry selection: %v", err)
+	}
+	if len(profiles[0].Skills) != 16 {
+		t.Fatalf("skills = %#v, want all sixteen entries", profiles[0].Skills)
+	}
+}
+
 func TestFileProviderRereadsOnEveryCall(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "profiles.yaml")
 	initial := []byte(`profiles:

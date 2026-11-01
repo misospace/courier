@@ -280,8 +280,12 @@ func main() {
 
 	// Deployment-approved skill bundles register once at trusted setup from
 	// a deployment-mounted file; nothing run- or model-controlled ever
-	// registers a bundle. The registry stays block-local until the upcoming
-	// lane-resolution wiring consumes it (#658).
+	// registers a bundle. The registry feeds the secure launch path only:
+	// secure admission resolves a lane's selection against it and pins the
+	// per-run identities (#658). Nil means the deployment registers no
+	// bundles, so any lane selecting skills fails closed; the legacy
+	// launcher needs no registry — it rejects skill selections outright.
+	var skillRegistry *skills.Registry
 	skillBundlesFile = strings.TrimSpace(skillBundlesFile)
 	if skillBundlesFile != "" {
 		registry, err := skills.Load(skillBundlesFile)
@@ -289,6 +293,7 @@ func main() {
 			setupLog.Error(err, "unable load skill bundles")
 			os.Exit(1)
 		}
+		skillRegistry = registry
 		setupLog.Info("skill bundles registered", "bundles", len(registry.Names()))
 		for _, bundle := range registry.Bundles() {
 			setupLog.Info("skill bundle registered", "name", bundle.Name, "digest", bundle.Digest, "files", bundle.Files, "bytes", bundle.Bytes)
@@ -679,6 +684,7 @@ func main() {
 			operatorNS:        os.Getenv("POD_NAMESPACE"),
 			restConfig:        mgr.GetConfig(),
 			tokenReviewRole:   brokerTokenReviewClusterRole,
+			skillRegistry:     skillRegistry,
 		})
 		if err != nil {
 			setupLog.Error(err, "unable to configure secure mode")
@@ -1083,6 +1089,10 @@ type secureConfig struct {
 	operatorNS        string
 	restConfig        *rest.Config
 	tokenReviewRole   string
+	// skillRegistry is the loaded deployment skill bundle registry, nil when
+	// no bundles are registered; the secure control then fails closed on any
+	// lane selecting skills (#658).
+	skillRegistry *skills.Registry
 }
 
 const (
@@ -1200,6 +1210,7 @@ func buildSecureControl(config secureConfig) (*controller.SecureControl, error) 
 			GatewayKeySecret:       strings.TrimSpace(config.gatewayKeySecret),
 			GatewayKeyName:         strings.TrimSpace(config.gatewayKeyName),
 			TokenReviewClusterRole: strings.TrimSpace(config.tokenReviewRole),
+			Skills:                 config.skillRegistry,
 			LiveProbes:             true,
 			Kubernetes:             clientset,
 			OperatorNamespace:      strings.TrimSpace(config.operatorNS),

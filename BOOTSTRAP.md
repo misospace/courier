@@ -312,7 +312,10 @@ at startup prevents the manager from starting; a bad edit afterwards is
 logged and retried on the next pass. The config's `resources` carries
 requests and limits only — the same narrowed vocabulary as the LaneProfile
 CRD — so a `claims` key is rejected at parse time rather than silently
-ignored (#403).
+ignored (#403). A lane's `skills` lists approved skill bundles from the
+deployment's skill registry by logical name (e.g. `- simple-english`); names
+must match registered bundles, and the selection is pinned per run at
+admission so a later registry edit never silently alters a live run.
 
 ```yaml
 # charts/courier values
@@ -322,6 +325,8 @@ laneProfiles:
     runtimeImage: ghcr.io/misospace/courier-go:0.1.0
     roles:
       coordinator: litellm/your-model
+    skills:
+      - simple-english
     framing: |
       keep parallelism modest and leave the pull request ready for review
 ```

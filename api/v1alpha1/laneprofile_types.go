@@ -112,6 +112,22 @@ type LaneProfileSpec struct {
 	// exactly as it does without one.
 	// +optional
 	CIRepair *CIRepairPolicy `json:"ciRepair,omitempty"`
+
+	// Skills names the deployment-approved skill bundles native runs on this
+	// lane load (#658). Names resolve against the deployment's skill registry
+	// at admission and the resolved identities are pinned per run, so a later
+	// lane or registry edit never silently alters a live run. Names are
+	// approved logical names only — never URLs or paths supplied by work
+	// input — and must be valid DNS-1123 labels matching the registry's
+	// naming. When a registered bundle and a repository-local skill share a
+	// name, the registered bundle wins: deployment-owned configuration
+	// shadows repository-local content deterministically (#656).
+	// +optional
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	// +kubebuilder:validation:items:MaxLength=63
+	Skills []string `json:"skills,omitempty"`
 }
 
 // ContextPolicy is a lane's declared context budget for the harness (#243).
