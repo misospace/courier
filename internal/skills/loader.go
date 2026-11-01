@@ -26,6 +26,19 @@ const (
 	// maxRepoLocalSkills is the largest repository-local skill set one
 	// checkout may contribute to the visible view.
 	maxRepoLocalSkills = 16
+	// maxRejectedSkillReports bounds the quarantine reports one discovery
+	// retains. Beyond it further malformed candidates are still skipped but
+	// no longer reported, so a hostile checkout cannot grow the report, the
+	// rendered index, or the telemetry without limit. One terminal report —
+	// the first unexamined directory when the candidate bound below is hit —
+	// is appended past this bound, because it is the only signal that names
+	// may be missing.
+	maxRejectedSkillReports = 16
+	// maxRepoSkillCandidates bounds how many candidate skill directories
+	// discovery examines at all. Repository content is untrusted, so the
+	// work discovery does over it is bounded by count as well as by the
+	// per-document read bounds; the first unexamined directory is reported.
+	maxRepoSkillCandidates = 64
 	// maxSkillInstructionsBytes bounds one skill's rendered instructions.
 	maxSkillInstructionsBytes = 16 << 10
 	// maxSkillDescriptionBytes bounds one skill's rendered description.
@@ -219,9 +232,15 @@ func bundleView(name, digest string, bundle Bundle) (SkillView, error) {
 // that is not a valid skill name, a non-regular SKILL.md (symlinks included
 // — a checked-out symlink could point anywhere on the control pod's
 // filesystem, and the loader must not follow it), an oversized or malformed
-// document, or a frontmatter name mismatch is quarantined and reported,
-// never failed or followed. Only the count bound fails closed, so the
-// visible view stays deterministic and bounded.
+// document, a frontmatter name mismatch, or a skill beyond the
+// repository-local count bound is quarantined and reported, never failed or
+// followed — repository content must never park a run, so an over-bound
+// checkout quarantines its excess instead of failing the pinned run.
+// Discovery's work over that content is bounded too: it examines at most
+// maxRepoSkillCandidates candidate directories and retains at most
+// maxRejectedSkillReports quarantine reports (plus the one terminal
+// unexamined report), so neither the retained reports nor the examination
+// itself can grow without limit.
 func discoverRepositorySkills(checkoutDir string) ([]string, map[string]SkillView, []RejectedSkill, error) {
 	root := filepath.Join(checkoutDir, ".agents", "skills")
 	entries, err := os.ReadDir(root)
@@ -234,16 +253,30 @@ func discoverRepositorySkills(checkoutDir string) ([]string, map[string]SkillVie
 	names := make([]string, 0, len(entries))
 	views := make(map[string]SkillView, len(entries))
 	var rejected []RejectedSkill
+	examined := 0
 	for _, entry := range entries {
-		name := entry.Name()
 		if !entry.IsDir() {
 			// Not a skill directory shape: a stray file or a symlink is not
 			// a skill and is not a fault. Skip without reading anything —
 			// in particular, never follow a checked-out symlink's target.
 			continue
 		}
+		if examined >= maxRepoSkillCandidates {
+			// The candidate bound is reached: report the first unexamined
+			// directory and stop. Nothing beyond this point is read. This
+			// terminal report is never dropped, even when the report bound
+			// is already full — it is the one signal that names may be
+			// missing because discovery stopped, so retained reports are
+			// bounded by maxRejectedSkillReports plus this one entry.
+			rejected = append(rejected, RejectedSkill{Name: entry.Name(), Reason: fmt.Sprintf("repository-local discovery examines at most %d candidate directories; this directory and any after it were not examined", maxRepoSkillCandidates)})
+			break
+		}
+		examined++
+		name := entry.Name()
 		if labelErrs := utilvalidation.IsDNS1123Label(name); len(labelErrs) > 0 {
-			rejected = append(rejected, RejectedSkill{Name: name, Reason: "directory name is not a valid DNS-1123 label: " + strings.Join(labelErrs, ", ")})
+			if len(rejected) < maxRejectedSkillReports {
+				rejected = append(rejected, RejectedSkill{Name: name, Reason: "directory name is not a valid DNS-1123 label: " + strings.Join(labelErrs, ", ")})
+			}
 			continue
 		}
 		docPath := filepath.Join(root, name, "SKILL.md")
@@ -257,11 +290,15 @@ func discoverRepositorySkills(checkoutDir string) ([]string, map[string]SkillVie
 			return nil, nil, nil, fmt.Errorf("repository-local skill %q: stat SKILL.md: %w", name, err)
 		}
 		if !info.Mode().IsRegular() {
-			rejected = append(rejected, RejectedSkill{Name: name, Reason: "SKILL.md is not a regular file; repository-local skills must be plain checkout content"})
+			if len(rejected) < maxRejectedSkillReports {
+				rejected = append(rejected, RejectedSkill{Name: name, Reason: "SKILL.md is not a regular file; repository-local skills must be plain checkout content"})
+			}
 			continue
 		}
 		if info.Size() > maxSkillInstructionsBytes {
-			rejected = append(rejected, RejectedSkill{Name: name, Reason: fmt.Sprintf("SKILL.md is %d bytes, above the %d byte limit", info.Size(), maxSkillInstructionsBytes)})
+			if len(rejected) < maxRejectedSkillReports {
+				rejected = append(rejected, RejectedSkill{Name: name, Reason: fmt.Sprintf("SKILL.md is %d bytes, above the %d byte limit", info.Size(), maxSkillInstructionsBytes)})
+			}
 			continue
 		}
 		file, err := os.Open(docPath)
@@ -275,7 +312,21 @@ func discoverRepositorySkills(checkoutDir string) ([]string, map[string]SkillVie
 		}
 		description, instructions, err := renderSkillDocument(name, data)
 		if err != nil {
-			rejected = append(rejected, RejectedSkill{Name: name, Reason: err.Error()})
+			if len(rejected) < maxRejectedSkillReports {
+				rejected = append(rejected, RejectedSkill{Name: name, Reason: err.Error()})
+			}
+			continue
+		}
+		if len(names) >= maxRepoLocalSkills {
+			// The checkout carries more repository-local skills than the
+			// visible view can hold. The excess is quarantined, not
+			// failed: repository content must never park a run. ReadDir
+			// sorts entries, so the first maxRepoLocalSkills valid skills
+			// in name order are the visible ones and the visible set stays
+			// deterministic.
+			if len(rejected) < maxRejectedSkillReports {
+				rejected = append(rejected, RejectedSkill{Name: name, Reason: fmt.Sprintf("the checkout carries more than %d repository-local skills; this skill is quarantined", maxRepoLocalSkills)})
+			}
 			continue
 		}
 		names = append(names, name)
@@ -284,9 +335,6 @@ func discoverRepositorySkills(checkoutDir string) ([]string, map[string]SkillVie
 			Origin:       OriginRepository,
 			Description:  description,
 			Instructions: instructions,
-		}
-		if len(names) > maxRepoLocalSkills {
-			return nil, nil, nil, fmt.Errorf("the checkout carries more than %d repository-local skills", maxRepoLocalSkills)
 		}
 	}
 	sort.Strings(names)

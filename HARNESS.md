@@ -1523,8 +1523,12 @@ pinned bundles is #659's harness behavior:
   visibility: a pinned bundle shadows a same-named repository-local skill,
   and the shadowed names are reported rather than silently dropped. The
   visible set is bounded (32 skills, 16 repository-local), as is each
-  skill's rendered material (16 KiB instructions, 1 KiB description), so
-  loading cannot grow the context without limit.
+  skill's rendered material (16 KiB instructions, 1 KiB description), and
+  discovery's own work over the untrusted checkout is bounded too (64
+  candidate directories examined, 16 retained quarantine reports plus one
+  terminal report naming the first unexamined directory; excess valid
+  skills are quarantined, never run-ending), so loading cannot grow the
+  context without limit.
 - **One trusted skill tool.** Roles see a bounded index — names, origins,
   deployment-authored descriptions for bundle skills, and the shadowed and
   quarantined reports — pinned into the coordinator's and every delegated

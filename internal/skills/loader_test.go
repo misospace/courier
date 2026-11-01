@@ -1,6 +1,7 @@
 package skills
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -394,11 +395,11 @@ func TestLoadForRunSymlinkedSkillDirectoryIsSkipped(t *testing.T) {
 	}
 }
 
-func TestLoadForRunTooManyRepositorySkillsFailsClosed(t *testing.T) {
+func TestLoadForRunExcessRepositorySkillsAreQuarantined(t *testing.T) {
 	dir := t.TempDir()
 	files := map[string]string{}
 	for i := 0; i <= maxRepoLocalSkills; i++ {
-		files[".agents/skills/skill-"+string(rune('a'+i))+"/SKILL.md"] = "body\n"
+		files[".agents/skills/skill-"+string(rune('a'+i))+"/SKILL.md"] = "body " + string(rune('a'+i)) + "\n"
 	}
 	writeLoaderTree(t, dir, files)
 	writeLoaderTree(t, dir, map[string]string{
@@ -406,8 +407,83 @@ func TestLoadForRunTooManyRepositorySkillsFailsClosed(t *testing.T) {
 	})
 	config := writeLoaderConfig(t, dir, map[string]string{"alpha": "alpha"})
 	pins := resolvePinned(t, config, "alpha")
-	if _, err := LoadForRun(pins, config, dir); err == nil {
-		t.Fatal("expected the repository-local count bound to fail closed")
+	loaded, err := LoadForRun(pins, config, dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	// The excess repository-local skill is quarantined, never a run-ending
+	// failure: the visible set holds the bundle plus exactly the bound.
+	if len(loaded.Visible) != maxRepoLocalSkills+1 || loaded.Visible[0].Name != "alpha" {
+		t.Fatalf("visible = %d skills (first %q), want %d with the bundle first", len(loaded.Visible), loaded.Visible[0].Name, maxRepoLocalSkills+1)
+	}
+	if len(loaded.Rejected) != 1 || loaded.Rejected[0].Name != "skill-"+string(rune('a'+maxRepoLocalSkills)) {
+		t.Fatalf("rejected = %#v, want the one excess skill quarantined", loaded.Rejected)
+	}
+}
+
+func TestLoadForRunRepositoryDiscoveryReportBound(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{}
+	// More malformed directories than the report bound holds.
+	for i := 0; i < maxRejectedSkillReports+8; i++ {
+		files[fmt.Sprintf(".agents/skills/bad-%03d/SKILL.md", i)] = ""
+	}
+	writeLoaderTree(t, dir, files)
+	writeLoaderTree(t, dir, map[string]string{
+		"alpha/SKILL.md": "bundle body\n",
+	})
+	config := writeLoaderConfig(t, dir, map[string]string{"alpha": "alpha"})
+	pins := resolvePinned(t, config, "alpha")
+	loaded, err := LoadForRun(pins, config, dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(loaded.Rejected) != maxRejectedSkillReports {
+		t.Fatalf("rejected = %d reports, want the %d-report bound", len(loaded.Rejected), maxRejectedSkillReports)
+	}
+}
+
+func TestLoadForRunRepositoryDiscoveryCandidateBound(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{}
+	// More candidate skill directories than discovery examines; the ones
+	// past the bound are never read.
+	for i := 0; i < maxRepoSkillCandidates+8; i++ {
+		files[fmt.Sprintf(".agents/skills/skill-%03d/SKILL.md", i)] = "body\n"
+	}
+	writeLoaderTree(t, dir, files)
+	writeLoaderTree(t, dir, map[string]string{
+		"alpha/SKILL.md": "bundle body\n",
+	})
+	config := writeLoaderConfig(t, dir, map[string]string{"alpha": "alpha"})
+	pins := resolvePinned(t, config, "alpha")
+	loaded, err := LoadForRun(pins, config, dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	// Discovery examined the candidate bound, quarantining valid skills past
+	// the repository-local visible bound, and reports the first unexamined
+	// directory by name.
+	var unexamined bool
+	for _, r := range loaded.Rejected {
+		if strings.Contains(r.Reason, "were not examined") {
+			unexamined = true
+			if r.Name != fmt.Sprintf("skill-%03d", maxRepoSkillCandidates) {
+				t.Fatalf("unexamined report names %q, want skill-%03d", r.Name, maxRepoSkillCandidates)
+			}
+		}
+	}
+	if !unexamined {
+		t.Fatalf("rejected = %#v, want the first unexamined directory reported", loaded.Rejected)
+	}
+	// The terminal unexamined report lands even though the report bound was
+	// already full of excess-valid quarantines: 16 capped reports plus the
+	// one terminal report.
+	if len(loaded.Rejected) != maxRejectedSkillReports+1 {
+		t.Fatalf("rejected = %d reports, want %d plus the one terminal report", len(loaded.Rejected), maxRejectedSkillReports)
+	}
+	if len(loaded.Visible) != maxRepoLocalSkills+1 || loaded.Visible[0].Name != "alpha" {
+		t.Fatalf("visible = %d skills (first %q), want %d with the bundle first", len(loaded.Visible), loaded.Visible[0].Name, maxRepoLocalSkills+1)
 	}
 }
 

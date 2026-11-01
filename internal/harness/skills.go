@@ -77,7 +77,7 @@ func NewSkillSet(loaded skills.LoadedSkills) (*SkillSet, error) {
 		b.WriteString("\n\nShadowed by deployment pins and not visible this run: " + strings.Join(loaded.Shadowed, ", ") + ".")
 	}
 	if len(loaded.Rejected) > 0 {
-		b.WriteString("\n\nQuarantined repository-local skills (present but malformed; not loadable):")
+		b.WriteString("\n\nQuarantined repository-local skills (present but malformed or over-bound; not loadable):")
 		for i, rejected := range loaded.Rejected {
 			if i == 32 {
 				b.WriteString(fmt.Sprintf("\n- (%d more quarantined skills not listed)", len(loaded.Rejected)-i))
