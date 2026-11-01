@@ -29,7 +29,15 @@ const (
 	// claims under test, and an unproven claim is a failure, not a hang.
 	reaperAdoptLimit = 5 * time.Second
 	reaperReapLimit  = 5 * time.Second
-	reaperPoll       = 20 * time.Millisecond
+	// The churn wait replaces the fixed wall with a liveness check, because
+	// the tail of the fork storm — scheduling the last grandchild and its
+	// SIGCHLD — can exceed any fixed wall on a runner contending with a
+	// dozen parallel CI jobs (#692). A stall of this long with the tally
+	// short of want still fails: a reaper that lost a child never advances
+	// again. The ceiling keeps even an advancing tally bounded.
+	reaperReapStallLimit = 10 * time.Second
+	reaperReapCeiling    = 2 * time.Minute
+	reaperPoll           = 20 * time.Millisecond
 )
 
 // runReaperHelper re-executes this test binary as the reaper's helper and
@@ -276,7 +284,7 @@ func reaperSurvivesChurn(t *testing.T, reaper *adoptedChildReaper) {
 			t.Fatalf("churn turn %d: %v", turn, err)
 		}
 	}
-	waitForReaped(t, reaper, before+turns)
+	waitForReapedProgress(t, reaper, before+turns)
 	waitForNoZombieDescendants(t)
 }
 
@@ -334,6 +342,38 @@ func waitForReaped(t *testing.T, reaper *adoptedChildReaper, want uint64) {
 	for reaper.reaped.Load() < want {
 		if time.Now().After(deadline) {
 			t.Fatalf("reaper collected %d adopted descendants, want %d within %s", reaper.reaped.Load(), want, reaperReapLimit)
+		}
+		time.Sleep(reaperPoll)
+	}
+}
+
+// waitForReapedProgress waits until the reaper has collected at least want
+// adopted descendants while the tally keeps advancing: every collection
+// restarts the stall window, so a loaded runner that schedules the tail of a
+// fork storm late still passes, while a reaper that lost a child — whose
+// tally stops short of want and never moves again — fails at the stall. The
+// ceiling bounds the wait even if the tally crawls.
+func waitForReapedProgress(t *testing.T, reaper *adoptedChildReaper, want uint64) {
+	t.Helper()
+	ceiling := time.Now().Add(reaperReapCeiling)
+	seen := reaper.reaped.Load()
+	stall := time.Now().Add(reaperReapStallLimit)
+	for {
+		collected := reaper.reaped.Load()
+		if collected >= want {
+			return
+		}
+		if collected > seen {
+			seen = collected
+			stall = time.Now().Add(reaperReapStallLimit)
+		}
+		if time.Now().After(ceiling) {
+			t.Fatalf("reaper crawled to %d adopted descendants, want %d, past the %s ceiling",
+				collected, want, reaperReapCeiling)
+		}
+		if time.Now().After(stall) {
+			t.Fatalf("reaper stalled at %d adopted descendants, want %d: no collection advanced the tally within %s",
+				collected, want, reaperReapStallLimit)
 		}
 		time.Sleep(reaperPoll)
 	}

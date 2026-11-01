@@ -23,9 +23,36 @@ import (
 	"github.com/misospace/courier/internal/topology"
 )
 
+// Inbound HTTP bounds for the worker's task API, matching the broker and the
+// evidence intake's treatment of the same bounded-bundle workload: they reclaim
+// stalled and idle connections, and sit far above what a healthy 65 MiB
+// snapshot upload costs in-cluster. The only handler that deliberately waits
+// before responding is cancellation, whose verified-termination wait stays well
+// inside the write budget.
+const (
+	apiReadHeaderTimeout = 10 * time.Second
+	apiReadTimeout       = 60 * time.Second
+	apiWriteTimeout      = 30 * time.Second
+	apiIdleTimeout       = 120 * time.Second
+)
+
 func main() {
 	if err := runArgs(os.Args[1:]); err != nil {
 		log.Fatal(err)
+	}
+}
+
+// newHTTPServer builds the worker's listener with the full inbound bound set so
+// a client that stalls after the header read, or an idle keep-alive connection,
+// cannot hold its goroutine and file descriptor for the pod's lifetime.
+func newHTTPServer(handler http.Handler, addr string) *http.Server {
+	return &http.Server{
+		Addr:              ":" + addr,
+		Handler:           handler,
+		ReadHeaderTimeout: apiReadHeaderTimeout,
+		ReadTimeout:       apiReadTimeout,
+		WriteTimeout:      apiWriteTimeout,
+		IdleTimeout:       apiIdleTimeout,
 	}
 }
 
@@ -74,11 +101,7 @@ func runArgs(args []string) error {
 		log.Printf("courier-worker: %v", err)
 	}
 
-	server := &http.Server{
-		Addr:              ":" + addr,
-		Handler:           worker.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	server := newHTTPServer(worker.Handler(), addr)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
