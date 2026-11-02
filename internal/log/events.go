@@ -112,6 +112,12 @@ const (
 	// audit trail reaches the log store on every finished request, not only on
 	// debug runs.
 	EventRunRetry = "run.retry"
+	// EventSkillsLoaded reports the run's loaded pinned skill view (#659):
+	// each visible skill's name, origin, content digest, file count, and
+	// bounded description, plus the names a pinned bundle shadowed. Skill
+	// identities are inspectable in run telemetry; instruction bodies are
+	// not logged.
+	EventSkillsLoaded = "skills.loaded"
 )
 
 // Status values for the status field.

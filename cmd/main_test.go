@@ -19,6 +19,7 @@ import (
 	"github.com/misospace/courier/internal/controller"
 	"github.com/misospace/courier/internal/forge"
 	couriergithub "github.com/misospace/courier/internal/github"
+	"github.com/misospace/courier/internal/skills"
 	"github.com/misospace/courier/internal/source/cron"
 	"github.com/misospace/courier/internal/source/dispatch"
 	corev1 "k8s.io/api/core/v1"
@@ -1338,5 +1339,55 @@ func TestBrokerTokenReviewDefaultMatchesChart(t *testing.T) {
 	}
 	if len(values.Ownership.Namespaces) != 0 || strings.TrimSpace(values.Ownership.LeaderElectionID) != "" {
 		t.Fatal("chart defaults for ownership must stay empty so a single release keeps the backward-compatible boundary")
+	}
+}
+
+// TestSkillBundleSourcesGateTheStartup pins the registration gate: a bundle
+// source that could not be mounted into a run's pods fails manager startup
+// explicitly, so the deployment learns about the collision before a run
+// selects the bundle. Two bundles at one source path are such a collision.
+func TestSkillBundleSourcesGateTheStartup(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "shared")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "SKILL.md"), []byte("tour the repository first."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "bundles.yaml")
+	document := "bundles:\n" +
+		"  - name: repo-tour\n    source: " + source + "\n" +
+		"  - name: repo-tour-copy\n    source: " + source + "\n"
+	if err := os.WriteFile(path, []byte(document), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := skills.Load(path)
+	if err != nil {
+		t.Fatalf("load registry: %v", err)
+	}
+	if err := validateSkillBundleRegistration(registry); err == nil {
+		t.Fatal("two bundles at one source path must fail startup")
+	}
+
+	// A registry whose bundles sit at distinct paths is the ordinary
+	// registration and must pass the gate.
+	distinct := filepath.Join(root, "distinct")
+	if err := os.MkdirAll(distinct, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(distinct, "SKILL.md"), []byte("tour the repository first."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	document = "bundles:\n  - name: repo-tour\n    source: " + distinct + "\n"
+	if err := os.WriteFile(path, []byte(document), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	registry, err = skills.Load(path)
+	if err != nil {
+		t.Fatalf("load registry: %v", err)
+	}
+	if err := validateSkillBundleRegistration(registry); err != nil {
+		t.Fatalf("a distinct bundle source must pass the startup gate: %v", err)
 	}
 }

@@ -2567,7 +2567,42 @@ shadowed skills so precedence is visible rather than silent. Registry
 content is
 deployment-controlled and never fed from CoderRun, source, or model data.
 The legacy launcher has no registry seam and rejects a skill-selecting lane
-outright (`LaneConfig`). Harness loading of the pinned bundles is #659.
+outright (`LaneConfig`). Harness loading of the pinned bundles (#659): the
+operator materializes each pinned bundle into a per-run ConfigMap and mounts
+it read-only into the run's control and worker pods at the registered
+absolute source path, and writes the run's bundle config into a second
+per-run ConfigMap mounted at `executor.SkillBundlesConfigPath` (the path the
+operator renders as `COURIER_SKILL_BUNDLES_FILE`). The control pod
+re-resolves each pin against that config, reads the bundle's files through
+the mount, and requires the recomputed digest to match, failing closed
+before the coordinator's first model request on a missing, drifted, or
+oversized mount. The operator owns the materialization because it renders
+the run's pods: a deployment cannot mount content into them.
+The registered source path is the mount path inside the run's pods, so it
+has to be mountable. The path must be a clean absolute path, no two bundles
+may share or nest one path, and no bundle may sit at a path the operator's
+own pods own: the workspaces, the control runtime, the toolchain cache and
+its read-only reference, the control's credential mounts, the bundle config
+directory, and the image-owned toolchain and entrypoint directories a bundle
+mount would hide. A bundle at one of those paths would shadow the operator's
+volume, and a bundle at a path above one would shadow it too. The source is
+normalized once at the registration boundary, so one location has one
+spelling in the registry, in the pod mount, and in the rendered run config. A
+colliding registration fails manager startup explicitly, and the
+materialization and the pod render reject the same configuration, so a run
+never comes up with a shadowed or duplicated mount.
+Repository-local skills discovered under `.agents/skills/<name>/SKILL.md` of
+the integration checkout compose with the pins through `skills.Overlay`;
+malformed repository-local documents are quarantined and reported, never
+run-ending, because repository content must not park a pinned run. The
+visible set and each skill's rendered material are bounded. Roles see a
+bounded index pinned into their system messages and load full instructions
+only through the trusted `skill` tool, which serves verified content as data
+and executes nothing — a skill's scripts run only as ordinary untrusted
+worker shell, with assets exposed to the worker as read-only mounts at the
+same registered paths. The loaded view emits as the `skills.loaded` run
+event; every incarnation re-verifies the same pinned identities, so restart
+and resume load identical pinned content.
 
 Resolution contract: the registered source may be a symlink (kubelet
 ConfigMap/Secret projections place per-key symlinks and a `..data` ->

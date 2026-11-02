@@ -16,7 +16,8 @@ func TestSkillsEnvContract(t *testing.T) {
 	pinned := Invocation{
 		RunName: "run-1", Namespace: "runs", Mode: courierv1alpha1.ModeResolveIssue,
 		Repo: "acme/widgets", Ref: 1, Goal: "g", Model: "m", Workspace: "/w",
-		Skills: `[{"name":"repo-tour","digest":"sha256:` + strings.Repeat("b", 64) + `"}]`,
+		Skills:           `[{"name":"repo-tour","digest":"sha256:` + strings.Repeat("b", 64) + `"}]`,
+		SkillBundlesFile: SkillBundlesConfigPath,
 	}
 	values := map[string]string{}
 	for _, env := range RunContextEnvironment(pinned) {
@@ -25,12 +26,25 @@ func TestSkillsEnvContract(t *testing.T) {
 	if got := values[EnvSkills]; got != pinned.Skills {
 		t.Fatalf("COURIER_SKILLS_JSON = %q, want the operator-authored envelope", got)
 	}
+	if got := values[EnvSkillBundlesFile]; got != SkillBundlesConfigPath {
+		t.Fatalf("COURIER_SKILL_BUNDLES_FILE = %q, want the mounted config path", got)
+	}
 	decoded, err := InvocationFromEnv(func(name string) string { return values[name] })
 	if err != nil {
 		t.Fatalf("InvocationFromEnv: %v", err)
 	}
 	if decoded.Skills != pinned.Skills {
 		t.Fatalf("round trip Skills = %q, want %q", decoded.Skills, pinned.Skills)
+	}
+	if decoded.SkillBundlesFile != SkillBundlesConfigPath {
+		t.Fatalf("round trip SkillBundlesFile = %q, want %q", decoded.SkillBundlesFile, SkillBundlesConfigPath)
+	}
+	pins, err := SkillPins(decoded)
+	if err != nil {
+		t.Fatalf("SkillPins: %v", err)
+	}
+	if len(pins) != 1 || pins[0].Name != "repo-tour" || pins[0].Digest != "sha256:"+strings.Repeat("b", 64) {
+		t.Fatalf("SkillPins = %#v, want the decoded pin", pins)
 	}
 
 	// A skillless run emits nothing: absence is meaningful.
@@ -43,6 +57,19 @@ func TestSkillsEnvContract(t *testing.T) {
 	}
 	if _, ok := values[EnvSkills]; ok {
 		t.Fatal("a skillless invocation must not emit COURIER_SKILLS_JSON")
+	}
+	if _, ok := values[EnvSkillBundlesFile]; ok {
+		t.Fatal("a skillless invocation must not emit COURIER_SKILL_BUNDLES_FILE")
+	}
+	skillless, err := InvocationFromEnv(func(name string) string { return values[name] })
+	if err != nil {
+		t.Fatalf("InvocationFromEnv: %v", err)
+	}
+	if skillless.SkillBundlesFile != "" {
+		t.Fatalf("skillless SkillBundlesFile = %q, want empty", skillless.SkillBundlesFile)
+	}
+	if pins, err := SkillPins(skillless); err != nil || pins != nil {
+		t.Fatalf("SkillPins(skillless) = %#v, %v; want nil, nil", pins, err)
 	}
 }
 
@@ -82,5 +109,22 @@ func TestInvocationFromEnvRejectsMalformedSkills(t *testing.T) {
 	}
 	if legacy.Skills != "" {
 		t.Fatalf("skillless env reconstructed Skills %q, want empty", legacy.Skills)
+	}
+}
+
+// TestSkillPinsRejectsHandAssembledEnvelope pins the helper's fail-closed
+// contract: an invocation assembled outside the environment boundary must
+// not drift from the envelope validation the reconstruction applies.
+func TestSkillPinsRejectsHandAssembledEnvelope(t *testing.T) {
+	for name, envelope := range map[string]string{
+		"unparsable":   "{not skill pins",
+		"empty name":   `[{"name":"","digest":"sha256:` + strings.Repeat("a", 64) + `"}]`,
+		"bad digest":   `[{"name":"repo-tour","digest":"sha256:zz"}]`,
+		"short digest": `[{"name":"repo-tour","digest":"sha256:abc"}]`,
+	} {
+		_, err := SkillPins(Invocation{Skills: envelope})
+		if !errors.Is(err, ErrInvalidSkills) {
+			t.Fatalf("%s: error = %v, want ErrInvalidSkills", name, err)
+		}
 	}
 }

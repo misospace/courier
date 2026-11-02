@@ -17,6 +17,7 @@ import (
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/broker/grammar"
+	"github.com/misospace/courier/internal/skills"
 	"github.com/misospace/courier/internal/source"
 )
 
@@ -90,6 +91,14 @@ type Invocation struct {
 	// can never author it. Loading is the native harness's job (#659); this
 	// carries the pin.
 	Skills string
+	// SkillBundlesFile is the path of the deployment-mounted bundle config
+	// the run's pinned skills resolve against (#659): the same config file
+	// the manager registered bundles from, mounted into the control pod at
+	// SkillBundlesConfigPath when the run carries pins. An empty value is a
+	// skillless run that requires no mount. The loader re-resolves the
+	// pinned content and verifies digests against this envelope, so a
+	// missing or tampered mount fails closed pre-model.
+	SkillBundlesFile string
 }
 
 // Command is a process command with no shell interpolation.
@@ -634,6 +643,13 @@ func RunContextEnvironment(inv Invocation) []EnvVar {
 	if inv.Skills != "" {
 		values = append(values, EnvVar{Name: EnvSkills, Value: inv.Skills})
 	}
+	// The bundle config path travels beside the pin envelope it resolves
+	// (#659), but only when the run pins skills: a skillless run requires no
+	// mount, so absence is meaningful to the reconstruction boundary rather
+	// than an empty stand-in.
+	if inv.SkillBundlesFile != "" {
+		values = append(values, EnvVar{Name: EnvSkillBundlesFile, Value: inv.SkillBundlesFile})
+	}
 	return values
 }
 
@@ -666,6 +682,20 @@ const EnvContextPolicy = "COURIER_CONTEXT_JSON"
 // names what the run may load; loading itself is the native harness's job
 // (#659), and a worker or model can never set it.
 const EnvSkills = "COURIER_SKILLS_JSON"
+
+// EnvSkillBundlesFile is the trusted environment key carrying the path of
+// the deployment-mounted skill bundle config a pinned run resolves against
+// (#659). Exported so the operator's pod rendering and the native control's
+// reconstruction name the same variable and cannot drift. The value is a
+// path the deployment mounts; a worker or model can never set it.
+const EnvSkillBundlesFile = "COURIER_SKILL_BUNDLES_FILE"
+
+// SkillBundlesConfigPath is the documented control-pod mount path for the
+// skill bundle config (#659): a deployment whose lanes select skills mounts
+// the same bundles.yaml the manager registered from at this path in the run's
+// control and worker pods, so pinned content resolves at identical absolute
+// paths in both pods.
+const SkillBundlesConfigPath = "/etc/courier/skill-bundles-config/bundles.yaml"
 
 // Default git identity names used when a deployment configures none. A fresh
 // clone has no git identity, so the coordinator environment must always carry
@@ -832,6 +862,31 @@ type EnvVar struct {
 // the same failure class as unparsable JSON.
 var skillPinDigestShape = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
+// SkillPins decodes the invocation's pinned skill envelope into the loader's
+// pin type (#659). The envelope was validated at reconstruction, so a
+// malformed value here is unreachable through InvocationFromEnv; the helper
+// re-applies the same light validation anyway so a hand-assembled invocation
+// cannot drift from the envelope contract. An empty envelope decodes to nil
+// pins: a skillless run.
+func SkillPins(inv Invocation) ([]skills.Pin, error) {
+	if strings.TrimSpace(inv.Skills) == "" {
+		return nil, nil
+	}
+	var pins []skills.Pin
+	if err := json.Unmarshal([]byte(inv.Skills), &pins); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidSkills, err)
+	}
+	for _, pin := range pins {
+		if pin.Name == "" {
+			return nil, fmt.Errorf("%w: a pin names no skill", ErrInvalidSkills)
+		}
+		if !skillPinDigestShape.MatchString(pin.Digest) {
+			return nil, fmt.Errorf("%w: skill %q digest %q is not a sha256 content identity", ErrInvalidSkills, pin.Name, pin.Digest)
+		}
+	}
+	return pins, nil
+}
+
 // InvocationFromEnv reconstructs an Invocation from the run-context
 // environment contract written by RunContextEnvironment. It is the adapter
 // seam the native harness control binary uses: the operator renders one
@@ -918,6 +973,12 @@ func InvocationFromEnv(get func(string) string) (Invocation, error) {
 			}
 		}
 		inv.Skills = strings.TrimSpace(skillsJSON)
+	}
+	// The bundle config path reconstructs trivially: it is a mounted path,
+	// and a wrong or missing mount fails closed at the loader (#659), which
+	// is the pre-model point that names the deployment contract precisely.
+	if bundlesFile := get(EnvSkillBundlesFile); strings.TrimSpace(bundlesFile) != "" {
+		inv.SkillBundlesFile = strings.TrimSpace(bundlesFile)
 	}
 	switch {
 	case inv.RunName == "":

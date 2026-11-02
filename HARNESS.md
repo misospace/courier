@@ -1500,8 +1500,85 @@ policy for its incarnation.
 Skill pins travel the same seam (#658): the native control receives
 `COURIER_SKILLS_JSON`, the name+digest pairs resolved at admission and carried
 in the run's persisted status — never re-read from the live lane. Loading the
-pinned bundles, with a registered deployment bundle shadowing a same-named
-repository-local skill, lands in #659; this phase carries the pin only.
+pinned bundles is #659's harness behavior:
+
+- **One deterministic loader.** At control startup, after the capability gate,
+  a pinned run resolves its pins against the bundle config the operator
+  materialized for the run (`COURIER_SKILL_BUNDLES_FILE`, mounted at
+  `executor.SkillBundlesConfigPath`), re-resolves each pinned bundle's
+  content through the mount the operator rendered, and requires the
+  recomputed digest to equal the pinned digest. Missing config, an
+  unregistered pin, drifted content, a missing or empty `SKILL.md`, a
+  frontmatter name that disagrees with the pinned logical name, or oversized
+  instructions fail closed before the coordinator's first model request,
+  declared as a `skills` capability failure (`NeedsHuman`) — never an
+  omitted skill.
+- **Collision precedence.** Repository-local skills are discovered under
+  `<checkout>/.agents/skills/<name>/SKILL.md` of the integration tree —
+  seeded first, so discovery sees the world at incarnation start. A
+  repository-local document that is not a plain regular file (checked-out
+  symlinks included), is oversized, or contradicts its own name is
+  quarantined and reported, never loaded and never run-ending: third-party
+  repository content must not park a pinned run. `skills.Overlay` decides
+  visibility: a pinned bundle shadows a same-named repository-local skill,
+  and the shadowed names are reported rather than silently dropped. The
+  visible set is bounded (32 skills, 16 repository-local), as is each
+  skill's rendered material (16 KiB instructions, 1 KiB description), and
+  discovery's own work over the untrusted checkout is bounded too (64
+  candidate directories examined, 16 retained quarantine reports plus one
+  terminal report naming the first unexamined directory; excess valid
+  skills are quarantined, never run-ending), so loading cannot grow the
+  context without limit.
+- **One trusted skill tool.** Roles see a bounded index — names, origins,
+  deployment-authored descriptions for bundle skills, and the shadowed and
+  quarantined reports — pinned into the coordinator's and every delegated
+  brief's system message. Repository-local entries appear as untrusted
+  content without their descriptions; their text reaches roles only through
+  the tool. Full instructions arrive only through the trusted `skill` tool,
+  which serves the verified SKILL.md body and a bounded asset listing as
+  data and executes nothing. Control never executes skill content: a
+  skill's scripts run only as ordinary untrusted worker shell through the
+  existing boundaries. A skillless run pins no section and offers no tool —
+  absence is meaningful. The index is protected state: it counts against
+  the lane's declared context budget, and it survives every compaction, so a
+  compacted run still knows which skills it carries.
+- **Worker boundary.** The worker receives no new credential, identity, or
+  writable path into the skill source. The operator materializes each pinned
+  bundle into a per-run ConfigMap and mounts it read-only into the worker
+  pod at the same registered absolute path the loader resolved; the skill
+  tool's result names those paths. Executing a skill-provided script is
+  normal untrusted worker execution under the existing worker, network, and
+  tool boundaries. The material travels in a ConfigMap, never a Secret, so a
+  pinned run adds no identity material to the worker: the only difference
+  between a skillless and a pinned worker is one read-only content mount.
+  A pinned bundle above the ConfigMap size limit fails the run closed
+  rather than silently skillless.
+- **Telemetry.** The loaded view — each visible skill's name, origin, digest,
+  bounded description, and asset counts, plus the shadowed and quarantined
+  names — emits as the `skills.loaded` run event at info level. Content
+  identities are inspectable; instruction bodies are not logged.
+- **Restart/resume.** Every incarnation re-resolves and re-verifies exactly
+  the run's pinned identities from persisted status; the operator's
+  materialization is deterministic, so a relaunch carries the same bytes
+  into the same pods, and the same pinned bytes produce the same rendered
+  material. Drift fails closed.
+  Repository-local skills are not pinned identities: their discovered set
+  reflects each incarnation's seeded world, which is the collision
+  contract's own semantics.
+- **Executed canary.** `hack/skill-canary` runs the same chain a control pod
+  runs and reports one check per claim: the registration, the lane
+  selection, the run-context round trip, the control-side load, the pinned
+  index, the offered tool, the recorded tool call, the tool result, the
+  model's answer, the ending, the unchanged deployment content and checkout,
+  and the content identity's reaction to a changed byte. The default mode
+  writes its own bundle into a temporary directory and answers through a
+  hermetic stub gateway that quotes the marker it read in the request the
+  harness sent. Point the canary at a deployment's bundle config with
+  `--bundle-config`, at the per-run config the operator rendered with
+  `--run-config`, and at a real model with `--gateway-url`. The canary proves
+  the chain and the delivery of the instruction into the model's context. It
+  does not prove the kubelet's projection of a bundle or the worker pod's
+  read of an asset. The cluster procedure in BOOTSTRAP.md covers those two.
 
 Production verification reads two signals: the capability table's
 `context-budget:<role>` state (`healthy` = gateway-verified and enforced,

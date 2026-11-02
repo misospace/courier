@@ -458,3 +458,115 @@ Registration is deployment-controlled setup: CoderRun, source, issue,
 pull-request, and model data can never register a bundle. Skill content is
 untrusted data exposed to workers later (#658/#659); registration grants no
 shell, forge, or Kubernetes authority.
+
+A run whose lane selects skills loads its pinned bundles in the control pod
+(#659). The operator renders the run's control and worker pods, so you cannot
+mount bundle content into them. The operator does it for you: for each
+pinned bundle it copies the registered bytes into a per-run ConfigMap and
+mounts that ConfigMap read-only into the control pod and into the worker
+pod, at the absolute `source` path the manager registered. The operator also
+writes the run's bundle config into a per-run ConfigMap and mounts it at
+`/etc/courier/skill-bundles-config/bundles.yaml`, the path it renders as
+`COURIER_SKILL_BUNDLES_FILE` whenever the run carries pins.
+
+Your part of the contract does not change. Mount the bundle content into the
+manager pod at the absolute `source` path you registered. The manager reads
+those bytes at startup, digests them, and hands the same bytes to the run.
+
+The `source` path is also the absolute path the operator mounts the bundle at
+inside the run's control and worker pods, so it has to be mountable. Do not
+use a path the operator's own pods own: `/workspace`, `/courier-runtime`,
+`/courier-toolchain`, `/courier-toolchain-cache`,
+`/var/run/courier/signing`, `/var/run/courier/broker`,
+`/var/run/courier/gateway`, `/var/run/secrets/tokens`,
+`/etc/courier/skill-bundles-config`, `/usr/local/bin`, or `/usr/local/go`.
+Do not use a path inside one of those, or a path above one of those, either,
+and do not give two bundles the same `source`. A bundle at one of those paths
+would shadow what the operator mounts, two bundles at one path would mount
+twice, and a bundle over the image's tool directories would hide the binary
+the pod runs. A colliding source fails manager startup with an explicit error.
+
+The manager normalizes the path it registers, so a trailing separator or a `.`
+element names one location in one spelling.
+
+One bound applies. A ConfigMap holds at most 1 MiB of data. A pinned bundle
+above that size fails the run closed with a named capability error before
+the coordinator's first model request. The registry accepts a bundle of up to
+8 MiB, so a bundle above 1 MiB registers but cannot run.
+
+A run with no pinned skills needs none of this. The operator writes no
+ConfigMap and mounts nothing extra.
+
+### Canary a skill bundle
+
+Two canaries cover the skill path. The first one runs from a checkout and
+needs no cluster. The second one runs on a live cluster and proves the
+kubelet's own projection. Run both.
+
+#### Run the canary from a checkout
+
+`hack/skill-canary` runs the chain a control pod runs, against a bundle the
+deployment provides, and reports one check per claim the chain makes.
+
+```
+go run ./hack/skill-canary
+```
+
+By default the canary writes its own deployment tree into a temporary
+directory. The tree holds one bundle whose `SKILL.md` carries a unique marker
+and one supporting asset. The canary needs no credentials and no network. It
+exits non-zero when a check fails.
+
+To run the canary against a deployment, point it at the deployment's bundle
+config and at the bundle the lane selects.
+
+```
+go run ./hack/skill-canary \
+  --bundle-config /etc/courier/skill-bundles-config/bundles.yaml \
+  --skill simple-english
+```
+
+Add `--run-config` with the per-run bundle config the operator rendered for a
+run's pods. The canary then resolves the materialization form, which is the
+document a run's control pod reads.
+
+Add `--gateway-url` and `--gateway-key-file` to use a real model instead of
+the built-in stub. The stub answers with the marker it read in the request
+the harness sent, so a run against the stub shows that the harness delivered
+the instruction into the model's context. A run against a real gateway shows
+a real model quoting the instruction.
+
+A bundle that the deployment provides must carry a `CANARY-MARKER-<hex>`
+token in its `SKILL.md` body and at least one supporting asset. The marker is
+what proves that the instruction body reached the model. The canary fails
+closed when no loaded skill carries the token.
+
+#### Canary a skill bundle on a live cluster
+
+Use this procedure to prove that a deployment-provided skill loads and runs
+on a live cluster. You need a cluster with the chart installed, one lane that
+selects the skill, and one run on that lane.
+
+1. Write a test bundle in the manager pod at a path you control. Give it a
+   `SKILL.md` that names the skill and carries one instruction the run must
+   follow. Add one supporting file, such as `assets/checklist.md`.
+2. Register the bundle in `skillBundles` and mount its content into the
+   manager pod at the registered `source` path. Reload the manager.
+3. Set the lane's `skills` list to the bundle's name.
+4. Start one run on that lane.
+5. Read the control pod's log. The `skills.loaded` event names each visible
+   skill, its origin, its digest, and its asset count. The event is at info
+   level.
+6. Read the run transcript. The role's system message carries the skill
+   index, and the `skill` tool call returns the bundle's instructions.
+7. Read the worker log. The model reads the supporting file at the path the
+   tool named.
+
+If the run fails with the `skills` capability, the operator's message names
+the reason, such as a missing ConfigMap or a digest that does not match the
+pin.
+
+The cluster canary proves the kubelet's projection and the worker pod's read
+of an asset. The checkout canary proves the chain and the model's use of the
+instruction. Neither one replaces the other.
+

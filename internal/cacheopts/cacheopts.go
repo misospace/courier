@@ -24,11 +24,12 @@ import (
 // lanes, and run pods. Every other kind must be read point-wise through
 // the uncached API reader (SecureControl.reader), never through the cached
 // client: the chart grants list and watch for the three cached kinds, only
-// list for Secrets, Services, ServiceAccounts, NetworkPolicies, and the
-// RBAC objects, get and list for Nodes, and only get for Namespaces. A
-// cached read of any other kind therefore lazily starts an informer whose
-// initial list pulls every object of that kind into the operator's memory
-// and which cannot watch, so it relists forever — the #642 OOM.
+// list for Secrets, ConfigMaps, Services, ServiceAccounts, NetworkPolicies,
+// and the RBAC objects, get and list for Nodes, and only get for
+// Namespaces. A cached read of any other kind therefore lazily starts an
+// informer whose initial list pulls every object of that kind into the
+// operator's memory and which cannot watch, so it relists forever — the
+// #642 OOM.
 //
 // DefaultNamespaces bounds such an accidental informer for a namespaced kind
 // to the watched namespaces instead of the whole cluster. Cluster-scoped
@@ -72,6 +73,7 @@ func Options(watched []string) cache.Options {
 func UncachedReadObjects() []client.Object {
 	return []client.Object{
 		&corev1.Secret{},
+		&corev1.ConfigMap{},
 		&corev1.Service{},
 		&corev1.ServiceAccount{},
 		&corev1.Namespace{},

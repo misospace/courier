@@ -404,6 +404,12 @@ func (s *SecureControl) subjectAccessReviewAs(ctx context.Context, serviceAccoun
 // create probes. resources and workerImage are the lane-resolved values the
 // caller holds for this pass; the dry-run worker renders with the same image
 // the launch path will create, so the proof proves the real artifact.
+//
+// The run's pinned skill bundles are part of that artifact: the dry-run pods
+// carry the same read-only skill mounts the launch path renders, resolved
+// from the deployment registry exactly as the launch path resolves them. The
+// ConfigMaps themselves are created later, by the launch path, so the
+// dry-run proves a spec whose mounts are the ones the round will have.
 func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun, cache *topology.CachePin, resources corev1.ResourceRequirements, workerImage string, proveProbes bool) error {
 	registration, err := s.Config.Registry.Select(run.Spec.Repo)
 	if err != nil {
@@ -413,8 +419,12 @@ func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun,
 	if err != nil {
 		return err
 	}
+	material, err := s.resolveRunSkills(run)
+	if err != nil {
+		return fmt.Errorf("secure preflight: resolve run skills: %w", err)
+	}
 	pods := []*corev1.Pod{}
-	worker, err := topology.WorkerPod(run, workerImage, "dry-run-incarnation", publicKey, cache, resources)
+	worker, err := topology.WorkerPod(run, workerImage, "dry-run-incarnation", publicKey, cache, resources, material.mounts)
 	if err != nil {
 		return fmt.Errorf("secure preflight: render worker: %w", err)
 	}
@@ -427,6 +437,8 @@ func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun,
 		WorkerURL:             "http://dry-run:8080",
 		BrokerURL:             "https://dry-run:8443",
 		Resources:             resources,
+		Skills:                material.mounts,
+		SkillBundlesConfigMap: material.configMap,
 	})
 	if err != nil {
 		return fmt.Errorf("secure preflight: render control: %w", err)
