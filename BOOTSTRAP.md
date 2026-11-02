@@ -499,6 +499,50 @@ ConfigMap and mounts nothing extra.
 
 ### Canary a skill bundle
 
+Two canaries cover the skill path. The first one runs from a checkout and
+needs no cluster. The second one runs on a live cluster and proves the
+kubelet's own projection. Run both.
+
+#### Run the canary from a checkout
+
+`hack/skill-canary` runs the chain a control pod runs, against a bundle the
+deployment provides, and reports one check per claim the chain makes.
+
+```
+go run ./hack/skill-canary
+```
+
+By default the canary writes its own deployment tree into a temporary
+directory. The tree holds one bundle whose `SKILL.md` carries a unique marker
+and one supporting asset. The canary needs no credentials and no network. It
+exits non-zero when a check fails.
+
+To run the canary against a deployment, point it at the deployment's bundle
+config and at the bundle the lane selects.
+
+```
+go run ./hack/skill-canary \
+  --bundle-config /etc/courier/skill-bundles-config/bundles.yaml \
+  --skill simple-english
+```
+
+Add `--run-config` with the per-run bundle config the operator rendered for a
+run's pods. The canary then resolves the materialization form, which is the
+document a run's control pod reads.
+
+Add `--gateway-url` and `--gateway-key-file` to use a real model instead of
+the built-in stub. The stub answers with the marker it read in the request
+the harness sent, so a run against the stub shows that the harness delivered
+the instruction into the model's context. A run against a real gateway shows
+a real model quoting the instruction.
+
+A bundle that the deployment provides must carry a `CANARY-MARKER-<hex>`
+token in its `SKILL.md` body and at least one supporting asset. The marker is
+what proves that the instruction body reached the model. The canary fails
+closed when no loaded skill carries the token.
+
+#### Canary a skill bundle on a live cluster
+
 Use this procedure to prove that a deployment-provided skill loads and runs
 on a live cluster. You need a cluster with the chart installed, one lane that
 selects the skill, and one run on that lane.
@@ -521,3 +565,8 @@ selects the skill, and one run on that lane.
 If the run fails with the `skills` capability, the operator's message names
 the reason, such as a missing ConfigMap or a digest that does not match the
 pin.
+
+The cluster canary proves the kubelet's projection and the worker pod's read
+of an asset. The checkout canary proves the chain and the model's use of the
+instruction. Neither one replaces the other.
+

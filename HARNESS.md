@@ -1563,6 +1563,20 @@ pinned bundles is #659's harness behavior:
   Repository-local skills are not pinned identities: their discovered set
   reflects each incarnation's seeded world, which is the collision
   contract's own semantics.
+- **Executed canary.** `hack/skill-canary` runs the same chain a control pod
+  runs and reports one check per claim: the registration, the lane
+  selection, the run-context round trip, the control-side load, the pinned
+  index, the offered tool, the recorded tool call, the tool result, the
+  model's answer, the ending, the unchanged deployment content and checkout,
+  and the content identity's reaction to a changed byte. The default mode
+  writes its own bundle into a temporary directory and answers through a
+  hermetic stub gateway that quotes the marker it read in the request the
+  harness sent. Point the canary at a deployment's bundle config with
+  `--bundle-config`, at the per-run config the operator rendered with
+  `--run-config`, and at a real model with `--gateway-url`. The canary proves
+  the chain and the delivery of the instruction into the model's context. It
+  does not prove the kubelet's projection of a bundle or the worker pod's
+  read of an asset. The cluster procedure in BOOTSTRAP.md covers those two.
 
 Production verification reads two signals: the capability table's
 `context-budget:<role>` state (`healthy` = gateway-verified and enforced,
