@@ -68,6 +68,10 @@ type Server struct {
 	capabilities  CapabilityReporter
 	importMu      sync.Mutex
 	handler       http.Handler
+	// bodyReadBudget bounds each request body read inside the listener's
+	// write deadline. It is apiBodyReadBudget in production; tests compress
+	// it so the regressions below do not wait a production window.
+	bodyReadBudget time.Duration
 }
 
 func NewServer(config ServerConfig) (*Server, error) {
@@ -95,7 +99,7 @@ func NewServer(config ServerConfig) (*Server, error) {
 	if _, err := tls.LoadX509KeyPair(config.TLSCertFile, config.TLSKeyFile); err != nil {
 		return nil, fmt.Errorf("load broker TLS identity: %w", err)
 	}
-	s := &Server{policy: config.Policy, authenticator: config.Authenticator, importer: config.Importer, snapshot: config.Snapshot, scratchDir: config.ScratchDir, capabilities: config.Capabilities}
+	s := &Server{policy: config.Policy, authenticator: config.Authenticator, importer: config.Importer, snapshot: config.Snapshot, scratchDir: config.ScratchDir, capabilities: config.Capabilities, bodyReadBudget: apiBodyReadBudget}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+PathPublish, s.publish)
 	if s.importer != nil {
@@ -110,6 +114,10 @@ func NewServer(config ServerConfig) (*Server, error) {
 	mux.HandleFunc("POST "+PathCreatePR, s.createPR)
 	mux.HandleFunc("PATCH "+PathUpdatePR, s.updatePR)
 	s.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Bound the body read for every route before its handler runs, so a
+		// client that sends its headers and then stalls its body cannot hold
+		// the request past the listener's write deadline.
+		s.boundBodyRead(w)
 		// ServeMux normalizes dot segments and repeated slashes with redirects. Reject
 		// those spellings instead of allowing a non-canonical request to be replayed.
 		decoded, err := url.PathUnescape(r.URL.EscapedPath())
@@ -136,6 +144,16 @@ const (
 	InboundReadTimeout       = 60 * time.Second
 	InboundWriteTimeout      = 30 * time.Second
 	InboundIdleTimeout       = 120 * time.Second
+	// apiResponseReserve is the share of the write deadline kept for
+	// writing the answer once the request body read is done.
+	apiResponseReserve = 5 * time.Second
+	// apiBodyReadBudget bounds one handler's request body read. The write
+	// deadline starts when the request headers arrive and the read bound is
+	// longer than it, so a body read admitted up to the read bound could
+	// push the answer past an expired write deadline. The budget ends
+	// inside the write deadline with the response reserve between, and
+	// still sits far above what a healthy 65 MiB upload costs in-cluster.
+	apiBodyReadBudget = InboundWriteTimeout - apiResponseReserve
 )
 
 func (s *Server) ServeTLS(addr string, certFile, keyFile string) error {
@@ -155,6 +173,37 @@ func (s *Server) newHTTPServer(addr string) *http.Server {
 		WriteTimeout:      InboundWriteTimeout,
 		IdleTimeout:       InboundIdleTimeout,
 	}
+}
+
+// boundBodyRead keeps the request body read inside the listener's write
+// deadline. The listener's own read bound is longer than its write bound, so
+// a client that sends its headers and then stalls its body would hold the
+// request past the write deadline, and the answer would be written into an
+// expired deadline. The body read instead takes the handler's budget, which
+// ends inside the write deadline. A writer that does not support deadlines —
+// an in-process test recorder — keeps the listener's own read bound.
+func (s *Server) boundBodyRead(w http.ResponseWriter) {
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(s.bodyReadBudget))
+}
+
+// requestDeadlineExceeded reports whether a body read ended because the
+// request's read deadline expired. Both inbound stacks surface the bound as
+// os.ErrDeadlineExceeded: HTTP/1 through the connection deadline and HTTP/2
+// through the per-stream read timer.
+func requestDeadlineExceeded(err error) bool {
+	return errors.Is(err, os.ErrDeadlineExceeded)
+}
+
+// denyBodyRead answers a request whose body read failed. A read cut short by
+// the request deadline is an incomplete request, not a malformed one: the
+// answer stays retryable so the caller's retry machinery reruns it instead of
+// treating a stalled transport as a definite denial.
+func denyBodyRead(w http.ResponseWriter, err error) {
+	if requestDeadlineExceeded(err) {
+		http.Error(w, "request timed out", http.StatusRequestTimeout)
+		return
+	}
+	http.Error(w, "invalid request", http.StatusBadRequest)
 }
 
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (Identity, bool) {
@@ -209,7 +258,11 @@ func (s *Server) importBundle(w http.ResponseWriter, r *http.Request) {
 		ProposedOID: r.Header.Get("X-Courier-Proposed-OID"),
 	}
 	bundle, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBundleRequestBytes))
-	if err != nil || len(bundle) == 0 {
+	if err != nil {
+		denyBodyRead(w, err)
+		return
+	}
+	if len(bundle) == 0 {
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
 	}
@@ -378,7 +431,7 @@ func (s *Server) updatePR(w http.ResponseWriter, r *http.Request) {
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 	if err := decodeJSONBody(r, target); err != nil {
-		http.Error(w, "invalid request", http.StatusBadRequest)
+		denyBodyRead(w, err)
 		return false
 	}
 	return true
@@ -398,6 +451,9 @@ func decodeJSONBody(r *http.Request, target any) error {
 	}
 	var extra any
 	if err := dec.Decode(&extra); err != io.EOF {
+		if err != nil {
+			return err
+		}
 		return errors.New("invalid request")
 	}
 	return nil

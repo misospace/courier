@@ -1,6 +1,8 @@
 package broker
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -11,6 +13,8 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -527,5 +531,338 @@ func TestServeTLSBoundsStalledClient(t *testing.T) {
 	}
 	if elapsed > bound+5*time.Second {
 		t.Fatalf("connection closed after %v, far beyond the %v header-read bound", elapsed, bound)
+	}
+}
+
+// TestAPIBodyReadBudgetFitsInsideWriteDeadline pins the arithmetic that keeps
+// a bounded body read answerable: the budget plus the response reserve is the
+// write bound exactly, so a read that ends inside its budget leaves the whole
+// reserve to write the answer, and the read bound stays longer than the write
+// bound — the shape that makes the handler-level bound necessary.
+func TestAPIBodyReadBudgetFitsInsideWriteDeadline(t *testing.T) {
+	if apiBodyReadBudget <= 0 || apiResponseReserve <= 0 {
+		t.Fatalf("budget %v and reserve %v must both be finite", apiBodyReadBudget, apiResponseReserve)
+	}
+	if apiBodyReadBudget+apiResponseReserve != InboundWriteTimeout {
+		t.Fatalf("body-read budget %v + response reserve %v != write bound %v; an answer written after the budget could outrun the write deadline", apiBodyReadBudget, apiResponseReserve, InboundWriteTimeout)
+	}
+	if InboundReadTimeout <= InboundWriteTimeout {
+		t.Fatal("the read bound no longer exceeds the write bound; recheck why body reads need their own handler-level bound")
+	}
+	s, _ := serverForTest(t)
+	if s.bodyReadBudget != apiBodyReadBudget {
+		t.Fatalf("server body-read budget = %v, want the production %v", s.bodyReadBudget, apiBodyReadBudget)
+	}
+}
+
+// TestAPIStalledBodyCannotOutliveWriteDeadline: a client that sends its
+// headers and then stalls its body must not hold the model-facing API past
+// its write deadline. Without a handler-level bound the body read waits for
+// the longer read bound, the answer is written into an expired write
+// deadline, and the caller sees a closed connection instead of the retryable
+// answer. The body read instead takes the compressed budget, and the whole
+// 408 arrives while the write deadline is still ahead.
+func TestAPIStalledBodyCannotOutliveWriteDeadline(t *testing.T) {
+	s, _ := serverForTest(t)
+	cert, key := testTLSFiles(t)
+	// Compress the bounds so the regression does not wait a production window.
+	s.bodyReadBudget = 200 * time.Millisecond
+	srv := s.newHTTPServer("127.0.0.1:0")
+	srv.WriteTimeout = s.bodyReadBudget + 100*time.Millisecond
+	// The production bug shape: the read bound outlives the write bound, so
+	// only the handler-level bound can keep the answer inside the deadline.
+	if srv.ReadTimeout <= srv.WriteTimeout {
+		t.Fatalf("test needs a read bound longer than the write bound, got %v <= %v", srv.ReadTimeout, srv.WriteTimeout)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.ServeTLS(ln, cert, key) }()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("ServeTLS() = %v", err)
+		}
+	})
+	certPEM, err := os.ReadFile(cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(certPEM) {
+		t.Fatal("test certificate is not PEM")
+	}
+
+	conn, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{RootCAs: pool, ServerName: "broker.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	// The headers arrive; the body never does.
+	if _, err := conn.Write([]byte("POST " + PathImportBundle + " HTTP/1.1\r\nHost: broker.test\r\nAuthorization: Bearer valid-token\r\nX-Courier-Proposed-OID: " + strings.Repeat("b", 40) + "\r\nContent-Length: 64\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	// The generous read deadline is the failure margin: against the bug the
+	// answer is truncated and the connection hangs until this deadline, so
+	// the test must not wait forever on the defect it pins.
+	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodPost, "https://broker.test"+PathImportBundle, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(conn), request)
+	if err != nil {
+		t.Fatalf("stalled body did not receive a whole answer: %v", err)
+	}
+	defer response.Body.Close()
+	payload, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if response.StatusCode != http.StatusRequestTimeout {
+		t.Fatalf("status = %d, want 408; a body that could not be read in time is an incomplete request, not a denial", response.StatusCode)
+	}
+	if string(payload) != "request timed out\n" {
+		t.Fatalf("body = %q, want the whole retryable answer", payload)
+	}
+}
+
+// stalledBodyReader sends a prefix of the declared body and then blocks until
+// the test ends, standing in for a client that stalls its body mid-upload.
+type stalledBodyReader struct {
+	prefix string
+	done   <-chan struct{}
+}
+
+func (r *stalledBodyReader) Read(p []byte) (int, error) {
+	if r.prefix != "" {
+		n := copy(p, r.prefix)
+		r.prefix = r.prefix[n:]
+		return n, nil
+	}
+	<-r.done
+	return 0, errors.New("test ended")
+}
+
+// TestAPIStalledBodyCannotOutliveWriteDeadlineHTTP2: the same stalled-body
+// guarantee over HTTP/2, where the bound is a per-stream read timer rather
+// than the connection deadline. Today's harness transport speaks HTTP/1.1,
+// but the listener negotiates HTTP/2, so the guarantee must hold on both
+// inbound stacks.
+func TestAPIStalledBodyCannotOutliveWriteDeadlineHTTP2(t *testing.T) {
+	s, _ := serverForTest(t)
+	cert, key := testTLSFiles(t)
+	s.bodyReadBudget = 200 * time.Millisecond
+	srv := s.newHTTPServer("127.0.0.1:0")
+	srv.WriteTimeout = s.bodyReadBudget + 100*time.Millisecond
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.ServeTLS(ln, cert, key) }()
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		close(done)
+		_ = srv.Close()
+		if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("ServeTLS() = %v", err)
+		}
+	})
+	certPEM, err := os.ReadFile(cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(certPEM) {
+		t.Fatal("test certificate is not PEM")
+	}
+	transport := &http.Transport{ForceAttemptHTTP2: true, TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: "broker.test"}}
+	client := &http.Client{Transport: transport}
+	t.Cleanup(client.CloseIdleConnections)
+	// The request context is what releases the client's own stalled body
+	// writer once the answer has been read; the server's answer itself must
+	// arrive long before it, which the elapsed check below pins.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+ln.Addr().String()+PathImportBundle, &stalledBodyReader{prefix: "pack", done: done})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.ContentLength = 64
+	req.Header.Set("Authorization", "Bearer valid-token")
+	req.Header.Set("X-Courier-Proposed-OID", strings.Repeat("b", 40))
+	started := time.Now()
+	response, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("stalled body over HTTP/2 did not receive a whole answer: %v", err)
+	}
+	defer response.Body.Close()
+	if response.Proto != "HTTP/2.0" {
+		t.Fatalf("protocol = %s, want HTTP/2.0 for the second inbound stack", response.Proto)
+	}
+	payload, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= srv.WriteTimeout {
+		t.Fatalf("answer took %v, want it inside the %v write deadline it must not outrun", elapsed, srv.WriteTimeout)
+	}
+	if response.StatusCode != http.StatusRequestTimeout || string(payload) != "request timed out\n" {
+		t.Fatalf("status = %d body = %q, want the whole retryable 408 answer", response.StatusCode, payload)
+	}
+	// The answer is fully read. Release the client's own stalled body
+	// writer before the deferred Close waits for stream cleanup.
+	cancel()
+}
+
+// TestDecodeJSONDeadlineIsRetryableNotDenial pins the classification at the
+// shared body-read choke point: a read cut short by the request deadline
+// answers the retryable 408 the harness retry machinery reruns, while a body
+// that failed on its merits keeps the definite 400 denial.
+func TestDecodeJSONDeadlineIsRetryableNotDenial(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"read deadline", os.ErrDeadlineExceeded, http.StatusRequestTimeout},
+		{"wrapped read deadline", fmt.Errorf("read bundle body: %w", os.ErrDeadlineExceeded), http.StatusRequestTimeout},
+		{"connection reset", errors.New("connection reset by peer"), http.StatusBadRequest},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, PathPublish, errorReader{test.err})
+			req.ContentLength = 64
+			w := httptest.NewRecorder()
+			var target struct{}
+			if decodeJSON(w, req, &target) {
+				t.Fatal("decode succeeded on a failing body")
+			}
+			if w.Code != test.want {
+				t.Fatalf("status = %d, want %d: %s", w.Code, test.want, w.Body.String())
+			}
+		})
+	}
+}
+
+// TestDecodeJSONTrailingReadClassification pins the second Decode: a second
+// JSON value after the first is the malformed body's definite 400, while a
+// read that dies at the request deadline after an otherwise complete object
+// stays the retryable 408.
+func TestDecodeJSONTrailingReadClassification(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body io.Reader
+		want int
+	}{
+		{"trailing value", strings.NewReader(`{"expectedWorkOID":""} {"extra":true}`), http.StatusBadRequest},
+		{"deadline after complete object", io.MultiReader(strings.NewReader(`{"expectedWorkOID":""}`), errorReader{os.ErrDeadlineExceeded}), http.StatusRequestTimeout},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, PathPublish, test.body)
+			req.ContentLength = -1
+			w := httptest.NewRecorder()
+			var target struct {
+				ExpectedWorkOID string `json:"expectedWorkOID"`
+			}
+			if decodeJSON(w, req, &target) {
+				t.Fatal("decode accepted the body")
+			}
+			if w.Code != test.want {
+				t.Fatalf("status = %d, want %d: %s", w.Code, test.want, w.Body.String())
+			}
+		})
+	}
+}
+
+// TestServerRejectsOversizedChunkedBundle: the 65 MiB transport bound stays a
+// definite 400 when the size only reveals itself mid-read — a chunked body
+// whose overflow error must not be mistaken for a request deadline.
+func TestServerRejectsOversizedChunkedBundle(t *testing.T) {
+	s, _ := serverForTest(t)
+	importer := s.importer.(*serverImporter)
+	req := httptest.NewRequest(http.MethodPost, PathImportBundle, io.MultiReader(
+		bytes.NewReader(make([]byte, maxBundleRequestBytes)),
+		strings.NewReader("one byte past the bundle bound"),
+	))
+	req.ContentLength = -1 // chunked: the limit is only provable mid-read
+	req.Header.Set("Authorization", "Bearer valid-token")
+	req.Header.Set("X-Courier-Proposed-OID", strings.Repeat("b", 40))
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest || importer.calls != 0 {
+		t.Fatalf("status = %d importer calls = %d, want the definite 400 with no import", w.Code, importer.calls)
+	}
+}
+
+// errorReader is a request body that always fails, standing in for a
+// connection whose read deadline has just fired.
+type errorReader struct{ err error }
+
+func (r errorReader) Read([]byte) (int, error) { return 0, r.err }
+
+// TestAPIHealthyBundleUploadCompletesInsideWriteDeadline: bounding the body
+// read must not cut off a healthy upload. The production budget sits far
+// above what a healthy bundle upload costs in-cluster; this full round trip
+// over the production-bounded listener proves an import at the full 65 MiB
+// bundle bound still reaches the importer and answers in full.
+func TestAPIHealthyBundleUploadCompletesInsideWriteDeadline(t *testing.T) {
+	s, _ := serverForTest(t)
+	importer := s.importer.(*serverImporter)
+	cert, key := testTLSFiles(t)
+	srv := s.newHTTPServer("127.0.0.1:0")
+	if srv.ReadTimeout <= srv.WriteTimeout {
+		t.Fatalf("listener read bound %v must exceed the write bound %v, as in production", srv.ReadTimeout, srv.WriteTimeout)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.ServeTLS(ln, cert, key) }()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("ServeTLS() = %v", err)
+		}
+	})
+	certPEM, err := os.ReadFile(cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(certPEM) {
+		t.Fatal("test certificate is not PEM")
+	}
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: "broker.test"}}}
+	// The full bundle bound itself, streamed: a healthy import at exactly
+	// maxBundleRequestBytes must pass the transport bound and import whole.
+	chunk := make([]byte, 1<<20)
+	var readers []io.Reader
+	for range maxBundleRequestBytes / (1 << 20) {
+		readers = append(readers, bytes.NewReader(chunk))
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://"+ln.Addr().String()+PathImportBundle, io.MultiReader(readers...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.ContentLength = maxBundleRequestBytes
+	req.Header.Set("Authorization", "Bearer valid-token")
+	req.Header.Set("X-Courier-Proposed-OID", strings.Repeat("b", 40))
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("healthy bundle upload: %v", err)
+	}
+	defer resp.Body.Close()
+	payload, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read answer: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK || string(payload) != "{\"imported\":true}\n" || importer.calls != 1 {
+		t.Fatalf("status = %d body = %q importer calls = %d, want the whole import answer", resp.StatusCode, payload, importer.calls)
 	}
 }
