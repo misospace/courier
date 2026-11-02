@@ -162,7 +162,10 @@ selected topology, not a configurable shared-broker fallback.
   to control's pod. The broker uses that token to perform a TokenReview on
   *every* control request, specifying `courier-broker` as audience and
   rejecting review errors, unauthenticated results, or missing pod-bound
-  username/UID extras. It verifies the authenticated control SA name and UID,
+  username/UID extras. A review or live read that failed without a definite
+  answer is availability, not refusal: both broker listeners answer `503` so
+  the caller retries, while a definite refusal answers `401` and the caller
+  treats it as a denial. It verifies the authenticated control SA name and UID,
   bound pod name and UID, then reads that live, non-terminating pod and the
   `CoderRun` through an uncached API client on every request: pod SA, owner run
   UID and current control
