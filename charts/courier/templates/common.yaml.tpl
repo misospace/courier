@@ -466,6 +466,20 @@
 {{- if not $hasEvidenceBind }}{{- $args = append $args (printf "--evidence-intake-bind=:%d" (int $evidence.port)) }}{{- end }}
 {{- if not $hasEvidenceService }}{{- $args = append $args (printf "--evidence-intake-service=http://%s-evidence.%s.svc" .Release.Name .Release.Namespace) }}{{- end }}
 {{- end }}
+{{- $contributeAPI := .Values.contributeAPI }}
+{{- if $contributeAPI.enabled }}
+{{- if not $contributeAPI.keySecret }}
+{{- fail "contributeAPI.enabled requires contributeAPI.keySecret" }}
+{{- end }}
+{{- $hasAdmissionKeySecret := false }}
+{{- $hasAdmissionBind := false }}
+{{- range $arg := $args }}
+{{- if hasPrefix "--contribute-admission-key-secret=" $arg }}{{- $hasAdmissionKeySecret = true }}{{- end }}
+{{- if hasPrefix "--contribute-admission-bind=" $arg }}{{- $hasAdmissionBind = true }}{{- end }}
+{{- end }}
+{{- if not $hasAdmissionKeySecret }}{{- $args = append $args (printf "--contribute-admission-key-secret=%s" $contributeAPI.keySecret) }}{{- end }}
+{{- if not $hasAdmissionBind }}{{- $args = append $args (printf "--contribute-admission-bind=:%d" (int $contributeAPI.port)) }}{{- end }}
+{{- end }}
 {{- $retention := .Values.retention }}
 {{- if $retention }}
 {{- $hasDoneRetention := false }}

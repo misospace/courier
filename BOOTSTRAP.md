@@ -261,6 +261,47 @@ adopted automatically: a #97 retry is a fresh attempt, never a restoration of
 the old checkout, and deleting a `NeedsHuman` run deletes its evidence with it
 — retrieve before deleting.
 
+## Contribution admission API (#708)
+
+The operator can serve one authenticated HTTP endpoint that admits ad-hoc
+contributions: `POST /v1/contributions`. Non-kubectl frontends such as
+Dispatch submit work through it. The endpoint is a thin frontend over the
+same admission path `courierctl contribute` uses, so both frontends give one
+submission the same durable run identity. The contract is in
+docs/external-contributions.md § "Admission surface" and
+DESIGN.md § "Contribution admission API".
+
+The mechanism is off by default and invisible when off. With no
+`--contribute-admission-*` flags, and with the chart's default
+`contributeAPI.enabled: false`, the operator binds no admission listener and
+run behavior is otherwise unchanged.
+
+Enable it with two settings on the operator:
+
+- `--contribute-admission-bind` (for example `:8083`): binds the operator's
+  own admission listener in-process. The listener runs on every replica. The
+  chart renders the `<release>-contribute-api` ClusterIP Service (named
+  after the Helm release) that routes port 80 to the listener port; restrict
+  its ingress to the frontends you trust with a NetworkPolicy or an ingress
+  allowlist.
+- `--contribute-admission-key-secret`: name of a Secret in the operator
+  namespace whose `token` entry holds a random bearer token (for example
+  `openssl rand -hex 32`). Every request must present this token as
+  `Authorization: Bearer <token>`. The operator loads the token once at
+  startup, so a rotation takes effect when the operator restarts. The
+  operator fails closed at startup when this is configured and the Secret or
+  its `token` entry is missing.
+
+The endpoint performs no authority decisions. The approved base repository,
+the pinned base ref, the approved fork, and the lane are validated
+server-side in the controller admission path, exactly as for the CLI. The
+goal and the optional upstream issue are untrusted context. A request that
+names a namespace outside the deployment's ownership boundary is refused
+before the operator touches the cluster. A repeated request with the same
+idempotency key resumes the existing run: it never creates a second CoderRun,
+branch, or pull request. Responses carry run identity only, never the goal,
+the issue text, the token, or any credential.
+
 To enable native Dispatch discovery, configure the chart's `dispatch` values and
 create the referenced Secret with the `DISPATCH_AGENT_TOKEN` value under the
 configured key. The queue lane selects Dispatch work; `laneProfile` selects the

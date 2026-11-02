@@ -2964,6 +2964,43 @@ admission resolves the identical execution input through the owning adapter
 and pins that ref into the persisted policy (`PolicyFromRun`), which no model
 output can move (#653).
 
+### Contribution admission API
+
+Non-kubectl frontends admit contributions through one authenticated HTTP
+endpoint (#708): `POST /v1/contributions`, served by the operator's own
+in-process listener (`internal/source/adhoc/server.go`), wired like the
+evidence intake — every replica, no leader election, chart-rendered
+ClusterIP Service under the `contributeAPI:` values. The endpoint is a thin
+frontend over the same `adhoc.Adapter.Admit` path `courierctl contribute`
+uses. It adds transport discipline only: it owns authentication, body
+bounds, and error mapping, never a second contribution state machine.
+
+Authentication is a deployment-configured static bearer token, loaded once
+at startup from a Secret (`--contribute-admission-key-secret`, `token`
+entry); the listener is off unless `--contribute-admission-bind` names one,
+and the pair fails closed at startup. Comparison is constant-time, and
+missing, malformed, and wrong tokens share one rejection message, so an
+unauthenticated caller learns nothing about which part failed.
+
+The body is one strict JSON object over the same policy-approved fields the
+CLI takes — base repository and ref, goal, approved fork, lane, optional
+upstream issue and idempotency key, `fresh` for an intentional new key,
+`debug` — with unknown fields rejected and a 64 KiB body cap under a 30
+second admission deadline. The request never grants authority: the
+namespace defaults to the operator namespace and is checked against the
+deployment-ownership boundary before any cluster contact, and lane, base,
+fork, and ref are validated server-side by the adapter and the controller
+admission path exactly as for the CLI.
+
+The response carries run identity only — run name, namespace, work-item id,
+`resumed` — with 201 for a created run and 200 for a resume. A repeated
+idempotency key resumes the existing run and never creates a second
+CoderRun, branch, or PR. Invalid input is a 400 before any cluster effect,
+a foreign-name collision is 409, a stalled API server is 503. The goal, the
+issue text, the token, and any credential never appear in a response or a
+log line. Dispatch consumes this API (misospace/dispatch#1349) instead of
+writing CoderRuns directly, and Courier stays fully usable without it.
+
 ## Terminal retention and closed-unmerged PRs
 
 **The leak:** `reapDone` (`internal/controller/reap.go`) deletes only resolved `Done` runs after a default five minutes. `HandedOff`, `NeedsHuman`, and `Failed` are never reaped: `Reconcile` (`internal/controller/coderun_controller.go`) revisits a terminal phase only to retry a pending lifecycle report and otherwise returns without a timer. `AwaitingReview` was part of the same gap — the controller never re-observed a PR after a run settled — until #250 added the slow, bounded read of the recorded pull request that turns a confirmed merge into `Done`; a PR closed without merge still keeps its run indefinitely, which this design fixes below. The #179 dogfood deployment left 26 `AwaitingReview`, 6 `NeedsHuman`, 1 `Failed`, and 17 retained coordinator pods. `source.Runner.Poll` (`internal/source/runner.go`) lists every CoderRun on every poll to build its dedupe set, so the list grows without bound.
