@@ -155,7 +155,6 @@ func TestServerRejectsWrongRunIdentity(t *testing.T) {
 	}
 }
 
-
 // TestServerIdentityFailureSplit pins the availability split in the
 // model-facing API: an identity backend that failed to answer is transient
 // (503), so the caller retries, while a definite refusal stays 401.

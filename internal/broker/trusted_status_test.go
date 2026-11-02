@@ -326,7 +326,6 @@ func TestTrustedStatusDefiniteMismatchIsNonRetryable(t *testing.T) {
 	}
 }
 
-
 // TestTrustedStatusIdentityFailureSplit pins the availability split at the
 // authentication boundary: an identity backend that failed to answer is
 // transient (503), so the harness retries the status write, while a definite
