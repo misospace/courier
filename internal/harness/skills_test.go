@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"sort"
@@ -378,4 +379,76 @@ func TestSkillToolServesScriptContentAsData(t *testing.T) {
 	if _, err := os.Stat(marker); err == nil {
 		t.Fatal("the skill's script was executed by the control side")
 	}
+}
+
+// TestSkillIndexSurvivesContextCompaction pins the composition of skill
+// loading with the native context budget (#659 with #636): a run that
+// carries a pinned skill index still compacts at its boundary, and the
+// index survives the compaction, so a compacted run still knows which
+// skills it carries. The skill tool stays offered on every request.
+func TestSkillIndexSurvivesContextCompaction(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.completeAll = true
+	worker.snapshotTip = "snap-tip"
+	turn := strings.Repeat("reasoning about the workspace. ", 25)
+	script := make([]gatewayResponse, 0, 6)
+	for i := 0; i < 5; i++ {
+		script = append(script, gatewayResponse{body: sse(
+			contentChunk(turn),
+			toolCallChunk(0, "call-shell", toolShell, `{"command":"echo hi"}`),
+			finishChunk("tool_calls"),
+		)})
+	}
+	script = append(script, gatewayResponse{body: sse(
+		contentChunk(`{"outcome":"no_change_needed","evidence":"already done"}`), finishChunk("stop"))})
+	gateway, mock, cleanup := gatewayFor(script...)
+	defer cleanup()
+	sink := &recordingSink{}
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Gateway:  gateway,
+		Bindings: testBindings(),
+		Worker:   delegator,
+		Snapshot: snapshotProvider("snap-tip"),
+		ContextBudgets: map[string]ContextBudgetInput{
+			RoleCoordinator: {Role: RoleCoordinator, DeclaredMaxInputTokens: 2200, ProbedMaxInputTokens: 2200},
+		},
+		Compactions: sink,
+		Skills:      testSkillSet(t),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := coordinator.Run(context.Background(), testInvocation())
+	if result.Err != nil {
+		t.Fatalf("harness result = %+v", result)
+	}
+	if len(sink.events) == 0 {
+		t.Fatal("a run carrying a pinned skill index did not compact at its boundary")
+	}
+	for _, event := range sink.events {
+		if event.Role != RoleCoordinator {
+			t.Fatalf("event role = %q, want %q", event.Role, RoleCoordinator)
+		}
+	}
+	if len(mock.calls) == 0 {
+		t.Fatal("the harness sent no model request")
+	}
+	last := mock.calls[len(mock.calls)-1]
+	if !strings.Contains(last.rawBody, "- alpha (bundle): does alpha things") {
+		t.Fatalf("the skill index did not survive the compaction: %s", last.rawBody)
+	}
+	if !containsName(last.toolNames, toolSkill) {
+		t.Fatalf("the skill tool is not offered after the compaction: %v", last.toolNames)
+	}
+}
+
+// containsName reports whether a recorded request offered the named tool.
+func containsName(names []string, name string) bool {
+	for _, candidate := range names {
+		if candidate == name {
+			return true
+		}
+	}
+	return false
 }

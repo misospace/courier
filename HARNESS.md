@@ -1539,7 +1539,9 @@ pinned bundles is #659's harness behavior:
   data and executes nothing. Control never executes skill content: a
   skill's scripts run only as ordinary untrusted worker shell through the
   existing boundaries. A skillless run pins no section and offers no tool —
-  absence is meaningful.
+  absence is meaningful. The index is protected state: it counts against
+  the lane's declared context budget, and it survives every compaction, so a
+  compacted run still knows which skills it carries.
 - **Worker boundary.** The worker receives no new credential, identity, or
   writable path into the skill source. The operator materializes each pinned
   bundle into a per-run ConfigMap and mounts it read-only into the worker
