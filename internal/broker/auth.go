@@ -7,6 +7,7 @@ import (
 
 	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -28,6 +29,14 @@ type Identity struct {
 	ServiceAccount    string
 	ServiceAccountUID string
 }
+
+// IdentityUnavailableError reports a transient failure of the identity
+// backend: the TokenReview call or a live read failed without a definite
+// answer. Callers treat it as availability, never as a refusal.
+type IdentityUnavailableError struct{ Err error }
+
+func (e *IdentityUnavailableError) Error() string { return e.Err.Error() }
+func (e *IdentityUnavailableError) Unwrap() error { return e.Err }
 
 // Authenticator verifies pod-bound control tokens against live Kubernetes state.
 // The supplied controller-runtime Reader must read live API state, not a manager
@@ -80,9 +89,15 @@ func (a *Authenticator) Authenticate(ctx context.Context, token string) (Identit
 	}
 	tr, err := a.tokens.AuthenticationV1().TokenReviews().Create(ctx, &authenticationv1.TokenReview{Spec: authenticationv1.TokenReviewSpec{Token: token, Audiences: []string{BrokerAudience}}}, metav1.CreateOptions{})
 	if err != nil {
-		return Identity{}, fmt.Errorf("review control token: %w", err)
+		return Identity{}, &IdentityUnavailableError{Err: fmt.Errorf("review control token: %w", err)}
 	}
 	status := tr.Status
+	if status.Error != "" {
+		// The API server could not check the token at all: the answer is not
+		// definite, so the backend failed rather than refused. The server's
+		// own text is not echoed into the error.
+		return Identity{}, &IdentityUnavailableError{Err: fmt.Errorf("review control token: the token could not be checked")}
+	}
 	if !status.Authenticated || !contains(status.Audiences, BrokerAudience) {
 		return Identity{}, fmt.Errorf("token is unauthenticated or lacks broker audience")
 	}
@@ -98,7 +113,7 @@ func (a *Authenticator) Authenticate(ctx context.Context, token string) (Identit
 	}
 	pod := &corev1.Pod{}
 	if err := a.reader.Get(ctx, types.NamespacedName{Namespace: a.namespace, Name: podName}, pod); err != nil {
-		return Identity{}, fmt.Errorf("read authenticated control pod: %w", err)
+		return Identity{}, liveReadFailure(err, "read authenticated control pod")
 	}
 	if pod.DeletionTimestamp != nil || string(pod.UID) != podUID || pod.Spec.ServiceAccountName != a.controlSAName || pod.Labels[topology.LabelRun] != topology.RunLabelValue(a.runName) || pod.Labels["courier.misospace.dev/component"] != "coordinator" {
 		return Identity{}, fmt.Errorf("authenticated control pod is stale, terminating, or uses another service account")
@@ -109,7 +124,7 @@ func (a *Authenticator) Authenticate(ctx context.Context, token string) (Identit
 	}
 	run := &courier.CoderRun{}
 	if err := a.reader.Get(ctx, types.NamespacedName{Namespace: a.namespace, Name: a.runName}, run); err != nil {
-		return Identity{}, fmt.Errorf("read current CoderRun: %w", err)
+		return Identity{}, liveReadFailure(err, "read current CoderRun")
 	}
 	if run.UID != a.runUID || run.DeletionTimestamp != nil {
 		return Identity{}, fmt.Errorf("broker CoderRun incarnation is no longer live")
@@ -119,7 +134,9 @@ func (a *Authenticator) Authenticate(ctx context.Context, token string) (Identit
 	// an unlabeled duplicate must still make authorization ambiguous.
 	pods := &corev1.PodList{}
 	if err := a.reader.List(ctx, pods, ctrlclient.InNamespace(a.namespace)); err != nil {
-		return Identity{}, fmt.Errorf("list current run pods: %w", err)
+		// A list has no "not found" outcome: every failure is the backend
+		// failing to answer.
+		return Identity{}, &IdentityUnavailableError{Err: fmt.Errorf("list current run pods: %w", err)}
 	}
 	liveControls := 0
 	for i := range pods.Items {
@@ -138,13 +155,23 @@ func (a *Authenticator) Authenticate(ctx context.Context, token string) (Identit
 	// Re-read our own pod too: a replacement must not inherit this broker's authority.
 	broker := &corev1.Pod{}
 	if err := a.reader.Get(ctx, types.NamespacedName{Namespace: a.namespace, Name: a.brokerPodName}, broker); err != nil {
-		return Identity{}, fmt.Errorf("read current broker pod: %w", err)
+		return Identity{}, liveReadFailure(err, "read current broker pod")
 	}
 	brokerRunName, brokerRunUID, brokerOwned := controllerRunOwner(broker)
 	if broker.UID != a.brokerPodUID || broker.DeletionTimestamp != nil || !brokerOwned || brokerRunName != a.runName || brokerRunUID != a.runUID {
 		return Identity{}, fmt.Errorf("broker pod incarnation or owner is no longer live")
 	}
 	return Identity{RunUID: a.runUID, RunName: a.runName, Namespace: a.namespace, ControlPod: podName, ControlPodUID: pod.UID, ServiceAccount: a.controlSAName, ServiceAccountUID: user.UID}, nil
+}
+
+// liveReadFailure classifies one live read against the API server. A definite
+// "not found" is a refusal — the object the credential named is gone — while
+// any other failure is the backend failing to answer, which is availability.
+func liveReadFailure(err error, message string) error {
+	if apierrors.IsNotFound(err) {
+		return fmt.Errorf("%s: %w", message, err)
+	}
+	return &IdentityUnavailableError{Err: fmt.Errorf("%s: %w", message, err)}
 }
 
 func controllerRunOwner(pod *corev1.Pod) (string, types.UID, bool) {

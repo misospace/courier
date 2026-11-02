@@ -88,6 +88,14 @@ func (h *trustedStatusHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 			http.Error(w, "status update unavailable", http.StatusServiceUnavailable)
 			return
 		}
+		// A backend that failed to answer is availability, not denial: 503
+		// lets the caller's own retry machinery retry, while a definite
+		// refusal stays a 401 the caller treats as a denial.
+		var unavailable *IdentityUnavailableError
+		if errors.As(err, &unavailable) {
+			http.Error(w, "identity backend unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}

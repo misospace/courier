@@ -164,7 +164,18 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (Identity,
 		return Identity{}, false
 	}
 	identity, err := s.authenticator.Authenticate(r.Context(), strings.TrimPrefix(value, "Bearer "))
-	if err != nil || identity.RunUID == "" || string(identity.RunUID) != s.policy.policy.RunUID {
+	if err != nil {
+		// A backend that failed to answer is availability, not denial: 503
+		// lets the caller retry, while a definite refusal stays a 401.
+		var unavailable *IdentityUnavailableError
+		if errors.As(err, &unavailable) {
+			http.Error(w, "identity backend unavailable", http.StatusServiceUnavailable)
+			return Identity{}, false
+		}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return Identity{}, false
+	}
+	if identity.RunUID == "" || string(identity.RunUID) != s.policy.policy.RunUID {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return Identity{}, false
 	}

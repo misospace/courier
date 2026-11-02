@@ -28,6 +28,7 @@ type testAuthenticator struct {
 	calls  int
 	fail   bool
 	runUID string
+	err    error
 }
 type serverObserver struct{}
 
@@ -81,6 +82,9 @@ func (serverPusher) IsAncestor(context.Context, string, string, string) (bool, e
 func (serverPusher) Push(context.Context, string, string, string) error { return nil }
 func (a *testAuthenticator) Authenticate(_ context.Context, token string) (Identity, error) {
 	a.calls++
+	if a.err != nil {
+		return Identity{}, a.err
+	}
 	if a.fail || token != "valid-token" {
 		return Identity{}, context.Canceled
 	}
@@ -148,6 +152,37 @@ func TestServerRejectsWrongRunIdentity(t *testing.T) {
 	s.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want unauthorized", w.Code)
+	}
+}
+
+
+// TestServerIdentityFailureSplit pins the availability split in the
+// model-facing API: an identity backend that failed to answer is transient
+// (503), so the caller retries, while a definite refusal stays 401.
+func TestServerIdentityFailureSplit(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{name: "transient backend failure", err: &IdentityUnavailableError{Err: errors.New("review control token: api server unavailable")}, want: http.StatusServiceUnavailable},
+		{name: "definite refusal", err: errors.New("token is unauthenticated or lacks broker audience"), want: http.StatusUnauthorized},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, auth := serverForTest(t)
+			auth.err = tt.err
+			req := httptest.NewRequest(http.MethodPost, PathPublish, strings.NewReader(`{"proposedOID":"new"}`))
+			req.Header.Set("Authorization", "Bearer valid-token")
+			w := httptest.NewRecorder()
+			s.Handler().ServeHTTP(w, req)
+			if w.Code != tt.want {
+				t.Fatalf("status = %d, want %d; body = %q", w.Code, tt.want, w.Body.String())
+			}
+			if auth.calls != 1 {
+				t.Fatalf("authentication calls = %d, want one live auth", auth.calls)
+			}
+		})
 	}
 }
 

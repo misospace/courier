@@ -326,6 +326,39 @@ func TestTrustedStatusDefiniteMismatchIsNonRetryable(t *testing.T) {
 	}
 }
 
+
+// TestTrustedStatusIdentityFailureSplit pins the availability split at the
+// authentication boundary: an identity backend that failed to answer is
+// transient (503), so the harness retries the status write, while a definite
+// refusal stays 401 and is never retried.
+func TestTrustedStatusIdentityFailureSplit(t *testing.T) {
+	validate := func(context.Context, *courier.CoderRun, *corev1.Pod, HarnessPatch) error { return nil }
+	tests := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{name: "transient backend failure", err: &IdentityUnavailableError{Err: errors.New("review control token: api server unavailable")}, want: http.StatusServiceUnavailable},
+		{name: "definite refusal", err: errors.New("token is unauthenticated or lacks broker audience"), want: http.StatusUnauthorized},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler, auth, _, _ := trustedHandlerFixture(t, validate)
+			auth.err = tt.err
+			request := httptest.NewRequest(http.MethodPost, PathTrustedStatus, strings.NewReader(`{"checkpoint":{"plan":"x"}}`))
+			request.Header.Set("Authorization", "Bearer trusted-token")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != tt.want {
+				t.Fatalf("response = %d, want %d; body = %q", response.Code, tt.want, response.Body.String())
+			}
+			if auth.calls != 1 {
+				t.Fatalf("authentication calls = %d, want one live auth", auth.calls)
+			}
+		})
+	}
+}
+
 func stringPtr(v string) *string { return &v }
 
 // stalledValidator stands in for the live forge read a lastCommit

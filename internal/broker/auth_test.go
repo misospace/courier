@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -275,6 +276,162 @@ func (r terminatingPodReader) Get(ctx context.Context, key ctrlclient.ObjectKey,
 		}
 	}
 	return nil
+}
+
+// failingReadReader fails the read of one named object without an answer,
+// standing in for an API server that cannot serve that live read.
+type failingReadReader struct {
+	ctrlclient.Reader
+	name string
+	err  error
+}
+
+func (r failingReadReader) Get(ctx context.Context, key ctrlclient.ObjectKey, obj ctrlclient.Object, opts ...ctrlclient.GetOption) error {
+	if key.Name == r.name {
+		return r.err
+	}
+	return r.Reader.Get(ctx, key, obj, opts...)
+}
+
+// TestAuthenticateClassifiesIdentityBackendFailures pins the availability
+// split inside the authenticator: a backend that fails to answer is
+// transient (IdentityUnavailableError, so the listeners answer 503), while a
+// definite refusal stays untyped (so the listeners answer 401).
+func TestAuthenticateClassifiesIdentityBackendFailures(t *testing.T) {
+	t.Run("token review failure is transient", func(t *testing.T) {
+		client, tokens := fixture(t)
+		auth, err := NewAuthenticator(context.Background(), client, tokens, ns, brokerName, controlName, controlUID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tokens.PrependReactor("create", "tokenreviews", func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, context.DeadlineExceeded
+		})
+		_, err = auth.Authenticate(context.Background(), "token")
+		if err == nil {
+			t.Fatal("Authenticate succeeded; want a failed TokenReview")
+		}
+		var unavailable *IdentityUnavailableError
+		if !errors.As(err, &unavailable) {
+			t.Fatalf("error = %v, want IdentityUnavailableError for a failed TokenReview", err)
+		}
+	})
+
+	t.Run("review that could not check the token is transient", func(t *testing.T) {
+		client, tokens := fixture(t)
+		auth, err := NewAuthenticator(context.Background(), client, tokens, ns, brokerName, controlName, controlUID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tokens.PrependReactor("create", "tokenreviews", func(ktesting.Action) (bool, runtime.Object, error) {
+			review := validReview()
+			review.Status.Authenticated = false
+			review.Status.Audiences = nil
+			review.Status.Error = "authenticator was unreachable"
+			return true, review, nil
+		})
+		_, err = auth.Authenticate(context.Background(), "token")
+		if err == nil {
+			t.Fatal("Authenticate succeeded; want a review without a definite answer")
+		}
+		var unavailable *IdentityUnavailableError
+		if !errors.As(err, &unavailable) {
+			t.Fatalf("error = %v, want IdentityUnavailableError for a review that could not check the token", err)
+		}
+	})
+
+	t.Run("unauthenticated review result is a definite refusal", func(t *testing.T) {
+		client, tokens := fixture(t)
+		auth, err := NewAuthenticator(context.Background(), client, tokens, ns, brokerName, controlName, controlUID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tokens.PrependReactor("create", "tokenreviews", func(ktesting.Action) (bool, runtime.Object, error) {
+			review := validReview()
+			review.Status.Authenticated = false
+			return true, review, nil
+		})
+		_, err = auth.Authenticate(context.Background(), "token")
+		if err == nil {
+			t.Fatal("Authenticate accepted an unauthenticated token")
+		}
+		var unavailable *IdentityUnavailableError
+		if errors.As(err, &unavailable) {
+			t.Fatalf("error = %v, want a definite refusal for an unauthenticated token", err)
+		}
+	})
+
+	t.Run("live read failure is transient", func(t *testing.T) {
+		client, tokens := fixture(t)
+		auth, err := NewAuthenticator(context.Background(), client, tokens, ns, brokerName, controlName, controlUID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		auth.reader = failingReadReader{Reader: auth.reader, name: controlPod, err: errors.New("api server unavailable")}
+		_, err = auth.Authenticate(context.Background(), "token")
+		if err == nil {
+			t.Fatal("Authenticate succeeded; want a failed live read")
+		}
+		var unavailable *IdentityUnavailableError
+		if !errors.As(err, &unavailable) {
+			t.Fatalf("error = %v, want IdentityUnavailableError for a failed live read", err)
+		}
+	})
+
+	t.Run("run read failure is transient", func(t *testing.T) {
+		client, tokens := fixture(t)
+		auth, err := NewAuthenticator(context.Background(), client, tokens, ns, brokerName, controlName, controlUID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		auth.reader = failingReadReader{Reader: auth.reader, name: runName, err: errors.New("api server unavailable")}
+		_, err = auth.Authenticate(context.Background(), "token")
+		if err == nil {
+			t.Fatal("Authenticate succeeded; want a failed run read")
+		}
+		var unavailable *IdentityUnavailableError
+		if !errors.As(err, &unavailable) {
+			t.Fatalf("error = %v, want IdentityUnavailableError for a failed run read", err)
+		}
+	})
+
+	t.Run("missing live pod is a definite refusal", func(t *testing.T) {
+		client, tokens := fixture(t)
+		auth, err := NewAuthenticator(context.Background(), client, tokens, ns, brokerName, controlName, controlUID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := client.Delete(context.Background(), &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: controlPod}}); err != nil {
+			t.Fatal(err)
+		}
+		_, err = auth.Authenticate(context.Background(), "token")
+		if err == nil {
+			t.Fatal("Authenticate accepted a deleted control pod")
+		}
+		var unavailable *IdentityUnavailableError
+		if errors.As(err, &unavailable) {
+			t.Fatalf("error = %v, want a definite refusal for a deleted control pod", err)
+		}
+	})
+
+	t.Run("missing run is a definite refusal", func(t *testing.T) {
+		client, tokens := fixture(t)
+		auth, err := NewAuthenticator(context.Background(), client, tokens, ns, brokerName, controlName, controlUID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := client.Delete(context.Background(), &courier.CoderRun{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: runName}}); err != nil {
+			t.Fatal(err)
+		}
+		_, err = auth.Authenticate(context.Background(), "token")
+		if err == nil {
+			t.Fatal("Authenticate accepted a deleted run")
+		}
+		var unavailable *IdentityUnavailableError
+		if errors.As(err, &unavailable) {
+			t.Fatalf("error = %v, want a definite refusal for a deleted run", err)
+		}
+	})
 }
 
 func controlLabels() map[string]string {
