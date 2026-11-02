@@ -279,9 +279,14 @@ human merge, exactly as for resolve-issue runs:
   validates inputs client-side for ergonomics, then creates the `CoderRun`
   through the Kubernetes API. All real validation is server-side in the
   controller admission path, so the CLI is a dumb frontend by construction.
-- An HTTP admission API is follow-up work; when it lands it consumes the same
-  adapter and the same server-side validation. UI/MCP/Dispatch frontends
-  likewise stay thin.
+- An HTTP admission API ships as the operator's own authenticated listener
+  (#708, `internal/source/adhoc/server.go`): `POST /v1/contributions`, one
+  strict JSON body over the same policy-approved fields the CLI takes, a
+  deployment bearer token from a Secret, bounded bodies and deadlines, and
+  identity-only responses (201 created, 200 resumed). It consumes the same
+  adapter and the same server-side validation, adds no authority, and adds
+  no second contribution state machine. The chart renders its Service under
+  the `contributeAPI:` values. UI/MCP/Dispatch frontends likewise stay thin.
 
 ## Failure cases covered by tests
 
@@ -334,4 +339,6 @@ Implemented as bounded, file-scoped issues (each filed under #511):
 7. CLI admission surface (`cmd/courierctl/`): thin `contribute` frontend.
 8. Follow-on frontends: operator web UI (#510 ecosystem) and the optional
    Dispatch frontend (misospace/dispatch#1349) — blocked on this contract;
-   they must consume it, not reimplement it.
+   they must consume it, not reimplement it. The HTTP admission API
+   (#708, `internal/source/adhoc/server.go`) now ships that contract
+   in-repo.

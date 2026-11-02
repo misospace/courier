@@ -217,6 +217,21 @@ evidence:
   #    rendered Service routes port 80 to it.
   port: 8082
 
+contributeAPI:
+  # -- Authenticated contribution-admission API (#708). Disabled by default.
+  #    When enabled the manager serves the admission listener on its bind
+  #    port and the chart renders the ClusterIP Service non-kubectl
+  #    frontends POST contributions to. It is a thin frontend over the same
+  #    admission path `courierctl contribute` uses.
+  enabled: false
+  # -- Name of a Secret in the operator namespace whose "token" entry holds
+  #    the bearer token frontends present (see BOOTSTRAP.md). Required when
+  #    enabled.
+  keySecret: ""
+  # -- Port the admission listener binds to inside the manager container;
+  #    the rendered Service routes port 80 to it.
+  port: 8083
+
 retention:
   # -- Terminal CoderRun retention (#287). The controller deletes terminal runs
   #    after these windows and always keeps the most recent `auditKeep` terminal

@@ -1042,6 +1042,18 @@ func TestStartupReadsSurfaceDeadlineErrors(t *testing.T) {
 			t.Fatalf("githubObserver() error = %q, want it to name the failing read", err)
 		}
 	})
+
+	t.Run("contribution admission token read", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		defer cancel()
+		_, err := loadAdmissionToken(ctx, reader, "courier-system", "courier-admission-token", "token")
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("loadAdmissionToken() error = %v, want a deadline-exceeded error", err)
+		}
+		if !strings.Contains(err.Error(), "read contribution admission key Secret courier-system/courier-admission-token") {
+			t.Fatalf("loadAdmissionToken() error = %q, want it to name the failing read", err)
+		}
+	})
 }
 
 func TestLoadEvidenceKey(t *testing.T) {
@@ -1133,6 +1145,145 @@ func TestLoadEvidenceKey(t *testing.T) {
 			}
 			if !bytes.Equal(got, test.want) {
 				t.Fatalf("loadEvidenceKey() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestValidateContributeAdmissionFlags(t *testing.T) {
+	tests := []struct {
+		name      string
+		bind      string
+		keySecret string
+		wantErr   string
+	}{
+		{name: "both empty disables the API", bind: "", keySecret: ""},
+		{name: "secret without bind is legal but inert", bind: "", keySecret: "courier-admission-token"},
+		{name: "pair configured", bind: ":8083", keySecret: "courier-admission-token"},
+		{
+			name:      "bind without secret authenticates nothing",
+			bind:      ":8083",
+			keySecret: "",
+			wantErr:   "--contribute-admission-bind requires --contribute-admission-key-secret",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateContributeAdmissionFlags(test.bind, test.keySecret)
+			if test.wantErr != "" {
+				if err == nil {
+					t.Fatalf("validateContributeAdmissionFlags() error = nil, want error mentioning %q", test.wantErr)
+				}
+				if !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("validateContributeAdmissionFlags() error = %q, want it to mention %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validateContributeAdmissionFlags() error = %v, want none", err)
+			}
+		})
+	}
+}
+
+func TestLoadAdmissionToken(t *testing.T) {
+	const tokenValue = "a-test-bearer-token-of-some-length"
+
+	tests := []struct {
+		name       string
+		namespace  string
+		secretName string
+		secretKey  string
+		data       map[string][]byte // nil: no Secret in the namespace
+		want       string
+		wantErr    string // substring required in the error
+	}{
+		{
+			name:       "happy path with the default key",
+			namespace:  "courier-system",
+			secretName: "courier-admission-token",
+			data:       map[string][]byte{"token": []byte(tokenValue)},
+			want:       tokenValue,
+		},
+		{
+			name:       "explicit key override",
+			namespace:  "courier-system",
+			secretName: "courier-admission-token",
+			secretKey:  "bearer",
+			data:       map[string][]byte{"bearer": []byte(tokenValue)},
+			want:       tokenValue,
+		},
+		{
+			name:       "secret missing",
+			namespace:  "courier-system",
+			secretName: "courier-admission-token",
+			wantErr:    "not found",
+		},
+		{
+			name:       "no token entry",
+			namespace:  "courier-system",
+			secretName: "courier-admission-token",
+			data:       map[string][]byte{"other": []byte("not-the-token")},
+			wantErr:    `no non-empty "token" entry`,
+		},
+		{
+			name:       "whitespace-only token",
+			namespace:  "courier-system",
+			secretName: "courier-admission-token",
+			data:       map[string][]byte{"token": []byte("   ")},
+			wantErr:    `no non-empty "token" entry`,
+		},
+		{
+			name:       "empty namespace",
+			namespace:  "",
+			secretName: "courier-admission-token",
+			data:       map[string][]byte{"token": []byte(tokenValue)},
+			wantErr:    "POD_NAMESPACE",
+		},
+		{
+			name:       "empty name",
+			namespace:  "courier-system",
+			secretName: "",
+			data:       map[string][]byte{"token": []byte(tokenValue)},
+			wantErr:    "name is required",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := corev1.AddToScheme(scheme); err != nil {
+				t.Fatalf("add core scheme: %v", err)
+			}
+			builder := fake.NewClientBuilder().WithScheme(scheme)
+			if test.data != nil {
+				builder = builder.WithRuntimeObjects(&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "courier-admission-token",
+						Namespace: "courier-system",
+					},
+					Data: test.data,
+				})
+			}
+			fakeClient := builder.Build()
+
+			got, err := loadAdmissionToken(context.Background(), fakeClient, test.namespace, test.secretName, test.secretKey)
+			if test.wantErr != "" {
+				if err == nil {
+					t.Fatalf("loadAdmissionToken() error = nil, want error mentioning %q", test.wantErr)
+				}
+				if !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("loadAdmissionToken() error = %q, want it to mention %q", err, test.wantErr)
+				}
+				if strings.Contains(err.Error(), tokenValue) {
+					t.Fatalf("loadAdmissionToken() error = %q must not contain the token value", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadAdmissionToken() error = %v", err)
+			}
+			if got != test.want {
+				t.Fatalf("loadAdmissionToken() = %q, want %q", got, test.want)
 			}
 		})
 	}

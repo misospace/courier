@@ -100,6 +100,9 @@ func main() {
 	var evidenceIntakeKeySecret string
 	var evidenceIntakeService string
 	var evidenceIntakeBind string
+	var contributeAdmissionBind string
+	var contributeAdmissionKeySecret string
+	var contributeAdmissionKey string
 	var doneRetention time.Duration
 	var failedRetention time.Duration
 	var needsHumanRetention time.Duration
@@ -186,6 +189,9 @@ func main() {
 	flag.StringVar(&evidenceIntakeKeySecret, "evidence-intake-key-secret", "", "Name of the Secret in the operator namespace holding the evidence intake HMAC key under the \"key\" entry; empty with no --evidence-intake-service disables evidence wiring.")
 	flag.StringVar(&evidenceIntakeService, "evidence-intake-service", "", "URL coordinator pods POST failure evidence to; required with --evidence-intake-key-secret.")
 	flag.StringVar(&evidenceIntakeBind, "evidence-intake-bind", "", "Address the operator's own evidence-intake server binds to in-process (for example :8082); the chart derives the matching --evidence-intake-service URL. Empty leaves the operator-side intake off, and a non-empty value requires --evidence-intake-key-secret.")
+	flag.StringVar(&contributeAdmissionBind, "contribute-admission-bind", "", "Address the operator's own contribution-admission API binds to in-process (for example :8083); frontends POST ad-hoc contributions to it (#708). Empty leaves the API off, and a non-empty value requires --contribute-admission-key-secret.")
+	flag.StringVar(&contributeAdmissionKeySecret, "contribute-admission-key-secret", "", "Name of the Secret in the operator namespace holding the contribution-admission API bearer token; required with --contribute-admission-bind.")
+	flag.StringVar(&contributeAdmissionKey, "contribute-admission-key", "token", "Key within the contribution-admission key Secret.")
 	flag.DurationVar(&doneRetention, "done-retention", 5*time.Minute, "How long a resolved Done CoderRun is kept before the retention reaper deletes it.")
 	flag.DurationVar(&failedRetention, "failed-retention", 168*time.Hour, "How long a Failed CoderRun is kept, once its lifecycle report has settled, before the retention reaper deletes it.")
 	flag.DurationVar(&needsHumanRetention, "needs-human-retention", 168*time.Hour, "How long a NeedsHuman CoderRun is kept, once its lifecycle report has settled, before the retention reaper deletes it.")
@@ -345,6 +351,8 @@ func main() {
 
 	evidenceSecretSet := strings.TrimSpace(evidenceIntakeKeySecret) != ""
 	evidenceBindSet := strings.TrimSpace(evidenceIntakeBind) != ""
+	admissionSecretSet := strings.TrimSpace(contributeAdmissionKeySecret) != ""
+	admissionBindSet := strings.TrimSpace(contributeAdmissionBind) != ""
 	if err := validateEvidenceFlags(evidenceIntakeKeySecret, evidenceIntakeService, evidenceIntakeBind); err != nil {
 		setupLog.Error(err, "unable to configure evidence intake")
 		os.Exit(1)
@@ -381,6 +389,50 @@ func main() {
 			// attempts on nothing. Say so plainly at startup.
 			setupLog.Info("evidence intake listener disabled: --evidence-intake-bind is empty, coordinator capture POSTs will be refused", "service", strings.TrimSpace(evidenceIntakeService))
 		}
+	}
+
+	// The contribution-admission API (#708) is the operator's own in-process
+	// HTTP frontend over the ad-hoc source adapter: non-kubectl frontends
+	// submit contributions through the same admission path courierctl uses.
+	// The listener takes no leader election and runs on every replica; the
+	// adapter's create-or-resume idempotency, not the listener, absorbs
+	// duplicate submissions. A bearer-token Secret without a bind address is
+	// legal but inert: no listener answers, so every submission would be
+	// refused — say so plainly at startup, like the evidence intake does.
+	if err := validateContributeAdmissionFlags(contributeAdmissionBind, contributeAdmissionKeySecret); err != nil {
+		setupLog.Error(err, "unable to configure contribution admission")
+		os.Exit(1)
+	}
+	if admissionSecretSet && !admissionBindSet {
+		setupLog.Info("contribution admission listener disabled: --contribute-admission-bind is empty, admission POSTs will be refused", "secret", strings.TrimSpace(contributeAdmissionKeySecret))
+	}
+	if admissionBind := strings.TrimSpace(contributeAdmissionBind); admissionBind != "" {
+		podNamespace := strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
+		if podNamespace == "" {
+			setupLog.Error(fmt.Errorf("POD_NAMESPACE is empty"), "unable to configure contribution admission")
+			os.Exit(1)
+		}
+		token, err := loadAdmissionToken(startupCtx, mgr.GetAPIReader(), podNamespace, contributeAdmissionKeySecret, contributeAdmissionKey)
+		if err != nil {
+			setupLog.Error(err, "unable to configure contribution admission")
+			os.Exit(1)
+		}
+		server, err := adhoc.NewAdmissionServer(adhoc.AdmissionServerConfig{
+			Admitter:         adhoc.New(mgr.GetClient(), mgr.GetAPIReader()),
+			Token:            token,
+			Bind:             admissionBind,
+			DefaultNamespace: podNamespace,
+			OwnedNamespaces:  ownedRunNamespaces,
+		})
+		if err != nil {
+			setupLog.Error(err, "unable to configure contribution admission")
+			os.Exit(1)
+		}
+		if err := mgr.Add(server); err != nil {
+			setupLog.Error(err, "unable to add contribution admission server")
+			os.Exit(1)
+		}
+		setupLog.Info("contribution admission API enabled", "bind", admissionBind, "secret", strings.TrimSpace(contributeAdmissionKeySecret))
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -768,6 +820,21 @@ func validateEvidenceFlags(keySecret, service, bind string) error {
 	return nil
 }
 
+// validateContributeAdmissionFlags reports a clear error when the
+// contribution-admission flags are inconsistent (#708). The listener is the
+// only consumer of the bearer-token Secret, so an empty --contribute-admission-bind
+// leaves the whole API off: a bind without its key Secret would start a
+// listener that authenticates nothing, and that is a startup error rather
+// than a runtime surprise. A Secret without a bind is legal but inert.
+func validateContributeAdmissionFlags(bind, keySecret string) error {
+	bindSet := strings.TrimSpace(bind) != ""
+	secretSet := strings.TrimSpace(keySecret) != ""
+	if bindSet && !secretSet {
+		return fmt.Errorf("--contribute-admission-bind requires --contribute-admission-key-secret")
+	}
+	return nil
+}
+
 // dispatchBinding pairs one Dispatch queue lane with one Courier LaneProfile.
 // agentName is the per-binding Dispatch identity. It defaults to the global
 // --dispatch-agent-name in single-binding shorthand and is auto-derived per
@@ -1073,6 +1140,38 @@ func loadEvidenceKey(ctx context.Context, reader client.Reader, namespace, name 
 		return nil, fmt.Errorf("evidence intake key Secret %s/%s has no non-empty %q entry", namespace, secretName, "key")
 	}
 	return key, nil
+}
+
+// loadAdmissionToken reads the contribution-admission API's bearer token from
+// the named Secret in the operator namespace (#708). It fails closed like
+// loadEvidenceKey: the listener must agree with the deployment on one token,
+// so a missing or empty key is a startup error rather than an API that
+// authenticates nothing. The token value never appears in any error.
+func loadAdmissionToken(ctx context.Context, reader client.Reader, namespace, secretName, secretKey string) (string, error) {
+	secretName = strings.TrimSpace(secretName)
+	if secretName == "" {
+		return "", fmt.Errorf("contribution admission key Secret name is required")
+	}
+	secretKey = strings.TrimSpace(secretKey)
+	if secretKey == "" {
+		secretKey = "token"
+	}
+	namespace = strings.TrimSpace(namespace)
+	if namespace == "" {
+		return "", fmt.Errorf("POD_NAMESPACE is required when a contribution admission key Secret is configured")
+	}
+	var secret corev1.Secret
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretName}, &secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", fmt.Errorf("contribution admission key Secret %s/%s not found: %w", namespace, secretName, err)
+		}
+		return "", fmt.Errorf("read contribution admission key Secret %s/%s: %w", namespace, secretName, err)
+	}
+	token, ok := secret.Data[secretKey]
+	if !ok || strings.TrimSpace(string(token)) == "" {
+		return "", fmt.Errorf("contribution admission key Secret %s/%s has no non-empty %q entry", namespace, secretName, secretKey)
+	}
+	return string(token), nil
 }
 
 // secureConfig carries the parsed secure-mode flags into buildSecureControl.
