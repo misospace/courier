@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.1.15](https://github.com/misospace/courier/compare/v0.1.14...v0.1.15) (2026-11-02)
+
+
+### Features
+
+* **harness:** load pinned skill bundles into the native control pod ([#699](https://github.com/misospace/courier/issues/699)) ([5050594](https://github.com/misospace/courier/commit/50505944808a888465f8adbaec6d6a4ed346087f))
+* **skills:** select and pin approved skills per run ([#687](https://github.com/misospace/courier/issues/687)) ([6be40b0](https://github.com/misospace/courier/commit/6be40b05441c0c9df2de13927299d14f361c5f78))
+
+
+### Bug Fixes
+
+* **courier-broker:** bound the trusted status listener's inbound reads, writes, and idle connections ([#694](https://github.com/misospace/courier/issues/694)) ([8721e05](https://github.com/misospace/courier/commit/8721e05e8cbe739e023b148a9b11ba95cad76136))
+* **courier-broker:** keep the model-facing API body read inside its write deadline ([#698](https://github.com/misospace/courier/issues/698)) ([7dd9e5e](https://github.com/misospace/courier/commit/7dd9e5e8b971fc489c0b5eff2888d066e0be22b5)), closes [#696](https://github.com/misospace/courier/issues/696)
+* **courier-broker:** separate a transient identity failure from a refused credential ([#697](https://github.com/misospace/courier/issues/697)) ([f0c37dd](https://github.com/misospace/courier/commit/f0c37ddae62a09cfb91144716022af7c5165a271))
+* **courier-worker:** bound inbound reads, writes, and idle connections ([#690](https://github.com/misospace/courier/issues/690)) ([77845d2](https://github.com/misospace/courier/commit/77845d2fe784d42319b078cd834ba26878bf7546)), closes [#683](https://github.com/misospace/courier/issues/683)
+* **courierctl:** bound the contribute admission request with a deadline ([#688](https://github.com/misospace/courier/issues/688)) ([f776d56](https://github.com/misospace/courier/commit/f776d5602be3e1e34b03754fd53d13b62017b093))
+* **deps:** update dependency astro (7.4.4 → 7.4.5) ([#707](https://github.com/misospace/courier/issues/707)) ([60a7750](https://github.com/misospace/courier/commit/60a7750b83ddcf2bddf04a15f77b085157446dff))
+* **harness:** reuse tracked check receipts ([#667](https://github.com/misospace/courier/issues/667)) ([749cf1f](https://github.com/misospace/courier/commit/749cf1f78941c0979d83641269e66787d0bce6af))
+* **preflight:** cover the per-run skill ConfigMap read in the operator access review ([#702](https://github.com/misospace/courier/issues/702)) ([2572619](https://github.com/misospace/courier/commit/25726198104156ab672e3d5affa738cbce5b7b6c))
+* **preflight:** prove the skill ConfigMap create and delete in the secure access review ([#704](https://github.com/misospace/courier/issues/704)) ([44a1473](https://github.com/misospace/courier/commit/44a14735a6f6b8e90b2996e5ab1c43d0608c044c)), closes [#701](https://github.com/misospace/courier/issues/701)
+* **preflight:** prove the teardown deletes Revoke needs in the operator access review ([#706](https://github.com/misospace/courier/issues/706)) ([87fc24e](https://github.com/misospace/courier/commit/87fc24e13aaf2c9ecca5656e97ef14f620364484)), closes [#703](https://github.com/misospace/courier/issues/703)
+* **topology:** prove broker API-server egress in preflight and bound broker-loss churn ([#680](https://github.com/misospace/courier/issues/680)) ([#685](https://github.com/misospace/courier/issues/685)) ([4de8925](https://github.com/misospace/courier/commit/4de89257bc1926d901b7b013a789929002b50019))
+
+
+### Chores
+
+* **container:** update docker image digests ([#686](https://github.com/misospace/courier/issues/686)) ([60b5380](https://github.com/misospace/courier/commit/60b5380ab513e781e0d8913b7e4f43f1818876d9))
+* **container:** update image gcr.io/distroless/static (18f4cc2 → 25ac8f0) ([#681](https://github.com/misospace/courier/issues/681)) ([9cedfa0](https://github.com/misospace/courier/commit/9cedfa0274067110f2cd8e4d84ffeb0269385a3f))
+* **deps:** lock file maintenance ([#705](https://github.com/misospace/courier/issues/705)) ([b615751](https://github.com/misospace/courier/commit/b615751b76892b5051860cc7bd281d93d8c06a89))
+* **renovate:** bump the manager-side probe digest in the same PR as the chart ([#691](https://github.com/misospace/courier/issues/691)) ([eb6f405](https://github.com/misospace/courier/commit/eb6f405dac15b5eea8b984eb16af8bfd940aad4e))
+
 ## [0.1.14](https://github.com/misospace/courier/compare/v0.1.13...v0.1.14) (2026-10-31)
 
 
