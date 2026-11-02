@@ -209,8 +209,8 @@ func (s *SecureControl) checkOperatorAccess(ctx context.Context, run *courier.Co
 // for its sizing (secure_launcher.go:295), the run's signing secret read for
 // the dry-run rendering (preflight.go:493), the credential source secrets the
 // selected registration names, read in the operator's own namespace
-// (secure_launcher.go:866), the per-run skill ConfigMap reads the
-// materialization makes before it creates a round (see
+// (secure_launcher.go:866), the per-run skill ConfigMap reads and writes
+// the materialization makes before it creates a round (see
 // skill_materialization.go), and the service reads the live probes make
 // for their targets (preflight.go:515). The pod review is the list the
 // real read issues — the operator does not read the topology pods by name on
@@ -278,28 +278,33 @@ func (s *SecureControl) operatorAccessReviews(run *courier.CoderRun, registratio
 	}
 	// skill_materialization.go reads each per-run skill ConfigMap by name
 	// before creating a round, so a relaunch converges onto the content that
-	// is already there without a write. The run's persisted pins name every
-	// bundle, so the reviews carry the rendered content ConfigMap names plus
-	// the bundle config ConfigMap — the exact objects the materialization
-	// reads, so a resourceNames-scoped Role granting them satisfies the
-	// proof without granting get on any other ConfigMap. A skillless run
-	// performs no such read, so no review is manufactured for it (#700).
+	// is already there without a write, and it creates a ConfigMap that is
+	// missing or deletes and recreates one whose content drifted. The run's
+	// persisted pins name every bundle, so the reviews carry get, create,
+	// and delete for the rendered content ConfigMap names plus the bundle
+	// config ConfigMap — the exact objects the materialization reads and
+	// writes, so a Role granting exactly them satisfies the proof without
+	// reaching any other ConfigMap. The launch path performs none of these
+	// requests for a skillless run, so no review is manufactured for it
+	// (#700, #701).
 	seenConfigMaps := map[string]bool{}
-	addSkillConfigMapReview := func(name string) {
+	addSkillConfigMapReviews := func(name string) {
 		if seenConfigMaps[name] {
 			return
 		}
 		seenConfigMaps[name] = true
-		reviews = append(reviews, accessReview{
-			group: core, resource: "configmaps", verb: "get",
-			name: name, namespace: runNamespace,
-		})
+		for _, verb := range []string{"get", "create", "delete"} {
+			reviews = append(reviews, accessReview{
+				group: core, resource: "configmaps", verb: verb,
+				name: name, namespace: runNamespace,
+			})
+		}
 	}
 	for _, pin := range run.Status.SkillPins {
-		addSkillConfigMapReview(topology.SkillContentConfigMapName(run.Name, pin.Name))
+		addSkillConfigMapReviews(topology.SkillContentConfigMapName(run.Name, pin.Name))
 	}
 	if len(run.Status.SkillPins) > 0 {
-		addSkillConfigMapReview(topology.SkillBundlesConfigMapName(run.Name))
+		addSkillConfigMapReviews(topology.SkillBundlesConfigMapName(run.Name))
 	}
 	// preflight.go:515 locates the live probes' targets: the API server
 	// and cluster DNS services, and the run's own broker service.

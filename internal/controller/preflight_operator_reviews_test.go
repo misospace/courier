@@ -34,9 +34,9 @@ func TestCheckOperatorAccessReviewScoping(t *testing.T) {
 	)
 
 	// The proof follows the launch path: a run with persisted skill pins
-	// performs per-run skill ConfigMap reads a skillless run never makes,
-	// so the review set carries those ConfigMaps only for the run whose
-	// real requests will name them (#700).
+	// performs per-run skill ConfigMap reads and writes a skillless run
+	// never makes, so the review set carries those ConfigMaps only for
+	// the run whose real requests will name them (#700, #701).
 	for _, tc := range []struct {
 		name string
 		pins []courier.SkillPin
@@ -110,17 +110,25 @@ func TestCheckOperatorAccessReviewScoping(t *testing.T) {
 				{"", "services", "get", "kube-dns", "kube-system"}:                          1,
 				{"", "services", "get", topology.BrokerServiceName(run.Name), runNamespace}: 1,
 			}
-			// The skill ConfigMap reads (#700): the materialization reads
-			// every pinned bundle's content ConfigMap and the bundle
-			// config ConfigMap by name in the run namespace before it
-			// creates a round, so the reviews carry those exact rendered
-			// names; a skillless run performs no such read and earns no
-			// configmaps review.
-			if len(tc.pins) > 0 {
-				want[key{"", "configmaps", "get", topology.SkillBundlesConfigMapName(run.Name), runNamespace}] = 1
-			}
+			// The skill ConfigMap reads and writes (#700, #701): the
+			// materialization reads every pinned bundle's content
+			// ConfigMap and the bundle config ConfigMap by name in the
+			// run namespace, creates the ones that are missing, and
+			// deletes and recreates one whose content drifted, so the
+			// reviews carry get, create, and delete for those exact
+			// rendered names; a skillless run performs no such request
+			// and earns no configmaps review.
+			var skillConfigMaps []string
 			for _, pin := range tc.pins {
-				want[key{"", "configmaps", "get", topology.SkillContentConfigMapName(run.Name, pin.Name), runNamespace}] = 1
+				skillConfigMaps = append(skillConfigMaps, topology.SkillContentConfigMapName(run.Name, pin.Name))
+			}
+			if len(tc.pins) > 0 {
+				skillConfigMaps = append(skillConfigMaps, topology.SkillBundlesConfigMapName(run.Name))
+			}
+			for _, name := range skillConfigMaps {
+				for _, verb := range []string{"get", "create", "delete"} {
+					want[key{"", "configmaps", verb, name, runNamespace}] = 1
+				}
 			}
 
 			for _, r := range reviews {
