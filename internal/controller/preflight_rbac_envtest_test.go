@@ -352,7 +352,7 @@ func TestPreflightOperatorClusterScopedReviewNotNamespacedEnvtest(t *testing.T) 
 		Rules: []rbacv1.PolicyRule{
 			{APIGroups: []string{""}, Resources: []string{"nodes"}, Verbs: []string{"list"}},
 			{APIGroups: []string{""}, Resources: []string{"namespaces"}, Verbs: []string{"get"}},
-			{APIGroups: []string{"rbac.authorization.k8s.io"}, Resources: []string{"clusterrolebindings"}, Verbs: []string{"create"}},
+			{APIGroups: []string{"rbac.authorization.k8s.io"}, Resources: []string{"clusterrolebindings"}, Verbs: []string{"create", "delete"}},
 			{APIGroups: []string{"authorization.k8s.io"}, Resources: []string{"selfsubjectaccessreviews", "subjectaccessreviews"}, Verbs: []string{"create"}},
 		},
 	}
@@ -533,8 +533,9 @@ func TestPreflightOperatorReadGrantsNamespaceScopedEnvtest(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: run.Name + "-operator-provisioning"},
 		Rules: []rbacv1.PolicyRule{
 			{APIGroups: []string{""}, Resources: []string{"secrets", "serviceaccounts", "pods", "services"}, Verbs: []string{"create", "delete"}},
+			{APIGroups: []string{""}, Resources: []string{"configmaps"}, Verbs: []string{"delete"}},
 			{APIGroups: []string{"networking.k8s.io"}, Resources: []string{"networkpolicies"}, Verbs: []string{"create", "delete"}},
-			{APIGroups: []string{"rbac.authorization.k8s.io"}, Resources: []string{"roles", "rolebindings", "clusterrolebindings"}, Verbs: []string{"create"}},
+			{APIGroups: []string{"rbac.authorization.k8s.io"}, Resources: []string{"roles", "rolebindings", "clusterrolebindings"}, Verbs: []string{"create", "delete"}},
 			{APIGroups: []string{""}, Resources: []string{"nodes"}, Verbs: []string{"list"}},
 			{APIGroups: []string{""}, Resources: []string{"namespaces"}, Verbs: []string{"get"}},
 			{APIGroups: []string{"authorization.k8s.io"}, Resources: []string{"selfsubjectaccessreviews", "subjectaccessreviews"}, Verbs: []string{"create"}},

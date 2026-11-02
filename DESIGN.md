@@ -2436,7 +2436,8 @@ error is not gated at all, because the design classifies it as transient.
 A permanent misconfiguration is only a verdict if the launch path can tell it
 from a transient one, and the deployment's own facts are what tell it: the
 operator's provisioning grants — the namespaced creates and deletes the secure
-topology needs, the reads the secure launch path makes on its own behalf, and
+topology needs, the deletes the teardown path issues, the reads the secure
+launch path makes on its own behalf, and
 the cluster-scoped grants the proof itself uses — and the
 dedicated run namespace's restricted Pod Security label are proven before the
 operator creates anything, so a missing one of those grants or an unlabelled
@@ -2450,8 +2451,9 @@ the Role the run renders exists, because that check compares the live Role
 against the intended one.
 An access review is asked at the scope the request it stands for has. The
 broker's TokenReview creation and the operator's own cluster-scoped grants —
-the broker's ClusterRoleBinding, the node list, the run namespace read, and
-the two access-review creates — are reviewed without a namespace, so only a
+the broker's ClusterRoleBinding create and delete, the node list, the run
+namespace read, and the two access-review creates — are reviewed without a
+namespace, so only a
 cluster-wide grant can satisfy them: a namespaced Role authorizes a
 namespaced review of a cluster-scoped resource, but never the cluster-scoped
 request itself, and crediting one would let a run launch on an authority the
@@ -2466,7 +2468,14 @@ Secrets in the operator's own namespace — reviews asked in the namespace the
 reads target, since a grant scoped to one namespace never authorizes a request
 in another — and the services the live probes read for their targets (the API
 server in `default`, cluster DNS in `kube-system`, and the run's broker
-service in the run namespace). Each of those reviews mirrors the request it
+service in the run namespace). The proof also covers the deletes the teardown
+path issues, so a deployment whose Role grants exactly the proven set can
+finalize a deleted run, not only launch a live one: Revoke removes the run's
+broker Role, RoleBinding, and token-review ClusterRoleBinding by name, and it
+deletes the bundle config ConfigMap on every run, skillless included, so that
+delete is not gated on pins (#703). The remaining teardown deletes ride the
+unnamed delete grants the provisioning proof already carries. Each of those
+reviews mirrors the request it
 stands for, name included where the request names an object: the pod review is
 the list the real read issues — the launch path reads no topology pod by name
 on this path — and the credential reads are reviewed by the Secret names the

@@ -190,18 +190,18 @@ func (s *SecureControl) checkOperatorAccess(ctx context.Context, run *courier.Co
 
 // operatorAccessReviews returns the access reviews that prove the operator's
 // own grants before the launch path creates anything: the provisioning grants
-// the secure topology's creation needs, and the reads the secure launch path
-// makes on its own behalf. Each review mirrors the request it stands for —
-// same verb, the same object name where the request names one, the namespace
-// the request targets — because a review asked at a scope the request does not
-// have can be satisfied by a grant the real request would be refused by
-// (#650, #655).
+// the secure topology's creation needs, the reads the secure launch path
+// makes on its own behalf, and the deletes the teardown path (Revoke) issues.
+// Each review mirrors the request it stands for — same verb, the same object
+// name where the request names one, the namespace the request targets —
+// because a review asked at a scope the request does not have can be
+// satisfied by a grant the real request would be refused by (#650, #655).
 //
-// The provisioning creates and deletes happen in the run namespace. Five of
-// the requests are cluster-scoped — the broker's ClusterRoleBinding create,
-// the node list, the run namespace read, and the two access-review creates —
-// and are reviewed with no namespace, so only a cluster-wide grant can satisfy
-// them.
+// The provisioning creates and deletes happen in the run namespace. Six of
+// the requests are cluster-scoped — the broker's ClusterRoleBinding create
+// and delete, the node list, the run namespace read, and the two
+// access-review creates — and are reviewed with no namespace, so only a
+// cluster-wide grant can satisfy them.
 //
 // The launch-path reads (#655) mirror where the secure path reads outside the
 // provisioning set: the run-namespace pod list read to decide whether a
@@ -220,6 +220,18 @@ func (s *SecureControl) checkOperatorAccess(ctx context.Context, run *courier.Co
 // runs, so the names are the ones the real requests will carry, and a
 // resourceNames-scoped Role granting exactly those Secrets satisfies the proof
 // without granting get on any other Secret.
+//
+// The teardown deletes (#703) stand for the writes Revoke issues when a run
+// finalizes: the run's broker Role, RoleBinding, and token-review
+// ClusterRoleBinding, each deleted by name, and the bundle config ConfigMap.
+// The proof carried a delete for every other provisioned resource but none of
+// these, so a deployment whose Role grants exactly the reviewed set launched
+// the run and then could not finalize its deletion — the Forbidden there is
+// not NotFound, so the finalizer stays stuck. The bundle config delete is not
+// gated on pins the way the materialization reads are: Revoke issues it for
+// every run, skillless included. The rest of Revoke's deletes — Secrets,
+// ServiceAccounts, Services, NetworkPolicies, pods — ride the unnamed delete
+// reviews the provisioning set already carries.
 //
 // The SelfSubjectAccessReview the operator asks about itself is a canary
 // rather than a proof on a stock cluster: the API server's default
@@ -281,19 +293,22 @@ func (s *SecureControl) operatorAccessReviews(run *courier.CoderRun, registratio
 	// is already there without a write, and it creates a ConfigMap that is
 	// missing or deletes and recreates one whose content drifted. The run's
 	// persisted pins name every bundle, so the reviews carry get, create,
-	// and delete for the rendered content ConfigMap names plus the bundle
-	// config ConfigMap — the exact objects the materialization reads and
-	// writes, so a Role granting exactly them satisfies the proof without
-	// reaching any other ConfigMap. The launch path performs none of these
-	// requests for a skillless run, so no review is manufactured for it
-	// (#700, #701).
-	seenConfigMaps := map[string]bool{}
-	addSkillConfigMapReviews := func(name string) {
-		if seenConfigMaps[name] {
-			return
-		}
-		seenConfigMaps[name] = true
-		for _, verb := range []string{"get", "create", "delete"} {
+	// and delete for the rendered content ConfigMap names plus get and
+	// create for the bundle config ConfigMap — the exact objects the
+	// materialization reads and writes, so a Role granting exactly them
+	// satisfies the proof without reaching any other ConfigMap. The launch
+	// path performs none of these requests for a skillless run, so no
+	// materialization review is manufactured for it (#700, #701). The
+	// bundle config ConfigMap's delete is not part of this gate: Revoke's
+	// teardown issues it for every run (#703).
+	seenConfigMapReviews := map[string]bool{}
+	addSkillConfigMapReviews := func(name string, verbs ...string) {
+		for _, verb := range verbs {
+			key := verb + "/" + name
+			if seenConfigMapReviews[key] {
+				continue
+			}
+			seenConfigMapReviews[key] = true
 			reviews = append(reviews, accessReview{
 				group: core, resource: "configmaps", verb: verb,
 				name: name, namespace: runNamespace,
@@ -301,18 +316,33 @@ func (s *SecureControl) operatorAccessReviews(run *courier.CoderRun, registratio
 		}
 	}
 	for _, pin := range run.Status.SkillPins {
-		addSkillConfigMapReviews(topology.SkillContentConfigMapName(run.Name, pin.Name))
+		addSkillConfigMapReviews(topology.SkillContentConfigMapName(run.Name, pin.Name), "get", "create", "delete")
 	}
 	if len(run.Status.SkillPins) > 0 {
-		addSkillConfigMapReviews(topology.SkillBundlesConfigMapName(run.Name))
+		addSkillConfigMapReviews(topology.SkillBundlesConfigMapName(run.Name), "get", "create")
 	}
 	// preflight.go:515 locates the live probes' targets: the API server
 	// and cluster DNS services, and the run's own broker service.
-	return append(reviews,
+	reviews = append(reviews,
 		accessReview{group: core, resource: "services", verb: "get", name: "kubernetes", namespace: "default"},
 		accessReview{group: core, resource: "services", verb: "get", name: "kube-dns", namespace: "kube-system"},
 		accessReview{group: core, resource: "services", verb: "get", name: topology.BrokerServiceName(run.Name), namespace: runNamespace},
 	)
+	// Teardown deletes (#703): Revoke removes these objects by name on every
+	// run, so a Role granting exactly the launch-path set could still leave
+	// the finalizer stuck on a Forbidden. The names come from the same
+	// render calls Revoke deletes, so the proof stands for the objects the
+	// teardown really requests.
+	reviews = append(reviews,
+		accessReview{group: "rbac.authorization.k8s.io", resource: "roles", verb: "delete",
+			name: topology.BrokerRole(run).Name, namespace: runNamespace},
+		accessReview{group: "rbac.authorization.k8s.io", resource: "rolebindings", verb: "delete",
+			name: topology.BrokerRoleBinding(run).Name, namespace: runNamespace},
+		accessReview{group: "rbac.authorization.k8s.io", resource: "clusterrolebindings", verb: "delete",
+			name: topology.BrokerTokenReviewBinding(run, s.tokenReviewClusterRole()).Name},
+	)
+	addSkillConfigMapReviews(topology.SkillBundlesConfigMapName(run.Name), "delete")
+	return reviews
 }
 
 // checkBrokerRBAC verifies the broker's named grants two ways: the Role
