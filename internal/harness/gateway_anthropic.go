@@ -51,6 +51,12 @@ const anthropicMaxTokensFallback = 32768
 // anthropicVersion is the Messages API version header every request carries.
 const anthropicVersion = "2023-06-01"
 
+// anthropicSystemSeparator joins the transcript's consecutive leading system
+// messages inside the top-level system field. It is stable and plain — the
+// pinned system material (goal, harness framing, lane framing, skills index)
+// must re-read as one coherent block, never reordered or re-rendered.
+const anthropicSystemSeparator = "\n\n"
+
 func (a *AnthropicTransport) client() *http.Client {
 	if a.HTTP != nil {
 		return a.HTTP
@@ -131,19 +137,28 @@ func anthropicWireRequest(req ChatRequest) ([]byte, error) {
 		wire.MaxTokens = anthropicMaxTokensFallback
 	}
 	var system strings.Builder
-	leading := true
-	for i, message := range req.Messages {
+	leadingSystem := true
+	for _, message := range req.Messages {
+		// Every consecutive leading system message — a production session
+		// pins several: the goal plus harness framing, optional lane framing,
+		// the skills index (#716 review) — belongs in the top-level system
+		// field, in order, joined by the stable separator. None of them may
+		// be dropped or duplicated into messages. The first non-system
+		// message ends the collection: any later system message is
+		// mid-transcript framing (the compaction digest), which the Messages
+		// API has no role for and which renders as a user text block.
+		if message.Role == "system" && leadingSystem {
+			if system.Len() > 0 {
+				system.WriteString(anthropicSystemSeparator)
+			}
+			system.WriteString(message.Content)
+			continue
+		}
+		if message.Role != "system" {
+			leadingSystem = false
+		}
 		switch {
 		case message.Role == "system":
-			// A system message is top-level system material only while it
-			// leads the transcript. The compaction digest is placed where the
-			// first digested message stood, so it arrives mid-stream; the
-			// Messages API has no role for it, and the model reads it as
-			// transcript state.
-			if leading && i == countLeadingSystem(req.Messages)-1 {
-				system.WriteString(message.Content)
-				continue
-			}
 			wire.Messages = append(wire.Messages, anthropicWireMessage{
 				Role:    "user",
 				Content: []json.RawMessage{anthropicTextBlock(message.Content)},
@@ -177,7 +192,6 @@ func anthropicWireRequest(req ChatRequest) ([]byte, error) {
 			}
 			grouped.Content = append(grouped.Content, encoded)
 		default:
-			leading = false
 			wire.Messages = append(wire.Messages, anthropicWireMessage{
 				Role:    message.Role,
 				Content: []json.RawMessage{anthropicTextBlock(message.Content)},
@@ -199,19 +213,6 @@ func anthropicWireRequest(req ChatRequest) ([]byte, error) {
 		return nil, err
 	}
 	return encoded, nil
-}
-
-// countLeadingSystem returns how many of the transcript's leading messages
-// are system messages.
-func countLeadingSystem(messages []Message) int {
-	count := 0
-	for _, message := range messages {
-		if message.Role != "system" {
-			break
-		}
-		count++
-	}
-	return count
 }
 
 func anthropicTextBlock(text string) json.RawMessage {
@@ -396,8 +397,8 @@ func anthropicStopReason(reason string) (finish string, toolUse bool, err error)
 // the neutral availability classes. The type string is the only thing
 // retained — the message is provider-controlled body text and is never
 // echoed, exactly like every other transport path.
-func anthropicStreamErrorClass(errType string) *GatewayError {
-	classification := classifyStreamSignal("", errType, DefaultExhaustionSignals())
+func anthropicStreamErrorClass(errType string, signals ExhaustionSignals) *GatewayError {
+	classification := classifyStreamSignal("", errType, signals)
 	gerr := &GatewayError{Availability: classification.Availability, ProviderCode: classification.Code}
 	if gerr.Availability != ProviderUnknown {
 		return gerr
@@ -541,7 +542,7 @@ func normalizeAnthropicStream(body io.Reader, signals ExhaustionSignals) ([]Even
 			if event.Error != nil {
 				errType = event.Error.Type
 			}
-			return terminal(anthropicStreamErrorClass(errType))
+			return terminal(anthropicStreamErrorClass(errType, signals))
 		default:
 			// An unknown payload type is a wire shape this normalizer does
 			// not represent. Fail closed.

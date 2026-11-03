@@ -456,3 +456,79 @@ func TestAnthropicMaxTokens(t *testing.T) {
 		t.Fatalf("fallback max_tokens = %v; want the documented request-shape floor", got)
 	}
 }
+
+// Regression for the #716 review's merge blocker: a production session pins
+// several leading system messages — goal plus harness framing, lane framing,
+// skills index — and every one of them must reach the top-level system field
+// in order, joined by the stable separator, none dropped, none duplicated
+// into messages. The first non-system message ends the collection, and a
+// mid-transcript system message (the compaction digest) still renders as a
+// user block instead of system material.
+func TestAnthropicLeadingSystemMessagesAllPreserved(t *testing.T) {
+	var bodies [][]byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		payload, _ := readAllLimited(r.Body, maxStreamContentBytes)
+		bodies = append(bodies, payload)
+		_, _ = w.Write([]byte(anthropicSSE(
+			anthropicPayload(t, map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text"}}),
+			anthropicPayload(t, map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "ok"}}),
+			anthropicPayload(t, map[string]any{"type": "content_block_stop", "index": 0}),
+			anthropicPayload(t, map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn"}}),
+			anthropicPayload(t, map[string]any{"type": "message_stop"}),
+		)))
+	}))
+	defer server.Close()
+	transport := &AnthropicTransport{BaseURL: server.URL}
+	transcript := []Message{
+		{Role: "system", Content: "goal: land the fix"},
+		{Role: "system", Content: "harness framing: bounded steps"},
+		{Role: "system", Content: "skills index: shell, git"},
+		{Role: "user", Content: "go"},
+		{Role: "system", Content: "[compacted: digest]"},
+		{Role: "user", Content: "continue"},
+	}
+	if _, err := transport.StreamChat(context.Background(), ChatRequest{Model: "MiniMax-M3.1-Flash", Messages: transcript}); err != nil {
+		t.Fatal(err)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("captured %d requests", len(bodies))
+	}
+	var wire struct {
+		System   string `json:"system"`
+		Messages []struct {
+			Role    string           `json:"role"`
+			Content []map[string]any `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(bodies[0], &wire); err != nil {
+		t.Fatal(err)
+	}
+	want := "goal: land the fix\n\nharness framing: bounded steps\n\nskills index: shell, git"
+	if wire.System != want {
+		t.Fatalf("system = %q; want all three pinned messages in order joined by the separator", wire.System)
+	}
+	for i, message := range wire.Messages {
+		if message.Role == "system" {
+			t.Fatalf("message %d rendered as system role; the wire has no such role", i)
+		}
+		for _, block := range message.Content {
+			blockJSON, _ := json.Marshal(block)
+			for _, pinned := range []string{"goal: land the fix", "harness framing: bounded steps", "skills index: shell, git"} {
+				if strings.Contains(string(blockJSON), pinned) {
+					t.Fatalf("pinned system content %q duplicated into messages at %d: %s", pinned, i, blockJSON)
+				}
+			}
+		}
+	}
+	if len(wire.Messages) != 3 {
+		t.Fatalf("messages = %d; want user, digest user block, user", len(wire.Messages))
+	}
+	digestJSON, _ := json.Marshal(wire.Messages[1].Content[0])
+	var digest map[string]any
+	if err := json.Unmarshal(digestJSON, &digest); err != nil {
+		t.Fatal(err)
+	}
+	if digest["type"] != "text" || digest["text"] != "[compacted: digest]" {
+		t.Fatalf("mid-transcript system message = %s; want the compaction-digest user block", digestJSON)
+	}
+}
