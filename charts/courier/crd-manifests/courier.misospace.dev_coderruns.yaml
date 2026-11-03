@@ -115,12 +115,13 @@ spec:
                 - resolve-issue
                 - fix-pr
                 - contribute
+                - rebase
                 type: string
               ref:
                 description: |-
-                  Ref is the issue number (resolve-issue) or PR number (fix-pr). Required
-                  for resolve-issue and fix-pr runs; empty for contribute runs, which
-                  carry no source-owned work item (#595).
+                  Ref is the issue number (resolve-issue) or PR number (fix-pr, rebase).
+                  Required for resolve-issue, fix-pr, and rebase runs; empty for contribute
+                  runs, which carry no source-owned work item (#595).
                 minimum: 1
                 type: integer
               repo:
@@ -172,8 +173,8 @@ spec:
             x-kubernetes-validations:
             - message: spec is immutable
               rule: self == oldSelf
-            - message: contribute runs require spec.workRepo and no spec.ref; resolve-issue
-                and fix-pr runs require spec.ref and no spec.workRepo
+            - message: contribute runs require spec.workRepo and no spec.ref; resolve-issue,
+                fix-pr, and rebase runs require spec.ref and no spec.workRepo
               rule: (self.mode == 'contribute' && !has(self.ref) && has(self.workRepo))
                 || (self.mode != 'contribute' && has(self.ref) && !has(self.workRepo))
           status:

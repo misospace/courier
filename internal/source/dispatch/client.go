@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -64,11 +65,17 @@ type Task struct {
 	Reasons     []string     `json:"reasons,omitempty"`
 }
 
-// PRFixItem identifies one generation of a queued PR followup.
+// PRFixItem identifies one generation of a queued PR followup. FixType is
+// the queue item's classified followup kind (misospace/dispatch#1327); it is
+// carried, never interpreted as an execution capability. A "rebase" FixType
+// names work Courier executes only through its own rebase path (#715) and
+// only after the rebase capability contract is negotiated — it must never be
+// mapped onto ordinary fix-pr work.
 type PRFixItem struct {
 	ID           string `json:"id"`
 	Generation   int    `json:"generation"`
 	HandoutToken string `json:"handoutToken,omitempty"`
+	FixType      string `json:"fixType,omitempty"`
 }
 
 // Issue identifies the issue associated with a Dispatch task.
@@ -117,6 +124,11 @@ type workDescriptor struct {
 	PRFixID      string `json:"prFixId,omitempty"`
 	Generation   int    `json:"generation,omitempty"`
 	HandoutToken string `json:"handoutToken,omitempty"`
+	// FixType preserves the queue item's followup kind through the opaque ID
+	// so a rebase-marked attempt stays rebase-marked across recovery, launch,
+	// and settlement (#715). It never changes the wire task type: every
+	// Dispatch exchange still speaks followup-pr.
+	FixType string `json:"fixType,omitempty"`
 }
 
 // APIError reports a non-2xx Dispatch response.
@@ -179,6 +191,22 @@ type HTTPClient struct {
 	// reports short-circuit without an HTTP round trip for the life of the
 	// process.
 	observationsUnsupported atomic.Bool
+	// rebaseCapabilityEnabled declares that THIS connector is configured as a
+	// rebase executor (#715): discovery sends the versioned rebase-only
+	// intake declaration (dispatch#1533) and accepts rebase work only on the
+	// exact matching intake acknowledgment. It is a per-binding operator
+	// choice, never a startup default, so ordinary lanes keep negotiating
+	// nothing and stay operational with Dispatch deployments that predate the
+	// contract entirely.
+	rebaseCapabilityEnabled bool
+	// rebaseDeclines records, per declined generation, that the decline was
+	// already settled with the deployment: the recoverable release landed, or
+	// the deployment refused it and the refusal stands as the evidence. A
+	// declined generation must not be re-released on every later poll — one
+	// release per generation per process — so the decline keeps surfacing
+	// with its ownership evidence intact while the source's own stale-handout
+	// reclaimer remains the documented bounded recovery path.
+	rebaseDeclines sync.Map
 }
 
 // NewClient creates a Dispatch HTTP client without a queue lane override.
@@ -218,6 +246,32 @@ func (c *HTTPClient) WithPRFixExclusionLimit(limit int) *HTTPClient {
 	if limit >= 1 {
 		c.prFixExclusionLimit = limit
 	}
+	return c
+}
+
+// WithRebaseCapability declares this connector a rebase executor under the
+// versioned rebase-only intake contract (#715, misospace/dispatch#1532 as
+// shipped in dispatch#1533). Enabled per Dispatch binding — never by default
+// — discovery then declares work_scope=rebase-only, work_scope_version=1 and
+// capabilities=rebase-executor:1 on every next-task call, and enforces,
+// fail-closed:
+//
+//   - REBASE-marked work is accepted only on the exact v1 intake
+//     acknowledgment (contract version 1, the rebase-only scope, the scope
+//     enforced, rebase-executor granted at the requested version), and only
+//     as rebase mode — never mapped onto fix-pr;
+//   - ordinary work returned to a rebase-only connector is an ignored scope,
+//     a protocol error, and never accepted;
+//   - an absent intake acknowledgment (an older Dispatch), a different
+//     contract version, an unenforced scope, and a capability verdict that
+//     is not granted or requested at another version are all failed
+//     negotiation, never success.
+//
+// Connectors that do not enable this option keep negotiating nothing: their
+// discovery bytes are unchanged, which is what keeps existing lanes
+// operational with Dispatch deployments that predate the contract.
+func (c *HTTPClient) WithRebaseCapability(enabled bool) *HTTPClient {
+	c.rebaseCapabilityEnabled = enabled
 	return c
 }
 
@@ -347,6 +401,11 @@ var dispatchRepoPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[
 type nextTaskResponse struct {
 	Task
 	PRFixExclusions json.RawMessage `json:"prFixExclusions"`
+	// Intake is Dispatch's versioned intake acknowledgment (rebase.go),
+	// returned only to a poll that declared an intake contract. Absent
+	// otherwise — which is exactly how an older Dispatch (no intake field)
+	// fails closed.
+	Intake json.RawMessage `json:"intake"`
 }
 
 func (c *HTTPClient) discover(ctx context.Context, query url.Values) (items []source.WorkItem, err error) {
@@ -366,8 +425,28 @@ func (c *HTTPClient) discover(ctx context.Context, query url.Values) (items []so
 	}()
 	var response nextTaskResponse
 	endpoint := "/api/agents/" + url.PathEscape(c.agentName) + "/next-task"
+	queryParts := make([]string, 0, 2)
+	if c.rebaseCapabilityEnabled {
+		// The versioned rebase-only intake declaration rides every next-task
+		// call of a rebase executor connector (#715): the rebase-only work
+		// scope, the scope version, and the rebase-executor capability, all
+		// at the exact values Dispatch negotiated in dispatch#1533. A
+		// deployment that has not adopted the contract refuses the unknown
+		// parameters (400) or ignores them; either way the response
+		// validation below is what keeps that skew from becoming silent
+		// acceptance.
+		queryParts = append(queryParts,
+			workScopeQueryParam+"="+rebaseOnlyScope,
+			workScopeVersionQueryParam+"="+rebaseOnlyScopeVersion,
+			capabilityQueryParam+"="+rebaseCapabilityRequest)
+	}
 	if query != nil {
-		endpoint += "?" + query.Encode()
+		if encoded := query.Encode(); encoded != "" {
+			queryParts = append(queryParts, encoded)
+		}
+	}
+	if len(queryParts) > 0 {
+		endpoint += "?" + strings.Join(queryParts, "&")
 	}
 	if err := c.do(ctx, http.MethodGet, endpoint, nil, &response); err != nil {
 		return nil, err
@@ -392,11 +471,42 @@ func (c *HTTPClient) discover(ctx context.Context, query url.Values) (items []so
 	}
 	task := response.Task
 	if !task.ShouldRun || task.Type == "idle" {
+		if c.rebaseCapabilityEnabled {
+			// Idle answers nothing about the intake contract, so idleness is
+			// never read as negotiation success. When the server did not
+			// answer the request at all, surface it once per process so an
+			// operator sees a rebase lane polling a peer that cannot speak
+			// the contract — without turning every idle poll into a failure.
+			if negotiated, reason := validateRebaseIntake(response.Intake); !negotiated && reason == reasonRebaseCapabilityMissing {
+				c.diagnostics.Diagnostic(c.connectorName, connector.SignalProtocolError, reasonRebaseCapabilityMissing)
+			}
+		}
 		return nil, nil
 	}
 	if task.Type != "implement" && task.Type != "followup-pr" {
 		c.diagnostics.Diagnostic(c.connectorName, connector.SignalProtocolError, reasonUnsupportedTaskType)
 		return nil, fmt.Errorf("dispatch client: unsupported task type %q", task.Type)
+	}
+	if c.rebaseCapabilityEnabled {
+		negotiated, reason := validateRebaseIntake(response.Intake)
+		if !negotiated {
+			c.diagnostics.Diagnostic(c.connectorName, connector.SignalProtocolError, reason)
+			// Old Dispatch stamped the handout BEFORE returning this task:
+			// the queue write (agentHandouts push, handout receipt, attemptType
+			// lane stamp) is committed before next-task responds. Refusing
+			// with the negotiation error alone would leave that live handout
+			// reserved until the source's stale-handout recovery. When the
+			// offer carries a valid receipt, release that exact handout
+			// through the bounded decline path — generation-fenced, at most
+			// once per generation, never fabricated, never accepted — before
+			// surfacing the failure (#715, dispatch#1533 review). An offer
+			// without a valid receipt (issue implementation work carries no
+			// prFixItem) has nothing to release.
+			if task.PRFixItem != nil && strings.TrimSpace(task.PRFixItem.ID) != "" && task.PRFixItem.Generation >= 1 {
+				return nil, c.declineRebase(ctx, task, fmt.Sprintf("intake negotiation failed (%s)", reason))
+			}
+			return nil, fmt.Errorf("dispatch client: rebase intake negotiation failed (%s); offered %s work is declined, never accepted", reason, task.Type)
+		}
 	}
 	itemID, err := taskWorkItem(task)
 	if err != nil {
@@ -421,12 +531,36 @@ func (c *HTTPClient) discover(ctx context.Context, query url.Values) (items []so
 			return nil, nil
 		}
 		mode = "fix-pr"
+		if task.PRFixItem != nil && isRebaseFixType(task.PRFixItem.FixType) {
+			// REBASE-marked work rides this transport but never rides the
+			// fix-pr execution path (#715). Accept it only as rebase work,
+			// only when this connector negotiated the capability, and only
+			// with a valid queue receipt; otherwise decline it through the
+			// defined release path and surface why — a silent fallback to
+			// fix-pr is the exact failure this contract exists to prevent.
+			if !c.rebaseCapabilityEnabled {
+				return nil, c.declineRebase(ctx, task, "rebase capability is not negotiated for this connector")
+			}
+			if strings.TrimSpace(task.PRFixItem.ID) == "" || task.PRFixItem.Generation < 1 {
+				c.diagnostics.Diagnostic(c.connectorName, connector.SignalProtocolError, reasonRebaseTaskInvalid)
+				return nil, fmt.Errorf("dispatch client: rebase task carries no valid PR-fix receipt")
+			}
+			mode = "rebase"
+		} else if c.rebaseCapabilityEnabled {
+			// A negotiated rebase-only connector was offered ordinary work:
+			// the rebase-only scope was ignored. That is a protocol error,
+			// not ordinary work, and it is never accepted — accepting it
+			// would silently broaden the rebase lane back into the fix loop.
+			c.diagnostics.Diagnostic(c.connectorName, connector.SignalProtocolError, reasonRebaseFilterIgnored)
+			return nil, fmt.Errorf("dispatch client: rebase-only connector was offered non-rebase work; the rebase-only scope was ignored and the work is declined unclaimed")
+		}
 	}
 	context := ""
 	if task.PRFixItem != nil {
 		var receipt dispatchContext
 		receipt.PRFixID, receipt.Generation = task.PRFixItem.ID, task.PRFixItem.Generation
 		receipt.HandoutToken = task.PRFixItem.HandoutToken
+		receipt.FixType = task.PRFixItem.FixType
 		encoded, _ := json.Marshal(receipt)
 		context = string(encoded)
 	}
@@ -438,6 +572,9 @@ type dispatchContext struct {
 	PRFixID      string `json:"prFixId,omitempty"`
 	Generation   int    `json:"generation,omitempty"`
 	HandoutToken string `json:"handoutToken,omitempty"`
+	// FixType survives in the durable receipt so a rebase-marked attempt
+	// stays rebase-marked through recovery and settlement (#715).
+	FixType string `json:"fixType,omitempty"`
 }
 
 func encodeDispatchContext(existing, token, fixID string, generation int) string {
@@ -1131,6 +1268,7 @@ func EncodeWorkID(task Task) string {
 		d.PRFixID = strings.TrimSpace(task.PRFixItem.ID)
 		d.Generation = task.PRFixItem.Generation
 		d.HandoutToken = task.PRFixItem.HandoutToken
+		d.FixType = task.PRFixItem.FixType
 	}
 	if task.Issue != nil {
 		if task.Type == "implement" {

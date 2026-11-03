@@ -37,6 +37,14 @@ type PrepareOptions struct {
 	// RemoteName is normally left empty for origin.  It is configurable so the
 	// package remains useful with repositories that use another remote name.
 	RemoteName string
+	// SkipBaseSync adopts an existing remote work branch without merging the
+	// base into it. Ordinary run modes must never set it: the base sync is
+	// what keeps a normal push a fast-forward. Rebase work sets it (#715),
+	// because its whole contract is a history rewrite published through an
+	// explicitly leased force-push — a merge started by preparation would
+	// contradict the rebase and leave the branch mid-merge under a mode whose
+	// coordinator can never resolve one.
+	SkipBaseSync bool
 }
 
 // Workspace is a checked-out coordinator workspace.
@@ -52,6 +60,11 @@ type Workspace struct {
 	// The merge is left in progress so the coordinator can resolve it; the
 	// branch is adopted but not yet synchronized with Base.
 	Conflict *MergeConflictError
+	// SkipBaseSync records that this workspace was prepared without the base
+	// sync: rebase work adopts the branch verbatim (#715). Ordinary run modes
+	// never set it, and a coordinator that finds it set must not assume the
+	// branch is synchronized with Base.
+	SkipBaseSync bool
 }
 
 // MergeConflictError reports a base sync that stopped on conflicting paths.
@@ -342,9 +355,19 @@ func (e *CommandError) cutShort() bool {
 }
 
 func run(ctx context.Context, directory string, args ...string) ([]byte, error) {
+	return runWithEnv(ctx, directory, nil, args...)
+}
+
+// runWithEnv is run with extra environment variables layered over the
+// process environment. Only trusted, fixed values pass through it — the
+// editor pin for a scripted rebase continue — never interpolated content.
+func runWithEnv(ctx context.Context, directory string, env []string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	if directory != "" {
 		cmd.Dir = directory
+	}
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
 	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -631,6 +654,7 @@ func Prepare(ctx context.Context, options PrepareOptions) (*Workspace, error) {
 		BaseRemoteURL: strings.TrimSpace(options.BaseRemoteURL),
 		Base:          options.Base,
 		Branch:        options.Branch,
+		SkipBaseSync:  options.SkipBaseSync,
 	}
 	if workspace.BaseRemoteURL != "" && workspace.BaseRemoteURL != options.RemoteURL {
 		if err := workspace.ensureBaseRemote(ctx); err != nil {
@@ -663,7 +687,9 @@ func Prepare(ctx context.Context, options PrepareOptions) (*Workspace, error) {
 // code can make the adoption step explicit, while Prepare remains the normal
 // clone-and-prepare entry point.  A base sync that stops on conflicts is not
 // an error: the branch stays checked out with the merge in progress and the
-// conflict recorded on w.Conflict for the coordinator to resolve.
+// conflict recorded on w.Conflict for the coordinator to resolve. A workspace
+// prepared with SkipBaseSync adopts the branch verbatim instead: rebase work
+// must never find its branch mid-merge before execution begins (#715).
 func (w *Workspace) Adopt(ctx context.Context) error {
 	if err := validateRef(w.Base, "base"); err != nil {
 		return err
@@ -683,6 +709,10 @@ func (w *Workspace) Adopt(ctx context.Context) error {
 	}
 	if _, err := run(ctx, w.Directory, "checkout", "-B", w.Branch, w.remoteRef(w.Branch)); err != nil {
 		return err
+	}
+	if w.SkipBaseSync {
+		w.Adopted = true
+		return nil
 	}
 	// This order is intentional: adoption always synchronizes to base before
 	// a coordinator can inspect or change the worktree.
@@ -788,6 +818,135 @@ func (w *Workspace) ContainsBase(ctx context.Context) (bool, error) {
 	return false, err
 }
 
+// Fetch fetches the work-branch remote. It is the exported form of the fetch
+// the workspace preparation performs, so a consumer that adopted a branch
+// without a base sync can still refresh remote state deliberately.
+func (w *Workspace) Fetch(ctx context.Context) error {
+	return w.fetch(ctx)
+}
+
+// FetchBase fetches the remote that owns Base (the dedicated upstream remote
+// for a fork topology, the work-branch remote otherwise). The base-sync merge
+// normally performs this fetch; a workspace that skipped the sync fetches
+// deliberately before reading base content.
+func (w *Workspace) FetchBase(ctx context.Context) error {
+	_, err := run(ctx, w.Directory, "fetch", "--prune", w.baseRemote())
+	return err
+}
+
+// EnsureBaseRemote adds or updates the dedicated base remote for a fork
+// topology. It is the exported form of the preparation-time setup so a
+// consumer that adopted a branch without a base sync can still configure the
+// base remote before fetching it.
+func (w *Workspace) EnsureBaseRemote(ctx context.Context) error {
+	return w.ensureBaseRemote(ctx)
+}
+
+// DiffPaths lists the paths that differ between two revisions.
+func (w *Workspace) DiffPaths(ctx context.Context, from, to string) ([]string, error) {
+	out, err := run(ctx, w.Directory, "diff", "--name-only", from, to)
+	if err != nil {
+		return nil, err
+	}
+	var paths []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			paths = append(paths, line)
+		}
+	}
+	return paths, nil
+}
+
+// CommitCount counts the commits reachable from to but not from.
+func (w *Workspace) CommitCount(ctx context.Context, from, to string) (int, error) {
+	out, err := run(ctx, w.Directory, "rev-list", "--count", from+".."+to)
+	if err != nil {
+		return 0, err
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0, fmt.Errorf("parse commit count %q: %w", strings.TrimSpace(string(out)), err)
+	}
+	return count, nil
+}
+
+// RebaseConflictError reports a rebase that stopped on conflicting paths. It
+// is actionable for the mechanical resolver, not a setup failure.
+type RebaseConflictError struct {
+	Upstream string
+	Paths    []string
+}
+
+func (e *RebaseConflictError) Error() string {
+	return fmt.Sprintf("rebase onto %s stopped on conflicts in %d path(s): %s", e.Upstream, len(e.Paths), strings.Join(e.Paths, ", "))
+}
+
+// Rebase replays the current branch's commits onto upstreamRef, recording
+// conflict markers in the base-side-inclusive diff3 style so the mechanical
+// resolver can tell one-sided from two-sided edits. A stop on conflicts is
+// returned as *RebaseConflictError; the rebase stays in progress so the
+// resolver can classify the hunks. Anything else fails closed.
+func (w *Workspace) Rebase(ctx context.Context, upstreamRef string) error {
+	_, err := run(ctx, w.Directory, "-c", "merge.conflictstyle=diff3", "rebase", upstreamRef)
+	if err == nil {
+		return nil
+	}
+	paths, pathsErr := w.UnmergedPaths(ctx)
+	if pathsErr != nil || len(paths) == 0 {
+		return err
+	}
+	return &RebaseConflictError{Upstream: upstreamRef, Paths: paths}
+}
+
+// RebaseContinue resumes an in-progress rebase after the resolver staged its
+// mechanical resolutions. The editor is pinned to true so the continue never
+// opens one.
+func (w *Workspace) RebaseContinue(ctx context.Context) error {
+	_, err := runWithEnv(ctx, w.Directory, []string{"GIT_EDITOR=true"}, "rebase", "--continue")
+	return err
+}
+
+// RebaseAbort stops an in-progress rebase and restores the branch to its
+// pre-rebase state.
+func (w *Workspace) RebaseAbort(ctx context.Context) error {
+	_, err := run(ctx, w.Directory, "rebase", "--abort")
+	return err
+}
+
+// Stage records a resolved path in the index so a scripted rebase continue
+// can commit it.
+func (w *Workspace) Stage(ctx context.Context, path string) error {
+	_, err := run(ctx, w.Directory, "add", "--", path)
+	return err
+}
+
+// RebaseInProgress reports whether a rebase is still pending (a rebase state
+// directory exists). Unlike MergeInProgress it covers rebase state, which a
+// mechanical resolver must clear before any publication.
+func (w *Workspace) RebaseInProgress(ctx context.Context) (bool, error) {
+	out, err := run(ctx, w.Directory, "rev-parse", "--git-path", "rebase-merge")
+	if err != nil {
+		return false, err
+	}
+	gitPath := strings.TrimSpace(string(out))
+	if !filepath.IsAbs(gitPath) {
+		gitPath = filepath.Join(w.Directory, gitPath)
+	}
+	if _, statErr := os.Stat(gitPath); statErr == nil {
+		return true, nil
+	}
+	out, err = run(ctx, w.Directory, "rev-parse", "--git-path", "rebase-apply")
+	if err != nil {
+		return false, err
+	}
+	gitPath = strings.TrimSpace(string(out))
+	if !filepath.IsAbs(gitPath) {
+		gitPath = filepath.Join(w.Directory, gitPath)
+	}
+	_, statErr := os.Stat(gitPath)
+	return statErr == nil, nil
+}
+
 // SyncToBase synchronizes a checked-out work branch with a remote base branch.
 func SyncToBase(ctx context.Context, directory, remoteName, base string) error {
 	if remoteName == "" {
@@ -860,6 +1019,30 @@ func (w *Workspace) Push(ctx context.Context) error {
 		return err
 	}
 	_, err := run(ctx, w.Directory, "push", w.RemoteName, "HEAD:refs/heads/"+w.Branch)
+	return err
+}
+
+// PushForceWithLease publishes the current work branch by rewriting its
+// remote history, refusing the push unless the remote branch still carries
+// expectedRemoteHead (#715). The lease is git's own compare-and-set: a
+// concurrent writer that moved the remote branch between this process's last
+// read and the push makes the push fail instead of silently discarding that
+// writer's commits. Only an existing branch may be rewritten — the refspec
+// targets refs/heads/<Branch>, never a new ref — and expectedRemoteHead must
+// name the exact OID the caller observed, so an empty lease is refused rather
+// than turning into an unconditional force push.
+func (w *Workspace) PushForceWithLease(ctx context.Context, expectedRemoteHead string) error {
+	if err := validateRef(w.Branch, "branch"); err != nil {
+		return err
+	}
+	expectedRemoteHead = strings.TrimSpace(expectedRemoteHead)
+	if expectedRemoteHead == "" {
+		return errors.New("push: force-with-lease requires the expected remote head OID")
+	}
+	lease := "refs/heads/" + w.Branch + ":" + expectedRemoteHead
+	_, err := run(ctx, w.Directory, "push",
+		"--force-with-lease="+lease,
+		w.RemoteName, "HEAD:refs/heads/"+w.Branch)
 	return err
 }
 

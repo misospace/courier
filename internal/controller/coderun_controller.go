@@ -69,6 +69,11 @@ const (
 	lifecycleReportAcceptedSupportReason                    = "Accepted"
 	retryLifecycleReportAnnotation                          = "courier.misospace.dev/retry-lifecycle-report"
 	externalVerificationFailureReason                       = "external verification failed"
+	// rebaseAttemptFailedReason is the bounded report reason for a Failed
+	// rebase ending (#715): writer contention or a mechanical verdict the
+	// source's attempt cap governs. It never names a human decision — a
+	// semantic rebase conflict reports through NeedsHuman instead.
+	rebaseAttemptFailedReason = "rebase attempt failed; the episode returns to the source under its attempt cap"
 )
 
 type terminalLifecycleIntent struct {
@@ -1344,7 +1349,11 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 			// Record a declared no_change_needed fix-pr run (exit 3) so its terminal
 			// report can say no change was pushed; exit 0 also lands here but may have
 			// pushed a fix, so only the declared exit sets the flag.
-			if run.Spec.Mode == courierv1alpha1.ModeFixPR && (exitCode == exitDeclaredNoChange || (hasTrusted && trusted.Kind == courierv1alpha1.NativeResultNoChange)) {
+			// A rebase run that found the branch already current declares
+			// no_change the same way (its report must say nothing was pushed);
+			// the later AwaitingReview gate stays fix-pr-only, because a
+			// current rebase branch is a healthy PR, not unresolved feedback.
+			if (run.Spec.Mode == courierv1alpha1.ModeFixPR || run.Spec.Mode == courierv1alpha1.ModeRebase) && (exitCode == exitDeclaredNoChange || (hasTrusted && trusted.Kind == courierv1alpha1.NativeResultNoChange)) {
 				run.Status.DeclaredNoChange = true
 			}
 			run.Status.Phase = courierv1alpha1.PhaseVerifying
@@ -1865,7 +1874,7 @@ func (r *CoderRunReconciler) publishSourceLifecycle(ctx context.Context, run *co
 		state = source.StateInProgress
 	}
 	if isCapacityExhaustionRun(run) {
-		lifecycle := lifecycleForPhase(phase, state, run.Status.PR, startedAtForRun(run), intent)
+		lifecycle := lifecycleForPhase(phase, run.Spec.Mode, state, run.Status.PR, startedAtForRun(run), intent)
 		lifecycle.Result = source.ResultCapacityExhausted
 		lifecycle.IdempotencyKey = lifecycleIdempotencyKey(run, phase)
 		return reportLifecycle(ctx, adapter, item, lifecycle)
@@ -1883,7 +1892,7 @@ func (r *CoderRunReconciler) publishSourceLifecycle(ctx context.Context, run *co
 		t := run.Status.StartedAt.Time
 		startedAt = &t
 	}
-	lifecycle := lifecycleForPhase(phase, state, run.Status.PR, startedAt, intent)
+	lifecycle := lifecycleForPhase(phase, run.Spec.Mode, state, run.Status.PR, startedAt, intent)
 	// Fail closed for retained AwaitingReview runs written before the
 	// no-change verification gate: replay must not certify unresolved feedback.
 	if legacyNoChange {
@@ -1916,7 +1925,11 @@ func stateForTerminalPhase(phase courierv1alpha1.Phase, runMode courierv1alpha1.
 	case courierv1alpha1.PhaseNeedsHuman:
 		return source.StateNeedsHuman
 	case courierv1alpha1.PhaseFailed:
-		if runMode == courierv1alpha1.ModeFixPR && intent.ciFailure {
+		if (runMode == courierv1alpha1.ModeFixPR && intent.ciFailure) || runMode == courierv1alpha1.ModeRebase {
+			// A rebase Failed ending is writer contention or a mechanical
+			// verdict, retryable under the source's attempt cap — never a
+			// human park (#715). A rebase semantic conflict parks NeedsHuman
+			// instead, through the NeedsHuman case below.
 			return source.StateInProgress
 		}
 		return source.StateNeedsHuman
@@ -2168,7 +2181,7 @@ func startedAtForRun(run *courierv1alpha1.CoderRun) *time.Time {
 	return &t
 }
 
-func lifecycleForPhase(phase courierv1alpha1.Phase, state source.State, pr string, startedAt *time.Time, intent terminalLifecycleIntent) source.Lifecycle {
+func lifecycleForPhase(phase courierv1alpha1.Phase, runMode courierv1alpha1.Mode, state source.State, pr string, startedAt *time.Time, intent terminalLifecycleIntent) source.Lifecycle {
 	lifecycle := source.Lifecycle{State: state, PR: pr, StartedAt: startedAt}
 	switch phase {
 	case courierv1alpha1.PhaseAwaitingReview:
@@ -2179,6 +2192,15 @@ func lifecycleForPhase(phase courierv1alpha1.Phase, state source.State, pr strin
 		if intent.ciFailure {
 			lifecycle.Result = source.ResultFailed
 			lifecycle.Error = externalVerificationFailureReason
+		} else if runMode == courierv1alpha1.ModeRebase {
+			// A rebase attempt that ended Failed — a moved remote head, a
+			// leased push refusal, a check verdict on the replay — is writer
+			// contention or a mechanical verdict, never a human decision: the
+			// failed report hands the episode to the source's own attempt cap
+			// (#715). A rebase semantic conflict does not land here: the
+			// executor parks it NeedsHuman instead.
+			lifecycle.Result = source.ResultFailed
+			lifecycle.Error = rebaseAttemptFailedReason
 		} else {
 			// Coordinator failures are not an external CI attempt. Park the
 			// source for human attention rather than triggering queue retries.
@@ -2746,7 +2768,7 @@ func phaseForExit(mode courierv1alpha1.Mode, exitCode int32, outcome string) cou
 		}
 		return courierv1alpha1.PhaseNeedsHuman
 	case exitDeclaredNoChange:
-		if mode == courierv1alpha1.ModeFixPR {
+		if mode == courierv1alpha1.ModeFixPR || mode == courierv1alpha1.ModeRebase {
 			return courierv1alpha1.PhaseVerifying
 		}
 		return courierv1alpha1.PhaseAwaitingReview

@@ -418,6 +418,17 @@ func TestCoderRunSpecModeValidation(t *testing.T) {
 			s.WorkRepo = "contributor/fork"
 			return s
 		}(), true},
+		{"rebase accepted", specFixture(ModeRebase), false},
+		{"rebase without ref rejected", func() CoderRunSpec {
+			s := specFixture(ModeRebase)
+			s.Ref = 0
+			return s
+		}(), true},
+		{"rebase with workRepo rejected", func() CoderRunSpec {
+			s := specFixture(ModeRebase)
+			s.WorkRepo = "contributor/fork"
+			return s
+		}(), true},
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

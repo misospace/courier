@@ -260,7 +260,10 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 	// terminalize a request that merely moved base instead of following it
 	// to the base it targets now. A resolve-issue run keeps the
 	// deployment default.
-	if run.Spec.Mode == courierv1alpha1.ModeFixPR {
+	// A rebase run is pinned to the same live base: its whole contract is a
+	// replay onto the pull request's own target ref (#715), so an unpinned
+	// default base would rebase against a branch the request never named.
+	if run.Spec.Mode == courierv1alpha1.ModeFixPR || run.Spec.Mode == courierv1alpha1.ModeRebase {
 		base, err := l.resolveFixPRBase(ctx, run)
 		if err != nil {
 			return err

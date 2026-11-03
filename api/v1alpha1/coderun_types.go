@@ -5,7 +5,7 @@ import (
 )
 
 // Mode is the kind of work a CoderRun performs.
-// +kubebuilder:validation:Enum=resolve-issue;fix-pr;contribute
+// +kubebuilder:validation:Enum=resolve-issue;fix-pr;contribute;rebase
 type Mode string
 
 const (
@@ -17,6 +17,14 @@ const (
 	// into the base repository spec.repo, for a goal carried in spec.sourceContext
 	// and no source-owned work item (#595).
 	ModeContribute Mode = "contribute"
+	// ModeRebase: mechanically rebase an existing PR branch onto its live base
+	// (#715). Execution is trusted, bounded, and deterministic — never ordinary
+	// fix-pr merge preparation and never a model session — so only mechanical
+	// conflict resolution can land, and a semantic conflict stops for a human.
+	// The rebased head publishes to the existing PR branch through a lease tied
+	// to the expected remote head, so a concurrent writer can never be
+	// overwritten.
+	ModeRebase Mode = "rebase"
 )
 
 // SoftStopAnnotation is the human ingress for an operator soft-stop of a
@@ -270,7 +278,7 @@ const (
 // There is deliberately no attempts field: each CoderRun is one immutable
 // attempt at one goal. History is the sequence of runs linked by the branch/PR.
 // +kubebuilder:validation:XValidation:rule="self == oldSelf",message="spec is immutable"
-// +kubebuilder:validation:XValidation:rule="(self.mode == 'contribute' && !has(self.ref) && has(self.workRepo)) || (self.mode != 'contribute' && has(self.ref) && !has(self.workRepo))",message="contribute runs require spec.workRepo and no spec.ref; resolve-issue and fix-pr runs require spec.ref and no spec.workRepo"
+// +kubebuilder:validation:XValidation:rule="(self.mode == 'contribute' && !has(self.ref) && has(self.workRepo)) || (self.mode != 'contribute' && has(self.ref) && !has(self.workRepo))",message="contribute runs require spec.workRepo and no spec.ref; resolve-issue, fix-pr, and rebase runs require spec.ref and no spec.workRepo"
 type CoderRunSpec struct {
 	// Mode is the kind of work: resolve-issue, fix-pr, or contribute.
 	Mode Mode `json:"mode"`
@@ -329,9 +337,9 @@ type CoderRunSpec struct {
 	// +kubebuilder:validation:Pattern=`^[^/]+/[^/]+$`
 	WorkRepo string `json:"workRepo,omitempty"`
 
-	// Ref is the issue number (resolve-issue) or PR number (fix-pr). Required
-	// for resolve-issue and fix-pr runs; empty for contribute runs, which
-	// carry no source-owned work item (#595).
+	// Ref is the issue number (resolve-issue) or PR number (fix-pr, rebase).
+	// Required for resolve-issue, fix-pr, and rebase runs; empty for contribute
+	// runs, which carry no source-owned work item (#595).
 	// +optional
 	// +kubebuilder:validation:Minimum=1
 	Ref int `json:"ref,omitempty"`

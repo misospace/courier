@@ -184,7 +184,12 @@ func resolveRunBranch(ctx context.Context, run *courierv1alpha1.CoderRun, resolv
 			return HeadRef{}, fmt.Errorf("%w: resolve-issue", ErrEmptyResolvedBranch)
 		}
 		return HeadRef{Repo: run.Spec.Repo, Branch: resolved}, nil
-	case courierv1alpha1.ModeFixPR:
+	case courierv1alpha1.ModeFixPR, courierv1alpha1.ModeRebase:
+		// A rebase run resolves the same live PR identity a fix-pr run does
+		// (#715): the head repository, branch, and commit, plus the live base
+		// ref the pull request targets. The rebase execution path pins its
+		// lease to the resolved head and rebase-only work never re-targets a
+		// different PR than the one admission read.
 		if resolver == nil {
 			return HeadRef{}, ErrPRHeadResolverRequired
 		}
@@ -196,7 +201,7 @@ func resolveRunBranch(ctx context.Context, run *courierv1alpha1.CoderRun, resolv
 			return HeadRef{}, ErrEmptyResolvedBranch
 		}
 		if strings.TrimSpace(head.Repo) == "" {
-			return HeadRef{}, fmt.Errorf("%w: fix-pr head repository is empty", ErrHeadRepositoryGone)
+			return HeadRef{}, fmt.Errorf("%w: %s head repository is empty", ErrHeadRepositoryGone, run.Spec.Mode)
 		}
 		return head, nil
 	case courierv1alpha1.ModeContribute:
