@@ -42,6 +42,7 @@ import (
 	"github.com/misospace/courier/internal/git"
 	"github.com/misospace/courier/internal/github"
 	courierlog "github.com/misospace/courier/internal/log"
+	"github.com/misospace/courier/internal/rebase"
 	"github.com/misospace/courier/internal/telemetry"
 )
 
@@ -279,18 +280,26 @@ func readConfig(getenv func(string) string) (config, error) {
 			return config{}, fmt.Errorf("%s is required", required.name)
 		}
 	}
-	if strings.EqualFold(cfg.Mode, "fix-pr") && cfg.HeadRepo == "" {
-		return config{}, errors.New("COURIER_HEAD_REPO is required for fix-pr runs")
+	if isPRRepairMode(cfg.Mode) && cfg.HeadRepo == "" {
+		return config{}, errors.New("COURIER_HEAD_REPO is required for " + cfg.Mode + " runs")
 	}
-	if strings.EqualFold(cfg.Mode, "fix-pr") && cfg.Ref < 1 {
+	if isPRRepairMode(cfg.Mode) && cfg.Ref < 1 {
 		// A fix-pr run is admitted against one pinned pull request, and
 		// the pre-handoff observation verifies exactly that pull request
-		// (#517). Without a usable pinned reference there is nothing to
-		// verify, so the run must not proceed to a Verifying handoff it
-		// can never prove: it fails closed here, where the malformed
-		// input is still visible, instead of silently skipping the
-		// verification it exists to perform.
-		return config{}, errors.New("COURIER_REF must be the pinned pull request number for fix-pr runs")
+		// (#517). A rebase run is admitted the same way and additionally
+		// leases its publication to the head observed then (#715). Without a
+		// usable pinned reference there is nothing to verify, so the run
+		// must not proceed to a Verifying handoff it can never prove: it
+		// fails closed here, where the malformed input is still visible,
+		// instead of silently skipping the verification it exists to
+		// perform.
+		return config{}, errors.New("COURIER_REF must be the pinned pull request number for " + cfg.Mode + " runs")
+	}
+	if strings.EqualFold(cfg.Mode, "rebase") && cfg.HeadSHA == "" {
+		// The lease is the point of the rebase publication contract: without
+		// the admission head there is no compare-and-set, so the run refuses
+		// to start rather than publishing unleased (#715).
+		return config{}, errors.New("COURIER_HEAD_SHA is required for rebase runs")
 	}
 	scratchRelative, err := filepath.Rel(cfg.Directory, cfg.ScratchDirectory)
 	if err != nil {
@@ -587,6 +596,15 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 
 	if code := report.guardFixPRBase(ctx); code != 0 {
 		return code
+	}
+
+	// The rebase execution path is explicit and never shares fix-pr's flow
+	// (#715): the workspace is adopted without the base-sync merge, execution
+	// is the trusted deterministic rebase engine, and no model session starts.
+	// A rebase run therefore cannot fall into merge preparation whose conflict
+	// instructions prohibit rebase and force-push.
+	if strings.EqualFold(cfg.Mode, "rebase") {
+		return runRebaseMode(ctx, report, cfg)
 	}
 
 	workspace, err := git.Prepare(ctx, git.PrepareOptions{
@@ -1592,6 +1610,13 @@ func (r reporter) guardAdoption(ctx context.Context) (int, bool) {
 	return 0, false
 }
 
+// isPRRepairMode reports whether the mode operates on an existing pull
+// request's own branch: fix-pr and rebase (#715). Both share the branch
+// ownership guard below; they differ in everything execution does after it.
+func isPRRepairMode(mode string) bool {
+	return strings.EqualFold(mode, "fix-pr") || strings.EqualFold(mode, "rebase")
+}
+
 // guardFixPRHead enforces the fix-pr invariant that a run must operate on the
 // fork that owns the PR head. If the head branch is missing on that fork, the
 // run must stop and ask for a human; it must never adopt a same-named base
@@ -1602,9 +1627,10 @@ func (r reporter) guardAdoption(ctx context.Context) (int, bool) {
 // own verdict keeps the fail-closed crash ending (#580). It returns 0 when the
 // run may proceed. The guard assumes pod.go points COURIER_REPO_URL at the head
 // repo for fix-pr runs; single-remote deployments without a %s placeholder are
-// out of scope.
+// out of scope. Rebase runs take the same guard: a mechanical rebase publishes
+// only to the head branch it was admitted against (#715).
 func (r reporter) guardFixPRHead(ctx context.Context) int {
-	if r.cfg.Mode != "fix-pr" || r.cfg.HeadRepo == "" || strings.EqualFold(r.cfg.HeadRepo, r.cfg.Repo) {
+	if !isPRRepairMode(r.cfg.Mode) || r.cfg.HeadRepo == "" || strings.EqualFold(r.cfg.HeadRepo, r.cfg.Repo) {
 		return 0
 	}
 	exists, err := git.RemoteBranchExists(ctx, r.cfg.RemoteURL, r.cfg.Branch)
@@ -1644,11 +1670,11 @@ func (r reporter) guardFixPRHead(ctx context.Context) int {
 // same world the no-change claim is verified against (#515). It returns 0
 // when the run may proceed.
 func (r reporter) guardFixPRBase(ctx context.Context) int {
-	if !strings.EqualFold(r.cfg.Mode, "fix-pr") {
+	if !isPRRepairMode(r.cfg.Mode) {
 		return 0
 	}
 	if r.cfg.Ref < 1 {
-		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "COURIER_REF is not set; a fix-pr run without a pull request number cannot be validated", Category: terminalCategoryExecutorCrash})
+		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "COURIER_REF is not set; a run against a pull request without its number cannot be validated", Category: terminalCategoryExecutorCrash})
 		return 1
 	}
 	client, err := github.NewClient(r.cfg.GitHubAPIBase, r.cfg.GitHubToken)
@@ -1708,6 +1734,80 @@ func (r reporter) guardFixPRBase(ctx context.Context) int {
 		return exitNeedsHuman
 	}
 	return 0
+}
+
+// runRebaseMode is the rebase execution path (#715). It runs entirely in
+// trusted deterministic code: the workspace is adopted without the fix-pr
+// base-sync merge, the trusted mechanical rebase engine replays the PR
+// branch onto the pull request's live base, and the outcome maps onto the
+// operator's termination contract exactly like every other ending. No model
+// session starts, so only the engine's closed mechanical rules can ever
+// change a byte, and the publication is leased to the head observed at
+// admission. The rebase outcome decides the phase: published and up-to-date
+// hand off to the operator's world verification, a semantic conflict parks
+// for a human, and writer contention or an unattributable failure ends the
+// attempt Failed for the source's attempt cap to govern.
+func runRebaseMode(ctx context.Context, report reporter, cfg config) int {
+	workspace, err := git.Prepare(ctx, git.PrepareOptions{
+		RemoteURL:     cfg.RemoteURL,
+		BaseRemoteURL: cfg.BaseRemoteURL,
+		Directory:     cfg.Directory,
+		Base:          cfg.Base,
+		Branch:        cfg.Branch,
+		SkipBaseSync:  true,
+	})
+	if err != nil {
+		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: exitFailed, Reason: "prepare the rebase workspace: " + err.Error(), Category: terminalCategoryExecutorCrash})
+		return exitFailed
+	}
+	report.event(courierlog.EventWorkspaceReady, courierlog.StatusOK, map[string]any{
+		"adopted":       workspace.Adopted,
+		"base":          cfg.Base,
+		"branch":        cfg.Branch,
+		"baseSyncSkips": true,
+	})
+	outcome, err := rebase.Execute(ctx, rebase.Options{
+		Repo:          cfg.Repo,
+		Base:          cfg.Base,
+		Branch:        cfg.Branch,
+		ExpectedHead:  cfg.HeadSHA,
+		Workspace:     cfg.Directory,
+		RemoteURL:     cfg.RemoteURL,
+		BaseRemoteURL: cfg.BaseRemoteURL,
+	})
+	if err != nil {
+		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: exitFailed, Reason: err.Error(), Category: terminalCategoryExecutorCrash})
+		return exitFailed
+	}
+	switch outcome.Outcome {
+	case rebase.OutcomePublished:
+		report.event(courierlog.EventRunSummary, courierlog.StatusOK, map[string]any{
+			"summary": outcome.Reason,
+			"head":    outcome.Head,
+		})
+		// Still only a handoff: the operator's own PR/head/check observation
+		// remains the authority for Verifying.
+		report.terminate(termination{Phase: "Verifying", Result: "success", ExitCode: exitSuccess, Reason: outcome.Reason})
+		return exitSuccess
+	case rebase.OutcomeUpToDate:
+		report.terminate(termination{Phase: "NoChangeNeeded", Result: "success", ExitCode: exitNoChangeNeeded, Reason: outcome.Reason, Outcome: outcomeNoChangeNeeded})
+		return exitNoChangeNeeded
+	case rebase.OutcomeSemanticConflict:
+		reason := outcome.Reason
+		if outcome.Conflict != nil && len(outcome.Conflict.Files) > 0 {
+			reason = fmt.Sprintf("%s (files: %s)", reason, strings.Join(outcome.Conflict.Files, ", "))
+		}
+		report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: reason, Outcome: outcomeNeedsDecision, Category: terminalCategoryNeedsDecision})
+		return exitNeedsHuman
+	case rebase.OutcomeRemoteHeadMoved:
+		// Writer contention, not a human decision: the source's attempt cap
+		// governs any reissue, and the remote branch was never mutated.
+		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: exitFailed, Reason: outcome.Reason, Category: terminalCategoryVerifierRejection})
+		return exitFailed
+	default:
+		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: exitFailed, Reason: outcome.Reason, Category: terminalCategoryUnknown})
+		return exitFailed
+	}
 }
 
 // splitOwnerRepo splits an owner/name repository identity on the final "/".

@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -93,6 +94,7 @@ func main() {
 	var dispatchQueueLane string
 	var dispatchLane string
 	var dispatchLaneBindings stringSliceValue
+	var dispatchRebaseLanes stringSliceValue
 	var dispatchPollInterval time.Duration
 	var dispatchHTTPTimeout time.Duration
 	var cronSchedulesFile string
@@ -170,6 +172,7 @@ func main() {
 	flag.StringVar(&dispatchQueueLane, "dispatch-queue-lane", "", "Dispatch queue lane sent to next-task.")
 	flag.StringVar(&dispatchLane, "dispatch-lane", "", "LaneProfile assigned to discovered Dispatch work.")
 	flag.Var(&dispatchLaneBindings, "dispatch-lane-binding", "Repeatable Dispatch binding <queueLane>:<laneProfile>[:<agentName>]; one discovery runner per binding.")
+	flag.Var(&dispatchRebaseLanes, "dispatch-rebase-lane", "Repeatable queue-lane name whose Dispatch binding requests the versioned rebase capability contract (#715). A rebase binding accepts REBASE work only on an affirmative, version-matched capability response and declines everything else; ordinary bindings negotiate nothing and stay compatible with older Dispatch deployments.")
 	flag.DurationVar(&dispatchPollInterval, "dispatch-poll-interval", 30*time.Second, "Dispatch discovery poll interval.")
 	flag.DurationVar(&dispatchHTTPTimeout, "dispatch-http-timeout", 30*time.Second, "Dispatch HTTP request timeout.")
 	var labelSourceEnabled bool
@@ -562,6 +565,15 @@ func main() {
 			bindingClient.WithPullRequestStateChecker(checker)
 			if dispatchPRFixExclusions {
 				bindingClient.WithPRFixExclusions(true)
+			}
+			// A rebase lane is an explicit per-binding operator choice (#715):
+			// the binding sends the versioned rebase capability request and
+			// fail-closes on every negotiation refusal. Every other binding
+			// negotiates nothing, which is what keeps ordinary lanes
+			// operational with Dispatch deployments that predate the contract.
+			if slices.Contains(dispatchRebaseLanes, binding.queueLane) {
+				bindingClient.WithRebaseCapability(true)
+				setupLog.Info("Dispatch binding requests the rebase capability contract", "queueLane", binding.queueLane, "laneProfile", binding.laneProfile)
 			}
 			opts := []dispatch.Option{dispatch.WithConnectorDiagnostics(diagnostics)}
 			if binding.sourceAgent != "" {

@@ -376,7 +376,7 @@ func (r *Runner) Poll(ctx context.Context) error {
 			r.Metrics.IncSkipped(r.Config.Source, r.Config.LaneProfile, "missing-id")
 			continue
 		}
-		if item.Mode != string(courierv1alpha1.ModeResolveIssue) && item.Mode != string(courierv1alpha1.ModeFixPR) {
+		if item.Mode != string(courierv1alpha1.ModeResolveIssue) && item.Mode != string(courierv1alpha1.ModeFixPR) && item.Mode != string(courierv1alpha1.ModeRebase) {
 			log.FromContext(ctx).Info("skipping malformed source work item", "workItemID", item.ID, "reason", "unsupported mode", "mode", item.Mode)
 			r.Metrics.IncSkipped(r.Config.Source, r.Config.LaneProfile, "unsupported-mode")
 			continue

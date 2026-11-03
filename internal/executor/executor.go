@@ -330,6 +330,15 @@ func GoalWithContribution(run *courierv1alpha1.CoderRun, contribution Contributi
 		return fmt.Sprintf("Open a PR to address issue #%d.%s %s %s %s%s %s %s", run.Spec.Ref, assignment, forgeContract, completionContract, localValidationContract, publication, publicationBlockGrammar, fmt.Sprintf(outcomeContract, outcomeFile)) + repairContract(run), nil
 	case courierv1alpha1.ModeFixPR:
 		return fmt.Sprintf("Take over PR #%d.%s Inspect the current pull request state, CI/checks, and existing review feedback to determine what work is needed; address feedback already present without repeatedly searching for new reviews. %s %s %s%s %s", run.Spec.Ref, assignment, forgeContract, completionContract, localValidationContract, publication, fmt.Sprintf(outcomeContract, outcomeFile)) + repairContract(run), nil
+	case courierv1alpha1.ModeRebase:
+		// The goal of a rebase run is contract documentation, not model work
+		// (#715): execution is the trusted, deterministic rebase path, and no
+		// model session runs. The rendered text states the mechanical-only
+		// walls so any reader of the run — a human inspecting COURIER_GOAL, an
+		// audit trail, a future harness — sees exactly what this mode may and
+		// may not do, and the outcome declaration stays uniform with the other
+		// modes.
+		return fmt.Sprintf("Mechanically rebase PR #%d onto its base (#715). This run is trusted deterministic execution: it rebases the existing pull-request branch onto the pull request's live base, resolves nothing but provably mechanical conflicts (one-sided edits and comment-only overlaps), runs the bounded repository checks, and publishes only to the existing pull-request branch through a force-with-lease tied to the head observed at admission. It never merges, never edits code semantics, never resolves a two-sided code conflict — a semantic conflict stops the run for a human decision with the conflict summary — and never opens, retargets, or creates a pull request or branch.%s %s", run.Spec.Ref, publication, fmt.Sprintf(outcomeContract, outcomeFile)), nil
 	case courierv1alpha1.ModeContribute:
 		if run.Spec.Ref != 0 {
 			return "", ErrInvalidReference
@@ -922,7 +931,7 @@ func InvocationFromEnv(get func(string) string) (Invocation, error) {
 	}
 	inv.Mode = courierv1alpha1.Mode(get("COURIER_MODE"))
 	switch inv.Mode {
-	case courierv1alpha1.ModeResolveIssue, courierv1alpha1.ModeFixPR, courierv1alpha1.ModeContribute:
+	case courierv1alpha1.ModeResolveIssue, courierv1alpha1.ModeFixPR, courierv1alpha1.ModeContribute, courierv1alpha1.ModeRebase:
 	default:
 		return Invocation{}, fmt.Errorf("%w: %q", ErrInvalidMode, inv.Mode)
 	}
