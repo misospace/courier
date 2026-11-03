@@ -54,6 +54,21 @@ jobs:
             exit 1
           fi
 
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version: "1.27.3"
+          cache: true
+
+      - name: Build release binaries
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/manager cmd/main.go
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/courier-executor ./cmd/courier-executor
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/courier-control ./cmd/courier-control
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/courier-worker ./cmd/courier-worker
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/courier-broker ./cmd/courier-broker
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4.4.1
 
@@ -114,6 +129,7 @@ jobs:
         with:
           context: .
           target: manager
+          build-args: BINARIES=prebuilt
           push: true
           tags: ${{ steps.manager-meta.outputs.tags }}
           labels: ${{ steps.manager-meta.outputs.labels }}
@@ -125,6 +141,7 @@ jobs:
         with:
           context: .
           target: coordinator
+          build-args: BINARIES=prebuilt
           push: true
           tags: ${{ steps.coordinator-meta.outputs.tags }}
           labels: ${{ steps.coordinator-meta.outputs.labels }}
@@ -136,6 +153,7 @@ jobs:
         with:
           context: .
           target: coordinator-go
+          build-args: BINARIES=prebuilt
           push: true
           tags: ${{ steps.toolchain-meta.outputs.tags }}
           labels: ${{ steps.toolchain-meta.outputs.labels }}
@@ -147,6 +165,7 @@ jobs:
         with:
           context: .
           target: harness
+          build-args: BINARIES=prebuilt
           push: true
           tags: ${{ steps.harness-meta.outputs.tags }}
           labels: ${{ steps.harness-meta.outputs.labels }}
@@ -158,6 +177,7 @@ jobs:
         with:
           context: .
           target: harness-go
+          build-args: BINARIES=prebuilt
           push: true
           tags: ${{ steps.harness-go-meta.outputs.tags }}
           labels: ${{ steps.harness-go-meta.outputs.labels }}
@@ -187,27 +207,12 @@ jobs:
           docker run --rm --entrypoint sh
           ${{ env.TOOLCHAIN_IMAGE }}:${{ steps.version.outputs.version }}
           -c 'test "$(id -u)" = 65532 && go version && make --version >/dev/null && helm version --short >/dev/null && controller-gen --version >/dev/null && test ! -x "$(command -v gh || true)"'
-      - name: Validate Courier workflow in published Go toolchain image
+      - name: Smoke-test published Go toolchain image
         run: |
-          runtime_workspace="$(mktemp -d)"
-          chmod 777 "$runtime_workspace"
-          cleanup_runtime_workspace() {
-            docker run --rm \
-              --user 0:0 \
-              --mount "type=bind,src=$runtime_workspace,dst=/workspace" \
-              ${{ env.TOOLCHAIN_IMAGE }}:${{ steps.version.outputs.version }} \
-              sh -ec 'rm -rf /workspace/* /workspace/.[!.]*' >/dev/null || true
-            rmdir "$runtime_workspace" 2>/dev/null || true
-          }
-          trap cleanup_runtime_workspace EXIT
-          test "$(docker inspect --format '{{.Config.User}}' ${{ env.TOOLCHAIN_IMAGE }}:${{ steps.version.outputs.version }})" = "65532:65532"
           docker run --rm \
-            --user 65532:65532 \
             --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/source,readonly" \
-            --mount "type=bind,src=$runtime_workspace,dst=/workspace" \
-            --workdir /workspace \
             ${{ env.TOOLCHAIN_IMAGE }}:${{ steps.version.outputs.version }} \
-            sh -ec 'cp -R /source/. /workspace/ && rm -rf /workspace/.git && sh hack/verify-courier-go-runtime.sh'
+            sh /source/hack/verify-courier-go-runtime.sh --smoke
 
       - name: Validate Go toolchain harness image
         run: >-

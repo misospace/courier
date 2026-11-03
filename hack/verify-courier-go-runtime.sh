@@ -2,6 +2,19 @@
 
 set -eu
 
+case "${1:-}" in
+  "")
+    verify_mode=full
+    ;;
+  --smoke)
+    verify_mode=smoke
+    ;;
+  *)
+    echo "usage: $0 [--smoke]" >&2
+    exit 2
+    ;;
+esac
+
 test "$(id -u)" = "65532"
 test "$(id -g)" = "65532"
 go version
@@ -42,6 +55,23 @@ case "$gocache" in
 	*) echo "GOCACHE=$gocache is not under /courier-toolchain-cache" >&2; exit 1 ;;
 esac
 mkdir -p "$gocache" && test -w "$gocache"
+
+if [ "$verify_mode" = "smoke" ]; then
+  # Release-time validation proves the published image can execute a real Go
+  # compile with its pinned writable caches. The full repository
+  # generate/build/test contract remains the default mode and is exercised by
+  # CI before a release tag is cut.
+  probe_dir="$(mktemp -d)"
+  trap 'rm -rf "$probe_dir"' EXIT
+  cat > "$probe_dir/main.go" <<'EOF'
+package main
+
+func main() {}
+EOF
+  go build -o "$probe_dir/probe" "$probe_dir/main.go"
+  test -x "$probe_dir/probe"
+  exit 0
+fi
 
 make manifests
 make generate

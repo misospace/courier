@@ -447,6 +447,13 @@ jobs:
             courier-go:ci \
             sh -ec 'cp -R /source/. /workspace/ && rm -rf /workspace/.git && sh hack/verify-courier-go-runtime.sh'
 
+      - name: Validate Go toolchain smoke verifier
+        run: >-
+          docker run --rm
+          --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/source,readonly"
+          courier-go:ci
+          sh /source/hack/verify-courier-go-runtime.sh --smoke
+
   images:
     runs-on: ubuntu-latest
     needs: [images-classify, image-manager, image-coordinator, image-coordinator-go, image-harness]
