@@ -154,6 +154,11 @@ type SecureConfig struct {
 	RunNamespace string
 	// Registry is the loaded provider registry.
 	Registry *forge.Registry
+	// LaneRuntimeImage is the default worker image for lanes that declare no
+	// RuntimeImage of their own — the deployment's shipped lane runtime, for
+	// example the harness-go toolchain base at the chart's version. Empty
+	// preserves the legacy behavior: such lanes render HarnessImage (#717).
+	LaneRuntimeImage string
 	// HarnessImage is the image carrying courier-control, courier-worker, and
 	// courier-broker.
 	HarnessImage string

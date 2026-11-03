@@ -176,6 +176,15 @@ secure:
   harnessImage:
     repository: ghcr.io/misospace/courier-harness
     tag: ""
+  # -- Default worker image for lanes that declare no runtimeImage: the
+  #    shipped lane runtime (the harness-go toolchain base), tracked to the
+  #    chart's version when tag is empty — a chart bump moves every
+  #    defaulting lane's worker with it, so no deployment hand-pins a lane
+  #    image version (#717). A lane's spec.runtimeImage overrides this for
+  #    its worker.
+  laneRuntimeImage:
+    repository: ghcr.io/misospace/courier-harness-go
+    tag: ""
   probeImage: "busybox:1.38@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4"
   dependencyCacheService: ""
   dependencyCachePort: 0

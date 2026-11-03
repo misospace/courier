@@ -327,11 +327,12 @@ func (s *SecureControl) controlInvocation(ctx context.Context, run *courier.Code
 type laneLaunchSpec struct {
 	resources corev1.ResourceRequirements
 	// workerImage is the operator-approved execution-environment seam: the
-	// lane's RuntimeImage when set, the deployment harness image otherwise.
-	// It selects the WORKER image only — control and broker always render
-	// the deployment HarnessImage, because they carry Courier's trusted
-	// binaries and fixed trust contracts, while the worker is the untrusted
-	// execution environment the lane sizes. A selected image must carry
+	// lane's RuntimeImage when set, the deployment's lane runtime image
+	// otherwise, and the deployment harness image when neither exists. It
+	// selects the WORKER image only — control and broker always render the
+	// deployment HarnessImage, because they carry Courier's trusted binaries
+	// and fixed trust contracts, while the worker is the untrusted execution
+	// environment the lane sizes. A selected image must carry
 	// /usr/local/bin/courier-worker; the published harness-go image is the
 	// shipped contract that layers the harness binaries onto the Go
 	// toolchain base.
@@ -353,7 +354,17 @@ func (s *SecureControl) laneLaunchSpec(ctx context.Context, run *courier.CoderRu
 	if err := lane.Spec.ValidateResources(); err != nil {
 		return laneLaunchSpec{}, secureNeedsHuman(laneConfigReason, "lane profile %q: %v", lane.Name, err)
 	}
+	// The resolution chain is explicit and versionless by default: the lane's
+	// own full-string override wins; otherwise the deployment's lane runtime
+	// image — the chart ships the harness-go toolchain base at the chart's
+	// version, so a chart bump moves every defaulting lane's worker with it
+	// (#717) and no deployment has to hand-pin a lane image version; and the
+	// deployment harness image remains the last fallback for deployments
+	// that configure neither.
 	image := strings.TrimSpace(lane.Spec.RuntimeImage)
+	if image == "" {
+		image = strings.TrimSpace(s.Config.LaneRuntimeImage)
+	}
 	if image == "" {
 		image = s.Config.HarnessImage
 	}
