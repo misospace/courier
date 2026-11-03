@@ -635,6 +635,35 @@ func TestServiceAccountsNeverAutomount(t *testing.T) {
 	}
 }
 
+// The control policy must never declare deny-all ingress: on datapaths where
+// reply-path statefulness is not guaranteed (k3s + Cilium, #711), the broker's
+// service-path SYN-ACK is evaluated as new ingress and dropped, so the
+// control's own outbound connections to the broker never complete. The rest
+// of the cluster stays out: only the run's own topology pods may connect.
+func TestControlNetworkPolicyIngressAllowsOnlyRunPods(t *testing.T) {
+	run := testRun("netpol-711")
+	for _, policy := range NetworkPolicies(run, nil, nil) {
+		if policy.Labels["courier.misospace.dev/component"] != ComponentCoordinator {
+			continue
+		}
+		if len(policy.Spec.Ingress) != 2 {
+			t.Fatalf("control ingress rules = %+v; want exactly broker and worker", policy.Spec.Ingress)
+		}
+		allowed := map[string]bool{}
+		for _, rule := range policy.Spec.Ingress {
+			if len(rule.From) != 1 || rule.From[0].PodSelector == nil {
+				t.Fatalf("control ingress rule %+v must allow exactly one run pod selector", rule)
+			}
+			allowed[rule.From[0].PodSelector.MatchLabels["courier.misospace.dev/component"]] = true
+		}
+		if !allowed[ComponentBroker] || !allowed[ComponentWorker] || len(allowed) != 2 {
+			t.Fatalf("control ingress must allow only the run's broker and worker; got %v", allowed)
+		}
+		return
+	}
+	t.Fatal("control policy missing")
+}
+
 func TestWorkerNetworkPolicyIsolation(t *testing.T) {
 	run := testRun("netpol")
 	policies := NetworkPolicies(run, nil, nil)

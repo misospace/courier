@@ -106,10 +106,19 @@ func NetworkPolicies(run *courier.CoderRun, cache *CachePin, gateway *GatewayPin
 		Spec: networkingv1.NetworkPolicySpec{
 			PodSelector: metav1.LabelSelector{MatchLabels: coordinatorSelector(run.Name)},
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
-			// No ingress rules: nothing in the cluster may connect to
-			// control.
-			Ingress: []networkingv1.NetworkPolicyIngressRule{},
-			Egress:  egress,
+			// Nothing outside the run may connect to control, and the
+			// run's own pods only need this because reply-path statefulness
+			// is not guaranteed: on k3s + Cilium the broker's service-path
+			// SYN-ACK back to the control is evaluated as new ingress and
+			// dropped when the control declares deny-all ingress, so every
+			// run died needs-human on "broker is unreachable" (#711). Allowing
+			// only the run's own topology pods keeps the rest of the cluster
+			// out while the handshake completes on any datapath.
+			Ingress: []networkingv1.NetworkPolicyIngressRule{
+				{From: []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{MatchLabels: brokerSelector(run.Name)}}}},
+				{From: []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{MatchLabels: workerSelector(run.Name)}}}},
+			},
+			Egress: egress,
 		},
 	}
 
