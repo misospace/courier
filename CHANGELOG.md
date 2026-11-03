@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.16](https://github.com/misospace/courier/compare/v0.1.15...v0.1.16) (2026-11-03)
+
+
+### Features
+
+* **admission:** add authenticated HTTP admission API for contributions ([#708](https://github.com/misospace/courier/issues/708)) ([#709](https://github.com/misospace/courier/issues/709)) ([73b9a98](https://github.com/misospace/courier/commit/73b9a987745f3d14684c4768b428b0e6acb27708))
+
+
+### Bug Fixes
+
+* **topology:** admit the run's own pods to the control pod ([#711](https://github.com/misospace/courier/issues/711)) ([#713](https://github.com/misospace/courier/issues/713)) ([6313f6c](https://github.com/misospace/courier/commit/6313f6c3c33871194d458179d7f76b00c49d741c))
+
 ## [0.1.15](https://github.com/misospace/courier/compare/v0.1.14...v0.1.15) (2026-11-02)
 
 
