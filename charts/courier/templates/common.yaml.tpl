@@ -224,6 +224,7 @@
 {{- $hasProvidersFile := false }}
 {{- $hasRunNamespace := false }}
 {{- $hasHarnessImage := false }}
+{{- $hasLaneRuntimeImage := false }}
 {{- $hasProbeImage := false }}
 {{- $hasCacheService := false }}
 {{- $hasCachePort := false }}
@@ -234,6 +235,7 @@
 {{- if hasPrefix "--forge-providers-file=" $arg }}{{- $hasProvidersFile = true }}{{- end }}
 {{- if hasPrefix "--run-namespace=" $arg }}{{- $hasRunNamespace = true }}{{- end }}
 {{- if hasPrefix "--harness-image=" $arg }}{{- $hasHarnessImage = true }}{{- end }}
+{{- if hasPrefix "--lane-runtime-image=" $arg }}{{- $hasLaneRuntimeImage = true }}{{- end }}
 {{- if hasPrefix "--probe-image=" $arg }}{{- $hasProbeImage = true }}{{- end }}
 {{- if hasPrefix "--dependency-cache-service=" $arg }}{{- $hasCacheService = true }}{{- end }}
 {{- if hasPrefix "--dependency-cache-port=" $arg }}{{- $hasCachePort = true }}{{- end }}
@@ -255,6 +257,10 @@
 {{- $harnessTag := $secure.harnessImage.tag }}
 {{- if not $harnessTag }}{{- $harnessTag = .Chart.AppVersion }}{{- end }}
 {{- if not $hasHarnessImage }}{{- $args = append $args (printf "--harness-image=%s:%s" $harnessRepository $harnessTag) }}{{- end }}
+{{- $laneRuntimeRepository := $secure.laneRuntimeImage.repository }}
+{{- $laneRuntimeTag := $secure.laneRuntimeImage.tag }}
+{{- if not $laneRuntimeTag }}{{- $laneRuntimeTag = .Chart.AppVersion }}{{- end }}
+{{- if not $hasLaneRuntimeImage }}{{- $args = append $args (printf "--lane-runtime-image=%s:%s" $laneRuntimeRepository $laneRuntimeTag) }}{{- end }}
 {{- if not $hasProbeImage }}{{- $args = append $args (printf "--probe-image=%s" $secure.probeImage) }}{{- end }}
 {{- if $secure.dependencyCacheService }}
 {{- if not $hasCacheService }}{{- $args = append $args (printf "--dependency-cache-service=%s" $secure.dependencyCacheService) }}{{- end }}

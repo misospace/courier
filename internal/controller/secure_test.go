@@ -4482,3 +4482,54 @@ func TestSecureMatrixAdmissionCarriesNoResolvedCredentials(t *testing.T) {
 	// RedactsMetadata, TestLongPathSecretWithheld), and forge availability
 	// diagnostics pass through RedactDetail (internal/forge/forge_test.go).
 }
+
+// TestLaunchSecureResolvesWorkerImageByPrecedence pins the worker-image
+// resolution chain (#717): the lane's own runtimeImage wins; otherwise the
+// deployment's lane runtime image — the chart-shipped toolchain base tracked
+// to the chart's version, so no deployment hand-pins a lane image version;
+// and the deployment harness image remains the fallback when neither exists.
+// Control and broker always render the harness image regardless.
+func TestLaunchSecureResolvesWorkerImageByPrecedence(t *testing.T) {
+	lane := &courier.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Namespace: secureTestNamespace, Name: "default-lane"},
+		Spec: courier.LaneProfileSpec{
+			Roles: map[string]string{"coordinator": "test/coordinator", "coder": "test/coder"},
+		},
+	}
+	for name, laneRuntimeImage := range map[string]string{
+		"the deployment lane runtime image wins over the harness image": "harness-go:test",
+		"an unset lane runtime image falls back to the harness image":   "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			control, c := secureControl(t, lane)
+			control.Config.LaneRuntimeImage = laneRuntimeImage
+			run := launchedSecureRun(t, c, "default-lane", "default-lane")
+			if _, err := control.LaunchSecure(context.Background(), run); err != nil {
+				t.Fatalf("LaunchSecure: %v", err)
+			}
+			want := laneRuntimeImage
+			if want == "" {
+				want = "harness:test"
+			}
+			worker := &corev1.Pod{}
+			if err := c.Get(context.Background(), client.ObjectKey{Namespace: secureTestNamespace, Name: topology.WorkerPodName(run.Name)}, worker); err != nil {
+				t.Fatal(err)
+			}
+			if worker.Spec.Containers[0].Image != want {
+				t.Fatalf("worker image = %q, want %q", worker.Spec.Containers[0].Image, want)
+			}
+			for component, podName := range map[string]string{
+				topology.ComponentCoordinator: topology.ControlPodName(run.Name),
+				topology.ComponentBroker:      topology.BrokerPodName(run.Name),
+			} {
+				pod := &corev1.Pod{}
+				if err := c.Get(context.Background(), client.ObjectKey{Namespace: secureTestNamespace, Name: podName}, pod); err != nil {
+					t.Fatalf("read %s pod: %v", component, err)
+				}
+				if pod.Spec.Containers[0].Image != "harness:test" {
+					t.Fatalf("%s image = %q; control and broker always render the harness image", component, pod.Spec.Containers[0].Image)
+				}
+			}
+		})
+	}
+}
