@@ -3511,7 +3511,15 @@ only informs.
   material distinguishes it. Control-to-worker tasks use signed
   run/incarnation-bound envelopes; the worker has no secret, service-account
   token, or signing key. Worker network access is limited to the dedicated Go
-   module/checksum cache and no DNS, never broker or forge. Enforced
+   module/checksum cache and no DNS, never broker or forge. Control serves no
+   port and only dials out, so its ingress admits the run's own pods and
+   nothing else. The reply to a control-originated connection lands on
+   control's ephemeral port. A datapath that does not recognize that reply as
+   established drops it under a deny-all ingress, which leaves the broker
+   unreachable on datapaths that put kube-proxy in the service path beside
+   Cilium. The admission covers the run's untrusted worker, so the worker's
+   own deny-egress is what keeps the worker from reaching control.
+   Enforced
    network policy, live deny probes, and secure preflight fail closed before
    workload exposure; the broker's own API-server allow path is probed the
    same way, and on identity-based CNIs such as Cilium the deployment must

@@ -674,6 +674,81 @@ func TestWorkerNetworkPolicyIsolation(t *testing.T) {
 	}
 }
 
+// The control pod serves nothing and only dials out, so its ingress exists
+// to let the run's own pods reach it: the reply to a control-originated
+// connection lands on the control pod's ephemeral port and is judged as fresh
+// ingress, which a deny-all ingress drops on datapaths that do not treat it
+// as an established reply (#711). Nothing outside the run can reach control.
+func TestControlNetworkPolicyAdmitsTheRunsOwnPods(t *testing.T) {
+	run := testRun("netpol-control")
+	control := controlPolicy(t, run)
+	if len(control.Spec.Ingress) != 1 {
+		t.Fatalf("control ingress rules = %+v", control.Spec.Ingress)
+	}
+	rule := control.Spec.Ingress[0]
+	if len(rule.From) != 1 {
+		t.Fatalf("control ingress peers = %+v", rule.From)
+	}
+	peer := rule.From[0]
+	if peer.PodSelector == nil {
+		t.Fatalf("control ingress peer must select pods: %+v", peer)
+	}
+	if peer.NamespaceSelector != nil {
+		t.Fatalf("control ingress peer must stay namespace-local: %+v", peer)
+	}
+	if got, want := peer.PodSelector.MatchLabels[LabelRun], RunLabelValue(run.Name); got != want {
+		t.Fatalf("control ingress run label = %q; want %q", got, want)
+	}
+	if component, named := peer.PodSelector.MatchLabels["courier.misospace.dev/component"]; named {
+		t.Fatalf("control ingress must admit the whole run, not component %q: %+v", component, peer.PodSelector.MatchLabels)
+	}
+	// The reply lands on the control pod's ephemeral port, so the rule may
+	// not restrict ports.
+	if len(rule.Ports) != 0 {
+		t.Fatalf("control ingress ports = %+v", rule.Ports)
+	}
+	// Another run's pods carry a different run label, so they stay out.
+	other := controlPolicy(t, testRun("other-run"))
+	if peer.PodSelector.MatchLabels[LabelRun] == other.Spec.Ingress[0].From[0].PodSelector.MatchLabels[LabelRun] {
+		t.Fatal("control ingress admits another run's pods")
+	}
+	// The egress the control depends on is unchanged: its broker, its
+	// worker, and cluster DNS, each named within this run.
+	egressPeers := map[string]bool{}
+	for _, egress := range control.Spec.Egress {
+		for _, to := range egress.To {
+			if to.PodSelector == nil {
+				continue
+			}
+			if to.PodSelector.MatchLabels["k8s-app"] == "kube-dns" {
+				egressPeers["kube-dns"] = true
+				continue
+			}
+			if got, want := to.PodSelector.MatchLabels[LabelRun], RunLabelValue(run.Name); got != want {
+				t.Fatalf("control egress peer run label = %q; want %q", got, want)
+			}
+			egressPeers[to.PodSelector.MatchLabels["courier.misospace.dev/component"]] = true
+		}
+	}
+	for _, component := range []string{ComponentBroker, ComponentWorker, "kube-dns"} {
+		if !egressPeers[component] {
+			t.Fatalf("control egress must reach the %s: %+v", component, control.Spec.Egress)
+		}
+	}
+}
+
+// controlPolicy returns the control pod's rendered NetworkPolicy.
+func controlPolicy(t *testing.T, run *courier.CoderRun) *networkingv1.NetworkPolicy {
+	t.Helper()
+	for _, p := range NetworkPolicies(run, nil, nil) {
+		if p.Labels["courier.misospace.dev/component"] == ComponentCoordinator {
+			return p
+		}
+	}
+	t.Fatal("control policy missing")
+	return nil
+}
+
 func TestBrokerTLSIdentity(t *testing.T) {
 	tls, err := GenerateBrokerTLS([]string{"r-broker.ns.svc.cluster.local", "r-broker.ns.svc", "r-broker"})
 	if err != nil {
@@ -979,9 +1054,21 @@ func TestRenderedSelectorsAgreeWithLabels(t *testing.T) {
 			check(policy.Name+" pod selector", policy.Spec.PodSelector.MatchLabels)
 			for _, ingress := range policy.Spec.Ingress {
 				for _, from := range ingress.From {
-					if from.PodSelector != nil {
-						check(policy.Name+" ingress selector", from.PodSelector.MatchLabels)
+					if from.PodSelector == nil {
+						continue
 					}
+					if policy.Labels["courier.misospace.dev/component"] == ComponentCoordinator {
+						// The control's ingress admits the whole run, so
+						// that peer names the run and no component. Every
+						// other selector must name a component, or a
+						// dropped component label would admit a pod the
+						// policy never meant to admit.
+						if got := from.PodSelector.MatchLabels; len(got) != 1 || got[LabelRun] != runLabel {
+							t.Errorf("run %q: %s ingress peer must select the run's own pods: %+v", name, policy.Name, got)
+						}
+						continue
+					}
+					check(policy.Name+" ingress selector", from.PodSelector.MatchLabels)
 				}
 			}
 			for _, egress := range policy.Spec.Egress {
