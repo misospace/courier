@@ -1168,10 +1168,19 @@ or status.
 
 **Model binding.** At run start, each role named in the lane's
 `LaneProfile.roles` (coordinator, coder, reviewer, …) is bound to the model
-identifier the profile supplies and resolved through the LiteLLM gateway's
-OpenAI-compatible API. The gateway endpoint and key are deployment/model
-configuration, not hardware specifics in `LaneProfile`; the profile supplies
-only the per-role model identifiers.
+identifier the profile supplies and resolved through the LiteLLM gateway.
+The gateway endpoint and key are deployment/model configuration, not
+hardware specifics in `LaneProfile`; the profile supplies only the per-role
+model identifiers — and, since #716, the wire format they speak:
+`LaneProfile.transport` selects the OpenAI-compatible surface (the default)
+or the native Anthropic Messages surface, explicitly and per lane, never
+inferred from a model name. Both transports normalize into the same fixed
+event vocabulary behind one `ModelTransport` boundary; provider protocol
+details stay below it. Anthropic thinking blocks are the one deliberate
+opacity: they ride the transcript as provider-native continuation blocks,
+re-rendered verbatim on the next request, because reasoning survives only
+its own protocol — never flattened into assistant text, dropped, or
+surfaced as user-visible content.
 
 **Coordinator ownership.** The coordinator owns the run's terminal contract:
 plan, integrate, locally validate, publish, and hand off. Delegation covers

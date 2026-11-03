@@ -57,10 +57,14 @@ type Invocation struct {
 	Goal      string
 	Model     string
 	Roles     map[string]string
-	Framing   string
-	Session   string
-	Workspace string
-	Debug     bool
+	// GatewayTransport is the lane's declared model wire format (#716):
+	// openai (the default when empty) or anthropic. It is a lane-declared
+	// value, never inferred from a model name.
+	GatewayTransport string
+	Framing          string
+	Session          string
+	Workspace        string
+	Debug            bool
 	// Criteria is the bounded JSON envelope of the acceptance-criterion set
 	// pinned at admission (#280), in the broker criterion-set shape: the
 	// trusted issue identity, criteria with IDs/texts/digests, and the set
@@ -577,10 +581,14 @@ func NewInvocationWithContribution(run *courierv1alpha1.CoderRun, lane *courierv
 		Goal:      goal,
 		Model:     model,
 		Roles:     roles,
-		Framing:   lane.Spec.Framing,
-		Workspace: workspace,
-		Debug:     run.Spec.Debug,
-		Context:   lane.Spec.Context.DeepCopy(),
+		// The lane declares its model wire format (#716): openai when empty,
+		// anthropic for the native Messages surface. Passed through verbatim;
+		// the control binary fails closed on an unknown value.
+		GatewayTransport: lane.Spec.Transport,
+		Framing:          lane.Spec.Framing,
+		Workspace:        workspace,
+		Debug:            run.Spec.Debug,
+		Context:          lane.Spec.Context.DeepCopy(),
 	}, nil
 }
 
@@ -609,6 +617,10 @@ func RunContextEnvironment(inv Invocation) []EnvVar {
 		{Name: "COURIER_GOAL", Value: inv.Goal},
 		{Name: "COURIER_MODEL", Value: inv.Model},
 		{Name: "COURIER_ROLES_JSON", Value: string(rolesJSON)},
+		// The lane's declared model wire format travels beside the roles it
+		// binds (#716). Absence is meaningful: an old invocation reconstructs
+		// as the default OpenAI-compatible transport, exactly as before.
+		{Name: "COURIER_GATEWAY_TRANSPORT", Value: inv.GatewayTransport},
 		{Name: "COURIER_FRAMING", Value: inv.Framing},
 		{Name: "COURIER_WORKSPACE", Value: inv.Workspace},
 		{Name: "COURIER_LOG_LEVEL", Value: level},
@@ -928,6 +940,10 @@ func InvocationFromEnv(get func(string) string) (Invocation, error) {
 		return Invocation{}, ErrInvalidReference
 	}
 	inv.Ref = ref
+	// The lane's declared model wire format (#716): empty reconstructs as
+	// the default OpenAI-compatible transport, exactly as old invocations
+	// did. The control binary fails closed on an unknown value.
+	inv.GatewayTransport = get("COURIER_GATEWAY_TRANSPORT")
 	rolesJSON := get("COURIER_ROLES_JSON")
 	if strings.TrimSpace(rolesJSON) != "" {
 		if err := json.Unmarshal([]byte(rolesJSON), &inv.Roles); err != nil {

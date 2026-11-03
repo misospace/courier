@@ -15,11 +15,12 @@ import (
 	"time"
 )
 
-// Gateway is the LiteLLM-compatible model gateway client: the harness's only
-// model transport. The endpoint and key are deployment/model configuration,
+// Gateway is the OpenAI-compatible model transport (#716): one of the two
+// wire formats behind the ModelTransport boundary, and the default for lanes
+// that declare none. The endpoint and key are deployment/model configuration,
 // never a LaneProfile concern; a lane supplies only per-role model
 // identifiers. The OpenAI-compatible wire format is parsed here and nowhere
-// else.
+// else; the Anthropic Messages wire format lives in the Anthropic transport.
 type Gateway struct {
 	// BaseURL is the OpenAI-compatible API root, for example
 	// "http://litellm:4000/v1". Requests post to BaseURL + "/chat/completions".
@@ -54,14 +55,21 @@ func (g *Gateway) signals() ExhaustionSignals {
 // Message is one conversation message in the normalized transcript. Role is
 // the OpenAI-compatible role vocabulary; tool results ride in Role "tool"
 // with ToolCallID set, and an assistant's own tool requests ride in
-// ToolCalls. Messages are never marshaled directly: toWireMessages renders
-// them in the OpenAI-compatible request shape.
+// ToolCalls. Messages are never marshaled directly: each transport renders
+// them in its own wire shape.
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content,omitempty"`
 	// ToolCallID links a Role "tool" message to the request it answers.
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 	ToolCalls  []ToolCall `json:"-"`
+	// Blocks is the assistant turn's provider-native content blocks, opaque
+	// above the transport (#716): the transport that produced them re-renders
+	// them verbatim on the next request — Anthropic thinking blocks with
+	// their signatures foremost, so continuation keeps provider semantics —
+	// and every other transport ignores them. Nothing above the transport
+	// may parse, log, render, or flatten these bytes into ordinary text.
+	Blocks []json.RawMessage `json:"-"`
 }
 
 // wireMessage is the OpenAI-compatible request shape of one transcript
@@ -114,6 +122,12 @@ type ChatRequest struct {
 	Model    string
 	Messages []Message
 	Tools    []ToolDef
+	// MaxTokens is the output ceiling the caller reserves for the turn, from
+	// the lane's declared output reservation when one is declared. Wire
+	// formats that require an explicit output bound — the Anthropic Messages
+	// API — send it; formats that treat it as optional, like the OpenAI
+	// chat-completions request, ignore it exactly as today.
+	MaxTokens int
 }
 
 type wireRequest struct {
@@ -210,22 +224,35 @@ const maxModelInfoBody = 1 << 20
 // reads under maxModelInfoBody, so a hostile 200 cannot amplify memory at
 // startup.
 func (g *Gateway) ModelInputLimit(ctx context.Context, model string) (int, error) {
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSuffix(g.BaseURL, "/")+"/model/info", nil)
+	return modelInfoInputLimit(ctx, g.client(), g.BaseURL, g.APIKey, model, g.signals())
+}
+
+// modelInfoInputLimit is the shared /model/info read behind every transport's
+// verified input limit. The endpoint is gateway deployment metadata, not part
+// of either wire protocol, so both transports may use it where it exists; a
+// transport whose gateway lacks it returns the explicit error and the role's
+// declared ceiling stays `configured` (#716 — the endpoint is never a
+// universal protocol requirement, and a missing limit is never invented).
+func modelInfoInputLimit(ctx context.Context, client *http.Client, baseURL, apiKey, model string, signals ExhaustionSignals) (int, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSuffix(baseURL, "/")+"/model/info", nil)
 	if err != nil {
 		return 0, fmt.Errorf("harness: build model info request: %w", err)
 	}
 	httpReq.Header.Set("Accept", "application/json")
-	if g.APIKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+g.APIKey)
+	if apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
-	resp, err := g.client().Do(httpReq)
+	resp, err := client.Do(httpReq)
 	if err != nil {
 		return 0, &GatewayTransportError{Err: err}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxProviderErrorBody))
-		return 0, gatewayStatusError(resp.StatusCode, resp.Header, body, g.signals())
+		return 0, gatewayStatusError(resp.StatusCode, resp.Header, body, signals)
 	}
 	var report wireModelInfo
 	decoder := json.NewDecoder(io.LimitReader(resp.Body, maxModelInfoBody))

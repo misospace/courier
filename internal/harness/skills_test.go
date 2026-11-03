@@ -81,8 +81,8 @@ func TestSkillSetRejectsOverboundIndex(t *testing.T) {
 // no skills section.
 func TestSkillToolOfferedToBothRoles(t *testing.T) {
 	skillless, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
-		Bindings: testBindings(),
+		Transport: &Gateway{BaseURL: "http://unused.invalid"},
+		Bindings:  testBindings(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -92,9 +92,9 @@ func TestSkillToolOfferedToBothRoles(t *testing.T) {
 	}
 
 	skilled, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
-		Bindings: testBindings(),
-		Skills:   testSkillSet(t),
+		Transport: &Gateway{BaseURL: "http://unused.invalid"},
+		Bindings:  testBindings(),
+		Skills:    testSkillSet(t),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -109,9 +109,9 @@ func TestSkillToolOfferedToBothRoles(t *testing.T) {
 
 func TestRunSkillServesVerifiedInstructionsAsData(t *testing.T) {
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
-		Bindings: testBindings(),
-		Skills:   testSkillSet(t),
+		Transport: &Gateway{BaseURL: "http://unused.invalid"},
+		Bindings:  testBindings(),
+		Skills:    testSkillSet(t),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -142,9 +142,9 @@ func TestRunSkillServesVerifiedInstructionsAsData(t *testing.T) {
 
 func TestRunSkillUnknownNameIsToolData(t *testing.T) {
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
-		Bindings: testBindings(),
-		Skills:   testSkillSet(t),
+		Transport: &Gateway{BaseURL: "http://unused.invalid"},
+		Bindings:  testBindings(),
+		Skills:    testSkillSet(t),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -167,8 +167,8 @@ func TestRunSkillUnknownNameIsToolData(t *testing.T) {
 // control pod.
 func TestRunSkillOnSkilllessCoordinatorIsToolData(t *testing.T) {
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
-		Bindings: testBindings(),
+		Transport: &Gateway{BaseURL: "http://unused.invalid"},
+		Bindings:  testBindings(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -204,9 +204,9 @@ func TestRunSkillBoundsTheAssetListing(t *testing.T) {
 		t.Fatalf("NewSkillSet: %v", err)
 	}
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
-		Bindings: testBindings(),
-		Skills:   set,
+		Transport: &Gateway{BaseURL: "http://unused.invalid"},
+		Bindings:  testBindings(),
+		Skills:    set,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -306,9 +306,9 @@ func TestSkillToolServesMaterializedBundle(t *testing.T) {
 		"assets/checklist.md": "check\n",
 	})
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
-		Bindings: testBindings(),
-		Skills:   set,
+		Transport: &Gateway{BaseURL: "http://unused.invalid"},
+		Bindings:  testBindings(),
+		Skills:    set,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -362,9 +362,9 @@ func TestSkillToolServesScriptContentAsData(t *testing.T) {
 		"SKILL.md": "---\nname: alpha\ndescription: does alpha things\n---\nRun the helper:\n\n" + script + "\n",
 	})
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
-		Bindings: testBindings(),
-		Skills:   set,
+		Transport: &Gateway{BaseURL: "http://unused.invalid"},
+		Bindings:  testBindings(),
+		Skills:    set,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -406,10 +406,10 @@ func TestSkillIndexSurvivesContextCompaction(t *testing.T) {
 	defer cleanup()
 	sink := &recordingSink{}
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  gateway,
-		Bindings: testBindings(),
-		Worker:   delegator,
-		Snapshot: snapshotProvider("snap-tip"),
+		Transport: gateway,
+		Bindings:  testBindings(),
+		Worker:    delegator,
+		Snapshot:  snapshotProvider("snap-tip"),
 		ContextBudgets: map[string]ContextBudgetInput{
 			RoleCoordinator: {Role: RoleCoordinator, DeclaredMaxInputTokens: 2200, ProbedMaxInputTokens: 2200},
 		},

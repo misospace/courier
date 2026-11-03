@@ -296,7 +296,7 @@ func TestStatusPersistenceFailurePreventsDispatch(t *testing.T) {
 	transport := &recordingStatusTransport{errs: []error{brokerDenied()}}
 	reporter := NewStatusReporter(transport, testControlUID, testWorkerUID, 0)
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:   gateway,
+		Transport: gateway,
 		Bindings:  testBindings(),
 		Worker:    delegator,
 		Snapshot:  snapshotProvider("snap-tip"),
@@ -348,7 +348,7 @@ func TestCompletedBriefCheckpointRecordsConfirmedOID(t *testing.T) {
 	transport := &recordingStatusTransport{}
 	reporter := NewStatusReporter(transport, testControlUID, testWorkerUID, 0)
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:   gateway,
+		Transport: gateway,
 		Bindings:  testBindings(),
 		Worker:    delegator,
 		Snapshot:  snapshotProvider("snap-tip"),
@@ -430,7 +430,7 @@ func TestAmbiguousDispatchClearsEntryAfterVerifiedNonExecution(t *testing.T) {
 	worker.snapshotTip = "snap-tip"
 	transport := &recordingStatusTransport{}
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:   gateway,
+		Transport: gateway,
 		Bindings:  testBindings(),
 		Worker:    delegator,
 		Snapshot:  snapshotProvider("snap-tip"),
@@ -593,7 +593,7 @@ func TestFailedCheckpointWriteBlocksSuccessfulChangesEnding(t *testing.T) {
 		nil, nil, nil, nil, nil, nil, brokerDenied(), brokerDenied(),
 	}}
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:   gateway,
+		Transport: gateway,
 		Bindings:  testBindings(),
 		Worker:    delegator,
 		Snapshot:  snapshotProvider("snap-tip"),
@@ -650,7 +650,7 @@ func TestRecoveredCheckpointDebtLetsChangesEndingLand(t *testing.T) {
 		nil, nil, nil, nil, nil, nil, brokerDenied(), nil,
 	}}
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:   gateway,
+		Transport: gateway,
 		Bindings:  testBindings(),
 		Worker:    delegator,
 		Snapshot:  snapshotProvider("snap-tip"),
@@ -813,7 +813,7 @@ func TestFinishClassifiesTrustedTerminalResults(t *testing.T) {
 				publisher.publishErr = tt.publishErr
 			}
 			coordinator, err := NewCoordinator(CoordinatorConfig{
-				Gateway:   &Gateway{BaseURL: "http://gateway.invalid"},
+				Transport: &Gateway{BaseURL: "http://gateway.invalid"},
 				Bindings:  testBindings(),
 				Publisher: publisher,
 				Status:    NewStatusReporter(&recordingStatusTransport{}, testControlUID, testWorkerUID, 0),

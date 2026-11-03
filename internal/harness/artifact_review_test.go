@@ -92,10 +92,10 @@ func TestWorkerLyingTipFailsPrepare(t *testing.T) {
 	)
 	defer cleanup()
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  gateway,
-		Bindings: testBindings(),
-		Worker:   delegator,
-		Snapshot: snapshotProvider("0000000000000000000000000000000000000002"),
+		Transport: gateway,
+		Bindings:  testBindings(),
+		Worker:    delegator,
+		Snapshot:  snapshotProvider("0000000000000000000000000000000000000002"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -205,7 +205,7 @@ func TestFailedBriefNeverEntersTheArtifactChain(t *testing.T) {
 		defer cleanup()
 		publisher := &mockPublisher{}
 		coordinator, err := NewCoordinator(CoordinatorConfig{
-			Gateway:   gateway,
+			Transport: gateway,
 			Bindings:  testBindings(),
 			Worker:    delegator,
 			Snapshot:  snapshotProvider("snap-tip"),
@@ -255,7 +255,7 @@ func TestFailedBriefNeverEntersTheArtifactChain(t *testing.T) {
 		defer cleanup()
 		publisher := &mockPublisher{}
 		coordinator, err := NewCoordinator(CoordinatorConfig{
-			Gateway:   gateway,
+			Transport: gateway,
 			Bindings:  testBindings(),
 			Worker:    delegator,
 			Snapshot:  snapshotProvider("snap-tip"),

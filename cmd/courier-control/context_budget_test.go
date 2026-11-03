@@ -111,7 +111,7 @@ func wiredBudgets(t *testing.T, values map[string]string, gateway *harness.Gatew
 	}
 	budgetInputs := make(map[string]harness.ContextBudgetInput)
 	deps := harness.ProbeDeps{
-		Gateway:            gateway,
+		Transport:          gateway,
 		Bindings:           bindings,
 		Broker:             budgetBroker(t),
 		Mode:               string(inv.Mode),
@@ -130,7 +130,7 @@ func wiredBudgets(t *testing.T, values map[string]string, gateway *harness.Gatew
 		t.Fatalf("gate failed: %v", err)
 	}
 	coordinator, err := harness.NewCoordinator(harness.CoordinatorConfig{
-		Gateway:        gateway,
+		Transport:      gateway,
 		Bindings:       bindings,
 		ContextBudgets: budgetInputs,
 	})
@@ -322,7 +322,7 @@ func TestControlWiringDefaultedLaneFailsClosedOnUnverifiableCoordinator(t *testi
 		t.Fatal(err)
 	}
 	deps := harness.ProbeDeps{
-		Gateway:            gateway,
+		Transport:          gateway,
 		Bindings:           bindings,
 		Broker:             budgetBroker(t),
 		Mode:               string(inv.Mode),
@@ -364,7 +364,7 @@ func TestControlWiringInvalidDeclarationFailsTheGate(t *testing.T) {
 		t.Fatal(err)
 	}
 	deps := harness.ProbeDeps{
-		Gateway:            gateway,
+		Transport:          gateway,
 		Bindings:           bindings,
 		Broker:             budgetBroker(t),
 		Mode:               string(inv.Mode),

@@ -417,8 +417,8 @@ func TestNewCoordinatorFailsClosedOnAnUnresolvableBudget(t *testing.T) {
 	gateway, _, cleanup := gatewayFor()
 	defer cleanup()
 	_, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  gateway,
-		Bindings: testBindings(),
+		Transport: gateway,
+		Bindings:  testBindings(),
 		ContextBudgets: map[string]ContextBudgetInput{
 			RoleCoordinator: {Role: RoleCoordinator}, // neither declared nor verified
 		},
@@ -436,8 +436,8 @@ func TestRunFailsClosedWhenCompactionCannotFit(t *testing.T) {
 	gateway, mock, cleanup := gatewayFor()
 	defer cleanup()
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  gateway,
-		Bindings: testBindings(),
+		Transport: gateway,
+		Bindings:  testBindings(),
 		ContextBudgets: map[string]ContextBudgetInput{
 			// Effective limit far below the goal plus framing the pinned
 			// system message carries: the protected tail can never fit.
@@ -495,10 +495,10 @@ func TestRunCompactsAcrossItsTurnsAndReportsTelemetry(t *testing.T) {
 	defer cleanup()
 	sink := &recordingSink{}
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  gateway,
-		Bindings: testBindings(),
-		Worker:   delegator,
-		Snapshot: snapshotProvider("snap-tip"),
+		Transport: gateway,
+		Bindings:  testBindings(),
+		Worker:    delegator,
+		Snapshot:  snapshotProvider("snap-tip"),
 		ContextBudgets: map[string]ContextBudgetInput{
 			RoleCoordinator: {Role: RoleCoordinator, DeclaredMaxInputTokens: 1600, ProbedMaxInputTokens: 1600},
 		},
@@ -555,7 +555,7 @@ func TestRunBelowCompactPointLeavesTheTranscriptAlone(t *testing.T) {
 		gateway, mock, cleanup := gatewayFor(script...)
 		defer cleanup()
 		coordinator, err := NewCoordinator(CoordinatorConfig{
-			Gateway:        gateway,
+			Transport:      gateway,
 			Bindings:       testBindings(),
 			Worker:         delegator,
 			Snapshot:       snapshotProvider("snap-tip"),
@@ -604,8 +604,8 @@ func TestRunBriefFailsClosedOnUnfittableCompaction(t *testing.T) {
 	gateway, mock, cleanup := gatewayFor()
 	defer cleanup()
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  gateway,
-		Bindings: testBindings(),
+		Transport: gateway,
+		Bindings:  testBindings(),
 		ContextBudgets: map[string]ContextBudgetInput{
 			"coder": {Role: "coder", DeclaredMaxInputTokens: 10, ProbedMaxInputTokens: 10},
 		},
@@ -652,8 +652,8 @@ func TestRunBriefCompactsAndCarriesSettledState(t *testing.T) {
 	defer cleanup()
 	sink := &recordingSink{}
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  gateway,
-		Bindings: testBindings(),
+		Transport: gateway,
+		Bindings:  testBindings(),
 		ContextBudgets: map[string]ContextBudgetInput{
 			"coder": {Role: "coder", DeclaredMaxInputTokens: 800, ProbedMaxInputTokens: 800},
 		},
@@ -738,10 +738,10 @@ func TestRunCompactionNeverOrphansToolResults(t *testing.T) {
 	defer cleanup()
 	sink := &recordingSink{}
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  gateway,
-		Bindings: testBindings(),
-		Worker:   delegator,
-		Snapshot: snapshotProvider("snap-tip"),
+		Transport: gateway,
+		Bindings:  testBindings(),
+		Worker:    delegator,
+		Snapshot:  snapshotProvider("snap-tip"),
 		ContextBudgets: map[string]ContextBudgetInput{
 			RoleCoordinator: {Role: RoleCoordinator, DeclaredMaxInputTokens: 1600, ProbedMaxInputTokens: 1600},
 		},

@@ -319,7 +319,7 @@ func TestCoordinatorBootstrapsApprovedContractAndAttachesEnv(t *testing.T) {
 	defer cleanup()
 
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:   gateway,
+		Transport: gateway,
 		Bindings:  testBindings(),
 		Worker:    delegator,
 		Snapshot:  contractSnapshotProvider("snap-tip", devenv.StateApproved),
@@ -374,10 +374,10 @@ func TestCoordinatorBlockedExternalWhenBootstrapContractFails(t *testing.T) {
 	defer cleanup()
 
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  gateway,
-		Bindings: testBindings(),
-		Worker:   delegator,
-		Snapshot: contractSnapshotProvider("snap-tip", devenv.StateApproved),
+		Transport: gateway,
+		Bindings:  testBindings(),
+		Worker:    delegator,
+		Snapshot:  contractSnapshotProvider("snap-tip", devenv.StateApproved),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -423,10 +423,10 @@ func TestCoordinatorBlockedExternalOnMalformedBootstrapCapture(t *testing.T) {
 	defer cleanup()
 
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  gateway,
-		Bindings: testBindings(),
-		Worker:   delegator,
-		Snapshot: contractSnapshotProvider("snap-tip", devenv.StateApproved),
+		Transport: gateway,
+		Bindings:  testBindings(),
+		Worker:    delegator,
+		Snapshot:  contractSnapshotProvider("snap-tip", devenv.StateApproved),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -459,10 +459,10 @@ func TestCoordinatorBlockedExternalOnFailedCaptureStage(t *testing.T) {
 	defer cleanup()
 
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  gateway,
-		Bindings: testBindings(),
-		Worker:   delegator,
-		Snapshot: contractSnapshotProvider("snap-tip", devenv.StateApproved),
+		Transport: gateway,
+		Bindings:  testBindings(),
+		Worker:    delegator,
+		Snapshot:  contractSnapshotProvider("snap-tip", devenv.StateApproved),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -499,7 +499,7 @@ func TestCoordinatorSkipsBootstrapWithoutAnApprovedContract(t *testing.T) {
 			defer cleanup()
 
 			coordinator, err := NewCoordinator(CoordinatorConfig{
-				Gateway:   gateway,
+				Transport: gateway,
 				Bindings:  testBindings(),
 				Worker:    delegator,
 				Snapshot:  contractSnapshotProvider("snap-tip", state),
@@ -535,7 +535,7 @@ func TestRunBriefAbortsOnRecordedBootstrapBlocker(t *testing.T) {
 		gatewayResponse{body: sse(contentChunk("about to work"), finishChunk("stop"))},
 	)
 	defer cleanup()
-	coordinator, err := NewCoordinator(CoordinatorConfig{Gateway: gateway, Bindings: testBindings()})
+	coordinator, err := NewCoordinator(CoordinatorConfig{Transport: gateway, Bindings: testBindings()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -563,7 +563,7 @@ func TestBootstrapLivenessBoundIsABlocker(t *testing.T) {
 
 	gateway, _, cleanup := gatewayFor()
 	defer cleanup()
-	coordinator, err := NewCoordinator(CoordinatorConfig{Gateway: gateway, Bindings: testBindings(), Worker: delegator})
+	coordinator, err := NewCoordinator(CoordinatorConfig{Transport: gateway, Bindings: testBindings(), Worker: delegator})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -600,7 +600,7 @@ func TestBootstrapBoundExpiryDeliversTheKill(t *testing.T) {
 
 	gateway, _, cleanup := gatewayFor()
 	defer cleanup()
-	coordinator, err := NewCoordinator(CoordinatorConfig{Gateway: gateway, Bindings: testBindings(), Worker: delegator})
+	coordinator, err := NewCoordinator(CoordinatorConfig{Transport: gateway, Bindings: testBindings(), Worker: delegator})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -647,7 +647,7 @@ func TestBootstrapStageBlockerNamesTheHungStage(t *testing.T) {
 
 			gateway, _, cleanup := gatewayFor()
 			defer cleanup()
-			coordinator, err := NewCoordinator(CoordinatorConfig{Gateway: gateway, Bindings: testBindings(), Worker: delegator})
+			coordinator, err := NewCoordinator(CoordinatorConfig{Transport: gateway, Bindings: testBindings(), Worker: delegator})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -698,7 +698,7 @@ func TestBootstrapReceiptSinkReceivesAppliedReceipt(t *testing.T) {
 	gateway, _, cleanup := gatewayFor()
 	defer cleanup()
 	sink := &recordingBootstrapReceipts{}
-	coordinator, err := NewCoordinator(CoordinatorConfig{Gateway: gateway, Bindings: testBindings(), Worker: delegator, BootstrapReceipts: sink})
+	coordinator, err := NewCoordinator(CoordinatorConfig{Transport: gateway, Bindings: testBindings(), Worker: delegator, BootstrapReceipts: sink})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -754,7 +754,7 @@ func TestBootstrapReceiptSinkReceivesFailedReceiptOnNonzeroExit(t *testing.T) {
 	gateway, _, cleanup := gatewayFor()
 	defer cleanup()
 	sink := &recordingBootstrapReceipts{}
-	coordinator, err := NewCoordinator(CoordinatorConfig{Gateway: gateway, Bindings: testBindings(), Worker: delegator, BootstrapReceipts: sink})
+	coordinator, err := NewCoordinator(CoordinatorConfig{Transport: gateway, Bindings: testBindings(), Worker: delegator, BootstrapReceipts: sink})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -892,7 +892,7 @@ func TestBootstrapUnverifiedTerminationIsNotABlocker(t *testing.T) {
 			gateway, _, cleanup := gatewayFor()
 			defer cleanup()
 			coordinator, err := NewCoordinator(CoordinatorConfig{
-				Gateway:           gateway,
+				Transport:         gateway,
 				Bindings:          testBindings(),
 				Worker:            delegator,
 				Status:            NewStatusReporter(transport, "control-uid", "worker-uid", 0),
@@ -1021,7 +1021,7 @@ func TestBootstrapObservedLiveDescendantsIsNotABlocker(t *testing.T) {
 	gateway, _, cleanup := gatewayFor()
 	defer cleanup()
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:           gateway,
+		Transport:         gateway,
 		Bindings:          testBindings(),
 		Worker:            delegator,
 		Status:            NewStatusReporter(transport, "control-uid", "worker-uid", 0),

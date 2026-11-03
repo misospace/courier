@@ -12,7 +12,10 @@
 // external verification remains with the operator.
 package harness
 
-import "errors"
+import (
+	"encoding/json"
+	"errors"
+)
 
 // EventKind is the fixed normalized event vocabulary. It is deliberately
 // closed: provider wire shapes are parsed in the gateway client and nothing
@@ -62,6 +65,14 @@ type Event struct {
 	Tool         ToolCall   // KindToolRequest
 	Result       ToolResult // KindToolResult
 	FinishReason string     // KindFinal
+	// Blocks carries the assistant turn's provider-native content blocks on
+	// the turn's terminal events (KindFinal, KindToolRequest) for transports
+	// whose continuation semantics need them verbatim — Anthropic thinking
+	// blocks with their signatures foremost (#716). The bytes are opaque
+	// above the transport: only the transport that produced them reads them,
+	// and nothing above the boundary may parse, log, render, or flatten
+	// them. Transports with no continuation payload leave it nil.
+	Blocks []json.RawMessage
 	// Err is the redacted failure for KindError. It is safe to log or
 	// surface: the gateway normalizer never echoes provider response bodies.
 	Err error

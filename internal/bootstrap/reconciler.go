@@ -207,6 +207,7 @@ func desiredSpec(profile *Profile) courierv1alpha1.LaneProfileSpec {
 		RuntimeImage:  profile.RuntimeImage,
 		Concurrency:   profile.Concurrency,
 		Roles:         profile.Roles,
+		Transport:     profile.Transport,
 		Framing:       profile.Framing,
 		CapacityGroup: profile.CapacityGroup,
 		// DeepCopy so the managed object never shares the provider-owned

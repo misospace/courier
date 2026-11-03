@@ -1755,6 +1755,14 @@ replaces them) with `COURIER_MODEL_EXHAUSTION_CODES` and
 provider policy. Diagnostics expose the fixed class and the allowlisted code
 only — never the response body, credentials, or an unbounded string as a label.
 
+**Wire transports.** The lane declares its model wire format — the
+OpenAI-compatible surface or the native Anthropic Messages surface — and both
+normalize into the same trusted event vocabulary behind one `ModelTransport`
+boundary (#716). LiteLLM's OpenAI translation is not semantics-preserving for
+provider-native reasoning, so a model whose thinking survives only its own
+protocol is served by its own transport, with thinking blocks carried as
+opaque provider continuation data and never flattened into assistant text.
+
 **Unknowns and remaining scope.** The legacy OpenCode executor delegates model
 calls to an external binary and has no structured provider signal, so it is not
 yet classified here; until it is, its exhaustion still consumes continuations

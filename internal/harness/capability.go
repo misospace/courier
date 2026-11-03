@@ -256,7 +256,11 @@ func hostOnly(rawURL string) string {
 type ProbeDeps struct {
 	// Gateway probes the model bindings per role. Optional roles probe as
 	// optional capabilities.
-	Gateway *Gateway
+	// Transport is the model boundary under capability probing (#716): both
+	// the per-role model probe and the verified input-limit read go through
+	// it, so every transport meets the same redaction and classification
+	// contract.
+	Transport ModelTransport
 	// Bindings names the roles and their model identifiers.
 	Bindings Bindings
 	// Broker reaches the run's broker capabilities report.
@@ -397,7 +401,7 @@ func probeForge(ctx context.Context, deps ProbeDeps) []Capability {
 // degraded run is a visible decision, not a silent drop.
 func probeModelBindings(ctx context.Context, deps ProbeDeps) []Capability {
 	caps := make([]Capability, 0, len(deps.Bindings.Roles()))
-	if deps.Gateway == nil || deps.ModelProbe == nil {
+	if deps.Transport == nil || deps.ModelProbe == nil {
 		for _, role := range deps.Bindings.Roles() {
 			caps = append(caps, unavailable("model-binding:"+role, role == RoleCoordinator,
 				"no model gateway is configured in this build"))
@@ -449,10 +453,10 @@ func probeContextBudgets(ctx context.Context, deps ProbeDeps) []Capability {
 		required := deps.Context.DeclaresRole(role)
 		model := deps.Bindings.Model(role)
 		inputLimit, probeErr := 0, error(nil)
-		if deps.Gateway != nil {
+		if deps.Transport != nil {
 			inputLimit, probeErr = probed[model], failed[model]
 			if inputLimit == 0 && probeErr == nil {
-				inputLimit, probeErr = deps.Gateway.ModelInputLimit(ctx, model)
+				inputLimit, probeErr = deps.Transport.ModelInputLimit(ctx, model)
 				probed[model], failed[model] = inputLimit, probeErr
 			}
 		}
@@ -472,7 +476,7 @@ func probeContextBudgets(ctx context.Context, deps ProbeDeps) []Capability {
 		// capacity was established — but a role the lane never declared for is
 		// never gated by it.
 		if err != nil || budget.EffectiveLimit <= 0 {
-			caps = append(caps, budgetUnavailable(name, required, err, probeErr, deps.Gateway == nil))
+			caps = append(caps, budgetUnavailable(name, required, err, probeErr, deps.Transport == nil))
 			continue
 		}
 		if budget.State == StateConfigured {

@@ -249,6 +249,17 @@ spec:
                 maxItems: 16
                 type: array
                 x-kubernetes-list-type: atomic
+              transport:
+                description: |-
+                  Transport declares the model wire format the lane's sessions speak
+                  (#716): `openai` (the LiteLLM/OpenAI-compatible surface, the default
+                  when empty) or `anthropic` (the native Anthropic Messages surface).
+                  The choice is explicit and lane-level — never inferred from a model
+                  name — and the control binary fails closed on an unknown value.
+                enum:
+                - openai
+                - anthropic
+                type: string
             required:
             - concurrency
             - roles

@@ -94,6 +94,11 @@ laneProfiles: {}
   #   runtimeImage: ghcr.io/misospace/courier-go:0.1.0
   #   roles:
   #     coordinator: litellm/your-model
+  #   # Model wire format the lane's sessions speak: openai (the default) or
+  #   # anthropic — the native Anthropic Messages surface, for models whose
+  #   # reasoning only survives their own protocol (#716). The choice is
+  #   # explicit per lane and never inferred from a model name.
+  #   transport: openai
   #   framing: |
   #     keep parallelism modest and leave the pull request ready for review
   # -- Deployment-approved skill bundles registered at manager startup.

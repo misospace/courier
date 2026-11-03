@@ -42,7 +42,11 @@ type Profile struct {
 	RuntimeImage string            `json:"runtimeImage,omitempty"`
 	Concurrency  int               `json:"concurrency,omitempty"`
 	Roles        map[string]string `json:"roles"`
-	Framing      string            `json:"framing,omitempty"`
+	// Transport declares the model wire format this lane speaks (#716):
+	// openai (the default when empty) or anthropic. Parsed and fail-closed
+	// in Parse; the reconciled spec carries the validated value.
+	Transport string `json:"transport,omitempty"`
+	Framing   string `json:"framing,omitempty"`
 	// CapacityGroup names the shared execution-capacity pool this lane
 	// draws from (#327); empty means the lane is its own capacity identity.
 	CapacityGroup string `json:"capacityGroup,omitempty"`
@@ -126,6 +130,20 @@ func Parse(data []byte) ([]Profile, error) {
 			roles[trimmedRole] = trimmedModel
 		}
 		profile.Roles = roles
+		// The declared transport is validated here, at the same fail-closed
+		// boundary as every other profile field: an unknown wire format is
+		// bootstrap configuration error, never a run-time fallback (#716).
+		// The empty value is stored as declared — it means the default
+		// OpenAI-compatible transport downstream, and mirroring a
+		// normalized value here would churn every lane that omitted the
+		// field against its server-stored spec.
+		if strings.TrimSpace(profile.Transport) != "" {
+			wire, err := harness.ParseWire(profile.Transport)
+			if err != nil {
+				return nil, fmt.Errorf("bootstrap profile %q: %w", name, err)
+			}
+			profile.Transport = wire
+		}
 		if profile.Context != nil {
 			if err := normalizeContext(name, profile.Context); err != nil {
 				return nil, err

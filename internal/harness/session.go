@@ -222,7 +222,7 @@ type CompactionSink interface {
 // context capacity, which is never the same as capacity being unbounded.
 // compactions reports applied compactions to the sink.
 type Session struct {
-	gateway  *Gateway
+	gateway  ModelTransport
 	binding  string
 	Messages []Message
 	activity ActivitySink
@@ -265,7 +265,7 @@ func WithCompactionSink(sink CompactionSink) SessionOption {
 }
 
 // NewSession opens a session for one role's bound model.
-func NewSession(gateway *Gateway, binding Bindings, role string, activity ActivitySink, options ...SessionOption) (*Session, error) {
+func NewSession(gateway ModelTransport, binding Bindings, role string, activity ActivitySink, options ...SessionOption) (*Session, error) {
 	model := binding.Model(role)
 	if model == "" {
 		return nil, fmt.Errorf("harness: no model is bound to role %q", role)
@@ -312,7 +312,12 @@ func (s *Session) Settle(text string) {
 // terminal event (final, tool requests, or error).
 func (s *Session) Turn(ctx context.Context, tools []ToolDef) []Event {
 	for attempt := 0; ; attempt++ {
-		events, err := s.gateway.StreamChat(ctx, ChatRequest{Model: s.binding, Messages: s.Messages, Tools: tools})
+		events, err := s.gateway.StreamChat(ctx, ChatRequest{
+			Model:     s.binding,
+			Messages:  s.Messages,
+			Tools:     tools,
+			MaxTokens: s.budget.OutputReservation,
+		})
 		if err != nil {
 			// A request-build failure is the harness's own bug, not the
 			// gateway's; report it once without retry theater.
@@ -356,6 +361,11 @@ func estimateMessageTokens(message Message) int {
 	chars := len(message.Role) + len(message.Content) + len(message.ToolCallID)
 	for _, call := range message.ToolCalls {
 		chars += len(call.ID) + len(call.Name) + len(call.Arguments)
+	}
+	// Provider-native continuation blocks are prompt bytes on the transports
+	// that carry them (#716): opaque to this estimate, but never free.
+	for _, block := range message.Blocks {
+		chars += len(block)
 	}
 	tokens := chars / tokensPerChar
 	if tokens < 1 {
@@ -698,4 +708,13 @@ func ToolResultMessage(result ToolResult) Message {
 // results.
 func AssistantMessage(text string, calls []ToolCall) Message {
 	return Message{Role: "assistant", Content: text, ToolCalls: calls}
+}
+
+// AssistantMessageWithBlocks renders the model's own turn with the
+// provider-native content blocks its terminal event carried (#716). The
+// blocks are opaque continuation data: the transport that produced them
+// re-renders them verbatim on the next request, and nothing above the
+// transport reads them. An OpenAI-compatible turn carries none.
+func AssistantMessageWithBlocks(text string, calls []ToolCall, blocks []json.RawMessage) Message {
+	return Message{Role: "assistant", Content: text, ToolCalls: calls, Blocks: blocks}
 }

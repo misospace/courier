@@ -20,10 +20,10 @@ func checkCall(command string) ToolCall {
 func newCheckCoordinator(t *testing.T, delegator *Delegator, snapshot SnapshotProvider) *Coordinator {
 	t.Helper()
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
-		Bindings: testBindings(),
-		Worker:   delegator,
-		Snapshot: snapshot,
+		Transport: &Gateway{BaseURL: "http://unused.invalid"},
+		Bindings:  testBindings(),
+		Worker:    delegator,
+		Snapshot:  snapshot,
 	})
 	if err != nil {
 		t.Fatal(err)
