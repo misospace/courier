@@ -691,6 +691,75 @@ spec:
                 - coordinatorPodUID
                 - kind
                 type: object
+              noChange:
+                description: |-
+                  NoChange is the durable, incarnation-fenced record of a resolve-issue
+                  run's grounded no-change conclusion (#720): the ask was declared
+                  already satisfied by existing work, with per-criterion pinned
+                  excerpts. It is a proposal the source's own evidence-gated closure
+                  policy judges, never closure authorization on the model's word.
+                properties:
+                  at:
+                    description: At is when trusted control recorded the conclusion,
+                      before process exit.
+                    format: date-time
+                    type: string
+                  coordinatorPodUID:
+                    description: |-
+                      CoordinatorPodUID is the control incarnation that recorded the
+                      conclusion. It is the fence: the broker refuses a record attributing
+                      itself to any other incarnation, and the operator trusts it only for
+                      the coordinator pod whose termination carries the same UID.
+                    maxLength: 128
+                    minLength: 1
+                    type: string
+                  criteria:
+                    description: |-
+                      Criteria are the grounded per-criterion excerpts, 1 to
+                      MaxNoChangeCriteria rows.
+                    items:
+                      description: |-
+                        NoChangeCloseCriterion grounds one acceptance criterion in a repository
+                        file: the criterion text, the repo-relative file path, and a verbatim
+                        excerpt of that file at the repository's default-branch head.
+                      properties:
+                        criterion:
+                          description: Criterion is the acceptance criterion this
+                            row grounds.
+                          maxLength: 300
+                          minLength: 1
+                          type: string
+                        excerpt:
+                          description: Excerpt is a verbatim excerpt of the file at
+                            the default-branch head.
+                          maxLength: 300
+                          minLength: 24
+                          type: string
+                        path:
+                          description: Path is the repository-relative file path (no
+                            line anchors).
+                          maxLength: 1024
+                          minLength: 1
+                          type: string
+                      required:
+                      - criterion
+                      - excerpt
+                      - path
+                      type: object
+                    maxItems: 12
+                    minItems: 1
+                    type: array
+                  evidence:
+                    description: |-
+                      Evidence is the coordinator's free-form summary, recorded for audit
+                      only. It is never read as closure authorization.
+                    maxLength: 2000
+                    type: string
+                required:
+                - at
+                - coordinatorPodUID
+                - criteria
+                type: object
               phase:
                 description: Phase is the current lifecycle phase.
                 enum:
@@ -702,6 +771,7 @@ spec:
                 - HandedOff
                 - NeedsHuman
                 - Done
+                - AlreadyDone
                 - Failed
                 - BlockedExternal
                 type: string
