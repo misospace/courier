@@ -532,3 +532,115 @@ func TestAnthropicLeadingSystemMessagesAllPreserved(t *testing.T) {
 		t.Fatalf("mid-transcript system message = %s; want the compaction-digest user block", digestJSON)
 	}
 }
+
+// Regression for #724: the pinned coordinator transcript is all system role,
+// which rendered zero wire messages and marshaled "messages": null — a shape
+// litellm's /v1/messages normalizer 500s on every first turn. The all-system
+// transcript must produce a non-null messages array of exactly one user turn
+// carrying the final pinned system message verbatim, with everything before
+// it joined in the top-level system field.
+func TestAnthropicAllSystemTranscriptPromotesFinalSystemToUserTurn(t *testing.T) {
+	var bodies [][]byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		payload, _ := readAllLimited(r.Body, maxStreamContentBytes)
+		bodies = append(bodies, payload)
+		_, _ = w.Write([]byte(anthropicSSE(
+			anthropicPayload(t, map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text"}}),
+			anthropicPayload(t, map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "ok"}}),
+			anthropicPayload(t, map[string]any{"type": "content_block_stop", "index": 0}),
+			anthropicPayload(t, map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn"}}),
+			anthropicPayload(t, map[string]any{"type": "message_stop"}),
+		)))
+	}))
+	defer server.Close()
+	transport := &AnthropicTransport{BaseURL: server.URL}
+	transcript := []Message{
+		{Role: "system", Content: "goal: land the fix"},
+		{Role: "system", Content: "harness framing: bounded steps"},
+		{Role: "system", Content: "skills index: shell, git"},
+	}
+	if _, err := transport.StreamChat(context.Background(), ChatRequest{Model: "MiniMax-M3.1-Flash", Messages: transcript}); err != nil {
+		t.Fatal(err)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("captured %d requests", len(bodies))
+	}
+	if strings.Contains(string(bodies[0]), `"messages":null`) {
+		t.Fatalf("wire marshaled a null messages array: %s", bodies[0])
+	}
+	var wire struct {
+		System   string `json:"system"`
+		Messages []struct {
+			Role    string           `json:"role"`
+			Content []map[string]any `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(bodies[0], &wire); err != nil {
+		t.Fatal(err)
+	}
+	if want := "goal: land the fix\n\nharness framing: bounded steps"; wire.System != want {
+		t.Fatalf("system = %q; want the first two pinned messages joined by the separator", wire.System)
+	}
+	if len(wire.Messages) != 1 {
+		t.Fatalf("messages = %d entries; want exactly one user turn", len(wire.Messages))
+	}
+	if wire.Messages[0].Role != "user" {
+		t.Fatalf("promoted turn role = %q; want user", wire.Messages[0].Role)
+	}
+	if len(wire.Messages[0].Content) != 1 {
+		t.Fatalf("promoted turn carries %d blocks; want one text block", len(wire.Messages[0].Content))
+	}
+	blockJSON, _ := json.Marshal(wire.Messages[0].Content[0])
+	var block map[string]any
+	if err := json.Unmarshal(blockJSON, &block); err != nil {
+		t.Fatal(err)
+	}
+	if block["type"] != "text" || block["text"] != "skills index: shell, git" {
+		t.Fatalf("promoted turn block = %s; want the final pinned system message verbatim", blockJSON)
+	}
+}
+
+// The single-pinned-message edge of #724: with one system message and
+// nothing else, there is nothing left for the system field — the whole
+// pinned message becomes the user turn and the system field is omitted.
+func TestAnthropicSingleSystemMessageBecomesTheUserTurn(t *testing.T) {
+	var bodies [][]byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		payload, _ := readAllLimited(r.Body, maxStreamContentBytes)
+		bodies = append(bodies, payload)
+		_, _ = w.Write([]byte(anthropicSSE(
+			anthropicPayload(t, map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text"}}),
+			anthropicPayload(t, map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "ok"}}),
+			anthropicPayload(t, map[string]any{"type": "content_block_stop", "index": 0}),
+			anthropicPayload(t, map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn"}}),
+			anthropicPayload(t, map[string]any{"type": "message_stop"}),
+		)))
+	}))
+	defer server.Close()
+	transport := &AnthropicTransport{BaseURL: server.URL}
+	if _, err := transport.StreamChat(context.Background(), ChatRequest{Model: "MiniMax-M3.1-Flash", Messages: []Message{
+		{Role: "system", Content: "goal: land the fix"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		System   *string `json:"system"`
+		Messages []struct {
+			Role    string           `json:"role"`
+			Content []map[string]any `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(bodies[0], &wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire.System != nil {
+		t.Fatalf("system = %q; want the field omitted for a single pinned message", *wire.System)
+	}
+	if len(wire.Messages) != 1 || wire.Messages[0].Role != "user" {
+		t.Fatalf("messages = %+v; want exactly one user turn", wire.Messages)
+	}
+	blockJSON, _ := json.Marshal(wire.Messages[0].Content[0])
+	if !strings.Contains(string(blockJSON), "goal: land the fix") {
+		t.Fatalf("promoted turn block = %s; want the pinned message verbatim", blockJSON)
+	}
+}
