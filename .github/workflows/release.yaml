@@ -209,10 +209,6 @@ jobs:
           -c 'test "$(id -u)" = 65532 && go version && make --version >/dev/null && helm version --short >/dev/null && controller-gen --version >/dev/null && test ! -x "$(command -v gh || true)"'
       - name: Smoke-test published Go toolchain image
         run: |
-          # CI runs the verifier's full generate/build/test mode against the
-          # release commit. At publish time, prove the pulled artifact still
-          # satisfies the runtime contract and can execute a real Go compile
-          # without re-running the entire repository test suite cold.
           docker run --rm \
             --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/source,readonly" \
             ${{ env.TOOLCHAIN_IMAGE }}:${{ steps.version.outputs.version }} \
