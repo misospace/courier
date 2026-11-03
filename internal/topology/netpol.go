@@ -15,8 +15,8 @@ import (
 //     no egress at all unless the dependency cache is pinned, in which case
 //     egress is allowed only to that ClusterIP as an IP literal on the cache
 //     port. No DNS, no metadata, no API, no cross-run paths.
-//   - control: no ingress; egress to its broker, its worker, cluster DNS, and
-//     the optional model-gateway slot.
+//   - control: ingress from the run's own pods only; egress to its broker,
+//     its worker, cluster DNS, and the optional model-gateway slot.
 //   - broker: ingress only from the run's control pod on its two TLS ports;
 //     egress to cluster DNS and TCP 443 (the API server and the configured
 //     forge/git endpoints). The broker is trusted code that pins destinations
@@ -106,10 +106,38 @@ func NetworkPolicies(run *courier.CoderRun, cache *CachePin, gateway *GatewayPin
 		Spec: networkingv1.NetworkPolicySpec{
 			PodSelector: metav1.LabelSelector{MatchLabels: coordinatorSelector(run.Name)},
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
-			// No ingress rules: nothing in the cluster may connect to
-			// control.
-			Ingress: []networkingv1.NetworkPolicyIngressRule{},
-			Egress:  egress,
+			// The control pod serves nothing. It only dials out, and the
+			// reply to a control-originated connection lands on the control
+			// pod's ephemeral port. That reply is judged as ingress to the
+			// control pod, so the ingress must admit the run's own pods.
+			//
+			// A deny-all ingress looks equivalent under a stateful
+			// firewall, where a reply to an outbound connection bypasses
+			// ingress policy. That equivalence does not hold on every
+			// datapath: with kube-proxy in the service path beside Cilium,
+			// the reply to a control-originated connection to the broker's
+			// ClusterIP Service arrives as a flow the datapath does not
+			// recognize as established, so a deny-all ingress drops the
+			// broker's SYN-ACK, the handshake never completes, and the run
+			// dies needs-human on "broker is unreachable" (#711, live
+			// evidence from the #102 acceptance exercise). The worker
+			// Service is headless and stays unaffected, which is what made
+			// the asymmetry hard to see.
+			//
+			// The design intent survives: the rest of the cluster still
+			// cannot connect to control, because the peer selects the run's
+			// own pods in the run's own namespace. The admission covers the
+			// run's untrusted worker too. The worker's own policy denies
+			// all egress, so the worker still cannot open a connection to
+			// control. The ports stay unrestricted because the reply's
+			// destination port is the control pod's ephemeral port, which
+			// no policy can name ahead of time.
+			Ingress: []networkingv1.NetworkPolicyIngressRule{{
+				From: []networkingv1.NetworkPolicyPeer{{
+					PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{LabelRun: RunLabelValue(run.Name)}},
+				}},
+			}},
+			Egress: egress,
 		},
 	}
 

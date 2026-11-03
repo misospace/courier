@@ -150,7 +150,10 @@ secure:
   # reserved identity that vanilla NetworkPolicy ipBlock rules cannot match,
   # so the run namespace needs a companion CNI policy for the run's broker
   # pod — on Cilium, a CiliumNetworkPolicy granting
-  # `toEntities: [kube-apiserver]`. Without it preflight stops each run with
+  # `toEntities: [kube-apiserver]` with `enableDefaultDeny: {ingress: false,
+  # egress: false}`. The companion policy then adds the API-server path only.
+  # The run's own NetworkPolicy stays in sole charge of the broker's ingress
+  # and egress. Without the companion policy preflight stops each run with
   # the BrokerEgress verdict instead of launching a broker that cannot reach
   # the API server. IP-based CNIs (kube-proxy) need nothing extra.
   # -- Registry of forge provider registrations. Each entry: name, type

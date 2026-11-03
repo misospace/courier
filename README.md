@@ -148,6 +148,9 @@ spec:
   endpointSelector:
     matchLabels:
       courier.misospace.dev/component: broker
+  enableDefaultDeny:
+    ingress: false
+    egress: false
   egress:
     - toEntities:
         - kube-apiserver
@@ -155,6 +158,14 @@ spec:
 
 Without it, preflight's broker probe stops each run with a `BrokerEgress`
 verdict instead of launching a broker that cannot reach the API server.
+`enableDefaultDeny` keeps the companion policy additive. The companion policy
+adds the API-server path. It does not decide the broker's default-deny mode,
+so the run's own NetworkPolicy stays in sole charge of the broker's ingress
+and egress. That NetworkPolicy already denies the broker every ingress except
+from control, and every egress except DNS and TCP 443. The companion policy
+therefore widens only the API-server path. The `ingress`/`egress` form of the
+field needs a Cilium release that accepts it. Older releases take a boolean
+and reject this form.
 IP-based CNIs (kube-proxy) need nothing extra.
 
 ## Design

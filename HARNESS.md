@@ -245,6 +245,12 @@ selected topology, not a configurable shared-broker fallback.
   Deny all worker access to the Kubernetes API, metadata endpoints,
   other cluster services, other runs, broker, forge, and model gateway. The
   worker uses no host network, host mounts/sockets, or privileged resources.
+  Control accepts ingress from the run's own pods and from nothing else. Control
+  serves no port. The reply to a control-originated connection lands on
+  control's ephemeral port, and a datapath can judge that reply as fresh
+  ingress instead of as a reply. The admission covers the run's untrusted
+  worker, so the worker's own deny-egress is what keeps the worker from
+  reaching control. No pod outside the run can reach control.
   NetworkPolicy is defense in depth, not the primary boundary: secure mode
   requires enforced policy and refuses clusters that cannot enforce it. Launch
   no workload exposure before policy is applied and live deny probes pass.
