@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.17](https://github.com/misospace/courier/compare/v0.1.16...v0.1.17) (2026-11-03)
+
+
+### Features
+
+* **harness:** support native Anthropic Messages transport alongside OpenAI ([#718](https://github.com/misospace/courier/issues/718)) ([b7be497](https://github.com/misospace/courier/commit/b7be497efc8cef7dae77b2dd411305152f105a47))
+* **rebase:** add version-safe execution path ([#715](https://github.com/misospace/courier/issues/715)) ([#717](https://github.com/misospace/courier/issues/717)) ([5f91aea](https://github.com/misospace/courier/commit/5f91aea66cc35babc3d40b30a07efebc0f4b8a44))
+
 ## [0.1.16](https://github.com/misospace/courier/compare/v0.1.15...v0.1.16) (2026-11-03)
 
 
