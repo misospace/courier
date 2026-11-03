@@ -147,21 +147,25 @@ func runArgs(args []string) error {
 	// behavior, preserved for old invocations and profiles.
 	policy := harness.ContextPolicyFromLane(invocation.Context)
 	budgetInputs := make(map[string]harness.ContextBudgetInput)
-	gateway := &harness.Gateway{
-		BaseURL: os.Getenv(topology.EnvGatewayURL),
+	// The model transport is the lane's declared wire format (#716): the
+	// OpenAI-compatible surface or the native Anthropic Messages surface,
+	// against the same deployment-configured gateway endpoint. An unknown
+	// declared transport fails closed here — a mistyped lane never falls
+	// back to a wire format its model does not speak.
+	gateway, err := harness.NewModelTransport(
+		invocation.GatewayTransport,
+		os.Getenv(topology.EnvGatewayURL),
+		gatewayKey(os.Getenv(topology.EnvGatewayKeyFile)),
+		nil,
 		// Provider-specific exhaustion codes are deployment configuration:
 		// the provider-neutral defaults are extended, never replaced (#320).
-		ExhaustionSignals: harness.ParseExhaustionSignals(
+		harness.ParseExhaustionSignals(
 			os.Getenv("COURIER_MODEL_EXHAUSTION_CODES"),
 			os.Getenv("COURIER_MODEL_EXHAUSTION_TYPES"),
 		),
-	}
-	if keyFile := os.Getenv(topology.EnvGatewayKeyFile); keyFile != "" {
-		key, err := os.ReadFile(keyFile)
-		if err != nil || len(key) == 0 {
-			return errors.New("courier-control: projected model gateway key is missing")
-		}
-		gateway.APIKey = string(key)
+	)
+	if err != nil {
+		return fmt.Errorf("courier-control: model transport: %w", err)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -174,7 +178,7 @@ func runArgs(args []string) error {
 	// hiccup) are re-probed for bounded rounds before declaring, so a
 	// slow-to-start dependency does not park the run with a human.
 	deps := harness.ProbeDeps{
-		Gateway:            gateway,
+		Transport:          gateway,
 		Bindings:           bindings,
 		Broker:             identity.brokerProber(),
 		Mode:               string(invocation.Mode),
@@ -273,7 +277,7 @@ func runArgs(args []string) error {
 		fmt.Printf("active-operation reconcile failed (continuing): %v\n", err)
 	}
 	coordinator, err := harness.NewCoordinator(harness.CoordinatorConfig{
-		Gateway:   gateway,
+		Transport: gateway,
 		Bindings:  bindings,
 		Worker:    identity.delegator(),
 		Snapshot:  engine.PrepareSnapshot,
@@ -832,9 +836,29 @@ func (i *controlIdentity) probeWorker(ctx context.Context) harness.Capability {
 	}
 }
 
+// gatewayKey reads the projected model gateway key. An unconfigured key file
+// means the gateway accepts unauthenticated callers — the same convention the
+// transports document — while a configured-but-unreadable key is a hard
+// configuration error the run must not start past.
+func gatewayKey(keyFile string) string {
+	if keyFile == "" {
+		return ""
+	}
+	key, err := os.ReadFile(keyFile)
+	if err != nil || len(key) == 0 {
+		// The transport constructors treat an empty key as "no auth", which
+		// would silently downgrade a configured deployment. Fail loudly here:
+		// a key that was projected empty or unreadable is a broken
+		// configuration, not an unauthenticated gateway.
+		fmt.Fprintf(os.Stderr, "courier-control: projected model gateway key is missing\n")
+		os.Exit(1)
+	}
+	return string(key)
+}
+
 // probeModel performs one cheap completion probe for a role binding. The
 // diagnostic is a fixed category: provider response bodies are never echoed.
-func probeModel(ctx context.Context, gateway *harness.Gateway, model string) error {
+func probeModel(ctx context.Context, gateway harness.ModelTransport, model string) error {
 	events, err := gateway.StreamChat(ctx, harness.ChatRequest{
 		Model:    model,
 		Messages: []harness.Message{{Role: "user", Content: "Reply with the single word: ready"}},

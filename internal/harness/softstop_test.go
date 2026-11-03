@@ -241,7 +241,7 @@ func TestSoftStopLatchBlocksNewBriefsOnly(t *testing.T) {
 	watcher.Poll(context.Background()) // the request landed before the first turn
 	publisher := &stubPublisher{result: Publication{OID: "abc123"}}
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway: gateway, Bindings: testBindings(),
+		Transport: gateway, Bindings: testBindings(),
 		Control: watcher, Publisher: publisher,
 		WorkRefBeyondAnchor: func(context.Context) (bool, error) { return true, nil },
 	})
@@ -298,7 +298,7 @@ func TestCoordinatorWithoutControlHasNoSoftStopPath(t *testing.T) {
 		gatewayResponse{body: sse(contentChunk(`{"outcome":"no_change_needed","evidence":"nothing to change"}`), finishChunk("stop"))},
 	)
 	defer cleanup()
-	coordinator, err := NewCoordinator(CoordinatorConfig{Gateway: gateway, Bindings: testBindings()})
+	coordinator, err := NewCoordinator(CoordinatorConfig{Transport: gateway, Bindings: testBindings()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,7 +315,7 @@ func TestSoftStopFinishDerivesOutcomeFromWorld(t *testing.T) {
 	t.Run("beyond-anchor-publishes-changes", func(t *testing.T) {
 		publisher := &stubPublisher{result: Publication{OID: "abc123"}}
 		coordinator, err := NewCoordinator(CoordinatorConfig{
-			Gateway: &Gateway{BaseURL: "http://unused.invalid"}, Bindings: testBindings(),
+			Transport: &Gateway{BaseURL: "http://unused.invalid"}, Bindings: testBindings(),
 			Publisher:           publisher,
 			WorkRefBeyondAnchor: func(context.Context) (bool, error) { return true, nil },
 		})
@@ -333,7 +333,7 @@ func TestSoftStopFinishDerivesOutcomeFromWorld(t *testing.T) {
 	t.Run("at-anchor-is-no-change", func(t *testing.T) {
 		publisher := &stubPublisher{}
 		coordinator, err := NewCoordinator(CoordinatorConfig{
-			Gateway: &Gateway{BaseURL: "http://unused.invalid"}, Bindings: testBindings(),
+			Transport: &Gateway{BaseURL: "http://unused.invalid"}, Bindings: testBindings(),
 			Publisher:           publisher,
 			WorkRefBeyondAnchor: func(context.Context) (bool, error) { return false, nil },
 		})
@@ -351,7 +351,7 @@ func TestSoftStopFinishDerivesOutcomeFromWorld(t *testing.T) {
 	t.Run("blocked-promotes-to-blocked-external", func(t *testing.T) {
 		publisher := &stubPublisher{err: &PublicationBlockedError{Reason: "the live work tip is foreign"}}
 		coordinator, err := NewCoordinator(CoordinatorConfig{
-			Gateway: &Gateway{BaseURL: "http://unused.invalid"}, Bindings: testBindings(),
+			Transport: &Gateway{BaseURL: "http://unused.invalid"}, Bindings: testBindings(),
 			Publisher:           publisher,
 			WorkRefBeyondAnchor: func(context.Context) (bool, error) { return true, nil },
 		})
@@ -365,7 +365,7 @@ func TestSoftStopFinishDerivesOutcomeFromWorld(t *testing.T) {
 	})
 	t.Run("failed-observation-is-infrastructure", func(t *testing.T) {
 		coordinator, err := NewCoordinator(CoordinatorConfig{
-			Gateway: &Gateway{BaseURL: "http://unused.invalid"}, Bindings: testBindings(),
+			Transport: &Gateway{BaseURL: "http://unused.invalid"}, Bindings: testBindings(),
 			Publisher:           &stubPublisher{},
 			WorkRefBeyondAnchor: func(context.Context) (bool, error) { return false, errors.New("broker unreachable") },
 		})
@@ -379,7 +379,7 @@ func TestSoftStopFinishDerivesOutcomeFromWorld(t *testing.T) {
 	})
 	t.Run("cancellation-takes-precedence", func(t *testing.T) {
 		coordinator, err := NewCoordinator(CoordinatorConfig{
-			Gateway: &Gateway{BaseURL: "http://unused.invalid"}, Bindings: testBindings(),
+			Transport: &Gateway{BaseURL: "http://unused.invalid"}, Bindings: testBindings(),
 			Publisher:           &stubPublisher{},
 			WorkRefBeyondAnchor: func(context.Context) (bool, error) { return true, nil },
 		})
@@ -430,7 +430,7 @@ func TestSoftStopEarlyFinishConfirmsRecoveredWork(t *testing.T) {
 	watcher := NewControlWatcher(&stubControlSource{requests: []*courierv1alpha1.ControlRequest{controlRequest("req-1")}}, &stubAckWriter{})
 	watcher.Poll(ctx) // acknowledged before the first turn, engine unprepared
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway: gateway, Bindings: testBindings(),
+		Transport: gateway, Bindings: testBindings(),
 		Control: watcher, Publisher: recovered,
 		WorkRefBeyondAnchor: recovered.WorkRefBeyondAnchor,
 	})

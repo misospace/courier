@@ -295,10 +295,10 @@ func TestModelInputLimitOverLongBodyFailsAsUndecodable(t *testing.T) {
 
 // budgetProbeDeps is a probe dependency set whose every other capability is
 // healthy, so the gate outcome a test asserts is the context budget's alone.
-func budgetProbeDeps(gateway *Gateway) ProbeDeps {
+func budgetProbeDeps(gateway ModelTransport) ProbeDeps {
 	return ProbeDeps{
-		Gateway:  gateway,
-		Bindings: testBindings(),
+		Transport: gateway,
+		Bindings:  testBindings(),
 		Broker: capabilityBroker(map[string]any{
 			"provider": map[string]any{"name": "acme-forge"},
 			"operations": []map[string]any{
@@ -429,7 +429,7 @@ func TestContextBudgetCapabilityStates(t *testing.T) {
 			if tt.gateway {
 				gateway, _, cleanup := modelInfoGateway(t, servingModelInfo(tt.body))
 				defer cleanup()
-				deps.Gateway = gateway
+				deps.Transport = gateway
 			}
 			deps.Context = tt.context
 			caps := ProbeCapabilities(context.Background(), deps)
@@ -702,7 +702,7 @@ func TestContextBudgetProbeFailureClassification(t *testing.T) {
 			w.WriteHeader(http.StatusNotFound)
 		})
 		defer cleanupUnreachable()
-		deps.Gateway = unreadable
+		deps.Transport = unreadable
 		// Declared fraction with no ceiling: the read is the only source of
 		// capacity, so the failure is the reason there is no budget.
 		deps.Context = ContextPolicy{CompactAtPercent: 75}
@@ -1130,7 +1130,7 @@ func TestProbeRecordsOverwriteAcrossRetryRounds(t *testing.T) {
 	}
 
 	// Round one: the gateway read fails, so the verified limit is zero.
-	deps.Gateway = nil
+	deps.Transport = nil
 	ProbeCapabilities(context.Background(), deps)
 	if recorded["coordinator"].ProbedMaxInputTokens != 0 {
 		t.Fatalf("round one recorded %+v, want an unverified input", recorded["coordinator"])
@@ -1139,7 +1139,7 @@ func TestProbeRecordsOverwriteAcrossRetryRounds(t *testing.T) {
 	gateway, _, cleanup := modelInfoGateway(t, servingModelInfo(
 		`{"data":[{"model_name":"test/coordinator","model_info":{"max_input_tokens":128000}}]}`))
 	defer cleanup()
-	deps.Gateway = gateway
+	deps.Transport = gateway
 	ProbeCapabilities(context.Background(), deps)
 	if recorded["coordinator"].ProbedMaxInputTokens != 128000 {
 		t.Fatalf("round two recorded %+v, want the passing round's verified limit", recorded["coordinator"])
@@ -1204,7 +1204,7 @@ func TestContextBudgetDefaultedLaneGatesEveryBoundRole(t *testing.T) {
 	broken, _, cleanupBroken := modelInfoGateway(t, servingModelInfo(
 		`{"data":[{"model_name":"test/coder","model_info":{"max_input_tokens":64000}}]}`))
 	defer cleanupBroken()
-	deps.Gateway = broken
+	deps.Transport = broken
 	recorded = map[string]ContextBudgetInput{}
 	deps.OnContextBudget = func(role string, input ContextBudgetInput) {
 		recorded[role] = input

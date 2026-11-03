@@ -64,6 +64,15 @@ type LaneProfileSpec struct {
 	// model identifier understood by the configured model gateway.
 	Roles map[string]string `json:"roles"`
 
+	// Transport declares the model wire format the lane's sessions speak
+	// (#716): `openai` (the LiteLLM/OpenAI-compatible surface, the default
+	// when empty) or `anthropic` (the native Anthropic Messages surface).
+	// The choice is explicit and lane-level — never inferred from a model
+	// name — and the control binary fails closed on an unknown value.
+	// +optional
+	// +kubebuilder:validation:Enum=openai;anthropic
+	Transport string `json:"transport,omitempty"`
+
 	// Framing is free-text lane context injected into the coordinator prompt:
 	// hardware reality, parallelism guidance, whether a load tool is available.
 	// +optional

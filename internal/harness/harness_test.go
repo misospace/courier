@@ -1348,7 +1348,7 @@ func TestDuplicateBriefIsRejectedWithoutWorkerContact(t *testing.T) {
 	worker.packArtifact = []byte("bundle-bytes")
 	publisher := &mockPublisher{}
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:   gateway,
+		Transport: gateway,
 		Bindings:  testBindings(),
 		Worker:    delegator,
 		Publisher: publisher,
@@ -1397,7 +1397,7 @@ func TestCancelledBriefIsTombstonedForNewWork(t *testing.T) {
 		gatewayResponse{body: sse(contentChunk(`{"outcome":"blocked_external","missing":"x"}`), finishChunk("stop"))},
 	)
 	defer cleanup()
-	coordinator, err := NewCoordinator(CoordinatorConfig{Gateway: gateway, Bindings: testBindings()})
+	coordinator, err := NewCoordinator(CoordinatorConfig{Transport: gateway, Bindings: testBindings()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1489,10 +1489,10 @@ func TestAmbiguousDispatchReconcilesWithoutRedelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
-		Bindings: testBindings(),
-		Worker:   delegator,
-		Snapshot: snapshotProvider("snap-tip"),
+		Transport: &Gateway{BaseURL: "http://unused.invalid"},
+		Bindings:  testBindings(),
+		Worker:    delegator,
+		Snapshot:  snapshotProvider("snap-tip"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1591,10 +1591,10 @@ func TestDispatchAndAwaitUnobservedTerminationIsUnverified(t *testing.T) {
 
 			transport := &recordingTransport{}
 			coordinator, err := NewCoordinator(CoordinatorConfig{
-				Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
-				Bindings: testBindings(),
-				Worker:   delegator,
-				Status:   NewStatusReporter(transport, "control-uid", "worker-uid", 0),
+				Transport: &Gateway{BaseURL: "http://unused.invalid"},
+				Bindings:  testBindings(),
+				Worker:    delegator,
+				Status:    NewStatusReporter(transport, "control-uid", "worker-uid", 0),
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -1678,10 +1678,10 @@ func TestDispatchAndAwaitTerminalLiveDescendantsFencesTheWorker(t *testing.T) {
 
 	transport := &recordingTransport{}
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
-		Bindings: testBindings(),
-		Worker:   delegator,
-		Status:   NewStatusReporter(transport, "control-uid", "worker-uid", 0),
+		Transport: &Gateway{BaseURL: "http://unused.invalid"},
+		Bindings:  testBindings(),
+		Worker:    delegator,
+		Status:    NewStatusReporter(transport, "control-uid", "worker-uid", 0),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1799,8 +1799,8 @@ func TestOptionalRoleDegradedDoesNotGate(t *testing.T) {
 	gateway, _, cleanup := gatewayFor(gatewayResponse{status: http.StatusServiceUnavailable})
 	defer cleanup()
 	deps := ProbeDeps{
-		Gateway:  gateway,
-		Bindings: testBindings(),
+		Transport: gateway,
+		Bindings:  testBindings(),
 		Broker: capabilityBroker(map[string]any{
 			"provider": map[string]any{"name": "acme-forge"},
 			"operations": []map[string]any{
@@ -1875,7 +1875,7 @@ func TestSubagentShellRoutesThroughWorkerAndOnlyControlPublishes(t *testing.T) {
 	publisher := &mockPublisher{}
 	activity := &recordingActivity{}
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:   gateway,
+		Transport: gateway,
 		Bindings:  testBindings(),
 		Worker:    delegator,
 		Snapshot:  snapshotProvider("snap-tip"),
@@ -1961,7 +1961,7 @@ func TestWorkerPublicationClaimWithoutDeclaredChangesNeverPublishes(t *testing.T
 	defer cleanup()
 	publisher := &mockPublisher{}
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway: gateway, Bindings: testBindings(), Worker: delegator,
+		Transport: gateway, Bindings: testBindings(), Worker: delegator,
 		Snapshot:  snapshotProvider("snap-tip"),
 		Publisher: publisher,
 	})
@@ -1984,7 +1984,7 @@ func TestUndeclaredEndingFailsIncomplete(t *testing.T) {
 		gatewayResponse{body: sse(contentChunk("no really"), finishChunk("stop"))},
 	)
 	defer cleanup()
-	coordinator, err := NewCoordinator(CoordinatorConfig{Gateway: gateway, Bindings: testBindings()})
+	coordinator, err := NewCoordinator(CoordinatorConfig{Transport: gateway, Bindings: testBindings()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2120,7 +2120,7 @@ func TestToolDeclarationsMatchSessionContext(t *testing.T) {
 	)
 	defer cleanup()
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway: gateway, Bindings: testBindings(), Worker: delegator,
+		Transport: gateway, Bindings: testBindings(), Worker: delegator,
 		Snapshot: snapshotProvider("snap-tip"),
 	})
 	if err != nil {
@@ -2164,8 +2164,8 @@ func contains(values []string, want string) bool {
 // never nested delegation or cross-brief tombstones.
 func TestSubagentCannotDelegateOrCancel(t *testing.T) {
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
-		Bindings: testBindings(),
+		Transport: &Gateway{BaseURL: "http://unused.invalid"},
+		Bindings:  testBindings(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2244,11 +2244,11 @@ func TestResultPollFailureReconciles(t *testing.T) {
 		t.Fatal(err)
 	}
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
-		Bindings: testBindings(),
-		Worker:   delegator,
-		Snapshot: snapshotProvider("snap-tip"),
-		Activity: &recordingActivity{},
+		Transport: &Gateway{BaseURL: "http://unused.invalid"},
+		Bindings:  testBindings(),
+		Worker:    delegator,
+		Snapshot:  snapshotProvider("snap-tip"),
+		Activity:  &recordingActivity{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2287,9 +2287,9 @@ func TestSnapshotTransientFailureIsRetried(t *testing.T) {
 	attempts := 0
 	worker.snapshotTip = "snap-tip"
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  gateway,
-		Bindings: testBindings(),
-		Worker:   delegator,
+		Transport: gateway,
+		Bindings:  testBindings(),
+		Worker:    delegator,
 		Snapshot: func(context.Context) (Snapshot, error) {
 			attempts++
 			if attempts == 1 {
@@ -2340,9 +2340,9 @@ func TestOversizedArtifactIsNotInlined(t *testing.T) {
 func TestSubagentCannotCallForge(t *testing.T) {
 	forge := &countingForge{}
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
-		Bindings: testBindings(),
-		Forge:    forge,
+		Transport: &Gateway{BaseURL: "http://unused.invalid"},
+		Bindings:  testBindings(),
+		Forge:     forge,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2377,9 +2377,9 @@ func (f *countingForge) Call(_ context.Context, _, _ string) (string, error) {
 func TestSubagentToolsetExcludesForge(t *testing.T) {
 	forge := &countingForge{}
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
-		Bindings: testBindings(),
-		Forge:    forge,
+		Transport: &Gateway{BaseURL: "http://unused.invalid"},
+		Bindings:  testBindings(),
+		Forge:     forge,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2475,7 +2475,7 @@ func TestBriefResultRetention(t *testing.T) {
 	worker.packArtifact = []byte("bundle-bytes")
 	publisher := &mockPublisher{}
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:   gateway,
+		Transport: gateway,
 		Bindings:  testBindings(),
 		Worker:    delegator,
 		Snapshot:  snapshotProvider("snap-tip"),
@@ -2538,7 +2538,7 @@ func TestCoordinatorShellRefreshesPublishedIntegrationSnapshot(t *testing.T) {
 	defer cleanup()
 	publisher := &mockPublisher{}
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway: gateway, Bindings: testBindings(), Worker: delegator,
+		Transport: gateway, Bindings: testBindings(), Worker: delegator,
 		Snapshot:  sequenceSnapshotProvider("brief-base", "published-head", "published-head"),
 		Publisher: publisher,
 	})
@@ -2592,10 +2592,10 @@ func TestToolResultEventsAreEmitted(t *testing.T) {
 	)
 	defer cleanup()
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  gateway,
-		Bindings: testBindings(),
-		Worker:   delegator,
-		Snapshot: snapshotProvider("snap-tip"),
+		Transport: gateway,
+		Bindings:  testBindings(),
+		Worker:    delegator,
+		Snapshot:  snapshotProvider("snap-tip"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2647,10 +2647,10 @@ func TestUnboundRoleDoesNotBurnBriefID(t *testing.T) {
 	)
 	defer cleanup()
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:  gateway,
-		Bindings: testBindings(), // coordinator + coder bound; reviewer is not
-		Worker:   delegator,
-		Snapshot: snapshotProvider("snap-tip"),
+		Transport: gateway,
+		Bindings:  testBindings(), // coordinator + coder bound; reviewer is not
+		Worker:    delegator,
+		Snapshot:  snapshotProvider("snap-tip"),
 	})
 	if err != nil {
 		t.Fatal(err)

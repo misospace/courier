@@ -49,7 +49,7 @@ const (
 // data; the loop owns the terminal contract, and every model-controlled
 // command executes on the untrusted worker, never in the control pod.
 type Coordinator struct {
-	gateway  *Gateway
+	gateway  ModelTransport
 	bindings Bindings
 	worker   *Delegator
 	forge    ForgeOps
@@ -217,7 +217,10 @@ func (c *Coordinator) currentBootstrapEnv() []string {
 // named by capability health, never a silent fallback. Status, when present,
 // persists earned heartbeats and dispatch evidence through the run's broker.
 type CoordinatorConfig struct {
-	Gateway   *Gateway
+	// Transport is the model boundary the lane declared: OpenAI-compatible
+	// or Anthropic Messages (#716). Construction fails closed on an unknown
+	// declared transport or a missing endpoint.
+	Transport ModelTransport
 	Bindings  Bindings
 	Worker    *Delegator
 	Snapshot  SnapshotProvider
@@ -265,7 +268,7 @@ type CoordinatorConfig struct {
 // NewCoordinator fails closed on an unusable model configuration: without a
 // gateway or a coordinator binding there is no harness.
 func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
-	if config.Gateway == nil || config.Gateway.BaseURL == "" {
+	if config.Transport == nil {
 		return nil, errors.New("harness: model gateway is not configured")
 	}
 	if config.Bindings.Model(RoleCoordinator) == "" {
@@ -284,7 +287,7 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 		budgets[role] = budget
 	}
 	return &Coordinator{
-		gateway:                 config.Gateway,
+		gateway:                 config.Transport,
 		bindings:                config.Bindings,
 		worker:                  config.Worker,
 		forge:                   config.Forge,
@@ -497,6 +500,11 @@ func (c *Coordinator) pump(ctx context.Context, session *Session, briefID string
 	events := session.Turn(ctx, tools)
 	var text strings.Builder
 	var calls []ToolCall
+	// blocks is the assistant turn's provider-native content blocks from the
+	// turn's terminal event — opaque continuation data (#716) that rides the
+	// transcript verbatim so the next request keeps provider semantics. It is
+	// nil for transports with no continuation payload.
+	var blocks []json.RawMessage
 	final := false
 	for _, event := range events {
 		switch event.Kind {
@@ -509,8 +517,11 @@ func (c *Coordinator) pump(ctx context.Context, session *Session, briefID string
 		case KindError:
 			return turnResult{streamErr: event.Err}
 		}
+		if len(event.Blocks) > 0 {
+			blocks = event.Blocks
+		}
 	}
-	session.Append(AssistantMessage(text.String(), calls))
+	session.Append(AssistantMessageWithBlocks(text.String(), calls, blocks))
 	if final {
 		return turnResult{text: text.String(), final: true}
 	}

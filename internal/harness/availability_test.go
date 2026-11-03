@@ -293,7 +293,7 @@ func TestCoordinatorEndsBlockedExternalOnAllowanceExhaustion(t *testing.T) {
 		errBody: `{"error":{"type":"insufficient_quota"}}`,
 	})
 	defer cleanup()
-	coordinator, err := NewCoordinator(CoordinatorConfig{Gateway: gateway, Bindings: testBindings()})
+	coordinator, err := NewCoordinator(CoordinatorConfig{Transport: gateway, Bindings: testBindings()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -317,7 +317,7 @@ func TestCoordinatorEndsBlockedExternalOnPersistentRateLimit(t *testing.T) {
 	}
 	gateway, mocker, cleanup := gatewayFor(script...)
 	defer cleanup()
-	coordinator, err := NewCoordinator(CoordinatorConfig{Gateway: gateway, Bindings: testBindings()})
+	coordinator, err := NewCoordinator(CoordinatorConfig{Transport: gateway, Bindings: testBindings()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,7 +341,7 @@ func TestCoordinatorKeepsInfraErrorOnProviderOutage(t *testing.T) {
 	}
 	gateway, _, cleanup := gatewayFor(script...)
 	defer cleanup()
-	coordinator, err := NewCoordinator(CoordinatorConfig{Gateway: gateway, Bindings: testBindings()})
+	coordinator, err := NewCoordinator(CoordinatorConfig{Transport: gateway, Bindings: testBindings()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,8 +353,8 @@ func TestCoordinatorKeepsInfraErrorOnProviderOutage(t *testing.T) {
 
 func TestExhaustedModelBindingGateIsRecoverable(t *testing.T) {
 	deps := ProbeDeps{
-		Gateway:  &Gateway{BaseURL: "http://example.invalid"},
-		Bindings: testBindings(),
+		Transport: &Gateway{BaseURL: "http://example.invalid"},
+		Bindings:  testBindings(),
 		Broker: capabilityBroker(map[string]any{
 			"provider": map[string]any{"name": "acme-forge"},
 			"operations": []map[string]any{
@@ -434,7 +434,7 @@ func TestCoordinatorEndsBlockedExternalOnDelegatedExhaustion(t *testing.T) {
 
 	publisher := &mockPublisher{}
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:   gateway,
+		Transport: gateway,
 		Bindings:  testBindings(),
 		Worker:    delegator,
 		Snapshot:  snapshotProvider("snap-tip"),
@@ -513,7 +513,7 @@ func TestDelegatedOrdinaryStreamFailureStaysToolFailure(t *testing.T) {
 
 	publisher := &mockPublisher{}
 	coordinator, err := NewCoordinator(CoordinatorConfig{
-		Gateway:   gateway,
+		Transport: gateway,
 		Bindings:  testBindings(),
 		Worker:    delegator,
 		Snapshot:  snapshotProvider("snap-tip"),

@@ -293,7 +293,7 @@ type canary struct {
 	marker     string
 	digest     string
 
-	gateway  *harness.Gateway
+	gateway  harness.ModelTransport
 	stub     *stubGateway
 	recorder *recorder
 	// gatewayName names the endpoint that answered the model.
@@ -705,9 +705,9 @@ func (c *canary) runCoordinator(ctx context.Context) (executor.HarnessResult, er
 		return executor.HarnessResult{}, fmt.Errorf("skillcanary: bind the coordinator role: %w", err)
 	}
 	coordinator, err := harness.NewCoordinator(harness.CoordinatorConfig{
-		Gateway:  c.gateway,
-		Bindings: bindings,
-		Skills:   c.skillSet,
+		Transport: c.gateway,
+		Bindings:  bindings,
+		Skills:    c.skillSet,
 	})
 	if err != nil {
 		return executor.HarnessResult{}, fmt.Errorf("skillcanary: build the coordinator: %w", err)
