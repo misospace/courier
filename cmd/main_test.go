@@ -1542,3 +1542,51 @@ func TestSkillBundleSourcesGateTheStartup(t *testing.T) {
 		t.Fatalf("a distinct bundle source must pass the startup gate: %v", err)
 	}
 }
+
+// The lane runtime image is deployment-authored, version-tracked by the
+// chart: a binary-level default would make laneLaunchSpec's legacy fallback
+// (an omitted value falls back to the harness image) unreachable (#721).
+func TestBuildSecureControlPreservesLaneRuntimeImageEmptiness(t *testing.T) {
+	registryFile := filepath.Join(t.TempDir(), "providers.json")
+	providers := `{"providers":[{"name":"github","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"forge-creds","key":"token"}},"serves":["*"]}]}`
+	if err := os.WriteFile(registryFile, []byte(providers), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client, err := couriergithub.New("single-secret-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The observer seam satisfied the same way the passing startup tests do,
+	// so the only variable under test is the lane runtime image itself.
+	base := secureConfig{
+		providersFile:  registryFile,
+		runNamespace:   "runs",
+		harnessImage:   "harness:test",
+		observer:       couriergithub.Observer{Client: client},
+		observerSecret: "forge-creds",
+		restConfig:     &rest.Config{Host: "https://127.0.0.1:1"},
+	}
+	t.Run("omitted stays empty and preserves the harness fallback", func(t *testing.T) {
+		control, err := buildSecureControl(base)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if control.Config.LaneRuntimeImage != "" {
+			t.Fatalf("LaneRuntimeImage = %q; an omitted value must stay empty so laneLaunchSpec falls back to the harness image", control.Config.LaneRuntimeImage)
+		}
+		if control.Config.HarnessImage != "harness:test" {
+			t.Fatalf("HarnessImage = %q; the legacy fallback must survive", control.Config.HarnessImage)
+		}
+	})
+	t.Run("explicitly configured passes through unchanged", func(t *testing.T) {
+		configured := base
+		configured.laneRuntimeImage = "harness-go:0.1.18"
+		control, err := buildSecureControl(configured)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if control.Config.LaneRuntimeImage != "harness-go:0.1.18" {
+			t.Fatalf("LaneRuntimeImage = %q; an explicit value must pass through unchanged", control.Config.LaneRuntimeImage)
+		}
+	})
+}

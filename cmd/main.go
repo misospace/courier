@@ -156,7 +156,7 @@ func main() {
 	flag.StringVar(&leaderElectionID, "leader-election-id", defaultLeaderElectionID, "Lease name for leader election. Two releases sharing an operator namespace need distinct IDs; separate operator namespaces do not (#632).")
 	flag.StringVar(&brokerTokenReviewClusterRole, "broker-tokenreview-cluster-role", defaultBrokerTokenReviewClusterRole, "Name of the chart-provided ClusterRole granting broker TokenReview creation; a side-by-side release renders a distinct name so the fixed cluster-scoped name never collides (#632).")
 	flag.StringVar(&harnessImage, "harness-image", defaultsHarnessImage, "Secure mode: image carrying courier-control, courier-worker, and courier-broker.")
-	flag.StringVar(&laneRuntimeImage, "lane-runtime-image", defaultsLaneRuntimeImage, "Secure mode: default worker image for lanes that declare no runtimeImage — the shipped lane runtime (the harness-go toolchain base), tracked to the chart's version by the chart. Empty falls back to the harness image (#717).")
+	flag.StringVar(&laneRuntimeImage, "lane-runtime-image", "", "Secure mode: default worker image for lanes that declare no runtimeImage. The chart passes its shipped lane runtime (the harness-go toolchain base) tracked to the chart's version; empty preserves the legacy fallback to the harness image (#717).")
 	flag.StringVar(&dependencyCacheService, "dependency-cache-service", "", "Secure mode: namespace/name of the approved read-only dependency cache Service; empty means workers have no egress.")
 	flag.IntVar(&dependencyCachePort, "dependency-cache-port", 0, "Secure mode: cache port override; empty uses the Service's first port.")
 	flag.StringVar(&probeImage, "probe-image", defaultsProbeImage, "Secure mode: image for disposable network-probe pods.")
@@ -1219,8 +1219,7 @@ type secureConfig struct {
 }
 
 const (
-	defaultsHarnessImage     = "ghcr.io/misospace/courier-harness:latest"
-	defaultsLaneRuntimeImage = "ghcr.io/misospace/courier-harness-go:latest"
+	defaultsHarnessImage = "ghcr.io/misospace/courier-harness:latest"
 	// defaultLeaderElectionID is the historical lease name. A second release
 	// sharing the operator namespace configures a distinct ID; separate
 	// operator namespaces already isolate the lease (#632).
@@ -1331,10 +1330,10 @@ func buildSecureControl(config secureConfig) (*controller.SecureControl, error) 
 	if harnessImage == "" {
 		harnessImage = defaultsHarnessImage
 	}
+	// Empty is preserved, never defaulted here: the legacy fallback to the
+	// harness image is laneLaunchSpec's decision at resolution time, and a
+	// binary-level default would make that fallback unreachable (#721).
 	laneRuntimeImage := strings.TrimSpace(config.laneRuntimeImage)
-	if laneRuntimeImage == "" {
-		laneRuntimeImage = defaultsLaneRuntimeImage
-	}
 	probeImage := strings.TrimSpace(config.probeImage)
 	if probeImage == "" {
 		probeImage = defaultsProbeImage
