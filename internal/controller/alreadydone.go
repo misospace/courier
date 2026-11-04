@@ -297,6 +297,8 @@ func (r *CoderRunReconciler) commentAlreadyDoneHold(ctx context.Context, run *co
 func (r *CoderRunReconciler) refreshFencedNoChange(ctx context.Context, run *courierv1alpha1.CoderRun, podUID string) bool {
 	live := &courierv1alpha1.CoderRun{}
 	if err := r.reader().Get(ctx, client.ObjectKeyFromObject(run), live); err != nil {
+		log.FromContext(ctx).V(1).Info("uncached re-read for the fenced no-change proposal failed; holding as evidence-incomplete",
+			"run", run.Name, "error", err.Error())
 		return false
 	}
 	if nc := live.Status.NoChange; nc != nil && nc.CoordinatorPodUID == podUID {

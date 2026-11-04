@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -10,7 +11,11 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/source"
@@ -187,7 +192,7 @@ func TestSettleAlreadyDoneClose(t *testing.T) {
 			wantComment: true,
 		},
 		{
-			name:        "permanent refusal moves ownership",
+			name:        "permanent refusal parks",
 			closeErr:    source.ErrPermanentRefusal,
 			wantPhase:   courierv1alpha1.PhaseNeedsHuman,
 			wantClose:   sourceCloseRefusedPermanentlyReason,
@@ -535,7 +540,119 @@ func TestGroundedNoChangeSurvivesCacheLag(t *testing.T) {
 	}
 }
 
-// TestEvidenceIncompleteNoChangeHoldsAndAnnounces drives the exit path for a// resolve-issue trusted no_change ending whose proposal is absent: the run
+// TestStaleFencedProposalNeverHonored proves the refresh path cannot adopt a
+// proposal fenced to a different incarnation, whether read from the cache or
+// the API server, and that the hold comment names the superseded execution
+// instead of claiming nothing was grounded.
+func TestStaleFencedProposalNeverHonored(t *testing.T) {
+	podUID := "pod-uid-current"
+	base := admissionRun("stale", "pool-a", courierv1alpha1.PhaseRunning)
+	base.UID = types.UID("run-uid-stale")
+	base.Spec.Source = "test"
+	base.Spec.WorkItemID = "stale-work"
+	base.Status.NativeResult = &courierv1alpha1.NativeResult{
+		Kind:              courierv1alpha1.NativeResultNoChange,
+		Reason:            "coordinator declared no change needed",
+		CoordinatorPodUID: podUID,
+		At:                metav1.NewTime(time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)),
+	}
+	cached := base.DeepCopy()
+	cached.Status.NoChange = groundedNoChange("pod-uid-dead")
+	live := cached.DeepCopy()
+	lane := admissionLaneWithCoordinator("pool-a", 1)
+	pod := coordinatorPodWithOutcome(cached, exitDeclaredNoChange, "no_change_needed", "the request looks satisfied")
+	pod.UID = types.UID(podUID)
+	pod.Status.Phase = corev1.PodFailed
+	cachedClient := capacityTestClient(t, lane, cached, pod)
+	liveClient := capacityTestClient(t, lane, live, pod)
+	s := &closeReportingSource{admissionSource: &admissionSource{}}
+	commenter := &fakeWorkItemCommenter{}
+	r := &CoderRunReconciler{
+		Client:           cachedClient,
+		APIReader:        liveClient,
+		Sources:          NewSourceRegistry(map[string]source.Adapter{"test": s}),
+		Now:              func() time.Time { return time.Date(2026, 10, 26, 12, 0, 1, 0, time.UTC) },
+		WorkItemComments: commenter,
+	}
+	if _, err := r.Reconcile(context.Background(), admissionRequest("stale")); err != nil {
+		t.Fatalf("Reconcile error = %v", err)
+	}
+	stored := &courierv1alpha1.CoderRun{}
+	if err := cachedClient.Get(context.Background(), admissionKey("stale"), stored); err != nil {
+		t.Fatalf("re-read run: %v", err)
+	}
+	if stored.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("phase = %s; want NeedsHuman — a foreign fence never authorizes the close", stored.Status.Phase)
+	}
+	if len(s.closeCalls) != 0 {
+		t.Fatalf("close calls = %d; want 0", len(s.closeCalls))
+	}
+	if len(commenter.bodies) != 1 || !strings.Contains(commenter.bodies[0], "superseded execution") {
+		t.Fatalf("comment bodies = %q; want the superseded-execution explanation", commenter.bodies)
+	}
+}
+
+// TestNoChangeHoldOnReaderFailure fails closed: an API-server re-read error
+// must not stop terminalization, and the ending holds for a human.
+func TestNoChangeHoldOnReaderFailure(t *testing.T) {
+	podUID := "pod-uid-readerr"
+	run := admissionRun("readerr", "pool-a", courierv1alpha1.PhaseRunning)
+	run.UID = types.UID("run-uid-readerr")
+	run.Spec.Source = "test"
+	run.Spec.WorkItemID = "readerr-work"
+	run.Status.NativeResult = &courierv1alpha1.NativeResult{
+		Kind:              courierv1alpha1.NativeResultNoChange,
+		Reason:            "coordinator declared no change needed",
+		CoordinatorPodUID: podUID,
+		At:                metav1.NewTime(time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)),
+	}
+	lane := admissionLaneWithCoordinator("pool-a", 1)
+	pod := coordinatorPodWithOutcome(run, exitDeclaredNoChange, "no_change_needed", "the request looks satisfied")
+	pod.UID = types.UID(podUID)
+	pod.Status.Phase = corev1.PodFailed
+	c := capacityTestClient(t, lane, run, pod)
+	failing := interceptor.Funcs{Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if _, ok := obj.(*courierv1alpha1.CoderRun); ok && key.Name == "readerr" {
+			return fmt.Errorf("injected read failure")
+		}
+		return cl.Get(ctx, key, obj, opts...)
+	}}
+	scheme := runtime.NewScheme()
+	if err := courierv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	failingClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&courierv1alpha1.CoderRun{}, &courierv1alpha1.LaneProfile{}).
+		WithRuntimeObjects(lane, run, pod).
+		WithInterceptorFuncs(failing).
+		Build()
+	s := &closeReportingSource{admissionSource: &admissionSource{}}
+	r := &CoderRunReconciler{
+		Client:    c,
+		APIReader: failingClient,
+		Sources:   NewSourceRegistry(map[string]source.Adapter{"test": s}),
+	}
+	if _, err := r.Reconcile(context.Background(), admissionRequest("readerr")); err != nil {
+		t.Fatalf("Reconcile error = %v", err)
+	}
+	stored := &courierv1alpha1.CoderRun{}
+	if err := c.Get(context.Background(), admissionKey("readerr"), stored); err != nil {
+		t.Fatalf("re-read run: %v", err)
+	}
+	if stored.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("phase = %s; want NeedsHuman fail-closed", stored.Status.Phase)
+	}
+	if len(s.closeCalls) != 0 {
+		t.Fatalf("close calls = %d; want 0", len(s.closeCalls))
+	}
+}
+
+// TestEvidenceIncompleteNoChangeHoldsAndAnnounces drives the exit path for a
+// resolve-issue trusted no_change ending whose proposal is absent: the run
 // parks NeedsHuman (never AwaitingReview), the source's close path is never
 // called, and the source work item receives exactly one explanation that no
 // PR is coming and no closure was attempted.
