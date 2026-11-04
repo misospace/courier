@@ -91,9 +91,10 @@ type WorkItemLinker interface {
 	FileLink(repo, path, sha string) string
 }
 
-// resolveIssueNoChangePhase classifies a trusted no_change ending for a
-// resolve-issue run. A durable, incarnation-fenced grounded close proposal
-// (status.noChange) that fences to this pod's UID upgrades the conclusion to
+// resolveIssueNoChangePhase classifies a resolve-issue no_change ending,
+// arriving as a trusted native result or as the legacy shim's verified exit.
+// A durable, incarnation-fenced grounded close proposal (status.noChange)
+// that fences to this pod's UID upgrades the conclusion to
 // AlreadyDone: the ask is claimed satisfied by existing work, with the source
 // as the only authority on whether that closes the item. A no-change ending
 // without such a proposal is evidence-incomplete and parks NeedsHuman — it

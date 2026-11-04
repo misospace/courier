@@ -163,7 +163,7 @@ func TestEnvtestResolveIssueLifecycle(t *testing.T) {
 	}
 }
 
-func TestEnvtestNoChangeNeededResolveIssueEndsInReview(t *testing.T) {
+func TestEnvtestNoChangeNeededResolveIssueParksNeedsHuman(t *testing.T) {
 	if envtestClient == nil {
 		t.Skip("KUBEBUILDER_ASSETS is not set")
 	}
@@ -229,11 +229,13 @@ func TestEnvtestNoChangeNeededResolveIssueEndsInReview(t *testing.T) {
 	reconcile()
 	assertEnvtestPhase(t, name, courierv1alpha1.PhaseRunning)
 	reconcile()
-	assertEnvtestPhase(t, name, courierv1alpha1.PhaseAwaitingReview)
-	// Exactly one in-review transition: the launch's in-progress plus the
-	// no_change_needed ending. The source must never be resolved.
-	if len(item.transitions) != 2 || item.transitions[0] != source.StateInProgress || item.transitions[1] != source.StateInReview {
-		t.Fatalf("source transitions = %#v, want in-progress then in-review", item.transitions)
+	assertEnvtestPhase(t, name, courierv1alpha1.PhaseNeedsHuman)
+	// Exactly one terminal transition: the launch's in-progress plus the
+	// evidence-incomplete no_change hold. The legacy shim records no durable
+	// proposal, so the source must land in needs-human — never the PR-less
+	// in-review state #720 forbids — and must never be resolved.
+	if len(item.transitions) != 2 || item.transitions[0] != source.StateInProgress || item.transitions[1] != source.StateNeedsHuman {
+		t.Fatalf("source transitions = %#v, want in-progress then needs-human", item.transitions)
 	}
 	if len(item.resolved) != 0 {
 		t.Fatalf("source resolves = %#v, want none", item.resolved)

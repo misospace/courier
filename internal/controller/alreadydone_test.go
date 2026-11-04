@@ -706,6 +706,63 @@ func TestEvidenceIncompleteNoChangeHoldsAndAnnounces(t *testing.T) {
 	}
 }
 
+// TestLegacyNoChangeEndingHoldsAndAnnounces drives the legacy shim's ending:
+// a resolve-issue run whose coordinator exits 3 with no trusted native result
+// and no durable proposal parks NeedsHuman (never AwaitingReview, never a
+// PR-less in-review state, #720), the source's close path is never called, the
+// source receives the ordinary needs-human park, and the work item receives
+// exactly one explanation that no PR is coming and no closure was attempted.
+func TestLegacyNoChangeEndingHoldsAndAnnounces(t *testing.T) {
+	run := admissionRun("legacy-hold", "pool-a", courierv1alpha1.PhaseRunning)
+	run.UID = types.UID("run-uid-legacy")
+	run.Spec.Source = "test"
+	run.Spec.WorkItemID = "legacy-hold-work"
+	lane := admissionLaneWithCoordinator("pool-a", 1)
+	pod := coordinatorPod(run, exitDeclaredNoChange)
+	pod.UID = types.UID("pod-uid-legacy")
+	pod.Status.Phase = corev1.PodFailed
+	c := capacityTestClient(t, lane, run, pod)
+	s := &closeReportingSource{admissionSource: &admissionSource{}}
+	commenter := &fakeWorkItemCommenter{}
+	r := &CoderRunReconciler{
+		Client:           c,
+		APIReader:        c,
+		Sources:          NewSourceRegistry(map[string]source.Adapter{"test": s}),
+		Now:              func() time.Time { return time.Date(2026, 10, 26, 12, 0, 1, 0, time.UTC) },
+		WorkItemComments: commenter,
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), admissionRequest("legacy-hold")); err != nil {
+			t.Fatalf("Reconcile[%d] error = %v", i, err)
+		}
+	}
+	stored := &courierv1alpha1.CoderRun{}
+	if err := c.Get(context.Background(), admissionKey("legacy-hold"), stored); err != nil {
+		t.Fatalf("re-read run: %v", err)
+	}
+	if stored.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("phase = %s; want NeedsHuman — the legacy exit never claims in-review", stored.Status.Phase)
+	}
+	if cond := apimeta.FindStatusCondition(stored.Status.Conditions, sourceCloseCondition); cond != nil {
+		t.Fatalf("SourceClose = %#v; want none — no close was attempted", cond)
+	}
+	if len(s.closeCalls) != 0 {
+		t.Fatalf("close calls = %d; want 0 without a grounded proposal", len(s.closeCalls))
+	}
+	if len(s.transitions) != 1 || s.transitions[0] != source.StateNeedsHuman {
+		t.Fatalf("source transitions = %#v; want one needs-human park", s.transitions)
+	}
+	if len(s.reports) != 1 || s.reports[0].Result != source.ResultBlocked {
+		t.Fatalf("reports = %#v; want one blocked hold report", s.reports)
+	}
+	if len(commenter.bodies) != 1 || !strings.Contains(commenter.bodies[0], "no grounded close evidence") {
+		t.Fatalf("comment bodies = %q; want exactly one hold announcement naming the missing evidence", commenter.bodies)
+	}
+	if cond := apimeta.FindStatusCondition(stored.Status.Conditions, sourceCloseCommentedCondition); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("SourceCloseCommented = %#v; want the announcement marker persisted", cond)
+	}
+}
+
 // TestAlreadyDoneCommentAnnouncesOnce verifies the announce-once marker: a
 // settled outcome is announced at most once per run even when the settlement
 // path runs twice (for example after a crash between post and write).

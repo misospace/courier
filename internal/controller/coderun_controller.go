@@ -1382,14 +1382,20 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		// item an explanation that no PR is coming and why.
 		noChangeHold := false
 		// A no_change ending of a resolve-issue run is not merely a declared
-		// question. When the coordinator's durable close proposal — fenced to
-		// this pod's incarnation — is present, the ask is claimed satisfied by
-		// existing work, and the conclusion upgrades to AlreadyDone, settling
-		// through the source's own evidence-gated close policy. Without that
-		// proposal the ending is evidence-incomplete and parks NeedsHuman. It
-		// never resolves on the coordinator's word alone, and never to
-		// AwaitingReview, which would imply an unverified pull request.
-		if run.Spec.Mode == courierv1alpha1.ModeResolveIssue && hasTrusted && trusted.Kind == courierv1alpha1.NativeResultNoChange {
+		// question, whether it arrives as a trusted native result or as the
+		// legacy shim's verified exit. When the coordinator's durable close
+		// proposal — fenced to this pod's incarnation — is present, the ask is
+		// claimed satisfied by existing work, and the conclusion upgrades to
+		// AlreadyDone, settling through the source's own evidence-gated close
+		// policy. Without that proposal the ending is evidence-incomplete and
+		// parks NeedsHuman. It never resolves on the coordinator's word alone,
+		// and never to AwaitingReview, which would imply an unverified pull
+		// request; the shim records no proposal at all, so its ending always
+		// takes the human hold (#720).
+		resolveIssueNoChange := run.Spec.Mode == courierv1alpha1.ModeResolveIssue &&
+			((hasTrusted && trusted.Kind == courierv1alpha1.NativeResultNoChange) ||
+				(!hasTrusted && exitCode == exitDeclaredNoChange))
+		if resolveIssueNoChange {
 			var grounded bool
 			phase, grounded = resolveIssueNoChangePhase(run, string(pod.UID))
 			if !grounded {
@@ -1467,8 +1473,9 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		// A no_change ending carries the coordinator's bounded conclusion into
 		// the source report: for a grounded AlreadyDone it is the explanation
 		// beside the close proposal, and for the evidence-incomplete NeedsHuman
-		// fallback it is the reason the human is being asked to review.
-		if run.Spec.Mode == courierv1alpha1.ModeResolveIssue && hasTrusted && trusted.Kind == courierv1alpha1.NativeResultNoChange {
+		// fallback — native or legacy shim — it is the reason the human is
+		// being asked to review.
+		if resolveIssueNoChange {
 			if reason := strings.TrimSpace(terminationReason); reason != "" {
 				intent.error = reason
 			} else {
@@ -2862,8 +2869,17 @@ func phaseForExit(mode courierv1alpha1.Mode, exitCode int32, outcome string) cou
 		}
 		return courierv1alpha1.PhaseNeedsHuman
 	case exitDeclaredNoChange:
-		if mode == courierv1alpha1.ModeFixPR || mode == courierv1alpha1.ModeRebase {
+		switch mode {
+		case courierv1alpha1.ModeFixPR, courierv1alpha1.ModeRebase:
 			return courierv1alpha1.PhaseVerifying
+		case courierv1alpha1.ModeResolveIssue:
+			// A legacy shim's resolve-issue no_change ending is evidence-incomplete
+			// by construction — the shim records no durable close proposal — so it
+			// parks NeedsHuman exactly like the native ending's ungrounded default,
+			// and the caller still re-checks a fenced proposal before terminalizing.
+			// It never reaches AwaitingReview, whose source state would claim an
+			// unverified pull request is in review (#720).
+			return courierv1alpha1.PhaseNeedsHuman
 		}
 		return courierv1alpha1.PhaseAwaitingReview
 	default:

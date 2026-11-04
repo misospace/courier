@@ -2773,9 +2773,10 @@ legitimate cluster-wide Node List per launch pass.
   committed elsewhere is not success.
   Exit `2` reaches **NeedsHuman** for a `needs_decision` declaration and the
   recoverable **BlockedExternal** phase for a `blocked_external` declaration;
-  exit `3` (`no_change_needed`) reaches **AwaitingReview** for the legacy shim's
-  resolve-issue run — the shim records no durable close proposal, so the human
-  gate remains its settlement — and
+  exit `3` (`no_change_needed`) parks **NeedsHuman** for the legacy shim's
+  resolve-issue run — the shim records no durable close proposal, so the
+  conclusion holds as evidence-incomplete with the hold explained on the work
+  item, never a PR-less `in-review` state (#720) — and
   is settled against the world through **Verifying** for fix-pr.
   Other failure exits reach **Failed**. When no outcome is declared, recoverable
   endings — uncommitted changes, commits off the run branch, or no commit and no
