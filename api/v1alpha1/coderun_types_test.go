@@ -564,6 +564,11 @@ func TestValidNoChangeClosePath(t *testing.T) {
 		"docs/my file.md",
 		"docs/日本語.md",
 		"a+b~c/d-e_f.md",
+		// Drive- and percent-shaped segments are legal literal file names
+		// on a repository filesystem; they are never decoded or rewritten,
+		// and the link renderer's stricter allowlist still refuses them.
+		"C:/Windows/win.ini",
+		"dir/%2e%2e/file",
 		strings.Repeat("a", MaxNoChangeClosePathBytes),
 	} {
 		if !ValidNoChangeClosePath(path) {
