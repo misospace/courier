@@ -476,12 +476,12 @@ func renderSkillConfigVolume(configMapName string) (corev1.Volume, corev1.Volume
 	}
 }
 
-// skillVolumeName derives the pod volume name of one materialized skill
-// bundle. A volume name is a DNS label, so it is bounded to a short
-// lowercase prefix of the skill's name with an 8-hex digest of that name
-// always following it: two distinct skill names can never render the same
-// volume, whatever prefix they share.
-func skillVolumeName(skillName string) string {
+// dnsSafeTag derives a short DNS-safe tag for a name: a lowercase
+// alphanumeric-and-dash prefix plus an 8-hex digest of the full name, within
+// a 16-character budget. The normalized prefix is readable only — distinct
+// names share long prefixes and can normalize to the same string — so the
+// digest of the full name always follows it and keeps the tag one name's own.
+func dnsSafeTag(name string) string {
 	const budget = 16
 	prefix := strings.Trim(strings.Map(func(r rune) rune {
 		switch {
@@ -492,13 +492,21 @@ func skillVolumeName(skillName string) string {
 		default:
 			return -1
 		}
-	}, skillName), "-")
-	sum := sha256.Sum256([]byte(skillName))
+	}, name), "-")
+	sum := sha256.Sum256([]byte(name))
 	digest := hex.EncodeToString(sum[:])[:8]
 	if len(prefix) > budget-len(digest) {
 		prefix = prefix[:budget-len(digest)]
 	}
-	return "skill-" + prefix + digest
+	return prefix + digest
+}
+
+// skillVolumeName derives the pod volume name of one materialized skill
+// bundle. A volume name is a DNS label, and the digest in dnsSafeTag means
+// two distinct skill names can never render the same volume, whatever
+// prefix they share.
+func skillVolumeName(skillName string) string {
+	return "skill-" + dnsSafeTag(skillName)
 }
 
 // WorkerPod renders the untrusted sandbox worker: no secret, certificate,
@@ -930,26 +938,9 @@ func probePod(run *courier.CoderRun, node, image, script, component, serviceAcco
 	return pod
 }
 
-// nodeNameTag produces a short DNS-safe tag for a node name. The normalized
-// name is a readable prefix only: distinct nodes share long prefixes and can
-// normalize to the same string, so an 8-hex digest of the full original name
-// always follows it and keeps the tag one node's own.
+// nodeNameTag produces a short DNS-safe tag for a node name: dnsSafeTag's
+// prefix-plus-digest keeps distinct nodes distinct however long their shared
+// normalized prefix.
 func nodeNameTag(node string) string {
-	const budget = 16
-	prefix := strings.Trim(strings.Map(func(r rune) rune {
-		switch {
-		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-':
-			return r
-		case r >= 'A' && r <= 'Z':
-			return r + ('a' - 'A')
-		default:
-			return -1
-		}
-	}, node), "-")
-	sum := sha256.Sum256([]byte(node))
-	digest := hex.EncodeToString(sum[:])[:8]
-	if len(prefix) > budget-len(digest) {
-		prefix = prefix[:budget-len(digest)]
-	}
-	return prefix + digest
+	return dnsSafeTag(node)
 }
