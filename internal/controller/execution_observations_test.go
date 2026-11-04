@@ -108,6 +108,10 @@ func TestExecutionObservationStateMapping(t *testing.T) {
 		{courierv1alpha1.PhaseNeedsHuman, source.ExecutionBlocked, true},
 		{courierv1alpha1.PhaseBlockedExternal, source.ExecutionBlockedExternal, true},
 		{courierv1alpha1.PhaseHandedOff, source.ExecutionHandedOff, true},
+		// An already-done conclusion performs no execution to observe: the close
+		// report through the source's own close policy is the settlement, so the
+		// run carries no execution observation.
+		{courierv1alpha1.PhaseAlreadyDone, "", false},
 	}
 	for _, tc := range tests {
 		state, ok := executionObservationState(tc.phase)

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -724,6 +725,7 @@ func main() {
 		StatusWriter:               status.KubePatchWriter{Client: mgr.GetClient()},
 		Observer:                   githubObserver,
 		PullRequests:               pullRequestReader(githubObserver),
+		WorkItemComments:           workItemCommenter(githubObserver),
 		Events:                     runEvents,
 		Evidence:                   evidenceIntake,
 		PRHeadResolver:             existingPRHeadResolver(githubObserver),
@@ -812,6 +814,46 @@ func pullRequestReader(observer controller.WorldObserver) controller.PullRequest
 		return nil
 	}
 	return githubObserver
+}
+
+// workItemCommenter gives the reconciler its best-effort source-issue comment
+// delivery for an already-done run's evidence-gated close. It routes each
+// comment through the observer's repository-selected forge provider — the same
+// endpoint and identity routing a pull-request read uses — so an enterprise
+// registration's comment never leaves for the public API. The core never
+// receives a forge-specific client: only the WorkItemCommenter seam and the
+// forge capability it drives. Nil when the observer is not a GitHub observer or
+// carries no client, so a deployment without a forge write path skips the
+// notification entirely; the close settlement itself is unaffected.
+func workItemCommenter(observer controller.WorldObserver) controller.WorkItemCommenter {
+	githubObserver, ok := observer.(couriergithub.Observer)
+	if !ok || githubObserver.Client == nil {
+		return nil
+	}
+	return alreadyDoneCommenter{observer: githubObserver}
+}
+
+// alreadyDoneCommenter posts an already-done run's close notification to its
+// source work item through the observer's repository-selected forge provider.
+// It implements the reconciler's best-effort WorkItemCommenter seam.
+type alreadyDoneCommenter struct {
+	observer couriergithub.Observer
+}
+
+var _ controller.WorkItemCommenter = alreadyDoneCommenter{}
+
+func (c alreadyDoneCommenter) CommentWorkItem(ctx context.Context, run *courierv1alpha1.CoderRun, body string) error {
+	repo := run.Spec.Repo
+	if repo == "" {
+		return fmt.Errorf("already-done comment: run has no repository")
+	}
+	provider, err := c.observer.ProviderForRepository(repo)
+	if err != nil {
+		return err
+	}
+	ref := forge.WorkItemRef{Repo: repo, ID: strconv.Itoa(run.Spec.Ref)}
+	_, err = provider.CommentWorkItem(ctx, ref, body)
+	return err
 }
 
 // validateEvidenceFlags reports a clear error when the evidence intake flags

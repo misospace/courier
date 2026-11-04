@@ -100,7 +100,7 @@ func TestPhaseForNativeResult(t *testing.T) {
 		phase courierv1alpha1.Phase
 	}{
 		{name: "published hands to world verification", kind: courierv1alpha1.NativeResultPublished, phase: courierv1alpha1.PhaseVerifying},
-		{name: "no change resolve-issue waits for review", kind: courierv1alpha1.NativeResultNoChange, phase: courierv1alpha1.PhaseAwaitingReview},
+		{name: "no change resolve-issue parks for human review without a grounded proposal", kind: courierv1alpha1.NativeResultNoChange, phase: courierv1alpha1.PhaseNeedsHuman},
 		{name: "no change fix-pr settles against the world", mode: courierv1alpha1.ModeFixPR, kind: courierv1alpha1.NativeResultNoChange, phase: courierv1alpha1.PhaseVerifying},
 		{name: "needs human parks for a human", kind: courierv1alpha1.NativeResultNeedsHuman, phase: courierv1alpha1.PhaseNeedsHuman},
 		{name: "blocked external stays recoverable", kind: courierv1alpha1.NativeResultBlockedExternal, phase: courierv1alpha1.PhaseBlockedExternal},
@@ -145,10 +145,10 @@ func TestNativeResultClassificationReconcile(t *testing.T) {
 			wantVerifying: true,
 		},
 		{
-			name:      "no change resolve-issue reaches AwaitingReview",
+			name:      "no change resolve-issue without a grounded proposal parks NeedsHuman",
 			kind:      courierv1alpha1.NativeResultNoChange,
 			exitCode:  3,
-			wantPhase: courierv1alpha1.PhaseAwaitingReview,
+			wantPhase: courierv1alpha1.PhaseNeedsHuman,
 		},
 		{
 			name:          "no change fix-pr settles against the world",
