@@ -775,9 +775,11 @@ func parseNoChangeClose(raw json.RawMessage, evidence string) *courierv1alpha1.N
 		if strings.TrimSpace(row.Criterion) == "" || len(row.Criterion) > courierv1alpha1.MaxNoChangeCriterionBytes {
 			return nil
 		}
-		// The path bound mirrors the CRD MaxLength=1024 on
-		// NoChangeCloseCriterion.Path; no named constant exists there.
-		if strings.TrimSpace(row.Path) == "" || len(row.Path) > 1024 {
+		// One canonical repository-relative grammar (#720): an absolute,
+		// traversing, backslash, or NUL-bearing path drops the proposal
+		// exactly like any other malformed row; the broker re-checks the
+		// same rule before anything persists.
+		if !courierv1alpha1.ValidNoChangeClosePath(row.Path) {
 			return nil
 		}
 		// Excerpt bounds: bytes against the ceiling (fail-closed under any

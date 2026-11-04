@@ -251,7 +251,7 @@ const outcomeContract = "You own this run's completion end to end, and you exerc
 // itself. It renders only into the resolve-issue goal; every other mode's
 // goal stays byte-identical, and the proposal is model data that authorizes
 // nothing on its own.
-const noChangeCloseContract = "When you declare no_change_needed because the ask is already satisfied by existing work, ground the conclusion with \"close\":{\"criteria\":[{\"criterion\":\"<acceptance criterion this row grounds>\",\"path\":\"<repo-relative file path>\",\"excerpt\":\"<24-300 character excerpt taken verbatim from that file at the default-branch HEAD>\"}]}: re-read each file at its current default-branch HEAD and quote the excerpt verbatim, because the source re-reads the file and re-verifies every excerpt itself; free-form evidence alone authorizes nothing."
+const noChangeCloseContract = "When you declare no_change_needed because the ask is already satisfied by existing work, ground the conclusion with \"close\":{\"criteria\":[{\"criterion\":\"<acceptance criterion this row grounds>\",\"path\":\"<repo-relative file path such as docs/a.md: slash-separated, never absolute, no . or .. segment>\",\"excerpt\":\"<24-300 character excerpt taken verbatim from that file at the default-branch HEAD>\"}]}: re-read each file at its current default-branch HEAD and quote the excerpt verbatim, because the source re-reads the file and re-verifies every excerpt itself; free-form evidence alone authorizes nothing."
 
 const outcomeFilename = "outcome.json"
 

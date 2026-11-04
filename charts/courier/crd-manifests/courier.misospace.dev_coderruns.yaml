@@ -736,8 +736,10 @@ spec:
                           minLength: 24
                           type: string
                         path:
-                          description: Path is the repository-relative file path (no
-                            line anchors).
+                          description: |-
+                            Path is the repository-relative file path (no line anchors): a slash
+                            path with no absolute, empty, or dot segment and no backslash or
+                            control character.
                           maxLength: 1024
                           minLength: 1
                           type: string

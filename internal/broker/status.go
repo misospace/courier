@@ -383,10 +383,12 @@ func validNoChange(proposal *courier.NoChangeClose) error {
 		if criterion.Criterion == "" || len(criterion.Criterion) > courier.MaxNoChangeCriterionBytes {
 			return fmt.Errorf("no-change close criterion text is out of bounds")
 		}
-		// The path ceiling mirrors the CRD MaxLength=1024; no named constant
-		// exists there.
-		if criterion.Path == "" || len(criterion.Path) > 1024 {
-			return fmt.Errorf("no-change close criterion path is out of bounds")
+		// The one canonical repository-relative grammar the harness parser
+		// also enforces, bounds included: a model-authored path that could
+		// escape a repository root never persists and never reaches a close
+		// transport.
+		if !courier.ValidNoChangeClosePath(criterion.Path) {
+			return fmt.Errorf("no-change close criterion path is malformed")
 		}
 		if utf8.RuneCountInString(criterion.Excerpt) < courier.MinNoChangeExcerptBytes ||
 			len(criterion.Excerpt) > courier.MaxNoChangeExcerptBytes {

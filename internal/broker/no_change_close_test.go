@@ -117,3 +117,30 @@ func TestStatusWriterNoChangeCloseFencesIdentity(t *testing.T) {
 		t.Fatal("proposal with an over-bound excerpt was accepted")
 	}
 }
+
+// TestStatusWriterNoChangeCloseRejectsUnsafePaths proves the broker enforces
+// the canonical repository-relative path grammar (#720): an absolute,
+// traversing, dot-segment, backslash, or NUL-bearing model-authored path is
+// refused before any status write, so it can never persist or reach a close
+// transport.
+func TestStatusWriterNoChangeCloseRejectsUnsafePaths(t *testing.T) {
+	w, _, identity := statusFixture(t)
+	for _, path := range []string{
+		"/etc/shadow",
+		"../outside.md",
+		"docs/../../etc/shadow",
+		"./docs/a.md",
+		"docs//a.md",
+		"docs/a.md/",
+		`docs\flags.md`,
+		"docs/\x00flags.md",
+		" ",
+		strings.Repeat("p", courier.MaxNoChangeClosePathBytes+1),
+	} {
+		unsafe := validCloseFixture(string(identity.ControlPodUID))
+		unsafe.Criteria[0].Path = path
+		if err := w.Write(context.Background(), identity, HarnessPatch{NoChange: unsafe}, nil); err == nil {
+			t.Fatalf("proposal with path %q was accepted", path)
+		}
+	}
+}

@@ -1,6 +1,9 @@
 package v1alpha1
 
 import (
+	"strings"
+	"unicode"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -739,7 +742,42 @@ const (
 	MinNoChangeExcerptBytes = 24
 	// MaxNoChangeEvidenceBytes bounds the free-form summary carried for audit.
 	MaxNoChangeEvidenceBytes = 2000
+	// MaxNoChangeClosePathBytes bounds one grounded criterion path. It mirrors
+	// the CRD MaxLength=1024 on NoChangeCloseCriterion.Path; markers cannot
+	// reference a Go constant, so this constant is the named source and the
+	// schema carries the same value.
+	MaxNoChangeClosePathBytes = 1024
 )
+
+// ValidNoChangeClosePath reports whether path matches the canonical
+// repository-relative grammar of NoChangeCloseCriterion.Path (#720): a
+// non-empty path within MaxNoChangeClosePathBytes, with no leading or
+// trailing whitespace, no backslash, no NUL or other control character, and
+// one or more non-empty "/"-separated segments, none of them "." or "..".
+// The harness parser and the broker enforce this one grammar, so a
+// model-authored path that could escape a repository root — absolute,
+// traversing, Windows-separated, or NUL-laced — is never persisted or
+// forwarded to a source close transport. Whether a clean path may also be
+// rendered as a forge web link stays a stricter render-time decision.
+func ValidNoChangeClosePath(path string) bool {
+	if path == "" || len(path) > MaxNoChangeClosePathBytes {
+		return false
+	}
+	if path != strings.TrimSpace(path) {
+		return false
+	}
+	for _, r := range path {
+		if r == '\\' || unicode.IsControl(r) {
+			return false
+		}
+	}
+	for _, segment := range strings.Split(path, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
+}
 
 // NoChangeCloseCriterion grounds one acceptance criterion in a repository
 // file: the criterion text, the repo-relative file path, and a verbatim
@@ -749,7 +787,9 @@ type NoChangeCloseCriterion struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=300
 	Criterion string `json:"criterion"`
-	// Path is the repository-relative file path (no line anchors).
+	// Path is the repository-relative file path (no line anchors): a slash
+	// path with no absolute, empty, or dot segment and no backslash or
+	// control character.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=1024
 	Path string `json:"path"`
