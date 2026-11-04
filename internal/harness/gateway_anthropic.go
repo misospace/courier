@@ -132,11 +132,17 @@ func anthropicWireRequest(req ChatRequest) ([]byte, error) {
 		Model:     req.Model,
 		MaxTokens: req.MaxTokens,
 		Stream:    true,
+		// The Messages API requires a non-null messages array (#724): an
+		// all-system transcript renders no wire messages, and a nil slice
+		// marshals "messages": null, which litellm's /v1/messages
+		// normalizer 500s on every first turn. Initialize non-nil so the
+		// field can never marshal as null.
+		Messages: []anthropicWireMessage{},
 	}
 	if wire.MaxTokens <= 0 {
 		wire.MaxTokens = anthropicMaxTokensFallback
 	}
-	var system strings.Builder
+	var systemParts []string
 	leadingSystem := true
 	for _, message := range req.Messages {
 		// Every consecutive leading system message — a production session
@@ -148,10 +154,12 @@ func anthropicWireRequest(req ChatRequest) ([]byte, error) {
 		// mid-transcript framing (the compaction digest), which the Messages
 		// API has no role for and which renders as a user text block.
 		if message.Role == "system" && leadingSystem {
-			if system.Len() > 0 {
-				system.WriteString(anthropicSystemSeparator)
+			// An empty pinned message contributes nothing to the system
+			// field — the pre-#724 join behavior — and can never carry the
+			// task turn, so it never becomes the promoted message either.
+			if message.Content != "" {
+				systemParts = append(systemParts, message.Content)
 			}
-			system.WriteString(message.Content)
 			continue
 		}
 		if message.Role != "system" {
@@ -198,8 +206,23 @@ func anthropicWireRequest(req ChatRequest) ([]byte, error) {
 			})
 		}
 	}
-	if system.Len() > 0 {
-		wire.System = system.String()
+	// An all-system transcript — the pinned coordinator session: goal plus
+	// harness framing, optional lane framing, skills index, all
+	// Role "system" — renders zero wire messages, but the Messages API
+	// requires at least one message and the model must be handed the task
+	// as a turn (#724). The final pinned system message is promoted to the
+	// user turn verbatim, nothing invented, and everything before it stays
+	// in the top-level system field.
+	if len(systemParts) > 0 && len(wire.Messages) == 0 {
+		promoted := systemParts[len(systemParts)-1]
+		systemParts = systemParts[:len(systemParts)-1]
+		wire.Messages = append(wire.Messages, anthropicWireMessage{
+			Role:    "user",
+			Content: []json.RawMessage{anthropicTextBlock(promoted)},
+		})
+	}
+	if len(systemParts) > 0 {
+		wire.System = strings.Join(systemParts, anthropicSystemSeparator)
 	}
 	for _, tool := range req.Tools {
 		schema := tool.Parameters
