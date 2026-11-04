@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.19](https://github.com/misospace/courier/compare/v0.1.18...v0.1.19) (2026-11-04)
+
+
+### Bug Fixes
+
+* **harness:** stop all-system transcripts marshaling a null messages array ([#725](https://github.com/misospace/courier/issues/725)) ([56585ca](https://github.com/misospace/courier/commit/56585ca60691277f66f9c0dd74029ac45a202d8b))
+
+## [0.1.18](https://github.com/misospace/courier/compare/v0.1.17...v0.1.18) (2026-11-03)
+
+
+### Features
+
+* **controller:** ship a default lane runtime image tracked to the chart ([#721](https://github.com/misospace/courier/issues/721)) ([83a39c6](https://github.com/misospace/courier/commit/83a39c64e2ea87cc33f89d7f646e60cea0ed8c85))
+
 ## [0.1.17](https://github.com/misospace/courier/compare/v0.1.16...v0.1.17) (2026-11-03)
 
 
