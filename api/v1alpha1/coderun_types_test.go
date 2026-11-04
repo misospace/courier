@@ -549,3 +549,58 @@ func TestCoderRunSpecExplicitZeroRefRejected(t *testing.T) {
 		})
 	}
 }
+
+// TestValidNoChangeClosePath pins the one canonical repository-relative
+// grammar (#720) the harness parser and the broker share: clean slash paths
+// pass, and absolute, dot-segment, empty-segment, backslash, whitespace-edge,
+// control-character, or over-bound paths do not.
+func TestValidNoChangeClosePath(t *testing.T) {
+	for _, path := range []string{
+		"a",
+		"docs/flags.md",
+		"a/b/c.md",
+		".hidden/rc.md",
+		"..hidden/x",
+		"docs/my file.md",
+		"docs/日本語.md",
+		"a+b~c/d-e_f.md",
+		// Drive- and percent-shaped segments are legal literal file names
+		// on a repository filesystem; they are never decoded or rewritten,
+		// and the link renderer's stricter allowlist still refuses them.
+		"C:/Windows/win.ini",
+		"dir/%2e%2e/file",
+		strings.Repeat("a", MaxNoChangeClosePathBytes),
+	} {
+		if !ValidNoChangeClosePath(path) {
+			t.Fatalf("rejected clean path %q", path)
+		}
+	}
+	for _, path := range []string{
+		"",
+		" ",
+		"   ",
+		" docs/a.md",
+		"docs/a.md ",
+		"/",
+		"/etc/passwd",
+		"//etc/passwd",
+		"docs/",
+		"docs//a.md",
+		".",
+		"..",
+		"./docs/a.md",
+		"../a.md",
+		"docs/../../etc/shadow",
+		`docs\flags.md`,
+		`\\server\share\a.md`,
+		"docs/\x00flags.md",
+		"docs/a\nmd",
+		"a\tb",
+		"C:\\Windows\\win.ini",
+		strings.Repeat("a", MaxNoChangeClosePathBytes+1),
+	} {
+		if ValidNoChangeClosePath(path) {
+			t.Fatalf("accepted unsafe path %q", path)
+		}
+	}
+}

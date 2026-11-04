@@ -155,6 +155,14 @@ const (
 	// feedback was addressed. Dispatch rejects this result without wire effects;
 	// the controller uses ResultBlockedExternal for unverified open PRs.
 	ResultNoChange Result = "no-change"
+	// ResultAlreadyDone marks a resolve-issue conclusion that the work item's
+	// ask is already satisfied by existing work, carried with a per-criterion
+	// grounded close proposal (#720). It is only meaningful alongside Close:
+	// a source without an evidence-gated closure path must refuse it (never
+	// fake a settlement), and a source with one re-derives its own evidence
+	// and applies its own close policy. The coordinator's assertion is a
+	// proposal, never closure authorization.
+	ResultAlreadyDone Result = "already-done"
 )
 
 // Lifecycle contains source-neutral metadata for an optional lifecycle report.
@@ -179,6 +187,69 @@ type Lifecycle struct {
 	// StartedAt is the coordinator container start time, reported so sources
 	// can record real run durations; optional.
 	StartedAt *time.Time
+	// Close carries the grounded close proposal for ResultAlreadyDone (#720):
+	// per-criterion pinned excerpts plus the coordinator's free-form summary.
+	// Nil for every other result. It is a proposal — the source's own
+	// evidence-gated close policy is the only authority — and adapters
+	// without such a path must refuse the result rather than ignore it.
+	Close *CloseProposal
+}
+
+// CloseCriterion grounds one acceptance criterion in a repository file for a
+// close proposal: the criterion statement, a repo-relative file path, and a
+// verbatim excerpt of that file at the repository's default-branch head.
+type CloseCriterion struct {
+	Criterion string
+	Path      string
+	Excerpt   string
+}
+
+// CloseProposal is the coordinator's evidence-grounded proposal that a work
+// item's ask is already satisfied. The free-form Evidence is audit text only;
+// a source authorizes closure from its own re-derived evidence catalog, never
+// from this text or any model confidence claim.
+type CloseProposal struct {
+	Criteria []CloseCriterion
+	Evidence string
+}
+
+// Close actions report what a source actually did with a close proposal. They
+// are consumed from the source's resolution, never inferred from an accepted
+// HTTP response: an accepted report alone does not prove the work item closed.
+const (
+	// CloseActionClosed means the source applied the close to the work item.
+	CloseActionClosed = "closed"
+	// CloseActionRefused means the source's close policy declined; Reasons
+	// carries the specific policy refusals.
+	CloseActionRefused = "refused"
+	// CloseActionFailed means the close could not be executed (for example a
+	// forge write failure) without a policy refusal.
+	CloseActionFailed = "failed"
+	// CloseActionSkipped means an idempotent replay whose original outcome was
+	// not recorded; the work item's state must be verified, not assumed.
+	CloseActionSkipped = "skipped"
+)
+
+// CloseResolution is the source's authoritative answer to a close proposal.
+type CloseResolution struct {
+	// Action is one of the CloseAction* constants.
+	Action string
+	// Reason is the source's single-line explanation.
+	Reason string
+	// Reasons carries the specific policy reasons when the close was refused.
+	Reasons []string
+	// HeadSHA is the default-branch head the source pinned its grounding to.
+	HeadSHA string
+	// EvidenceDigest identifies the source's re-derived evidence catalog.
+	EvidenceDigest string
+}
+
+// CloseReporter optionally settles evidence-grounded already-done conclusions
+// through the source's close policy. A source that offers no such path does
+// not implement it, and its caller must take the supported non-executable
+// hold path instead of reporting closure.
+type CloseReporter interface {
+	ReportClose(context.Context, WorkItem, Lifecycle) (CloseResolution, error)
 }
 
 // CapacityRecoveryAttempt is the immutable attempt identity supplied to a source

@@ -317,7 +317,7 @@ func runArgs(args []string) error {
 		return fmt.Errorf("courier-control: %w", err)
 	}
 	result := coordinator.Run(ctx, invocation)
-	return declare(result, reporter, identity)
+	return declare(result, invocation.Mode, reporter, identity)
 }
 
 // classifyGateFailure decides, for a harness.Gate failure, the reason the
@@ -351,10 +351,20 @@ func exhaustedGate(err error) bool {
 // the persisted result is the durable intent the operator classifies from —
 // the termination handoff below is the fallback channel for a write that
 // never landed.
-func declare(result executor.HarnessResult, reporter *harness.StatusReporter, identity *controlIdentity) error {
+func declare(result executor.HarnessResult, mode courierv1alpha1.Mode, reporter *harness.StatusReporter, identity *controlIdentity) error {
 	payload := terminationFor(result)
-	persistTerminalResult(payload, reporter, identity)
+	persistTerminalResult(payload, noChangeProposalFor(mode, result), reporter, identity)
 	return handoff(payload)
+}
+
+// noChangeProposalFor gates the grounded close proposal (#720): durable only
+// for a resolve-issue no-change ending; every other mode or kind writes
+// nothing new, and the proposal never travels without its matching result.
+func noChangeProposalFor(mode courierv1alpha1.Mode, result executor.HarnessResult) *courierv1alpha1.NoChangeClose {
+	if mode != courierv1alpha1.ModeResolveIssue || result.Kind != courierv1alpha1.NativeResultNoChange {
+		return nil
+	}
+	return result.NoChange
 }
 
 // persistTerminalResult writes the trusted native terminal result through
@@ -369,7 +379,7 @@ func declare(result executor.HarnessResult, reporter *harness.StatusReporter, id
 // is reported on stderr and the exit proceeds — the operator then falls back
 // to the termination handoff, and the absence of a persisted result never
 // grants trust.
-func persistTerminalResult(payload termination, reporter *harness.StatusReporter, identity *controlIdentity) {
+func persistTerminalResult(payload termination, noChange *courierv1alpha1.NoChangeClose, reporter *harness.StatusReporter, identity *controlIdentity) {
 	if reporter == nil || identity == nil || payload.ResultKind == "" {
 		return
 	}
@@ -381,7 +391,16 @@ func persistTerminalResult(payload termination, reporter *harness.StatusReporter
 		CoordinatorPodUID: identity.controlKubeUID,
 		At:                metav1.NewTime(clockNow()),
 	}
-	if err := reporter.TerminalResult(ctx, result); err != nil {
+	// The proposal rides the same fenced write as the result, stamped with
+	// the same incarnation UID and instant (#720): the operator trusts the
+	// conclusion only from the coordinator pod whose termination carries the
+	// same identity as the evidence.
+	if noChange != nil {
+		noChange = noChange.DeepCopy()
+		noChange.CoordinatorPodUID = identity.controlKubeUID
+		noChange.At = metav1.NewTime(clockNow())
+	}
+	if err := reporter.TerminalResult(ctx, result, noChange); err != nil {
 		fmt.Fprintf(os.Stderr, "courier-control: trusted terminal result was not persisted: %v\n", err)
 	}
 }
@@ -669,7 +688,7 @@ func declareBlockedExternal(reason string, caps []harness.Capability, reporter *
 		Kind:    courierv1alpha1.NativeResultBlockedExternal,
 		Reason:  reason,
 	})
-	persistTerminalResult(payload, reporter, identity)
+	persistTerminalResult(payload, nil, reporter, identity)
 	return handoff(payload)
 }
 
@@ -687,7 +706,7 @@ func declareNeedsHuman(reason string, caps []harness.Capability, reporter *harne
 		Reason:     boundReason(reason),
 		ResultKind: string(courierv1alpha1.NativeResultNeedsHuman),
 	}
-	persistTerminalResult(payload, reporter, identity)
+	persistTerminalResult(payload, nil, reporter, identity)
 	return handoff(payload)
 }
 

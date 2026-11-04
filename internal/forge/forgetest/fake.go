@@ -50,6 +50,7 @@ const (
 	OpCreatePullRequest       OpKind = "create-pull-request"
 	OpUpdatePullRequest       OpKind = "update-pull-request"
 	OpCommentPullRequest      OpKind = "comment-pull-request"
+	OpCommentWorkItem         OpKind = "comment-work-item"
 )
 
 // Op records one provider call. Only the fields matching Kind are meaningful;
@@ -82,7 +83,7 @@ type Op struct {
 	Input forge.CreatePullRequestInput
 	// Update is the update payload of UpdatePullRequest.
 	Update forge.UpdatePullRequestInput
-	// Body is the comment body of CommentPullRequest.
+	// Body is the comment body of CommentPullRequest and CommentWorkItem.
 	Body string
 }
 
@@ -124,6 +125,7 @@ var allCapabilities = []forge.Capability{
 	forge.CapabilityCreatePullRequest,
 	forge.CapabilityUpdatePullRequest,
 	forge.CapabilityComment,
+	forge.CapabilityCommentWorkItem,
 }
 
 // failure is one queued error injection.
@@ -555,6 +557,31 @@ func (f *Fake) CommentPullRequest(_ context.Context, ref forge.PullRequestRef, b
 	return comment, nil
 }
 
+// CommentWorkItem records a comment on a seeded work item and returns it,
+// forge.ErrUnsupported when the comment-work-item capability is not offered,
+// or ErrNotFound.
+func (f *Fake) CommentWorkItem(_ context.Context, ref forge.WorkItemRef, body string) (forge.Comment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record(Op{Kind: OpCommentWorkItem, Repo: ref.Repo, WorkItem: ref, Body: body})
+	if fail, ok := f.takeFailure(OpCommentWorkItem, false); ok {
+		return forge.Comment{}, fail.err
+	}
+	if !f.offers(forge.CapabilityCommentWorkItem) {
+		return forge.Comment{}, forge.ErrUnsupported
+	}
+	if _, ok := f.workItems[ref]; !ok {
+		return forge.Comment{}, ErrNotFound
+	}
+	id := fmt.Sprintf("comment-%d", f.nextComment)
+	f.nextComment++
+	comment := forge.Comment{ID: id, Author: "forgetest", Body: body}
+	if fail, ok := f.takeFailure(OpCommentWorkItem, true); ok {
+		return forge.Comment{}, fail.err
+	}
+	return comment, nil
+}
+
 // FailNext queues err so that the next call of kind returns it with no
 // effect, including a call the capability gate or a missing object would
 // otherwise have refused — the injection answers first. Queue entries of a
@@ -653,6 +680,7 @@ var writeKinds = map[OpKind]bool{
 	OpCreatePullRequest:  true,
 	OpUpdatePullRequest:  true,
 	OpCommentPullRequest: true,
+	OpCommentWorkItem:    true,
 }
 
 // WriteOps returns only the recorded write operations — create, update, and

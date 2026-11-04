@@ -134,6 +134,21 @@ type CoderRunReconciler struct {
 	// watch-only behavior of a deployment without a forge read path.
 	PullRequests PullRequestReader
 
+	// WorkItemComments, when set, posts the bounded operator-authored
+	// notification to an already-done run's source work item once its
+	// evidence-gated close settles. It is a best-effort delivery seam through
+	// the operator's explicitly configured forge comment identity (#727): a nil
+	// implementation or a failure never alters the run's outcome, but it is
+	// recorded as not announced rather than claimed. Nil disables the
+	// notification; the close settlement itself is unaffected.
+	WorkItemComments WorkItemCommenter
+
+	// WorkItemLinks, when set, renders the forge-web links the announcement
+	// carries for the source-pinned verification revision and its grounded
+	// criterion paths. It is consulted only while rendering an announcement;
+	// nil renders the same facts as plain text, never a half-built link.
+	WorkItemLinks WorkItemLinker
+
 	// Evidence reconciles the run's failure-evidence Secrets at the terminal
 	// boundary the operator can prove: a world-verified success (AwaitingReview,
 	// Done) has its evidence deleted, and a dirty terminal (Failed, NeedsHuman)
@@ -679,6 +694,24 @@ func (r *CoderRunReconciler) reconcileTerminal(ctx context.Context, run *courier
 			return ctrl.Result{}, nil
 		}
 		return r.observeMergedReviewPR(ctx, run)
+	}
+	if run.Status.Phase == courierv1alpha1.PhaseAlreadyDone {
+		// An already-done run is reaped only once its evidence-gated close
+		// reached a positive, settled state: the source closed the work item
+		// (Published) or a superseded rejection settled it. While the close is
+		// unsettled — a missing, Unknown, or non-positive condition — the run is
+		// the only durable settlement intent, so it is parked without a timer;
+		// the pending-report retry above re-arms an unsettled close, and a run
+		// whose condition is missing/Unknown/other remains unretained until the
+		// source answers or an operator intervenes. The per-repository audit
+		// floor does not apply: the source work is already resolved, so the
+		// short window is the full retention.
+		if !lifecycleReportSettled(run) {
+			log.FromContext(ctx).V(1).Info("already-done run observed without a positively settled LifecycleReported; leaving for retention",
+				"lifecycleReported", lifecycleReportConditionState(run))
+			return ctrl.Result{}, nil
+		}
+		return r.reapAlreadyDone(ctx, run)
 	}
 	if (run.Status.Phase == courierv1alpha1.PhaseFailed || run.Status.Phase == courierv1alpha1.PhaseNeedsHuman) && !isCapacityExhaustionRun(run) {
 		// A Failed or NeedsHuman run is reaped only once its source
@@ -1344,6 +1377,38 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		if hasTrusted {
 			phase = phaseForNativeResult(run.Spec.Mode, trusted.Kind)
 		}
+		// noChangeHold marks the evidence-incomplete resolve-issue no-change
+		// ending: terminalized to NeedsHuman, it still owes the source work
+		// item an explanation that no PR is coming and why.
+		noChangeHold := false
+		// A no_change ending of a resolve-issue run is not merely a declared
+		// question, whether it arrives as a trusted native result or as the
+		// legacy shim's verified exit. When the coordinator's durable close
+		// proposal — fenced to this pod's incarnation — is present, the ask is
+		// claimed satisfied by existing work, and the conclusion upgrades to
+		// AlreadyDone, settling through the source's own evidence-gated close
+		// policy. Without that proposal the ending is evidence-incomplete and
+		// parks NeedsHuman. It never resolves on the coordinator's word alone,
+		// and never to AwaitingReview, which would imply an unverified pull
+		// request; the shim records no proposal at all, so its ending always
+		// takes the human hold (#720).
+		resolveIssueNoChange := run.Spec.Mode == courierv1alpha1.ModeResolveIssue &&
+			((hasTrusted && trusted.Kind == courierv1alpha1.NativeResultNoChange) ||
+				(!hasTrusted && exitCode == exitDeclaredNoChange))
+		if resolveIssueNoChange {
+			var grounded bool
+			phase, grounded = resolveIssueNoChangePhase(run, string(pod.UID))
+			if !grounded {
+				// The fenced pre-exit write can outrun this informer's cache;
+				// consult the API server before declaring the conclusion
+				// evidence-incomplete.
+				grounded = r.refreshFencedNoChange(ctx, run, string(pod.UID))
+				if grounded {
+					phase = courierv1alpha1.PhaseAlreadyDone
+				}
+			}
+			noChangeHold = !grounded
+		}
 		if phase == courierv1alpha1.PhaseVerifying {
 			before := run.DeepCopy()
 			// Record a declared no_change_needed fix-pr run (exit 3) so its terminal
@@ -1405,6 +1470,18 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		if phase == courierv1alpha1.PhaseBlockedExternal {
 			intent.error = terminationReason
 		}
+		// A no_change ending carries the coordinator's bounded conclusion into
+		// the source report: for a grounded AlreadyDone it is the explanation
+		// beside the close proposal, and for the evidence-incomplete NeedsHuman
+		// fallback — native or legacy shim — it is the reason the human is
+		// being asked to review.
+		if resolveIssueNoChange {
+			if reason := strings.TrimSpace(terminationReason); reason != "" {
+				intent.error = reason
+			} else {
+				intent.error = trusted.Reason
+			}
+		}
 		// A diagnostic explains a non-success ending. Successful handoffs
 		// (Verifying, AwaitingReview) carry no failure cause, so they get none.
 		// The diagnostic's reason is operator-derived (category + kubelet
@@ -1422,7 +1499,13 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 			}
 			intent.diagnostic = buildTerminalDiagnostic(r.clock(), &exit, "", terminationOutcome, handoffCategory, k8sFailure, pod, trustedKind)
 		}
-		return r.transitionTerminal(ctx, run, phase, "", intent, terminationSummary)
+		result, err := r.transitionTerminal(ctx, run, phase, "", intent, terminationSummary)
+		if err == nil && noChangeHold {
+			// Best-effort, once per run: the hold's explanation belongs on the
+			// source work item, not only on the CoderRun.
+			r.commentAlreadyDoneHold(ctx, run)
+		}
+		return result, err
 	}
 	result, handled, err := r.checkLiveness(ctx, run, pods.Items)
 	if err != nil {
@@ -1819,6 +1902,14 @@ func pendingLifecycleIntent(run *courierv1alpha1.CoderRun) terminalLifecycleInte
 // report that a later reconcile retries; the source's idempotency key makes
 // the retry safe. The run itself is never held by the report.
 func (r *CoderRunReconciler) publishTerminalLifecycle(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, phase courierv1alpha1.Phase, intent terminalLifecycleIntent) (ctrl.Result, error) {
+	// An already-done conclusion settles through the source's own
+	// evidence-gated close policy, never through the ordinary lifecycle report.
+	// The close proposal is re-derived from the durable, incarnation-fenced
+	// status record, and the source's resolution — not the operator's — decides
+	// whether the work item closes.
+	if phase == courierv1alpha1.PhaseAlreadyDone {
+		return r.settleAlreadyDoneClose(ctx, run, adapter, item, intent)
+	}
 	err := r.publishSourceLifecycle(ctx, run, adapter, item, phase, intent)
 	retryToken := run.Status.LifecycleReportActiveRetryToken
 	if retryToken == "" && lifecycleReportUnsupported(run) && lifecycleReportRetryRequested(run) {
@@ -2029,7 +2120,7 @@ func (r *CoderRunReconciler) setLifecycleReportCapability(run *courierv1alpha1.C
 // retains the original report intent for retries.
 func lifecycleReportPending(run *courierv1alpha1.CoderRun) bool {
 	switch run.Status.Phase {
-	case courierv1alpha1.PhaseAwaitingReview, courierv1alpha1.PhaseHandedOff, courierv1alpha1.PhaseNeedsHuman, courierv1alpha1.PhaseFailed, courierv1alpha1.PhaseBlockedExternal:
+	case courierv1alpha1.PhaseAwaitingReview, courierv1alpha1.PhaseHandedOff, courierv1alpha1.PhaseNeedsHuman, courierv1alpha1.PhaseFailed, courierv1alpha1.PhaseBlockedExternal, courierv1alpha1.PhaseAlreadyDone:
 	default:
 		return false
 	}
@@ -2098,7 +2189,7 @@ func (r *CoderRunReconciler) reconcileEvidence(ctx context.Context, run *courier
 		return nil
 	}
 	switch run.Status.Phase {
-	case courierv1alpha1.PhaseAwaitingReview, courierv1alpha1.PhaseDone:
+	case courierv1alpha1.PhaseAwaitingReview, courierv1alpha1.PhaseDone, courierv1alpha1.PhaseAlreadyDone:
 		// The operator's own world observation proved the work landed, so the
 		// evidence it captured is no longer needed. The delete is idempotent: a
 		// run with no Secret simply lists nothing and leaves nothing to delete.
@@ -2222,6 +2313,16 @@ func lifecycleForPhase(phase courierv1alpha1.Phase, runMode courierv1alpha1.Mode
 		lifecycle.Error = intent.error
 		if lifecycle.Error == "" {
 			lifecycle.Error = "run is blocked on an external prerequisite"
+		}
+	case courierv1alpha1.PhaseAlreadyDone:
+		// Defensive fallback: the already-done close is normally settled by
+		// settleAlreadyDoneClose, which builds the close proposal from the
+		// durable, incarnation-fenced status record. This case only marks the
+		// result so a direct lifecycle report for an already-done phase is
+		// never misclassified as a success or a declared question.
+		lifecycle.Result = source.ResultAlreadyDone
+		if intent.error != "" {
+			lifecycle.Error = intent.error
 		}
 	}
 	return lifecycle
@@ -2768,8 +2869,17 @@ func phaseForExit(mode courierv1alpha1.Mode, exitCode int32, outcome string) cou
 		}
 		return courierv1alpha1.PhaseNeedsHuman
 	case exitDeclaredNoChange:
-		if mode == courierv1alpha1.ModeFixPR || mode == courierv1alpha1.ModeRebase {
+		switch mode {
+		case courierv1alpha1.ModeFixPR, courierv1alpha1.ModeRebase:
 			return courierv1alpha1.PhaseVerifying
+		case courierv1alpha1.ModeResolveIssue:
+			// A legacy shim's resolve-issue no_change ending is evidence-incomplete
+			// by construction — the shim records no durable close proposal — so it
+			// parks NeedsHuman exactly like the native ending's ungrounded default,
+			// and the caller still re-checks a fenced proposal before terminalizing.
+			// It never reaches AwaitingReview, whose source state would claim an
+			// unverified pull request is in review (#720).
+			return courierv1alpha1.PhaseNeedsHuman
 		}
 		return courierv1alpha1.PhaseAwaitingReview
 	default:
@@ -2830,6 +2940,15 @@ func phaseForNativeResult(mode courierv1alpha1.Mode, kind courierv1alpha1.Native
 	case courierv1alpha1.NativeResultNoChange:
 		if mode == courierv1alpha1.ModeFixPR {
 			return courierv1alpha1.PhaseVerifying
+		}
+		if mode == courierv1alpha1.ModeResolveIssue {
+			// A resolve-issue no_change is not a declared question: it claims the
+			// ask is already satisfied by existing work. It parks NeedsHuman by
+			// default (no grounded proposal) and is upgraded to AlreadyDone by
+			// the caller when the coordinator's incarnation-fenced close proposal
+			// is present. It never routes to AwaitingReview, which would imply an
+			// unverified pull request awaiting review.
+			return courierv1alpha1.PhaseNeedsHuman
 		}
 		return courierv1alpha1.PhaseAwaitingReview
 	case courierv1alpha1.NativeResultNeedsHuman:

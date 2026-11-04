@@ -46,6 +46,14 @@ type StatusPatch struct {
 	// +optional
 	TerminalResult *courierv1alpha1.NativeResult `json:"terminalResult,omitempty"`
 
+	// NoChange persists a resolve-issue run's grounded no-change close
+	// proposal (#720) alongside the terminal result, in the same fenced
+	// write. The broker fences it to the authenticated control incarnation
+	// exactly like TerminalResult: a stale incarnation cannot record one,
+	// and one incarnation's recorded proposal is final.
+	// +optional
+	NoChange *courierv1alpha1.NoChangeClose `json:"noChange,omitempty"`
+
 	// ControlRequestAck acknowledges the control request this incarnation
 	// served. The broker fences it to the live request the ack names, so it
 	// can never acknowledge a request that was not served to this
@@ -280,15 +288,17 @@ func (r *StatusReporter) ControlRequestAck(ctx context.Context, id string) error
 // fallback channels when this write never landed. A failed write is
 // reported to the caller, which proceeds to exit with the termination
 // handoff; the absence of a persisted result never grants trust, it only
-// keeps the legacy classification.
-func (r *StatusReporter) TerminalResult(ctx context.Context, result courierv1alpha1.NativeResult) error {
+// keeps the legacy classification. A grounded no-change close proposal
+// (#720) rides the same fenced write when the caller carries one; a nil
+// proposal writes nothing new.
+func (r *StatusReporter) TerminalResult(ctx context.Context, result courierv1alpha1.NativeResult, noChange *courierv1alpha1.NoChangeClose) error {
 	if r == nil || r.transport == nil {
 		return nil
 	}
 	if result.Kind == "" {
 		return nil
 	}
-	return r.retried(ctx, StatusPatch{TerminalResult: &result})
+	return r.retried(ctx, StatusPatch{TerminalResult: &result, NoChange: noChange})
 }
 
 // ReconcileDebt retries a retained checkpoint write. The broker's

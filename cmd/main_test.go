@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -444,6 +446,136 @@ func TestResolveOperatorForgeCredential(t *testing.T) {
 				t.Fatalf("resolveOperatorForgeCredential() = (%q, %q), want (%q, %q)", secret, key, test.wantSecret, test.wantKey)
 			}
 		})
+	}
+}
+
+// TestResolveWorkItemCommentCredential pins the #727 validation: the comment
+// identity has no fallback chain — empty disables the announcement, and a key
+// without its Secret is a startup error rather than a runtime surprise.
+func TestResolveWorkItemCommentCredential(t *testing.T) {
+	tests := []struct {
+		name    string
+		secret  string
+		key     string
+		wantErr bool
+	}{
+		{name: "both empty disables the announcement", secret: "", key: ""},
+		{name: "secret only", secret: "comment-identity", key: ""},
+		{name: "secret and key", secret: "comment-identity", key: "comment-token"},
+		{name: "key without secret is a startup error", secret: "", key: "comment-token", wantErr: true},
+		{name: "whitespace-only secret with a key is a startup error", secret: "   ", key: "comment-token", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := resolveWorkItemCommentCredential(test.secret, test.key)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("resolveWorkItemCommentCredential(%q, %q) error = %v, wantErr %v", test.secret, test.key, err, test.wantErr)
+			}
+			if test.wantErr && err == nil {
+				t.Fatal("expected an error")
+			}
+		})
+	}
+}
+
+// TestWorkItemCommenterAndLinkerWiring pins the #727 wiring seam: both
+// capabilities are built from the explicitly configured comment identity and
+// are nil when that identity is absent — never a fallback to the read
+// observer.
+func TestWorkItemCommenterAndLinkerWiring(t *testing.T) {
+	commentClient, err := couriergithub.New("comment-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commentObserver := couriergithub.Observer{Client: commentClient}
+	clientlessObserver := couriergithub.Observer{}
+
+	if got := workItemCommenter(commentObserver); got == nil {
+		t.Fatal("workItemCommenter() = nil, want a commenter for a configured identity")
+	}
+	if got := workItemCommenter(nil); got != nil {
+		t.Fatalf("workItemCommenter(nil) = %v, want nil", got)
+	}
+	if got := workItemCommenter(observerWithHeadResolver{}); got != nil {
+		t.Fatalf("workItemCommenter(non-GitHub observer) = %v, want nil", got)
+	}
+	if got := workItemCommenter(clientlessObserver); got != nil {
+		t.Fatalf("workItemCommenter(clientless observer) = %v, want nil", got)
+	}
+
+	if got := workItemLinker(commentObserver); got == nil {
+		t.Fatal("workItemLinker() = nil, want a linker for a configured identity")
+	}
+	if got := workItemLinker(nil); got != nil {
+		t.Fatalf("workItemLinker(nil) = %v, want nil", got)
+	}
+	if got := workItemLinker(observerWithHeadResolver{}); got != nil {
+		t.Fatalf("workItemLinker(non-GitHub observer) = %v, want nil", got)
+	}
+	if got := workItemLinker(clientlessObserver); got != nil {
+		t.Fatalf("workItemLinker(clientless observer) = %v, want nil", got)
+	}
+
+	linker := workItemLinker(commentObserver)
+	if got := linker.CommitLink("acme/demo", "abc123"); got != "https://github.com/acme/demo/commit/abc123" {
+		t.Fatalf("CommitLink() = %q, want the forge-web commit URL", got)
+	}
+	if got := linker.FileLink("acme/demo", "docs/readme.md", "abc123"); got != "https://github.com/acme/demo/blob/abc123/docs/readme.md" {
+		t.Fatalf("FileLink() = %q, want the forge-web file URL", got)
+	}
+}
+
+// TestWorkItemCommenterPostsThroughCommentCredential pins the #727 identity
+// separation end to end: the close announcement is a POST to the issue
+// comments endpoint authenticated with the comment credential — never the
+// read observer's token — and the write only happens because the resolved
+// provider offers the comment-work-item capability.
+func TestWorkItemCommenterPostsThroughCommentCredential(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		verb     string
+		postedTo string
+		auth     string
+		payload  string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		verb = r.Method
+		postedTo = r.URL.Path
+		auth = r.Header.Get("Authorization")
+		payload = string(body)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":11,"body":"posted"}`))
+	}))
+	defer server.Close()
+
+	client, err := couriergithub.NewClient(server.URL, "comment-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commenter := workItemCommenter(couriergithub.Observer{Client: client})
+	if commenter == nil {
+		t.Fatal("workItemCommenter() = nil, want a commenter")
+	}
+	run := &courierv1alpha1.CoderRun{
+		Spec: courierv1alpha1.CoderRunSpec{Repo: "acme/demo", Ref: 42},
+	}
+	if err := commenter.CommentWorkItem(context.Background(), run, "the evidence is in"); err != nil {
+		t.Fatalf("CommentWorkItem: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if verb != http.MethodPost || postedTo != "/repos/acme/demo/issues/42/comments" {
+		t.Fatalf("post = %s %s, want POST /repos/acme/demo/issues/42/comments", verb, postedTo)
+	}
+	if auth != "Bearer comment-token" {
+		t.Fatalf("Authorization = %q, want the comment credential, never the read token", auth)
+	}
+	if want := `{"body":"the evidence is in"}`; payload != want {
+		t.Fatalf("payload = %s, want %s", payload, want)
 	}
 }
 

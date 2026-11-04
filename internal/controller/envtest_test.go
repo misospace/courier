@@ -163,7 +163,7 @@ func TestEnvtestResolveIssueLifecycle(t *testing.T) {
 	}
 }
 
-func TestEnvtestNoChangeNeededResolveIssueEndsInReview(t *testing.T) {
+func TestEnvtestNoChangeNeededResolveIssueParksNeedsHuman(t *testing.T) {
 	if envtestClient == nil {
 		t.Skip("KUBEBUILDER_ASSETS is not set")
 	}
@@ -229,11 +229,13 @@ func TestEnvtestNoChangeNeededResolveIssueEndsInReview(t *testing.T) {
 	reconcile()
 	assertEnvtestPhase(t, name, courierv1alpha1.PhaseRunning)
 	reconcile()
-	assertEnvtestPhase(t, name, courierv1alpha1.PhaseAwaitingReview)
-	// Exactly one in-review transition: the launch's in-progress plus the
-	// no_change_needed ending. The source must never be resolved.
-	if len(item.transitions) != 2 || item.transitions[0] != source.StateInProgress || item.transitions[1] != source.StateInReview {
-		t.Fatalf("source transitions = %#v, want in-progress then in-review", item.transitions)
+	assertEnvtestPhase(t, name, courierv1alpha1.PhaseNeedsHuman)
+	// Exactly one terminal transition: the launch's in-progress plus the
+	// evidence-incomplete no_change hold. The legacy shim records no durable
+	// proposal, so the source must land in needs-human — never the PR-less
+	// in-review state #720 forbids — and must never be resolved.
+	if len(item.transitions) != 2 || item.transitions[0] != source.StateInProgress || item.transitions[1] != source.StateNeedsHuman {
+		t.Fatalf("source transitions = %#v, want in-progress then needs-human", item.transitions)
 	}
 	if len(item.resolved) != 0 {
 		t.Fatalf("source resolves = %#v, want none", item.resolved)
@@ -866,6 +868,71 @@ func TestEnvtestLaneProfileContextRoundTrip(t *testing.T) {
 		}
 		if err == nil {
 			t.Fatalf("role budget %+v stored, want schema rejection", bad)
+		}
+		if !apierrors.IsInvalid(err) && !apierrors.IsBadRequest(err) {
+			t.Fatalf("error = %v, want an invalid-object rejection", err)
+		}
+	}
+}
+
+// TestEnvtestAlreadyDoneNoChangeStatus pins the AlreadyDone terminal phase and
+// its noChange status record against the real API server: a grounded,
+// incarnation-fenced conclusion in the new phase is a valid status that
+// round-trips intact, while an unfenced or ungrounded record is rejected by the
+// CRD schema — the API server, not the controller, is the enforcement point.
+func TestEnvtestAlreadyDoneNoChangeStatus(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	ctx := context.Background()
+	name := "already-done"
+	run := envtestRun(name, "already-done-lane")
+	if err := envtestClient.Create(ctx, envtestLane("already-done-lane")); err != nil {
+		t.Fatal(err)
+	}
+	if err := envtestClient.Create(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+
+	run.Status.Phase = courierv1alpha1.PhaseAlreadyDone
+	run.Status.NoChange = &courierv1alpha1.NoChangeClose{
+		Criteria: []courierv1alpha1.NoChangeCloseCriterion{
+			{Criterion: "the ask is implemented", Path: "pkg/core/impl.go", Excerpt: "func Serve(ctx context.Context) error { return nil }"},
+		},
+		Evidence:          "the request is already satisfied by existing work",
+		CoordinatorPodUID: "pod-uid-1",
+		At:                metav1.Now(),
+	}
+	if err := envtestClient.Status().Update(ctx, run); err != nil {
+		t.Fatalf("valid AlreadyDone/noChange status rejected: %v", err)
+	}
+	stored := &courierv1alpha1.CoderRun{}
+	if err := envtestClient.Get(ctx, envtestKey(name), stored); err != nil {
+		t.Fatalf("re-read run: %v", err)
+	}
+	if stored.Status.Phase != courierv1alpha1.PhaseAlreadyDone {
+		t.Fatalf("phase = %s; want AlreadyDone", stored.Status.Phase)
+	}
+	nc := stored.Status.NoChange
+	if nc == nil {
+		t.Fatal("noChange lost through the API server")
+	}
+	if nc.CoordinatorPodUID != "pod-uid-1" || len(nc.Criteria) != 1 || nc.Criteria[0].Excerpt == "" {
+		t.Fatalf("noChange = %#v; want the fenced grounded proposal intact", nc)
+	}
+
+	for _, bad := range map[string]courierv1alpha1.NoChangeClose{
+		"unfenced":   {Criteria: []courierv1alpha1.NoChangeCloseCriterion{{Criterion: "c", Path: "p", Excerpt: "e"}}, CoordinatorPodUID: ""},
+		"ungrounded": {CoordinatorPodUID: "pod-uid-1", Criteria: []courierv1alpha1.NoChangeCloseCriterion{}},
+	} {
+		fresh := &courierv1alpha1.CoderRun{}
+		if err := envtestClient.Get(ctx, envtestKey(name), fresh); err != nil {
+			t.Fatal(err)
+		}
+		fresh.Status.NoChange = &bad
+		err := envtestClient.Status().Update(ctx, fresh)
+		if err == nil {
+			t.Fatalf("noChange %+v stored, want schema rejection", bad)
 		}
 		if !apierrors.IsInvalid(err) && !apierrors.IsBadRequest(err) {
 			t.Fatalf("error = %v, want an invalid-object rejection", err)

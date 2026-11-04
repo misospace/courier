@@ -209,7 +209,7 @@ func TestReAdmittedRunKeepsOriginalAdmittedAt(t *testing.T) {
 	}
 }
 
-func TestAwaitingReviewRecordsFinishedAndRunDuration(t *testing.T) {
+func TestNoChangeExitRecordsFinishedAndRunDuration(t *testing.T) {
 	start := timestampClock.Add(-30 * time.Minute)
 	creation := start.Add(-5 * time.Minute)
 	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
@@ -227,8 +227,8 @@ func TestAwaitingReviewRecordsFinishedAndRunDuration(t *testing.T) {
 	if err := client.Get(context.Background(), admissionKey("run"), &got); err != nil {
 		t.Fatalf("get run: %v", err)
 	}
-	if got.Status.Phase != courierv1alpha1.PhaseAwaitingReview {
-		t.Fatalf("phase = %q, want AwaitingReview", got.Status.Phase)
+	if got.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman", got.Status.Phase)
 	}
 	if got.Status.FinishedAt == nil || !got.Status.FinishedAt.Time.Equal(timestampClock) {
 		t.Fatalf("FinishedAt = %v, want %v: a no-change declaration ends the run's execution", got.Status.FinishedAt, timestampClock)

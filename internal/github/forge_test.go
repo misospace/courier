@@ -23,6 +23,9 @@ func TestProviderImplementsContract(t *testing.T) {
 	if got := p.Capabilities().Available(forge.CapabilityComment); !got.Available {
 		t.Fatalf("CapabilityComment availability = %#v, want available", got)
 	}
+	if got := p.Capabilities().Available(forge.CapabilityCommentWorkItem); !got.Available {
+		t.Fatalf("CapabilityCommentWorkItem availability = %#v, want available", got)
+	}
 	if got := p.Capabilities().Available(forge.CapabilityListReviews); got.Available {
 		t.Fatalf("CapabilityListReviews availability = %#v, want unavailable", got)
 	}
@@ -115,6 +118,51 @@ func TestProviderCoveredOperations(t *testing.T) {
 		if strings.Contains(path, "merge") {
 			t.Fatalf("recorded request path %q touches a merge endpoint", path)
 		}
+	}
+}
+
+func TestProviderCommentWorkItem(t *testing.T) {
+	var postPath string
+	var postBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/acme/demo/issues/42/comments":
+			postPath = r.URL.Path
+			postBody, _ = io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":9,"body":"run settled","html_url":"https://github.com/acme/demo/issues/42#issuecomment-9"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewProvider(forge.ProviderConfig{Name: "gh", Endpoint: server.URL, CredentialRef: "secret/gh"}, client)
+	ctx := context.Background()
+
+	comment, err := p.CommentWorkItem(ctx, forge.WorkItemRef{Repo: "acme/demo", ID: "42"}, "run settled")
+	if err != nil {
+		t.Fatalf("CommentWorkItem() error = %v", err)
+	}
+	if postPath != "/repos/acme/demo/issues/42/comments" {
+		t.Fatalf("recorded POST path = %q, want /repos/acme/demo/issues/42/comments", postPath)
+	}
+	if !strings.Contains(string(postBody), `"body":"run settled"`) {
+		t.Fatalf("recorded POST body = %q, want a body field with run settled", postBody)
+	}
+	if comment.ID != "9" || comment.Body != "run settled" || comment.URL != "https://github.com/acme/demo/issues/42#issuecomment-9" {
+		t.Fatalf("CommentWorkItem() = %#v, want comment 9 with body run settled and its URL", comment)
+	}
+
+	if _, err := p.CommentWorkItem(ctx, forge.WorkItemRef{Repo: "acme/demo", ID: "404"}, "hello"); err == nil {
+		t.Fatal("CommentWorkItem() on a missing issue error = nil, want error")
+	}
+	if _, err := p.CommentWorkItem(ctx, forge.WorkItemRef{Repo: "acme/demo", ID: "not-a-number"}, "hello"); err == nil {
+		t.Fatal("CommentWorkItem() with a non-numeric work item ID error = nil, want error")
 	}
 }
 

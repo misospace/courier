@@ -142,6 +142,10 @@ func (f *fakeAdmissionForge) CommentPullRequest(context.Context, forge.PullReque
 	return forge.Comment{}, forge.ErrUnsupported
 }
 
+func (f *fakeAdmissionForge) CommentWorkItem(context.Context, forge.WorkItemRef, string) (forge.Comment, error) {
+	return forge.Comment{}, forge.ErrUnsupported
+}
+
 func (f *fakeAdmissionForge) ListPullRequestsByHead(_ context.Context, base forge.PullRequestRef, repo, ref string) ([]forge.PullRequest, error) {
 	if f.headListErr != nil {
 		return nil, f.headListErr

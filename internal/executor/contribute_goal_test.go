@@ -277,7 +277,7 @@ func TestGoalByteCompat(t *testing.T) {
 		{
 			mode:   courierv1alpha1.ModeResolveIssue,
 			prefix: "Open a PR to address issue #7. Route every forge read and write through the configured forge capability, not a forge-specific CLI.",
-			suffix: "when something outside this run is missing. A run that ends without a valid declaration fails as incomplete.",
+			suffix: "when something outside this run is missing. A run that ends without a valid declaration fails as incomplete. " + noChangeCloseContract,
 		},
 		{
 			mode:   courierv1alpha1.ModeFixPR,

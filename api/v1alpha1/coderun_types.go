@@ -1,6 +1,9 @@
 package v1alpha1
 
 import (
+	"strings"
+	"unicode"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -251,7 +254,7 @@ type RetryRequest struct {
 }
 
 // Phase is the lifecycle phase of a CoderRun.
-// +kubebuilder:validation:Enum=Pending;Claimed;Running;Verifying;AwaitingReview;HandedOff;NeedsHuman;Done;Failed;BlockedExternal
+// +kubebuilder:validation:Enum=Pending;Claimed;Running;Verifying;AwaitingReview;HandedOff;NeedsHuman;Done;AlreadyDone;Failed;BlockedExternal
 type Phase string
 
 const (
@@ -264,7 +267,14 @@ const (
 	PhaseHandedOff  Phase = "HandedOff"
 	PhaseNeedsHuman Phase = "NeedsHuman"
 	PhaseDone       Phase = "Done"
-	PhaseFailed     Phase = "Failed"
+	// PhaseAlreadyDone is the terminal phase for a run whose run of work was
+	// concluded already satisfied by existing work, with the conclusion
+	// delivered through the source's evidence-gated closure path (#720). It
+	// is deliberately distinct from Done (this run published and merged
+	// work) and NeedsHuman (a human must decide): the ask needed no new
+	// change, and the source owns whether that closes the work item.
+	PhaseAlreadyDone Phase = "AlreadyDone"
+	PhaseFailed      Phase = "Failed"
 	// PhaseBlockedExternal is a terminal, recoverable external-dependency
 	// block: the run stopped on a prerequisite outside Courier, and the
 	// source may re-issue the work once that prerequisite is satisfied. It is
@@ -716,6 +726,115 @@ type NativeResult struct {
 	At metav1.Time `json:"at"`
 }
 
+// Bounds for the coordinator's grounded no-change close proposal (#720). They
+// mirror the source's own close-proposal limits so an over-large proposal is
+// refused at the run boundary with a specific reason rather than carried into
+// a report the source will reject.
+const (
+	// MaxNoChangeCriteria bounds one proposal's criterion count.
+	MaxNoChangeCriteria = 12
+	// MaxNoChangeCriterionBytes bounds one criterion statement.
+	MaxNoChangeCriterionBytes = 300
+	// MaxNoChangeExcerptBytes bounds one pinned excerpt.
+	MaxNoChangeExcerptBytes = 300
+	// MinNoChangeExcerptBytes floors one pinned excerpt: a quote short enough
+	// to match anywhere grounds nothing.
+	MinNoChangeExcerptBytes = 24
+	// MaxNoChangeEvidenceBytes bounds the free-form summary carried for audit.
+	MaxNoChangeEvidenceBytes = 2000
+	// MaxNoChangeClosePathBytes bounds one grounded criterion path. It mirrors
+	// the CRD MaxLength=1024 on NoChangeCloseCriterion.Path; markers cannot
+	// reference a Go constant, so this constant is the named source and the
+	// schema carries the same value.
+	MaxNoChangeClosePathBytes = 1024
+)
+
+// ValidNoChangeClosePath reports whether path matches the canonical
+// repository-relative grammar of NoChangeCloseCriterion.Path (#720): a
+// non-empty path within MaxNoChangeClosePathBytes, with no leading or
+// trailing whitespace, no backslash, no NUL or other control character, and
+// one or more non-empty "/"-separated segments, none of them "." or "..".
+// The harness parser and the broker enforce this one grammar, so a
+// model-authored path that could escape a repository root — absolute,
+// traversing, Windows-separated, or NUL-laced — is never persisted or
+// forwarded to a source close transport. Whether a clean path may also be
+// rendered as a forge web link stays a stricter render-time decision.
+func ValidNoChangeClosePath(path string) bool {
+	if path == "" || len(path) > MaxNoChangeClosePathBytes {
+		return false
+	}
+	if path != strings.TrimSpace(path) {
+		return false
+	}
+	for _, r := range path {
+		if r == '\\' || unicode.IsControl(r) {
+			return false
+		}
+	}
+	for _, segment := range strings.Split(path, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+// NoChangeCloseCriterion grounds one acceptance criterion in a repository
+// file: the criterion text, the repo-relative file path, and a verbatim
+// excerpt of that file at the repository's default-branch head.
+type NoChangeCloseCriterion struct {
+	// Criterion is the acceptance criterion this row grounds.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=300
+	Criterion string `json:"criterion"`
+	// Path is the repository-relative file path (no line anchors): a slash
+	// path with no absolute, empty, or dot segment and no backslash or
+	// control character.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=1024
+	Path string `json:"path"`
+	// Excerpt is a verbatim excerpt of the file at the default-branch head.
+	// +kubebuilder:validation:MinLength=24
+	// +kubebuilder:validation:MaxLength=300
+	Excerpt string `json:"excerpt"`
+}
+
+// NoChangeClose is the durable record of a resolve-issue run's grounded
+// no-change conclusion (#720): the coordinator declared its ask already
+// satisfied by existing work and pinned each criterion to a verbatim
+// repository excerpt. Trusted control writes it through the run's broker
+// status path fenced to the authenticated control incarnation, so the
+// conclusion and its evidence survive execution, reconciliation, and restart,
+// and the operator consumes it only for the coordinator incarnation it
+// fences to.
+//
+// The criteria and evidence are model-authored proposals, never closure
+// authorization: the source re-derives its own evidence catalog from a live
+// read and applies its own close policy (Dispatch #1143). The proposal's
+// presence routes the conclusion through that gated path; its absence is
+// handled as an evidence-incomplete conclusion, never as closure.
+type NoChangeClose struct {
+	// Criteria are the grounded per-criterion excerpts, 1 to
+	// MaxNoChangeCriteria rows.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=12
+	Criteria []NoChangeCloseCriterion `json:"criteria"`
+	// Evidence is the coordinator's free-form summary, recorded for audit
+	// only. It is never read as closure authorization.
+	// +optional
+	// +kubebuilder:validation:MaxLength=2000
+	Evidence string `json:"evidence,omitempty"`
+	// CoordinatorPodUID is the control incarnation that recorded the
+	// conclusion. It is the fence: the broker refuses a record attributing
+	// itself to any other incarnation, and the operator trusts it only for
+	// the coordinator pod whose termination carries the same UID.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	CoordinatorPodUID string `json:"coordinatorPodUID"`
+	// At is when trusted control recorded the conclusion, before process exit.
+	At metav1.Time `json:"at"`
+}
+
 // ActiveOperation is one concurrently dispatched tool/subagent operation in
 // the run's active-operation set. It is dispatch evidence for liveness
 // suppression — not liveness itself, not a checkpoint — and only a heartbeat
@@ -954,6 +1073,14 @@ type CoderRunStatus struct {
 	// change was pushed rather than claim a fix was pushed.
 	// +optional
 	DeclaredNoChange bool `json:"declaredNoChange,omitempty"`
+
+	// NoChange is the durable, incarnation-fenced record of a resolve-issue
+	// run's grounded no-change conclusion (#720): the ask was declared
+	// already satisfied by existing work, with per-criterion pinned
+	// excerpts. It is a proposal the source's own evidence-gated closure
+	// policy judges, never closure authorization on the model's word.
+	// +optional
+	NoChange *NoChangeClose `json:"noChange,omitempty"`
 
 	// LifecycleReportRetryToken records the last explicit retry token handled for an unsupported lifecycle result; it is an opaque, non-secret value limited to 128 Unicode code points.
 	// +optional

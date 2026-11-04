@@ -419,8 +419,11 @@ normal failure: the Dispatch adapter publishes a dedicated `waiting-external`
 task outcome and, for queue-backed follow-ups, a generation-fenced
 `WAITING_EXTERNAL` queue mark, so the prerequisite wait does not advance the
 issued generation or burn fix-attempt budget. Exit `3`
-(`no_change_needed`) moves a resolve-issue run to `AwaitingReview` with the
-source `in-review`, and settles a fix-pr run against the world through
+(`no_change_needed`) parks a resolve-issue run in `NeedsHuman` — an
+incarnation-fenced grounded proposal upgrades the ending to `AlreadyDone`,
+while an ungrounded ending, including every legacy shim ending, holds for a
+human with the hold explained on the work item, never a PR-less `in-review`
+state (#720) — and settles a fix-pr run against the world through
 `Verifying`: a verified merge reaches `Done`, an open green no-change PR
 waits recoverably in `BlockedExternal`, red CI reaches retryable `Failed`, and
 an unobservable PR reaches `NeedsHuman`. Green CI cannot certify queued review
@@ -429,10 +432,11 @@ rather than authorizing `already_addressed` or claiming a push. Recovery require
 a fresh source attempt identity; prior runs and evidence remain retained.
 Outcome comments are limited to human-attention requests: `needs_decision` and
 `blocked_external` post the question or missing explanation in full after
-redaction. A `no_change_needed` run posts no comment — the executor cannot
+redaction. A `no_change_needed` run posts no executor comment — the executor cannot
 authoritatively verify a success claim, so the evidence rides the redacted,
 bounded termination reason and the controller's lifecycle settlement stays
-authoritative (#474). Comment posting is best-effort: failures are logged as
+authoritative (#474); the controller itself may announce a resolve-issue human
+hold on the work item (#720). Comment posting is best-effort: failures are logged as
 `outcome.comment` and do not change the ending.
 
 When no outcome is declared, recoverable endings — uncommitted changes, commits

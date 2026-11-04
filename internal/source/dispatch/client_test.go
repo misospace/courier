@@ -1647,3 +1647,264 @@ func TestHTTPClientClaimOmitsLaneQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func closeTestLifecycle() source.Lifecycle {
+	started := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	return source.Lifecycle{
+		State:          source.StateInProgress,
+		Result:         source.ResultAlreadyDone,
+		IdempotencyKey: "close-key-1",
+		StartedAt:      &started,
+		Close: &source.CloseProposal{
+			Criteria: []source.CloseCriterion{{Criterion: "<=300 chars", Path: "docs/limits.md", Excerpt: "the limit is three hundred characters"}},
+			Evidence: "docs/limits.md already states the cap",
+		},
+	}
+}
+
+func TestHTTPClientReportCloseSendsGroundedCloseReport(t *testing.T) {
+	var request map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/agents/worker/tasks/report" {
+			t.Fatalf("request = %s %s, want POST /api/agents/worker/tasks/report", r.Method, r.URL.Path)
+		}
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"agentRunId":"run-1","closeResolution":{"matched":true,"action":"closed","reason":"all criteria grounded","reasons":[],"headSha":"abc123","evidenceDigest":"sha256:digest"}}`))
+	}))
+	defer server.Close()
+	// Dispatch requires the idempotency key for this outcome regardless of
+	// the deployment's reportIdempotencyEnabled flag, so the client under
+	// test explicitly disables ordinary report idempotency.
+	client, err := NewClient(server.URL, "worker", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.WithReportIdempotency(false)
+	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{ID: "issue-1", Repo: "acme/widgets", Number: 42}})
+	resolution, err := client.ReportClose(context.Background(), id, closeTestLifecycle())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request["taskType"] != "implement" || request["outcome"] != "already_done" || request["repoFullName"] != "acme/widgets" || request["issueNumber"] != float64(42) || request["idempotencyKey"] != "close-key-1" {
+		t.Fatalf("request = %#v", request)
+	}
+	closeBody, ok := request["close"].(map[string]any)
+	if !ok {
+		t.Fatalf("request close = %#v, want an object", request["close"])
+	}
+	rawCriteria, ok := closeBody["criteria"].([]any)
+	if !ok || len(rawCriteria) != 1 {
+		t.Fatalf("request close.criteria = %#v, want exactly one criterion", closeBody["criteria"])
+	}
+	criterion := rawCriteria[0].(map[string]any)
+	if criterion["criterion"] != "<=300 chars" || criterion["path"] != "docs/limits.md" || criterion["excerpt"] != "the limit is three hundred characters" {
+		t.Fatalf("criterion = %#v", criterion)
+	}
+	if request["evidence"] != "docs/limits.md already states the cap" {
+		t.Fatalf("request evidence = %v", request["evidence"])
+	}
+	if request["startedAt"] == nil {
+		t.Fatalf("request = %#v, want startedAt carried when the lifecycle has one", request)
+	}
+	for _, key := range []string{"prFixItem", "pullRequestNumber", "pullRequestUrl", "telemetry", "error"} {
+		if request[key] != nil {
+			t.Fatalf("request carries %s = %v, want the close path to send none of the PR-fix, pull request, or telemetry fields", key, request[key])
+		}
+	}
+	want := source.CloseResolution{Action: source.CloseActionClosed, Reason: "all criteria grounded", Reasons: []string{}, HeadSHA: "abc123", EvidenceDigest: "sha256:digest"}
+	if !reflect.DeepEqual(resolution, want) {
+		t.Fatalf("resolution = %#v, want %#v", resolution, want)
+	}
+}
+
+func TestHTTPClientReportCloseOmitsEmptyEvidence(t *testing.T) {
+	var request map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"closeResolution":{"matched":true,"action":"closed"}}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "worker", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{Repo: "acme/widgets", Number: 42}})
+	lifecycle := source.Lifecycle{Result: source.ResultAlreadyDone, IdempotencyKey: "close-key-1", Close: &source.CloseProposal{Criteria: []source.CloseCriterion{{Criterion: "c", Path: "p", Excerpt: "e"}}}}
+	if _, err := client.ReportClose(context.Background(), id, lifecycle); err != nil {
+		t.Fatal(err)
+	}
+	if request["evidence"] != nil || request["startedAt"] != nil {
+		t.Fatalf("request = %#v, want empty evidence and nil startedAt omitted", request)
+	}
+}
+
+func TestHTTPClientReportCloseParsesEveryCloseAction(t *testing.T) {
+	for _, action := range []string{source.CloseActionClosed, source.CloseActionRefused, source.CloseActionFailed, source.CloseActionSkipped, "pending-verification"} {
+		t.Run(action, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`{"ok":true,"closeResolution":{"matched":true,"action":"` + action + `","reason":"r","reasons":["policy-a","policy-b"],"headSha":"sha","evidenceDigest":"dig"}}`))
+			}))
+			defer server.Close()
+			client, err := NewClient(server.URL, "worker", "secret-token", time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{Repo: "acme/widgets", Number: 42}})
+			resolution, err := client.ReportClose(context.Background(), id, closeTestLifecycle())
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := source.CloseResolution{Action: action, Reason: "r", Reasons: []string{"policy-a", "policy-b"}, HeadSHA: "sha", EvidenceDigest: "dig"}
+			if !reflect.DeepEqual(resolution, want) {
+				t.Fatalf("resolution = %#v, want %#v", resolution, want)
+			}
+		})
+	}
+}
+
+func TestHTTPClientReportCloseReplaysStoredResolutionOnDuplicate(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true,"duplicate":true,"closeResolution":{"matched":true,"action":"refused","reason":"closed on the first report","reasons":["issue-already-closed"],"headSha":"sha","evidenceDigest":"dig"}}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "worker", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{Repo: "acme/widgets", Number: 42}})
+	resolution, err := client.ReportClose(context.Background(), id, closeTestLifecycle())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := source.CloseResolution{Action: source.CloseActionRefused, Reason: "closed on the first report", Reasons: []string{"issue-already-closed"}, HeadSHA: "sha", EvidenceDigest: "dig"}
+	if !reflect.DeepEqual(resolution, want) {
+		t.Fatalf("replayed resolution = %#v, want %#v", resolution, want)
+	}
+}
+
+func TestHTTPClientReportCloseRejectsAcceptedResponseWithoutResolution(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		statusCode int
+		body       string
+	}{
+		{name: "accepted without resolution", statusCode: http.StatusOK, body: `{"ok":true,"agentRunId":"run-1"}`},
+		{name: "no content", statusCode: http.StatusNoContent, body: ``},
+		{name: "empty resolution object", statusCode: http.StatusOK, body: `{"ok":true,"closeResolution":{}}`},
+		{name: "resolution without action", statusCode: http.StatusOK, body: `{"ok":true,"closeResolution":{"matched":true,"reason":"r"}}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if tt.statusCode != http.StatusOK || tt.body != "" {
+					w.WriteHeader(tt.statusCode)
+				}
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer server.Close()
+			client, err := NewClient(server.URL, "worker", "secret-token", time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{Repo: "acme/widgets", Number: 42}})
+			resolution, err := client.ReportClose(context.Background(), id, closeTestLifecycle())
+			if err == nil {
+				t.Fatal("ReportClose() error = nil, want an accepted response without a recorded close resolution to fail")
+			}
+			if !reflect.DeepEqual(resolution, source.CloseResolution{}) {
+				t.Fatalf("resolution = %#v, want the zero value", resolution)
+			}
+		})
+	}
+}
+
+func TestHTTPClientReportCloseClassifiesInvalidOutcomeAsUnsupported(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"Invalid outcome. Must be one of: pr_opened, pr_updated, issue_updated, issue_closed, blocked, failed"}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "worker", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{Repo: "acme/widgets", Number: 42}})
+	resolution, err := client.ReportClose(context.Background(), id, closeTestLifecycle())
+	if !errors.Is(err, source.ErrUnsupportedOutcome) {
+		t.Fatalf("ReportClose() error = %v, want ErrUnsupportedOutcome", err)
+	}
+	if errors.Is(err, source.ErrPermanentRefusal) {
+		t.Fatalf("ReportClose() error = %v, want the unsupported-outcome class, not a permanent refusal", err)
+	}
+	if !reflect.DeepEqual(resolution, source.CloseResolution{}) {
+		t.Fatalf("resolution = %#v, want the zero value", resolution)
+	}
+}
+
+func TestHTTPClientReportCloseMapsScopeDenialToPermanentRefusal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":"forbidden"}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "worker", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{Repo: "acme/widgets", Number: 42}})
+	resolution, err := client.ReportClose(context.Background(), id, closeTestLifecycle())
+	if !errors.Is(err, source.ErrPermanentRefusal) {
+		t.Fatalf("ReportClose() error = %v, want ErrPermanentRefusal", err)
+	}
+	if errors.Is(err, source.ErrUnsupportedOutcome) {
+		t.Fatalf("ReportClose() error = %v, want a scope denial, not an unsupported outcome", err)
+	}
+	if !reflect.DeepEqual(resolution, source.CloseResolution{}) {
+		t.Fatalf("resolution = %#v, want the zero value", resolution)
+	}
+}
+
+func TestHTTPClientReportCloseFailsClosedBeforeHTTP(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		id          string
+		lifecycle   func(source.Lifecycle) source.Lifecycle
+		unsupported bool
+	}{
+		{name: "nil close", id: EncodeWorkID(Task{Type: "implement", Issue: &Issue{Repo: "acme/widgets", Number: 42}}), lifecycle: func(l source.Lifecycle) source.Lifecycle { l.Close = nil; return l }},
+		{name: "empty criteria", id: EncodeWorkID(Task{Type: "implement", Issue: &Issue{Repo: "acme/widgets", Number: 42}}), lifecycle: func(l source.Lifecycle) source.Lifecycle { l.Close = &source.CloseProposal{}; return l }},
+		{name: "empty idempotency key", id: EncodeWorkID(Task{Type: "implement", Issue: &Issue{Repo: "acme/widgets", Number: 42}}), lifecycle: func(l source.Lifecycle) source.Lifecycle { l.IdempotencyKey = ""; return l }},
+		{name: "followup-pr descriptor", id: EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77}, PRFixItem: &PRFixItem{ID: "item-1", Generation: 2}}), lifecycle: func(l source.Lifecycle) source.Lifecycle { return l }, unsupported: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var requests int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests++
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+			client, err := NewClient(server.URL, "worker", "secret-token", time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resolution, err := client.ReportClose(context.Background(), tt.id, tt.lifecycle(closeTestLifecycle()))
+			if err == nil {
+				t.Fatal("ReportClose() error = nil, want fail-closed refusal")
+			}
+			if got := errors.Is(err, source.ErrUnsupportedOutcome); got != tt.unsupported {
+				t.Fatalf("errors.Is(ErrUnsupportedOutcome) = %t, error %v; want %t", got, err, tt.unsupported)
+			}
+			if requests != 0 {
+				t.Fatalf("requests = %d, want validation to fail closed with no HTTP call", requests)
+			}
+			if !reflect.DeepEqual(resolution, source.CloseResolution{}) {
+				t.Fatalf("resolution = %#v, want the zero value", resolution)
+			}
+		})
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/devenv"
@@ -401,13 +402,13 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 				}
 				return c.finishSoftStop(ctx)
 			}
-			outcome, parseErr := parseOutcome(turn.text)
+			outcome, noChange, parseErr := parseOutcome(turn.text)
 			if parseErr == nil {
-				return c.finish(ctx, inv, outcome, turn.text)
+				return c.finish(ctx, inv, outcome, turn.text, noChange)
 			}
 			if clarifications < maxOutcomeClarifications {
 				clarifications++
-				session.Append(Message{Role: "user", Content: "Your final message was not a valid outcome declaration. Reply with exactly one JSON object: {\"outcome\":\"changes\"}, {\"outcome\":\"no_change_needed\",\"evidence\":\"...\"}, {\"outcome\":\"needs_decision\",\"question\":\"...\"}, or {\"outcome\":\"blocked_external\",\"missing\":\"...\"}."})
+				session.Append(Message{Role: "user", Content: "Your final message was not a valid outcome declaration. Reply with exactly one JSON object: {\"outcome\":\"changes\"}, {\"outcome\":\"no_change_needed\",\"evidence\":\"...\"} (optionally with \"close\":{\"criteria\":[{\"criterion\":\"...\",\"path\":\"<repo file>\",\"excerpt\":\"<24-300 char excerpt verbatim from that file at the default-branch HEAD>\"}]} when the ask is already satisfied by existing work), {\"outcome\":\"needs_decision\",\"question\":\"...\"}, or {\"outcome\":\"blocked_external\",\"missing\":\"...\"}."})
 				continue
 			}
 			return executor.HarnessResult{
@@ -576,7 +577,7 @@ func (c *Coordinator) pump(ctx context.Context, session *Session, briefID string
 // world is NeedsHuman, transport failure is an infrastructure failure for
 // the operator to relaunch, and a declared-changes-with-no-work ending is a
 // workload failure.
-func (c *Coordinator) finish(ctx context.Context, inv executor.Invocation, outcome executor.DeclaredOutcome, summary string) executor.HarnessResult {
+func (c *Coordinator) finish(ctx context.Context, inv executor.Invocation, outcome executor.DeclaredOutcome, summary string, noChange *courierv1alpha1.NoChangeClose) executor.HarnessResult {
 	// The run is ending: opportunistically flush retained operation clears so
 	// a cleanly ended run does not leave suppression evidence behind. A
 	// failure never changes the declared outcome — the operator supersedes
@@ -632,7 +633,11 @@ func (c *Coordinator) finish(ctx context.Context, inv executor.Invocation, outco
 		if outcome == executor.OutcomeBlockedExternal {
 			kind = courierv1alpha1.NativeResultBlockedExternal
 		}
-		return executor.HarnessResult{Kind: kind, Outcome: outcome, Reason: summary}
+		// A grounded close proposal (#720) parses only for no_change_needed;
+		// it rides the result for trusted control to gate on mode and persist
+		// fenced. The free-form summary stays the handoff text; the proposal
+		// carries the declared evidence explicitly for the durable record.
+		return executor.HarnessResult{Kind: kind, Outcome: outcome, Reason: summary, NoChange: noChange}
 	default:
 		return executor.HarnessResult{Kind: courierv1alpha1.NativeResultWorkloadFailed, Reason: fmt.Sprintf("undeclared outcome %q", outcome)}
 	}
@@ -696,42 +701,100 @@ func (c *Coordinator) finishSoftStop(ctx context.Context) executor.HarnessResult
 }
 
 // parseOutcome parses the model's final message as the outcome declaration.
-// The declaration is data: an unparseable message is never an outcome.
-func parseOutcome(text string) (executor.DeclaredOutcome, error) {
+// The declaration is data: an unparseable message is never an outcome. A
+// no_change_needed declaration may carry an optional grounded close proposal
+// (#720); a malformed or over-bound proposal is dropped — the plain
+// no_change_needed ending stands, because losing a valid ending to a bad
+// evidence row would turn a conclusion into a clarification loop or a
+// workload failure, while the broker re-validates anything that survives.
+func parseOutcome(text string) (executor.DeclaredOutcome, *courierv1alpha1.NoChangeClose, error) {
 	var declaration struct {
-		Outcome  string `json:"outcome"`
-		Evidence string `json:"evidence"`
-		Question string `json:"question"`
-		Missing  string `json:"missing"`
+		Outcome  string           `json:"outcome"`
+		Evidence string           `json:"evidence"`
+		Question string           `json:"question"`
+		Missing  string           `json:"missing"`
+		Close    *json.RawMessage `json:"close"`
 	}
 	if err := json.Unmarshal([]byte(strings.TrimSpace(text)), &declaration); err != nil {
-		return "", fmt.Errorf("final message is not a JSON object: %w", err)
+		return "", nil, fmt.Errorf("final message is not a JSON object: %w", err)
 	}
 	outcome := executor.DeclaredOutcome(strings.TrimSpace(declaration.Outcome))
 	switch outcome {
 	case executor.OutcomeChanges:
-		if declaration.Evidence != "" || declaration.Question != "" || declaration.Missing != "" {
-			return "", errors.New("changes declaration carries no extra fields")
+		if declaration.Evidence != "" || declaration.Question != "" || declaration.Missing != "" || declaration.Close != nil {
+			return "", nil, errors.New("changes declaration carries no extra fields")
 		}
-		return outcome, nil
+		return outcome, nil, nil
 	case executor.OutcomeNoChangeNeeded:
 		if strings.TrimSpace(declaration.Evidence) == "" {
-			return "", errors.New("no_change_needed requires evidence")
+			return "", nil, errors.New("no_change_needed requires evidence")
 		}
-		return outcome, nil
+		if declaration.Close == nil {
+			return outcome, nil, nil
+		}
+		return outcome, parseNoChangeClose(*declaration.Close, declaration.Evidence), nil
 	case executor.OutcomeNeedsDecision:
 		if strings.TrimSpace(declaration.Question) == "" {
-			return "", errors.New("needs_decision requires a question")
+			return "", nil, errors.New("needs_decision requires a question")
 		}
-		return outcome, nil
+		return outcome, nil, nil
 	case executor.OutcomeBlockedExternal:
 		if strings.TrimSpace(declaration.Missing) == "" {
-			return "", errors.New("blocked_external requires the missing dependency")
+			return "", nil, errors.New("blocked_external requires the missing dependency")
 		}
-		return outcome, nil
+		return outcome, nil, nil
 	default:
-		return "", fmt.Errorf("unknown outcome %q", declaration.Outcome)
+		return "", nil, fmt.Errorf("unknown outcome %q", declaration.Outcome)
 	}
+}
+
+// parseNoChangeClose validates one declared close proposal against the API
+// bounds (#720) and returns the bounded typed value, or nil when the shape
+// is malformed or over bound — the caller keeps the plain no_change_needed
+// ending either way. The proposal is model data: it carries no incarnation
+// fence or timestamp here; trusted control stamps both at persistence.
+func parseNoChangeClose(raw json.RawMessage, evidence string) *courierv1alpha1.NoChangeClose {
+	var shape struct {
+		Criteria []struct {
+			Criterion string `json:"criterion"`
+			Path      string `json:"path"`
+			Excerpt   string `json:"excerpt"`
+		} `json:"criteria"`
+	}
+	if err := json.Unmarshal(raw, &shape); err != nil {
+		return nil
+	}
+	if len(shape.Criteria) < 1 || len(shape.Criteria) > courierv1alpha1.MaxNoChangeCriteria {
+		return nil
+	}
+	if len(evidence) > courierv1alpha1.MaxNoChangeEvidenceBytes {
+		return nil
+	}
+	proposal := &courierv1alpha1.NoChangeClose{Evidence: evidence}
+	for _, row := range shape.Criteria {
+		if strings.TrimSpace(row.Criterion) == "" || len(row.Criterion) > courierv1alpha1.MaxNoChangeCriterionBytes {
+			return nil
+		}
+		// One canonical repository-relative grammar (#720): an absolute,
+		// traversing, backslash, or NUL-bearing path drops the proposal
+		// exactly like any other malformed row; the broker re-checks the
+		// same rule before anything persists.
+		if !courierv1alpha1.ValidNoChangeClosePath(row.Path) {
+			return nil
+		}
+		// Excerpt bounds: bytes against the ceiling (fail-closed under any
+		// length interpretation), Unicode code points against the floor.
+		if utf8.RuneCountInString(row.Excerpt) < courierv1alpha1.MinNoChangeExcerptBytes ||
+			len(row.Excerpt) > courierv1alpha1.MaxNoChangeExcerptBytes {
+			return nil
+		}
+		proposal.Criteria = append(proposal.Criteria, courierv1alpha1.NoChangeCloseCriterion{
+			Criterion: row.Criterion,
+			Path:      row.Path,
+			Excerpt:   row.Excerpt,
+		})
+	}
+	return proposal
 }
 
 func shellTool() ToolDef {

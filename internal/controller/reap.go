@@ -22,9 +22,10 @@ import (
 // window for the new outcome must start at the transition, not inherit the
 // original execution's age.
 const (
-	doneAtAnnotation       = "courier.misospace.dev/done-at"
-	failedAtAnnotation     = "courier.misospace.dev/failed-at"
-	needsHumanAtAnnotation = "courier.misospace.dev/needs-human-at"
+	doneAtAnnotation        = "courier.misospace.dev/done-at"
+	failedAtAnnotation      = "courier.misospace.dev/failed-at"
+	needsHumanAtAnnotation  = "courier.misospace.dev/needs-human-at"
+	alreadyDoneAtAnnotation = "courier.misospace.dev/already-done-at"
 )
 
 // Retention defaults. Done runs are a short inspection window because their
@@ -47,6 +48,15 @@ const (
 // Done policy.
 func (r *CoderRunReconciler) reapDone(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
 	return r.reapTerminal(ctx, run, doneAtAnnotation, r.doneRetention(), false)
+}
+
+// reapAlreadyDone applies the terminal-run cleanup policy to an already-done
+// run whose evidence-gated close has settled and whose source work is therefore
+// resolved: retain briefly, then delete. Like a Done run it is exempt from the
+// per-repository audit floor, because the source work is already resolved and
+// the short window is the whole retention.
+func (r *CoderRunReconciler) reapAlreadyDone(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
+	return r.reapTerminal(ctx, run, alreadyDoneAtAnnotation, r.doneRetention(), false)
 }
 
 // reapTerminal is the generalized terminal reaper shared by Done, Failed, and
@@ -221,7 +231,8 @@ func terminalPhase(phase courierv1alpha1.Phase) bool {
 	switch phase {
 	case courierv1alpha1.PhaseAwaitingReview, courierv1alpha1.PhaseHandedOff,
 		courierv1alpha1.PhaseNeedsHuman, courierv1alpha1.PhaseDone,
-		courierv1alpha1.PhaseFailed, courierv1alpha1.PhaseBlockedExternal:
+		courierv1alpha1.PhaseFailed, courierv1alpha1.PhaseBlockedExternal,
+		courierv1alpha1.PhaseAlreadyDone:
 		return true
 	default:
 		return false

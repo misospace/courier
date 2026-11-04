@@ -25,6 +25,10 @@ type fakeClient struct {
 	preLaunches  []string
 	ackErr       error
 	acked        []source.WorkItem
+
+	closeReports    []source.Lifecycle
+	closeResolution source.CloseResolution
+	closeErr        error
 }
 
 type statusUpdate struct {
@@ -64,6 +68,11 @@ func (f *fakeClient) PreLaunch(_ context.Context, id string) error {
 func (f *fakeClient) AckHandout(_ context.Context, item source.WorkItem) error {
 	f.acked = append(f.acked, item)
 	return f.ackErr
+}
+
+func (f *fakeClient) ReportClose(_ context.Context, _ string, lifecycle source.Lifecycle) (source.CloseResolution, error) {
+	f.closeReports = append(f.closeReports, lifecycle)
+	return f.closeResolution, f.closeErr
 }
 
 func (f *fakeClient) Resolve(_ context.Context, id string) error {
@@ -252,3 +261,39 @@ func (basicClient) Claim(context.Context, string) error                 { return
 func (basicClient) Release(context.Context, string) error               { return nil }
 func (basicClient) SetStatus(context.Context, string, string) error     { return nil }
 func (basicClient) Resolve(context.Context, string) error               { return nil }
+
+func TestAdapterReportClose(t *testing.T) {
+	client := &fakeClient{closeResolution: source.CloseResolution{Action: source.CloseActionClosed, HeadSHA: "sha"}}
+	adapter := New(client)
+	item := source.WorkItem{ID: "work-123"}
+	lifecycle := source.Lifecycle{Result: source.ResultAlreadyDone, IdempotencyKey: "close-key-1", Close: &source.CloseProposal{Criteria: []source.CloseCriterion{{Criterion: "c", Path: "p", Excerpt: "e"}}}}
+	got, err := adapter.ReportClose(context.Background(), item, lifecycle)
+	if err != nil {
+		t.Fatalf("ReportClose() error = %v", err)
+	}
+	if !reflect.DeepEqual(client.closeReports, []source.Lifecycle{lifecycle}) {
+		t.Fatalf("close reports = %#v, want %#v", client.closeReports, []source.Lifecycle{lifecycle})
+	}
+	if got.Action != source.CloseActionClosed || got.HeadSHA != "sha" {
+		t.Fatalf("resolution = %#v, want the client's resolution forwarded unchanged", got)
+	}
+	client.closeErr = errors.New("close refused downstream")
+	if _, err := adapter.ReportClose(context.Background(), item, lifecycle); !errors.Is(err, client.closeErr) {
+		t.Fatalf("ReportClose() error = %v, want the client error forwarded", err)
+	}
+}
+
+func TestAdapterReportCloseWithoutCapability(t *testing.T) {
+	adapter := New(&basicClient{})
+	_, err := adapter.ReportClose(context.Background(), source.WorkItem{ID: "work-123"}, source.Lifecycle{Result: source.ResultAlreadyDone})
+	if err == nil {
+		t.Fatal("ReportClose() error = nil, want a missing-capability error")
+	}
+}
+
+func TestAdapterReportCloseRejectsEmptyWorkItemID(t *testing.T) {
+	adapter := New(&fakeClient{})
+	if _, err := adapter.ReportClose(context.Background(), source.WorkItem{}, source.Lifecycle{}); !errors.Is(err, ErrEmptyWorkItemID) {
+		t.Fatalf("ReportClose() error = %v, want ErrEmptyWorkItemID", err)
+	}
+}

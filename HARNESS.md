@@ -1829,7 +1829,12 @@ reaches `Verifying` only when the coordinator validates integrated work locally,
 fixes failures, and commits are reachable from the run branch; exit `2`
 (`needs_decision`) reaches `NeedsHuman` and `blocked_external` reaches the
 terminal, recoverable `BlockedExternal` phase; exit `3` (`no_change_needed`)
-reaches `AwaitingReview` with source `in-review` for resolve-issue runs, and for
+parks `NeedsHuman` for resolve-issue runs — an incarnation-fenced grounded
+proposal upgrades the ending to `AlreadyDone` and settles it through the
+source's evidence-gated close policy, while an ungrounded ending, including
+every legacy shim ending (the shim records no durable proposal), holds for a
+human with the hold explained on the work item, never a PR-less `in-review`
+state (#720) — and for
 fix-pr runs are settled through `Verifying`: a verified merge reaches `Done`, an open green no-change PR
 waits recoverably in `BlockedExternal`, red CI reaches retryable `Failed`, and
 an unobservable PR reaches `NeedsHuman`. Green CI cannot certify queued review
@@ -1859,9 +1864,12 @@ Outcome comments are human-attention requests the executor can authoritatively
 stand behind: `needs_decision` and `blocked_external` carry the full declared
 question or missing explanation after redaction, never shortened to the
 termination reason. The executor publishes no comment for `no_change_needed`:
-the controller settles that success claim against the world (#474), and the
-evidence rides the bounded, redacted termination reason in `run.exit` telemetry
-and the `COURIER_TERMINATION` handoff. Comment posting is best-effort: failures
+the controller owns that settlement — against the world for fix-pr, through
+the source's evidence-gated close policy or a human hold for resolve-issue,
+with any work-item announcement written by the controller (#474, #720) — and
+the evidence rides the bounded, redacted termination reason in
+`run.exit` telemetry and the `COURIER_TERMINATION` handoff. Comment posting is
+best-effort: failures
 are logged as `outcome.comment` and do not change the run ending.
 
 The criterion-evidence contract (#249, §4) adds one classification: a
@@ -1913,12 +1921,15 @@ The operator consumes the result only when it fences to the coordinator pod
 whose termination it is classifying, so a stale incarnation's result can never
 classify a replacement's ending, and classifies from it — never from the exit
 code or the model's prose alone. The phase routes mirror the legacy exit-code
-contract exactly: a `published` or `no_change` result still only hands the run
-to `Verifying` (or, for a resolve-issue `no_change`, `AwaitingReview`), where
+contract: a `published` result still only hands the run to `Verifying`, where
 the operator's own PR/head/check observation remains the authority — a zero
 exit with no verified PR, a wrong repo/ref/head, a declined forge capability,
 a stale incarnation, or an unverifiable forge read never reaches a falsely
-successful `AwaitingReview`. The one behavioral addition is the
+successful `AwaitingReview`. A resolve-issue `no_change` result never routes
+through `AwaitingReview` at all: the grounded ending settles through the #720
+evidence-gated close (`AlreadyDone`), and an ungrounded ending — like every
+legacy shim ending, which records no durable proposal — parks `NeedsHuman` and
+explains the hold on the work item. The one behavioral addition is the
 workload/infrastructure split: a `workload_failed` result terminalizes `Failed`
 with its own durable diagnostic category, while an `infrastructure_failed`
 result is never a terminal verdict — the operator deletes the terminated pod

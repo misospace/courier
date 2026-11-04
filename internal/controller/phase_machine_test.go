@@ -457,10 +457,11 @@ func TestRunningPodExitMapsPhaseAndSourceState(t *testing.T) {
 		{name: "success", exitCode: 0, wantPhase: courierv1alpha1.PhaseVerifying},
 		{name: "needs-human", exitCode: 2, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantSource: source.StateNeedsHuman, wantReport: true, wantResult: source.ResultBlocked},
 		// no_change_needed (issue #169) never settles the source directly: a
-		// resolve-issue run lands in AwaitingReview for a human to review the
-		// posted evidence; a fix-pr run is settled against the world through
-		// Verifying (issue #267).
-		{name: "no-change-needed resolve-issue", mode: courierv1alpha1.ModeResolveIssue, exitCode: 3, wantPhase: courierv1alpha1.PhaseAwaitingReview, wantSource: source.StateInReview, wantReport: true},
+		// resolve-issue run's legacy exit-3 ending records no durable close
+		// proposal, so it parks NeedsHuman with a blocked report — never the
+		// PR-less in-review state #720 forbids; a fix-pr run is settled against
+		// the world through Verifying (issue #267).
+		{name: "no-change-needed resolve-issue", mode: courierv1alpha1.ModeResolveIssue, exitCode: 3, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantSource: source.StateNeedsHuman, wantReport: true, wantResult: source.ResultBlocked},
 		// A fix-pr no_change_needed declaration is settled against the world
 		// by Verifying, not mapped straight to NeedsHuman (issue #267).
 		{name: "no-change-needed fix-pr", mode: courierv1alpha1.ModeFixPR, exitCode: 3, wantPhase: courierv1alpha1.PhaseVerifying},
@@ -1831,8 +1832,9 @@ func TestDoneRunResolvesSourceWorkItem(t *testing.T) {
 // TestExit3NoChangeNeededResolveIssueSettlesNothingDirectly checks the
 // resolve-issue no_change_needed path (issue #169) behind the human review
 // gate: a coordinator that exits 3 never settles the source directly. The run
-// ends AwaitingReview with the source transitioned to in-review, and neither
-// the first reconcile nor a follow-up resolves the work item.
+// parks NeedsHuman with the source transitioned to needs-human — never the
+// PR-less in-review state #720 forbids — and neither the first reconcile nor a
+// follow-up resolves the work item.
 func TestExit3NoChangeNeededResolveIssueSettlesNothingDirectly(t *testing.T) {
 	item := &admissionSource{}
 	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
@@ -1850,11 +1852,11 @@ func TestExit3NoChangeNeededResolveIssueSettlesNothingDirectly(t *testing.T) {
 	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
 		t.Fatalf("get run: %v", err)
 	}
-	if updated.Status.Phase != courierv1alpha1.PhaseAwaitingReview {
-		t.Fatalf("phase = %q, want AwaitingReview", updated.Status.Phase)
+	if updated.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman", updated.Status.Phase)
 	}
-	if len(item.transitions) != 1 || item.transitions[0] != source.StateInReview {
-		t.Fatalf("source transitions = %#v, want in-review", item.transitions)
+	if len(item.transitions) != 1 || item.transitions[0] != source.StateNeedsHuman {
+		t.Fatalf("source transitions = %#v, want needs-human", item.transitions)
 	}
 	// The terminal phase is stable: a follow-up reconcile must not settle the
 	// source.
@@ -2070,7 +2072,8 @@ func TestPhaseForExitClassification(t *testing.T) {
 		{name: "needs_decision is human", mode: courierv1alpha1.ModeResolveIssue, exitCode: 2, outcome: "needs_decision", want: courierv1alpha1.PhaseNeedsHuman},
 		{name: "legacy exit 2 with no outcome is human", mode: courierv1alpha1.ModeResolveIssue, exitCode: 2, want: courierv1alpha1.PhaseNeedsHuman},
 		{name: "blocked_external is a recoverable block", mode: courierv1alpha1.ModeFixPR, exitCode: 2, outcome: "blocked_external", want: courierv1alpha1.PhaseBlockedExternal},
-		{name: "no_change_needed resolve-issue awaits review", mode: courierv1alpha1.ModeResolveIssue, exitCode: 3, want: courierv1alpha1.PhaseAwaitingReview},
+		{name: "no_change_needed resolve-issue parks for a human", mode: courierv1alpha1.ModeResolveIssue, exitCode: 3, want: courierv1alpha1.PhaseNeedsHuman},
+		{name: "no_change_needed contribute awaits review", mode: courierv1alpha1.ModeContribute, exitCode: 3, want: courierv1alpha1.PhaseAwaitingReview},
 		{name: "legacy exit 3 fix-pr verifies", mode: courierv1alpha1.ModeFixPR, exitCode: 3, want: courierv1alpha1.PhaseVerifying},
 		{name: "provider failure stays failed", mode: courierv1alpha1.ModeFixPR, exitCode: 1, want: courierv1alpha1.PhaseFailed},
 		{name: "untrusted blocked_external on a failure exit stays failed", mode: courierv1alpha1.ModeFixPR, exitCode: 1, outcome: "blocked_external", want: courierv1alpha1.PhaseFailed},

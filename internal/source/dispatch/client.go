@@ -41,6 +41,13 @@ const (
 	// Dispatch that does not yet recognise this outcome will reject the
 	// report; that is a known cross-repo gap tracked alongside #267.
 	outcomeWaitingExternal = "waiting-external"
+
+	// outcomeAlreadyDone is the Dispatch task-report outcome Courier sends
+	// for a grounded already-done close proposal
+	// (source.ResultAlreadyDone, #720). Dispatch requires the outcome on an
+	// implement task together with a non-empty close criteria set and an
+	// idempotency key, and answers with its own close resolution.
+	outcomeAlreadyDone = "already_done"
 )
 
 var (
@@ -1115,6 +1122,84 @@ func isInvalidOutcomeResponse(message string) bool {
 	return strings.HasPrefix(strings.TrimSpace(response.Error), "Invalid outcome. Must be one of:")
 }
 
+// reportClose is the already_done sibling of reportTaskWithPR: valid only
+// for implement tasks, always idempotency-keyed (Dispatch requires the key
+// for this outcome regardless of reportIdempotencyEnabled), and never
+// carrying PR, PR-fix, or telemetry fields. The coordinator's proposal is
+// never closure authorization: an accepted response without a close
+// resolution means the outcome was not recorded, so it fails closed, and an
+// empty resolution object with a missing action fails the same way.
+func (c *HTTPClient) reportClose(ctx context.Context, d workDescriptor, lifecycle source.Lifecycle) (source.CloseResolution, error) {
+	if d.Type != "implement" {
+		return source.CloseResolution{}, fmt.Errorf("%w: close reports are valid only for implement tasks, got %q", source.ErrUnsupportedOutcome, d.Type)
+	}
+	if d.Repo == "" || d.Number <= 0 {
+		return source.CloseResolution{}, errors.New("dispatch client: close report requires a valid issue reference")
+	}
+	if strings.TrimSpace(lifecycle.IdempotencyKey) == "" {
+		return source.CloseResolution{}, errors.New("dispatch client: close report requires an idempotency key")
+	}
+	if lifecycle.Close == nil || len(lifecycle.Close.Criteria) == 0 {
+		return source.CloseResolution{}, errors.New("dispatch client: close report requires at least one grounded criterion")
+	}
+	criteria := make([]map[string]any, 0, len(lifecycle.Close.Criteria))
+	for _, criterion := range lifecycle.Close.Criteria {
+		criteria = append(criteria, map[string]any{"criterion": criterion.Criterion, "path": criterion.Path, "excerpt": criterion.Excerpt})
+	}
+	body := map[string]any{
+		"taskType":       d.Type,
+		"outcome":        outcomeAlreadyDone,
+		"repoFullName":   d.Repo,
+		"issueNumber":    d.Number,
+		"idempotencyKey": lifecycle.IdempotencyKey,
+		"close":          map[string]any{"criteria": criteria},
+	}
+	if lifecycle.Close.Evidence != "" {
+		body["evidence"] = lifecycle.Close.Evidence
+	}
+	if lifecycle.StartedAt != nil {
+		body["startedAt"] = *lifecycle.StartedAt
+	}
+	var response struct {
+		CloseResolution *struct {
+			Action         string   `json:"action"`
+			Reason         string   `json:"reason"`
+			Reasons        []string `json:"reasons"`
+			HeadSHA        string   `json:"headSha"`
+			EvidenceDigest string   `json:"evidenceDigest"`
+		} `json:"closeResolution"`
+	}
+	err := c.do(ctx, http.MethodPost, "/api/agents/"+url.PathEscape(c.agentName)+"/tasks/report", body, &response)
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusBadRequest && isInvalidOutcomeResponse(apiErr.Message) {
+		// The source rejected the outcome; this classification path owns the
+		// exchange's diagnostic under the unsupported-task-type class, and
+		// the report outcome itself is counted at the ReportClose boundary.
+		c.diagnostics.Diagnostic(c.connectorName, connector.SignalProtocolError, reasonUnsupportedTaskType)
+		absorbExchange(err)
+		return source.CloseResolution{}, fmt.Errorf("%w: %w", source.ErrUnsupportedOutcome, apiErr)
+	}
+	if err != nil {
+		return source.CloseResolution{}, err
+	}
+	if response.CloseResolution == nil {
+		return source.CloseResolution{}, errors.New("dispatch client: close report accepted without a close resolution")
+	}
+	if strings.TrimSpace(response.CloseResolution.Action) == "" {
+		return source.CloseResolution{}, errors.New("dispatch client: close resolution carries no action")
+	}
+	// The action passes through verbatim, including strings this client does
+	// not know: Dispatch's resolution is authoritative and the controller
+	// decides what each action settles to.
+	return source.CloseResolution{
+		Action:         response.CloseResolution.Action,
+		Reason:         response.CloseResolution.Reason,
+		Reasons:        response.CloseResolution.Reasons,
+		HeadSHA:        response.CloseResolution.HeadSHA,
+		EvidenceDigest: response.CloseResolution.EvidenceDigest,
+	}, nil
+}
+
 func parsePullRequest(value string) (int, string) {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -1248,6 +1333,21 @@ func (c *HTTPClient) emitReportOutcome(final error) {
 	default:
 		c.diagnostics.Diagnostic(c.connectorName, connector.SignalReport, reasonReportRetryable)
 	}
+}
+
+// ReportClose settles an evidence-grounded already-done conclusion
+// (source.ResultAlreadyDone, #720) through Dispatch's close-gated task
+// report. It never treats an accepted HTTP response as proof of closure:
+// the returned CloseResolution is Dispatch's authoritative answer, and a
+// report that records no resolution is an error.
+func (c *HTTPClient) ReportClose(ctx context.Context, id string, lifecycle source.Lifecycle) (source.CloseResolution, error) {
+	d, err := decodeWorkID(id)
+	if err != nil {
+		return source.CloseResolution{}, err
+	}
+	resolution, final := c.reportClose(ctx, d, lifecycle)
+	c.emitReportOutcome(final)
+	return resolution, final
 }
 
 func (c *HTTPClient) Resolve(ctx context.Context, id string) error {

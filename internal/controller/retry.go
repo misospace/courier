@@ -522,9 +522,11 @@ func isHex(s string) bool {
 // the phase can be retried at all. Failed and NeedsHuman are the retryable
 // terminal failures. BlockedExternal refuses the dedicated automatic-recovery-
 // channel reason: it is recoverable and its source re-issues the work through the
-// capacity-recovery channel, never a retry request. AwaitingReview and HandedOff —
-// the only other phases the terminal dispatch reaches — belong to the source's own
-// repair and review paths.
+// capacity-recovery channel, never a retry request. AwaitingReview, HandedOff, and
+// AlreadyDone — the other phases the terminal dispatch reaches — belong to the
+// source's own repair, review, and evidence-gated close paths, never a retry
+// request: an already-done conclusion is settled by the source's close policy,
+// and re-running the coordinator cannot change that verdict.
 func coreRetryRefusal(run *courierv1alpha1.CoderRun) (string, bool) {
 	switch run.Status.Phase {
 	case courierv1alpha1.PhaseFailed, courierv1alpha1.PhaseNeedsHuman:
