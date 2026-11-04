@@ -137,10 +137,17 @@ type CoderRunReconciler struct {
 	// WorkItemComments, when set, posts the bounded operator-authored
 	// notification to an already-done run's source work item once its
 	// evidence-gated close settles. It is a best-effort delivery seam through
-	// the operator's own forge write identity: a nil implementation or a
-	// failure never alters the run's outcome. Nil disables the notification;
-	// the close settlement itself is unaffected.
+	// the operator's explicitly configured forge comment identity (#727): a nil
+	// implementation or a failure never alters the run's outcome, but it is
+	// recorded as not announced rather than claimed. Nil disables the
+	// notification; the close settlement itself is unaffected.
 	WorkItemComments WorkItemCommenter
+
+	// WorkItemLinks, when set, renders the forge-web links the announcement
+	// carries for the source-pinned verification revision and its grounded
+	// criterion paths. It is consulted only while rendering an announcement;
+	// nil renders the same facts as plain text, never a half-built link.
+	WorkItemLinks WorkItemLinker
 
 	// Evidence reconciles the run's failure-evidence Secrets at the terminal
 	// boundary the operator can prove: a world-verified success (AwaitingReview,

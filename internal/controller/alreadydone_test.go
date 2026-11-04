@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -826,6 +827,367 @@ func TestAlreadyDoneRetention(t *testing.T) {
 		}
 		if _, ok := stored.Annotations[alreadyDoneAtAnnotation]; !ok {
 			t.Fatalf("retention marker not stamped: %#v", stored.Annotations)
+		}
+	})
+}
+
+// fakeLinks renders forge.test-shaped web links for the settled-outcome
+// announcement. A link is unrenderable (empty) when any part of its identity
+// is missing, and omitFile names one path whose file link cannot be rendered.
+type fakeLinks struct {
+	omitFile string
+}
+
+func (l *fakeLinks) CommitLink(repo, sha string) string {
+	if repo == "" || sha == "" {
+		return ""
+	}
+	return "https://forge.test/" + repo + "/commit/" + sha
+}
+
+func (l *fakeLinks) FileLink(repo, path, sha string) string {
+	if repo == "" || path == "" || sha == "" || path == l.omitFile {
+		return ""
+	}
+	return "https://forge.test/" + repo + "/blob/" + sha + "/" + path
+}
+
+// TestAlreadyDoneCommentRedactsSourceAndModelText is the redaction gate: model
+// authored evidence, criterion text, and paths, plus the source's own
+// resolution detail, must never carry a credential into the forge comment, on
+// either the closed or the refused (parked) announcement.
+func TestAlreadyDoneCommentRedactsSourceAndModelText(t *testing.T) {
+	const (
+		ghpToken  = "ghp_a1B2c3D4e5F6g7H8i9J0KlMn"
+		bearerTok = "abcdef0123456789ABCDEF"
+	)
+	tainted := func() *courierv1alpha1.NoChangeClose {
+		return &courierv1alpha1.NoChangeClose{
+			Criteria: []courierv1alpha1.NoChangeCloseCriterion{
+				{
+					Criterion: "the health endpoint proves authorization: bearer " + bearerTok + " is provisioned",
+					Path:      "docs/https://api:s3cretValue@internal.example.com/ask.md",
+				},
+				{
+					Criterion: "the reviewer note is archived",
+					Path:      "notes/" + ghpToken + "/review.md",
+				},
+				{
+					Criterion: "the clean path still links",
+					Path:      "src/clean.go",
+				},
+			},
+			Evidence:          "covered per https://user:hunter2@github.com/acme/demo; reviewer token " + ghpToken + " confirmed it",
+			CoordinatorPodUID: "pod-1",
+			At:                metav1.Now(),
+		}
+	}
+	cases := []struct {
+		name       string
+		resolution source.CloseResolution
+	}{
+		{"closed announcement", source.CloseResolution{Action: source.CloseActionClosed, Reason: "closed after checking https://tok:pwd@example.com/x", HeadSHA: "0a1b2c3d"}},
+		{"refused park announcement", source.CloseResolution{Action: source.CloseActionRefused, Reason: "policy check against https://tok:pwd@example.com/x declined", HeadSHA: "0a1b2c3d"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			run := runWithNoChange("pod-1")
+			run.Status.NoChange = tainted()
+			kube := phaseClient(t, admissionLane("local", 1), run)
+			adapter := &closeReportingSource{admissionSource: &admissionSource{}, closeResolution: tc.resolution}
+			commenter := &fakeWorkItemCommenter{}
+			r := &CoderRunReconciler{
+				Client:           kube,
+				APIReader:        kube,
+				Sources:          NewSourceRegistry(map[string]source.Adapter{"test": adapter}),
+				StatusWriter:     fakeStatusWriter{client: kube},
+				WorkItemComments: commenter,
+				WorkItemLinks:    &fakeLinks{},
+			}
+			item := source.WorkItem{ID: run.Spec.WorkItemID, Repo: run.Spec.Repo, Ref: run.Spec.Ref, Mode: string(run.Spec.Mode), Lane: run.Spec.Lane}
+			if _, err := r.settleAlreadyDoneClose(context.Background(), run, adapter, item, terminalLifecycleIntent{error: "no-change"}); err != nil {
+				t.Fatalf("settleAlreadyDoneClose() error = %v", err)
+			}
+			if len(commenter.bodies) != 1 {
+				t.Fatalf("comment bodies = %d; want 1", len(commenter.bodies))
+			}
+			body := commenter.bodies[0]
+			if !strings.Contains(body, "[REDACTED]") {
+				t.Fatalf("body = %q; want a redaction placeholder", body)
+			}
+			for _, leak := range []string{"hunter2", ghpToken, bearerTok, "tok:pwd", "s3cretValue"} {
+				if strings.Contains(body, leak) {
+					t.Fatalf("body leaked %q (href included): %q", leak, body)
+				}
+			}
+			// A redacted path never travels into an href; a clean path still
+			// renders its pinned link.
+			if strings.Contains(body, "(in [docs/") || strings.Contains(body, "(in [notes/") {
+				t.Fatalf("body = %q; want the redacted paths plain, never linked", body)
+			}
+			if !strings.Contains(body, "[src/clean.go](https://forge.test/acme/widgets/blob/0a1b2c3d/src/clean.go)") {
+				t.Fatalf("body = %q; want the clean path still linked", body)
+			}
+		})
+	}
+}
+
+// TestAlreadyDoneCommentRendersStructuredLinks checks the renderer's link
+// contract: the source-pinned verification revision and every grounded
+// criterion path render as forge links ahead of the free-form assessment,
+// with plain-text fallbacks when the linker cannot render a link, and no
+// verification block at all when the source pinned no revision.
+func TestAlreadyDoneCommentRendersStructuredLinks(t *testing.T) {
+	run := runWithNoChange("pod-1")
+	resolution := source.CloseResolution{Action: source.CloseActionClosed, HeadSHA: "0a1b2c3d", EvidenceDigest: "sha256:9f8e7d"}
+
+	t.Run("linker renders commit and file links", func(t *testing.T) {
+		body := alreadyDoneCommentBody(run, true, sourceCloseClosedReason, resolution, &fakeLinks{})
+		if !strings.Contains(body, "[acme/widgets@0a1b2c3d](https://forge.test/acme/widgets/commit/0a1b2c3d)") {
+			t.Fatalf("body = %q; want the commit link at the pinned revision", body)
+		}
+		if !strings.Contains(body, "[pkg/core/impl.go](https://forge.test/acme/widgets/blob/0a1b2c3d/pkg/core/impl.go)") {
+			t.Fatalf("body = %q; want the criterion path link at the pinned revision", body)
+		}
+		if !strings.Contains(body, "Evidence catalog: sha256:9f8e7d") {
+			t.Fatalf("body = %q; want the evidence catalog digest", body)
+		}
+		commit := strings.Index(body, "commit/0a1b2c3d")
+		criteria := strings.Index(body, "Grounded criteria:")
+		assessment := strings.Index(body, "Coordinator assessment:")
+		if !(commit >= 0 && commit < criteria && criteria < assessment) {
+			t.Fatalf("render order = commit %d, criteria %d, assessment %d; want links before prose", commit, criteria, assessment)
+		}
+	})
+
+	t.Run("nil linker renders plain text", func(t *testing.T) {
+		body := alreadyDoneCommentBody(run, true, sourceCloseClosedReason, resolution, nil)
+		if !strings.Contains(body, "Verified at acme/widgets@0a1b2c3d.") {
+			t.Fatalf("body = %q; want the plain repo@sha revision", body)
+		}
+		if !strings.Contains(body, "Evidence catalog: sha256:9f8e7d") {
+			t.Fatalf("body = %q; want the evidence digest even without a linker", body)
+		}
+		if !strings.Contains(body, "(in pkg/core/impl.go)") {
+			t.Fatalf("body = %q; want the plain criterion path", body)
+		}
+		if strings.Contains(body, "](") {
+			t.Fatalf("body = %q; want no markdown link without a linker", body)
+		}
+	})
+
+	t.Run("unrenderable path falls back to plain text", func(t *testing.T) {
+		body := alreadyDoneCommentBody(run, true, sourceCloseClosedReason, resolution, &fakeLinks{omitFile: "pkg/core/impl.go"})
+		if !strings.Contains(body, "[acme/widgets@0a1b2c3d](https://forge.test/acme/widgets/commit/0a1b2c3d)") {
+			t.Fatalf("body = %q; want the commit link even when the file link fails", body)
+		}
+		if !strings.Contains(body, "(in pkg/core/impl.go)") || strings.Contains(body, "blob/") {
+			t.Fatalf("body = %q; want the plain path fallback for the unrenderable path", body)
+		}
+	})
+
+	t.Run("an irregular revision omits the verification block", func(t *testing.T) {
+		body := alreadyDoneCommentBody(run, true, sourceCloseClosedReason,
+			source.CloseResolution{Action: source.CloseActionClosed, HeadSHA: "abc] [x](https://evil.test/y)", EvidenceDigest: "sha256:9f8e7d"}, &fakeLinks{})
+		if strings.Contains(body, "Verified at") || strings.Contains(body, "evil.test") || strings.Contains(body, "Evidence catalog") {
+			t.Fatalf("body = %q; want an irregular revision omitted, never rendered", body)
+		}
+		if strings.Contains(body, "](") {
+			t.Fatalf("body = %q; want no links built from an irregular revision", body)
+		}
+	})
+
+	t.Run("no pinned revision renders no links", func(t *testing.T) {
+		body := alreadyDoneCommentBody(run, true, sourceCloseClosedReason,
+			source.CloseResolution{Action: source.CloseActionClosed, EvidenceDigest: "sha256:9f8e7d"}, &fakeLinks{})
+		if strings.Contains(body, "Verified at") || strings.Contains(body, "Evidence catalog") {
+			t.Fatalf("body = %q; want no verification block without a pinned revision", body)
+		}
+		if strings.Contains(body, "](") {
+			t.Fatalf("body = %q; want no unpinned links — unpinned paths drift", body)
+		}
+		if !strings.Contains(body, "Grounded criteria: the ask is implemented (in pkg/core/impl.go)") {
+			t.Fatalf("body = %q; want plain grounded criteria", body)
+		}
+	})
+}
+
+// TestParkAlreadyDoneCloseKeepsPinnedRevision proves the park path carries the
+// source's real resolution — not a detail-string reconstruction — into the
+// announcement: a refused close still names the verification revision the
+// source pinned, with its links. A park with no source resolution at all
+// invents no verification block.
+func TestParkAlreadyDoneCloseKeepsPinnedRevision(t *testing.T) {
+	t.Run("refused park keeps the source-pinned revision", func(t *testing.T) {
+		run := runWithNoChange("pod-1")
+		kube := phaseClient(t, admissionLane("local", 1), run)
+		adapter := &closeReportingSource{admissionSource: &admissionSource{}, closeResolution: source.CloseResolution{
+			Action:         source.CloseActionRefused,
+			Reason:         "close policy not satisfied",
+			HeadSHA:        "11aa22bb",
+			EvidenceDigest: "sha256:cafe",
+		}}
+		commenter := &fakeWorkItemCommenter{}
+		r := &CoderRunReconciler{
+			Client:           kube,
+			APIReader:        kube,
+			Sources:          NewSourceRegistry(map[string]source.Adapter{"test": adapter}),
+			StatusWriter:     fakeStatusWriter{client: kube},
+			WorkItemComments: commenter,
+			WorkItemLinks:    &fakeLinks{},
+		}
+		item := source.WorkItem{ID: run.Spec.WorkItemID, Repo: run.Spec.Repo, Ref: run.Spec.Ref, Mode: string(run.Spec.Mode), Lane: run.Spec.Lane}
+		if _, err := r.settleAlreadyDoneClose(context.Background(), run, adapter, item, terminalLifecycleIntent{error: "no-change"}); err != nil {
+			t.Fatalf("settleAlreadyDoneClose() error = %v", err)
+		}
+		if run.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+			t.Fatalf("phase = %s; want NeedsHuman", run.Status.Phase)
+		}
+		if len(commenter.bodies) != 1 {
+			t.Fatalf("comment bodies = %d; want 1", len(commenter.bodies))
+		}
+		body := commenter.bodies[0]
+		if !strings.Contains(body, "Verified at [acme/widgets@11aa22bb](https://forge.test/acme/widgets/commit/11aa22bb)") {
+			t.Fatalf("body = %q; want the verified-at block at the source-pinned revision", body)
+		}
+		if !strings.Contains(body, "[pkg/core/impl.go](https://forge.test/acme/widgets/blob/11aa22bb/pkg/core/impl.go)") {
+			t.Fatalf("body = %q; want criterion paths linked at the pinned revision", body)
+		}
+		if !strings.Contains(body, "Evidence catalog: sha256:cafe") {
+			t.Fatalf("body = %q; want the evidence digest on the parked announcement", body)
+		}
+	})
+
+	t.Run("park with no source resolution invents no revision", func(t *testing.T) {
+		run := runWithNoChange("pod-1")
+		kube := phaseClient(t, admissionLane("local", 1), run)
+		adapter := &admissionSource{}
+		commenter := &fakeWorkItemCommenter{}
+		r := &CoderRunReconciler{
+			Client:           kube,
+			APIReader:        kube,
+			Sources:          NewSourceRegistry(map[string]source.Adapter{"test": adapter}),
+			StatusWriter:     fakeStatusWriter{client: kube},
+			WorkItemComments: commenter,
+			WorkItemLinks:    &fakeLinks{},
+		}
+		item := source.WorkItem{ID: run.Spec.WorkItemID, Repo: run.Spec.Repo, Ref: run.Spec.Ref, Mode: string(run.Spec.Mode), Lane: run.Spec.Lane}
+		if _, err := r.settleAlreadyDoneClose(context.Background(), run, adapter, item, terminalLifecycleIntent{error: "no-change"}); err != nil {
+			t.Fatalf("settleAlreadyDoneClose() error = %v", err)
+		}
+		if len(commenter.bodies) != 1 {
+			t.Fatalf("comment bodies = %d; want 1", len(commenter.bodies))
+		}
+		body := commenter.bodies[0]
+		if strings.Contains(body, "Verified at") || strings.Contains(body, "](") {
+			t.Fatalf("body = %q; want no invented revision without a source resolution", body)
+		}
+		if !strings.Contains(body, "evidence-gated close path") {
+			t.Fatalf("body = %q; want the source's detail in the refusal announcement", body)
+		}
+	})
+}
+
+// TestAlreadyDoneAnnouncementRecordsUndelivered proves a run is never left
+// reading as announced when no comment could reach the work item (#727): a
+// missing comment identity or a failed delivery records the announcement
+// condition False with the reason why — never claimed as posted. The recorded
+// failure detail is redacted like every other non-operator fragment.
+func TestAlreadyDoneAnnouncementRecordsUndelivered(t *testing.T) {
+	t.Run("closed settle with failed delivery records DeliveryFailed", func(t *testing.T) {
+		run := runWithNoChange("pod-1")
+		kube := phaseClient(t, admissionLane("local", 1), run)
+		adapter := &closeReportingSource{admissionSource: &admissionSource{}, closeResolution: source.CloseResolution{Action: source.CloseActionClosed}}
+		commenter := &fakeWorkItemCommenter{err: errors.New("post https://user:hunter2@forge.test/x returned 401")}
+		r := &CoderRunReconciler{
+			Client:           kube,
+			APIReader:        kube,
+			Sources:          NewSourceRegistry(map[string]source.Adapter{"test": adapter}),
+			StatusWriter:     fakeStatusWriter{client: kube},
+			WorkItemComments: commenter,
+		}
+		item := source.WorkItem{ID: run.Spec.WorkItemID, Repo: run.Spec.Repo, Ref: run.Spec.Ref, Mode: string(run.Spec.Mode), Lane: run.Spec.Lane}
+		if _, err := r.settleAlreadyDoneClose(context.Background(), run, adapter, item, terminalLifecycleIntent{error: "no-change"}); err != nil {
+			t.Fatalf("settleAlreadyDoneClose() error = %v", err)
+		}
+		stored := &courierv1alpha1.CoderRun{}
+		if err := kube.Get(context.Background(), admissionKey(run.Name), stored); err != nil {
+			t.Fatalf("re-read run: %v", err)
+		}
+		cond := apimeta.FindStatusCondition(stored.Status.Conditions, sourceCloseCommentedCondition)
+		if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != sourceCloseCommentDeliveryReason {
+			t.Fatalf("SourceCloseCommented = %#v; want False/%s", cond, sourceCloseCommentDeliveryReason)
+		}
+		if strings.Contains(cond.Message, "hunter2") || !strings.Contains(cond.Message, "[REDACTED]") {
+			t.Fatalf("delivery record leaked or lost redaction: %q", cond.Message)
+		}
+	})
+
+	t.Run("park without a comment identity records not-configured", func(t *testing.T) {
+		run := runWithNoChange("pod-1")
+		kube := phaseClient(t, admissionLane("local", 1), run)
+		adapter := &admissionSource{}
+		r := &CoderRunReconciler{
+			Client:       kube,
+			APIReader:    kube,
+			Sources:      NewSourceRegistry(map[string]source.Adapter{"test": adapter}),
+			StatusWriter: fakeStatusWriter{client: kube},
+		}
+		item := source.WorkItem{ID: run.Spec.WorkItemID, Repo: run.Spec.Repo, Ref: run.Spec.Ref, Mode: string(run.Spec.Mode), Lane: run.Spec.Lane}
+		if _, err := r.settleAlreadyDoneClose(context.Background(), run, adapter, item, terminalLifecycleIntent{error: "no-change"}); err != nil {
+			t.Fatalf("settleAlreadyDoneClose() error = %v", err)
+		}
+		stored := &courierv1alpha1.CoderRun{}
+		if err := kube.Get(context.Background(), admissionKey(run.Name), stored); err != nil {
+			t.Fatalf("re-read run: %v", err)
+		}
+		cond := apimeta.FindStatusCondition(stored.Status.Conditions, sourceCloseCommentedCondition)
+		if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != sourceCloseCommentNotConfiguredReason {
+			t.Fatalf("SourceCloseCommented = %#v; want False/%s", cond, sourceCloseCommentNotConfiguredReason)
+		}
+	})
+
+	t.Run("hold with a failed delivery records DeliveryFailed", func(t *testing.T) {
+		run := admissionRun("hold-fail", "local", courierv1alpha1.PhaseNeedsHuman)
+		kube := phaseClient(t, admissionLane("local", 1), run)
+		commenter := &fakeWorkItemCommenter{err: errors.New("forge unavailable")}
+		r := &CoderRunReconciler{
+			Client:           kube,
+			APIReader:        kube,
+			StatusWriter:     fakeStatusWriter{client: kube},
+			WorkItemComments: commenter,
+		}
+		r.commentAlreadyDoneHold(context.Background(), run)
+		stored := &courierv1alpha1.CoderRun{}
+		if err := kube.Get(context.Background(), admissionKey("hold-fail"), stored); err != nil {
+			t.Fatalf("re-read run: %v", err)
+		}
+		cond := apimeta.FindStatusCondition(stored.Status.Conditions, sourceCloseCommentedCondition)
+		if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != sourceCloseCommentDeliveryReason {
+			t.Fatalf("SourceCloseCommented = %#v; want False/%s", cond, sourceCloseCommentDeliveryReason)
+		}
+	})
+
+	t.Run("a later successful delivery replaces the failure record", func(t *testing.T) {
+		run := runWithNoChange("pod-1")
+		apimeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
+			Type:               sourceCloseCommentedCondition,
+			Status:             metav1.ConditionFalse,
+			Reason:             sourceCloseCommentDeliveryReason,
+			Message:            "announcement delivery failed: transient",
+			LastTransitionTime: metav1.NewTime(time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)),
+		})
+		commenter := &fakeWorkItemCommenter{}
+		r := &CoderRunReconciler{
+			WorkItemComments: commenter,
+			Now:              func() time.Time { return time.Date(2026, 10, 26, 12, 1, 0, 0, time.UTC) },
+		}
+		r.commentAlreadyDone(context.Background(), run, true, sourceCloseClosedReason, source.CloseResolution{Action: source.CloseActionClosed})
+		if len(commenter.bodies) != 1 {
+			t.Fatalf("comment bodies = %d; want the retry to deliver", len(commenter.bodies))
+		}
+		if cond := apimeta.FindStatusCondition(run.Status.Conditions, sourceCloseCommentedCondition); cond == nil || cond.Status != metav1.ConditionTrue {
+			t.Fatalf("SourceCloseCommented = %#v; want the True marker after delivery", cond)
 		}
 	})
 }

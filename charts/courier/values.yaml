@@ -313,6 +313,16 @@ controllers:
         #                               --observer-credential-secret; empty
         #                               falls back to --github-token-key,
         #                               --git-token-key, or token
+        #   --work-item-comment-credential-secret
+        #                               Secret carrying the operator's own
+        #                               forge write credential for work-item
+        #                               close announcements; configured
+        #                               explicitly, never falls back to the
+        #                               observer/read credential; empty
+        #                               disables the announcement (#727)
+        #   --work-item-comment-credential-key
+        #                               Optional key within it; requires
+        #                               --work-item-comment-credential-secret
         #   --executor-environment-secret
         #                               Secret exposed to coordinator pods for
         #                               model/provider environment

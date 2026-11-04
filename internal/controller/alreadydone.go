@@ -13,8 +13,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
+	courierlog "github.com/misospace/courier/internal/log"
 	"github.com/misospace/courier/internal/source"
 )
+
+// alreadyDoneCommentRedactor scrubs credential-shaped text out of every
+// non-operator fragment before it is rendered into the source-issue comment.
+// It is patterns-only: URL userinfo, bearer/authorization values, credential
+// query parameters, and well-known token shapes. Redact is idempotent, so a
+// fragment that is already clean passes through unchanged.
+var alreadyDoneCommentRedactor = courierlog.NewRedactor()
 
 // sourceCloseCondition tracks the operator's evidence-gated close of the run's
 // source work item (an already-done conclusion). Status True with the Closed
@@ -45,12 +53,20 @@ const (
 	// comment, which an operator can recognize, rather than silently drop
 	// the announcement.
 	sourceCloseCommentedCondition = "SourceCloseCommented"
+
+	// The False status of the announcement condition names why nothing was
+	// delivered, so a run never reads as announced when no comment could
+	// reach the work item (#727).
+	sourceCloseCommentNotConfiguredReason = "CommentIdentityNotConfigured"
+	sourceCloseCommentDeliveryReason      = "DeliveryFailed"
 )
 
 // alreadyDoneCommentBound bounds the operator-authored source-issue comment.
-// A longer body is hard-truncated on a rune boundary so a verbose proposal can
-// never overflow the forge's comment limit or drag the outcome along.
-const alreadyDoneCommentBound = 1500
+// The verification links and grounded criteria render ahead of the free-form
+// coordinator assessment, so a hard truncation on a rune boundary costs the
+// prose, never the structured links; a verbose proposal can still never
+// overflow the forge's comment limit or drag the outcome along.
+const alreadyDoneCommentBound = 2400
 
 // WorkItemCommenter posts a bounded, operator-authored comment to the run's
 // source work item through the operator's own forge write identity. It is the
@@ -60,6 +76,19 @@ const alreadyDoneCommentBound = 1500
 // notification, never a settlement authority.
 type WorkItemCommenter interface {
 	CommentWorkItem(ctx context.Context, run *courierv1alpha1.CoderRun, body string) error
+}
+
+// WorkItemLinker renders bounded forge-web links for the settled-outcome
+// announcement. CommitLink returns the forge's web URL for one commit of a
+// repository; FileLink returns the forge's web URL for one repo-relative path
+// at an exact revision. Each returns the empty string when it cannot render a
+// safe link for the given identity, and the caller then renders the plain
+// text instead. A renderer only formats a path, never dereferences it. The
+// controller stays source-agnostic through this seam: host and URL shape are
+// provider knowledge the wiring supplies, never string literals here.
+type WorkItemLinker interface {
+	CommitLink(repo, sha string) string
+	FileLink(repo, path, sha string) string
 }
 
 // resolveIssueNoChangePhase classifies a trusted no_change ending for a
@@ -134,14 +163,14 @@ func (r *CoderRunReconciler) settleAlreadyDoneClose(ctx context.Context, run *co
 	if run.Status.NoChange == nil {
 		// A run without a durable proposal cannot be evidence-gated: fail closed
 		// to human attention rather than reaping it as a success.
-		return r.parkAlreadyDoneClose(ctx, run, adapter, item, sourceCloseUnsupportedReason, "no grounded close proposal is recorded on the run")
+		return r.parkAlreadyDoneClose(ctx, run, adapter, item, sourceCloseUnsupportedReason, "no grounded close proposal is recorded on the run", source.CloseResolution{})
 	}
 	reporter, ok := adapter.(source.CloseReporter)
 	if !ok {
 		// The source offers no evidence-gated close path. It must refuse the
 		// result, and the operator must not imitate settlement with an ordinary
 		// lifecycle report, which the source contract forbids.
-		return r.parkAlreadyDoneClose(ctx, run, adapter, item, sourceCloseUnsupportedReason, "source does not offer an evidence-gated close path")
+		return r.parkAlreadyDoneClose(ctx, run, adapter, item, sourceCloseUnsupportedReason, "source does not offer an evidence-gated close path", source.CloseResolution{})
 	}
 	lifecycle := r.alreadyDoneLifecycle(run, intent)
 	resolution, err := reporter.ReportClose(ctx, item, lifecycle)
@@ -152,15 +181,15 @@ func (r *CoderRunReconciler) settleAlreadyDoneClose(ctx context.Context, run *co
 		return ctrl.Result{}, r.markLifecycleReportOutcome(ctx, run, true, lifecycleReportPublishedReason, "", "", lifecycleReportAcceptedSupportReason)
 	case err == nil:
 		reason := sourceCloseReasonForAction(resolution.Action)
-		return r.parkAlreadyDoneClose(ctx, run, adapter, item, reason, closeResolutionDetail(resolution))
+		return r.parkAlreadyDoneClose(ctx, run, adapter, item, reason, closeResolutionDetail(resolution), resolution)
 	case errors.Is(err, source.ErrSuperseded):
 		log.FromContext(ctx).Info("dropping superseded already-done close report",
 			"run", run.Name, "error", err.Error())
 		return ctrl.Result{}, r.markLifecycleReportOutcome(ctx, run, true, lifecycleReportSupersededReason, err.Error(), "", lifecycleReportSupersededReason)
 	case errors.Is(err, source.ErrUnsupportedOutcome):
-		return r.parkAlreadyDoneClose(ctx, run, adapter, item, sourceCloseUnsupportedReason, err.Error())
+		return r.parkAlreadyDoneClose(ctx, run, adapter, item, sourceCloseUnsupportedReason, err.Error(), source.CloseResolution{})
 	case errors.Is(err, source.ErrPermanentRefusal):
-		return r.parkAlreadyDoneClose(ctx, run, adapter, item, sourceCloseRefusedPermanentlyReason, err.Error())
+		return r.parkAlreadyDoneClose(ctx, run, adapter, item, sourceCloseRefusedPermanentlyReason, err.Error(), source.CloseResolution{})
 	default:
 		log.FromContext(ctx).Info("already-done close report failed; will retry",
 			"run", run.Name, "error", err.Error())
@@ -186,9 +215,15 @@ func (r *CoderRunReconciler) markAlreadyDoneClosePending(ctx context.Context, ru
 // written in the same status patch as the phase change, so the recorded reason
 // for the parking is never split from it. A best-effort source-issue comment
 // precedes the transition so the human reviewer has the source's answer beside
-// the parked outcome.
-func (r *CoderRunReconciler) parkAlreadyDoneClose(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, reason, detail string) (ctrl.Result, error) {
-	resolution := closeResolutionFromDetail(detail)
+// the parked outcome. The source's real resolution — when the park followed an
+// actual close report — is carried through to the condition and the comment,
+// so a parked announcement keeps the verification revision the source pinned;
+// a zero resolution means no source answer exists, and the detail string is
+// reconstructed into a resolution-shaped value in its place.
+func (r *CoderRunReconciler) parkAlreadyDoneClose(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, reason, detail string, resolution source.CloseResolution) (ctrl.Result, error) {
+	if closeResolutionIsZero(resolution) {
+		resolution = closeResolutionFromDetail(detail)
+	}
 	r.setSourceClose(run, false, reason, resolution)
 	r.commentAlreadyDone(ctx, run, false, reason, resolution)
 	park := terminalLifecycleIntent{
@@ -226,21 +261,27 @@ func (r *CoderRunReconciler) setSourceClose(run *courierv1alpha1.CoderRun, close
 
 // commentAlreadyDone posts the bounded operator-authored notification about the
 // run's close outcome to its source work item. It is best-effort: a missing
-// commenter or a delivery failure is logged and never alters the run's
-// outcome. A run whose settled outcome was already announced is never
-// announced twice.
+// commenter or a delivery failure never alters the run's outcome, but each is
+// recorded on the announcement condition as a False status naming why nothing
+// was delivered (#727) — a run whose comment could not reach the work item is
+// never left reading as announced. The False record is an in-memory mutation
+// that rides whichever settlement or transition patch follows. A run whose
+// settled outcome was already announced is never announced twice.
 func (r *CoderRunReconciler) commentAlreadyDone(ctx context.Context, run *courierv1alpha1.CoderRun, closed bool, reason string, resolution source.CloseResolution) {
-	if r.WorkItemComments == nil {
-		return
-	}
 	if alreadyDoneCommented(run) {
 		return
 	}
-	body := alreadyDoneCommentBody(run, closed, reason, resolution)
+	if r.WorkItemComments == nil {
+		r.recordAnnouncementNotDelivered(run, sourceCloseCommentNotConfiguredReason,
+			"the deployment configures no forge comment identity, so this outcome was not announced on the work item")
+		return
+	}
+	body := alreadyDoneCommentBody(run, closed, reason, resolution, r.WorkItemLinks)
 	if body == "" {
 		return
 	}
 	if err := r.WorkItemComments.CommentWorkItem(ctx, run, body); err != nil {
+		r.recordAnnouncementNotDelivered(run, sourceCloseCommentDeliveryReason, "announcement delivery failed: "+err.Error())
 		log.FromContext(ctx).V(1).Info("source-issue comment for already-done run failed",
 			"run", run.Name, "error", err.Error())
 		return
@@ -261,11 +302,23 @@ func (r *CoderRunReconciler) commentAlreadyDone(ctx context.Context, run *courie
 // the source work item: the run concluded no change without a grounded close
 // proposal, so no PR is coming and no closure was attempted. Best-effort and
 // once per run, exactly like the settled-outcome notification.
+// A missing commenter or a delivery failure is recorded as a False
+// announcement status naming why nothing was delivered (#727): the hold's
+// explanation reached no one when no identity could post it, and the run must
+// not read as announced. The hold runs after its transition patch, so each
+// record carries its own patch.
 func (r *CoderRunReconciler) commentAlreadyDoneHold(ctx context.Context, run *courierv1alpha1.CoderRun) {
-	if r.WorkItemComments == nil {
+	if alreadyDoneCommented(run) {
 		return
 	}
-	if alreadyDoneCommented(run) {
+	if r.WorkItemComments == nil {
+		before := run.DeepCopy()
+		r.recordAnnouncementNotDelivered(run, sourceCloseCommentNotConfiguredReason,
+			"the deployment configures no forge comment identity, so this hold was not announced on the work item")
+		if err := r.patchStatus(ctx, before, run); err != nil {
+			log.FromContext(ctx).V(1).Info("recording the undeliverable source-issue hold failed",
+				"run", run.Name, "error", err.Error())
+		}
 		return
 	}
 	// Name the actual deficiency: nothing grounded, or a proposal left over
@@ -277,6 +330,11 @@ func (r *CoderRunReconciler) commentAlreadyDoneHold(ctx context.Context, run *co
 	body := "Courier will not open a pull request for this issue and did not attempt to close it: the run concluded the request was already satisfied but " + deficiency + ", so the conclusion is held for a human. No publication is claimed."
 	before := run.DeepCopy()
 	if err := r.WorkItemComments.CommentWorkItem(ctx, run, body); err != nil {
+		r.recordAnnouncementNotDelivered(run, sourceCloseCommentDeliveryReason, "announcement delivery failed: "+err.Error())
+		if err := r.patchStatus(ctx, before, run); err != nil {
+			log.FromContext(ctx).V(1).Info("recording the failed source-issue hold comment failed",
+				"run", run.Name, "error", err.Error())
+		}
 		log.FromContext(ctx).V(1).Info("source-issue hold comment failed",
 			"run", run.Name, "error", err.Error())
 		return
@@ -286,6 +344,22 @@ func (r *CoderRunReconciler) commentAlreadyDoneHold(ctx context.Context, run *co
 		log.FromContext(ctx).V(1).Info("recording the source-issue hold comment failed",
 			"run", run.Name, "error", err.Error())
 	}
+}
+
+// recordAnnouncementNotDelivered records in memory that this run's outcome was
+// not announced on its source work item, with the reason it could not be:
+// no configured comment identity, or a failed delivery. The False status is
+// deliberate — a run must never read as announced when no comment can reach
+// the work item (#727) — while delivery stays best-effort and the settlement
+// unchanged. The caller persists it with the status patch that follows.
+func (r *CoderRunReconciler) recordAnnouncementNotDelivered(run *courierv1alpha1.CoderRun, reason, detail string) {
+	apimeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
+		Type:               sourceCloseCommentedCondition,
+		Status:             metav1.ConditionFalse,
+		Reason:             reason,
+		Message:            boundedAlreadyDoneText(alreadyDoneCommentRedactor.Redact(detail)),
+		LastTransitionTime: metav1.NewTime(r.clock()),
+	})
 }
 
 // refreshFencedNoChange re-reads the run through the uncached reader and
@@ -328,12 +402,17 @@ func (r *CoderRunReconciler) markAlreadyDoneCommented(run *courierv1alpha1.Coder
 }
 
 // alreadyDoneCommentBody renders the bounded operator notification about the
-// run's close outcome. It carries the coordinator's assessment and its grounded
-// criteria so a human reviewer can verify the conclusion against the
-// repository, and it names the source's answer when the close was not applied.
-func alreadyDoneCommentBody(run *courierv1alpha1.CoderRun, closed bool, reason string, resolution source.CloseResolution) string {
+// run's close outcome. The structured facts come first: the source-pinned
+// verification revision — linked to the forge when the linker can render it —
+// and the grounded criteria, each path linked at that exact revision, so a
+// hard truncation costs the free-form coordinator assessment, never the links.
+// Every non-operator fragment — the coordinator's evidence and criterion text,
+// each path, the source's resolution detail, and the evidence digest — passes
+// through the redactor before it reaches the forge; constant operator prose
+// never does.
+func alreadyDoneCommentBody(run *courierv1alpha1.CoderRun, closed bool, reason string, resolution source.CloseResolution, links WorkItemLinker) string {
 	var b strings.Builder
-	detail := closeResolutionDetail(resolution)
+	detail := alreadyDoneCommentRedactor.Redact(closeResolutionDetail(resolution))
 	if closed {
 		b.WriteString("Courier closed this work item: its request is already satisfied by existing work.")
 	} else {
@@ -343,21 +422,64 @@ func alreadyDoneCommentBody(run *courierv1alpha1.CoderRun, closed bool, reason s
 		}
 		b.WriteString("; a human has been asked to review.")
 	}
-	if nc := run.Status.NoChange; nc != nil {
-		if nc.Evidence != "" {
-			b.WriteString(" Coordinator assessment: " + nc.Evidence + ".")
+	// A revision is used only when it is plain hex: as text or as part of a
+	// link, anything else could carry markup or credential-shaped text into
+	// the comment, so an irregular value is treated as no pinned revision at
+	// all — the block and the path links are omitted rather than trusted.
+	sha := strings.TrimSpace(resolution.HeadSHA)
+	if !isRevisionText(sha) {
+		sha = ""
+	}
+	if sha != "" {
+		revision := sha
+		if repo := run.Spec.Repo; repo != "" {
+			revision = repo + "@" + sha
 		}
+		if links != nil {
+			if link := links.CommitLink(run.Spec.Repo, sha); link != "" {
+				revision = "[" + revision + "](" + link + ")"
+			}
+		}
+		b.WriteString(" Verified at " + revision + ".")
+		if digest := strings.TrimSpace(resolution.EvidenceDigest); digest != "" {
+			b.WriteString(" Evidence catalog: " + alreadyDoneCommentRedactor.Redact(digest) + ".")
+		}
+	}
+	if nc := run.Status.NoChange; nc != nil {
 		if len(nc.Criteria) > 0 {
-			b.WriteString(" Grounded criteria:")
+			b.WriteString(" Grounded criteria: ")
 			for i, c := range nc.Criteria {
 				if i > 0 {
 					b.WriteString(", ")
 				}
-				b.WriteString(fmt.Sprintf("%s (in %s)", c.Criterion, c.Path))
+				// Only a path that the redactor returns unchanged may be linked:
+				// a redacted path is credential-shaped, and its placeholder must
+				// not travel into an href either.
+				path := alreadyDoneCommentRedactor.Redact(c.Path)
+				if links != nil && sha != "" && path == c.Path {
+					if link := links.FileLink(run.Spec.Repo, path, sha); link != "" {
+						path = "[" + path + "](" + link + ")"
+					}
+				}
+				b.WriteString(fmt.Sprintf("%s (in %s)", alreadyDoneCommentRedactor.Redact(c.Criterion), path))
 			}
+		}
+		if nc.Evidence != "" {
+			b.WriteString(" Coordinator assessment: " + alreadyDoneCommentRedactor.Redact(nc.Evidence) + ".")
 		}
 	}
 	return boundAlreadyDoneComment(b.String())
+}
+
+// isRevisionText reports whether a source-reported revision is plain hex
+// (either case), the only shape safe to render as announcement text.
+func isRevisionText(s string) bool {
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return false
+		}
+	}
+	return s != ""
 }
 
 // boundAlreadyDoneComment trims and hard-truncates a notification body on a
@@ -416,6 +538,16 @@ func closeResolutionDetail(resolution source.CloseResolution) string {
 // bounded message.
 func closeResolutionFromDetail(detail string) source.CloseResolution {
 	return source.CloseResolution{Reason: detail}
+}
+
+// closeResolutionIsZero reports whether a resolution carries no source answer
+// at all, so a park can substitute the detail string for it.
+func closeResolutionIsZero(resolution source.CloseResolution) bool {
+	return resolution.Action == "" &&
+		resolution.Reason == "" &&
+		len(resolution.Reasons) == 0 &&
+		resolution.HeadSHA == "" &&
+		resolution.EvidenceDigest == ""
 }
 
 // alreadyDoneCloseParkMessage is the source-facing explanation a run parked for

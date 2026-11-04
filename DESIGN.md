@@ -400,11 +400,23 @@ on the run branch; the declaration never substitutes for that check (#169):
   ordinary `blocked` report as the supported non-executable hold — never a
   fabricated in-review or publication claim. A resolve-issue no-change ending
   without a grounded proposal is evidence-incomplete and parks **NeedsHuman**
-  directly. Each settled outcome is announced once per run on the source work
-  item by an operator-authored comment through the forge `comment-work-item`
-  capability, so an operator learns why no PR exists without reading CoderRuns
-  or pod logs; delivery is best-effort, and announce-once is marked by the
-  `SourceCloseCommented` condition. A fix-pr run is settled against the world
+   directly. Each settled outcome is announced once per run on the source work
+   item by an operator-authored comment through the forge `comment-work-item`
+   capability, so an operator learns why no PR exists without reading CoderRuns
+   or pod logs. The comment writer is an explicitly configured forge write
+   identity (`--work-item-comment-credential-secret`), never the observer's
+   read credential: with no such identity configured, nothing posts and the
+   run records why. Delivery is best-effort, but never silently unclaimed:
+   `SourceCloseCommented` is True only after a successful post, and False with
+   the reason when no identity exists or delivery fails. The announcement
+   carries structured links rendered only from trusted fields — the source's
+   pinned verification revision (`closeResolution.headSha`) linked to the
+   forge web front, each grounded criterion path linked at that exact
+   revision, and the source's evidence digest — never from the model's
+   free-form text, and a path the provider cannot render safely appears as
+   plain text. Every non-operator fragment — model evidence, criterion text
+   and paths, and the source's resolution detail — passes through the
+   credential redactor before it can reach the forge. A fix-pr run is settled against the world
   through **Verifying**: a merged/already-addressed pull request reaches
   **Done**; an open pull request with stable green checks reaches recoverable
   **BlockedExternal** because CI cannot verify queued feedback resolution.

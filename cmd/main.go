@@ -79,6 +79,8 @@ func main() {
 	var githubTokenKey string
 	var observerCredentialSecret string
 	var observerCredentialKey string
+	var workItemCommentCredentialSecret string
+	var workItemCommentCredentialKey string
 	var executorEnvironmentSecret string
 	var gitAuthorName string
 	var gitAuthorEmail string
@@ -141,6 +143,8 @@ func main() {
 	flag.StringVar(&githubTokenKey, "github-token-key", "", "Optional key in the GitHub API credential Secret; empty falls back to --git-token-key or token.")
 	flag.StringVar(&observerCredentialSecret, "observer-credential-secret", "", "Optional Secret carrying the trusted operator's own forge credential; when set it wins over --github-credential-secret and --git-credential-secret for operator observation and is never injected into coordinator pods (#638).")
 	flag.StringVar(&observerCredentialKey, "observer-credential-key", "", "Optional key in the observer credential Secret; requires --observer-credential-secret; empty falls back to --github-token-key, --git-token-key, or token.")
+	flag.StringVar(&workItemCommentCredentialSecret, "work-item-comment-credential-secret", "", "Secret carrying the operator's own forge WRITE credential for work-item close announcements; must be configured explicitly — never falls back to the observer/read credential; empty disables the announcement entirely (#727).")
+	flag.StringVar(&workItemCommentCredentialKey, "work-item-comment-credential-key", "", "Optional key in the work-item comment credential Secret; requires --work-item-comment-credential-secret.")
 	flag.StringVar(&executorEnvironmentSecret, "executor-environment-secret", "", "Optional Secret exposed as coordinator environment variables for model/provider configuration.")
 	flag.StringVar(&gitAuthorName, "git-author-name", defaults.Git.AuthorName, "Git author name rendered into operator-created coordinator pods; empty falls back to the explicit default. Separate from any forge authentication identity (#317).")
 	flag.StringVar(&gitAuthorEmail, "git-author-email", defaults.Git.AuthorEmail, "Git author email rendered into operator-created coordinator pods; empty falls back to the explicit default. Forge attribution requires an account-associated email (#317).")
@@ -476,6 +480,25 @@ func main() {
 		setupLog.Error(err, "unable to configure the operator forge credential")
 		os.Exit(1)
 	}
+	// The work-item close announcement posts through the operator's own
+	// forge WRITE identity (#727): it is a separately configured credential,
+	// never a reuse of the observer's read identity, and it is built by its
+	// own call with no fallback chain. An empty Secret leaves the whole
+	// announcement disabled: nothing posts and nothing is ever claimed. The
+	// call is made before the read-observer variable below, which shadows the
+	// constructor name for the rest of main.
+	if err := resolveWorkItemCommentCredential(workItemCommentCredentialSecret, workItemCommentCredentialKey); err != nil {
+		setupLog.Error(err, "unable to configure the work-item comment identity")
+		os.Exit(1)
+	}
+	commentObserver, err := githubObserver(startupCtx, mgr.GetAPIReader(), os.Getenv("POD_NAMESPACE"), workItemCommentCredentialSecret, workItemCommentCredentialKey, forgeRegistry)
+	if err != nil {
+		setupLog.Error(err, "unable to configure the work-item comment identity")
+		os.Exit(1)
+	}
+	if commentObserver == nil {
+		setupLog.Info("work-item close announcements disabled; no --work-item-comment-credential-secret configured")
+	}
 
 	githubObserver, err := githubObserver(startupCtx, mgr.GetAPIReader(), os.Getenv("POD_NAMESPACE"), operatorCredentialSecret, operatorCredentialKey, forgeRegistry)
 	if err != nil {
@@ -727,7 +750,8 @@ func main() {
 		StatusWriter:               status.KubePatchWriter{Client: mgr.GetClient()},
 		Observer:                   githubObserver,
 		PullRequests:               pullRequestReader(githubObserver),
-		WorkItemComments:           workItemCommenter(githubObserver),
+		WorkItemComments:           workItemCommenter(commentObserver),
+		WorkItemLinks:              workItemLinker(commentObserver),
 		Events:                     runEvents,
 		Evidence:                   evidenceIntake,
 		PRHeadResolver:             existingPRHeadResolver(githubObserver),
@@ -820,14 +844,15 @@ func pullRequestReader(observer controller.WorldObserver) controller.PullRequest
 }
 
 // workItemCommenter gives the reconciler its best-effort source-issue comment
-// delivery for an already-done run's evidence-gated close. It routes each
-// comment through the observer's repository-selected forge provider — the same
-// endpoint and identity routing a pull-request read uses — so an enterprise
-// registration's comment never leaves for the public API. The core never
-// receives a forge-specific client: only the WorkItemCommenter seam and the
-// forge capability it drives. Nil when the observer is not a GitHub observer or
-// carries no client, so a deployment without a forge write path skips the
-// notification entirely; the close settlement itself is unaffected.
+// delivery for an already-done run's evidence-gated close. The observer it
+// receives is the explicitly configured work-item comment identity, built from
+// its own credential Secret: it never falls back to the read observer's
+// credential, and a deployment without it is nil here, so it posts nothing
+// and never claims an announcement (#727). Each comment routes through the
+// identity's repository-selected forge provider — the same endpoint routing a
+// pull-request read uses — so an enterprise registration's comment never
+// leaves for the public API. The core never receives a forge-specific client:
+// only the WorkItemCommenter seam and the forge capability it drives.
 func workItemCommenter(observer controller.WorldObserver) controller.WorkItemCommenter {
 	githubObserver, ok := observer.(couriergithub.Observer)
 	if !ok || githubObserver.Client == nil {
@@ -836,9 +861,31 @@ func workItemCommenter(observer controller.WorldObserver) controller.WorkItemCom
 	return alreadyDoneCommenter{observer: githubObserver}
 }
 
+// workItemLinker gives the reconciler the forge-web link renderer the
+// announcement carries, driven by the same explicitly configured comment
+// identity as the commenter above. It returns the observer as the
+// WorkItemLinker seam when it implements it (the GitHub observer does,
+// routed to the endpoint serving each repository), and nil otherwise, so a
+// deployment without the comment identity renders plain text, never a
+// half-built link (#727).
+func workItemLinker(observer controller.WorldObserver) controller.WorkItemLinker {
+	linker, ok := observer.(controller.WorkItemLinker)
+	if !ok {
+		return nil
+	}
+	githubObserver, ok := observer.(couriergithub.Observer)
+	if !ok || githubObserver.Client == nil {
+		return nil
+	}
+	return linker
+}
+
 // alreadyDoneCommenter posts an already-done run's close notification to its
-// source work item through the observer's repository-selected forge provider.
-// It implements the reconciler's best-effort WorkItemCommenter seam.
+// source work item through the explicitly configured comment identity's
+// repository-selected forge provider. It implements the reconciler's
+// best-effort WorkItemCommenter seam; the write is attempted only when the
+// resolved provider explicitly offers the comment-work-item capability, so
+// the capability is checked at the seam rather than assumed.
 type alreadyDoneCommenter struct {
 	observer couriergithub.Observer
 }
@@ -853,6 +900,9 @@ func (c alreadyDoneCommenter) CommentWorkItem(ctx context.Context, run *courierv
 	provider, err := c.observer.ProviderForRepository(repo)
 	if err != nil {
 		return err
+	}
+	if !provider.Capabilities().Available(forge.CapabilityCommentWorkItem).Available {
+		return fmt.Errorf("already-done comment: provider for %s does not offer the comment-work-item capability", repo)
 	}
 	ref := forge.WorkItemRef{Repo: repo, ID: strconv.Itoa(run.Spec.Ref)}
 	_, err = provider.CommentWorkItem(ctx, ref, body)
@@ -1136,6 +1186,19 @@ func resolveOperatorForgeCredential(observerSecret, observerKey, githubSecret, g
 		key = strings.TrimSpace(gitKey)
 	}
 	return secret, key, nil
+}
+
+// resolveWorkItemCommentCredential validates the explicitly configured
+// work-item comment credential pair (#727). Unlike the read credential, this
+// identity has no fallback chain: the pair is exactly the two flags, empty
+// disables the announcement, and a key without its Secret would silently
+// re-key some other Secret, so it is a startup error rather than a runtime
+// surprise.
+func resolveWorkItemCommentCredential(secret, key string) error {
+	if strings.TrimSpace(key) != "" && strings.TrimSpace(secret) == "" {
+		return fmt.Errorf("--work-item-comment-credential-key requires --work-item-comment-credential-secret")
+	}
+	return nil
 }
 
 // loadGitHubToken reads the resolved operator forge credential from the named
