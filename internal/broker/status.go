@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -49,6 +50,12 @@ type HarnessPatch struct {
 	// a stale incarnation cannot record a result, one incarnation's recorded
 	// result is final, and a replacement incarnation records its own.
 	TerminalResult *courier.NativeResult `json:"terminalResult,omitempty"`
+	// NoChange persists a resolve-issue run's grounded no-change close
+	// proposal (#720). writer fences it authenticated control incarnation
+	// exactly like TerminalResult: stale incarnation cannot record one, one
+	// incarnation's recorded proposal is final, and replacement incarnation
+	// records its own.
+	NoChange *courier.NoChangeClose `json:"noChange,omitempty"`
 }
 
 // OperationAddition carries the operation ID (the map key) and the entry.
@@ -98,7 +105,7 @@ func (w *StatusWriter) Write(ctx context.Context, identity StatusIdentity, patch
 	}
 	if patch.Checkpoint == nil && patch.Heartbeat == nil && patch.LastCommit == nil &&
 		patch.AddOperation == nil && patch.ClearOperation == "" && !patch.ReconcileOperations &&
-		patch.ControlRequestAck == nil && patch.TerminalResult == nil {
+		patch.ControlRequestAck == nil && patch.TerminalResult == nil && patch.NoChange == nil {
 		return fmt.Errorf("empty harness status patch")
 	}
 	// An acknowledgement names the request it acknowledges and carries its
@@ -118,6 +125,19 @@ func (w *StatusWriter) Write(ctx context.Context, identity StatusIdentity, patch
 		}
 		if patch.TerminalResult.CoordinatorPodUID != string(identity.ControlPodUID) {
 			return fmt.Errorf("terminal result UID does not match the authenticated control incarnation")
+		}
+	}
+	// A close proposal must carry grounded criterion rows within bounds, its
+	// own time, and the authenticated control incarnation's UID: the fence
+	// keeps a stale or foreign writer from recording a conclusion for this
+	// run (#720). The set-once check against the fresh run runs inside the
+	// CAS loop below.
+	if patch.NoChange != nil {
+		if err := validNoChange(patch.NoChange); err != nil {
+			return err
+		}
+		if patch.NoChange.CoordinatorPodUID != string(identity.ControlPodUID) {
+			return fmt.Errorf("no-change close UID does not match the authenticated control incarnation")
 		}
 	}
 	if patch.LastCommit != nil && validate == nil {
@@ -228,6 +248,18 @@ func (w *StatusWriter) Write(ctx context.Context, identity StatusIdentity, patch
 			}
 			run.Status.NativeResult = patch.TerminalResult.DeepCopy()
 		}
+		if patch.NoChange != nil {
+			// Set-once per incarnation, mirroring the terminal result: the
+			// identical rewrite is the idempotent retry, a different proposal
+			// for the same incarnation is refused, and a replacement
+			// incarnation records its own (#720).
+			if existing := run.Status.NoChange; existing != nil && existing.CoordinatorPodUID == patch.NoChange.CoordinatorPodUID {
+				if !sameNoChange(existing, patch.NoChange) {
+					return fmt.Errorf("a no-change close is already recorded for this control incarnation")
+				}
+			}
+			run.Status.NoChange = patch.NoChange.DeepCopy()
+		}
 		if patch.ReconcileOperations {
 			run.Status.ActiveOperations = nil
 		}
@@ -325,6 +357,61 @@ func validTerminalResult(result *courier.NativeResult) error {
 // so the idempotent retry of one write resolves cleanly.
 func sameTerminalResult(a, b *courier.NativeResult) bool {
 	return a.Kind == b.Kind && a.Reason == b.Reason && a.CoordinatorPodUID == b.CoordinatorPodUID && a.At.Equal(&b.At)
+}
+
+// validNoChange checks one close proposal's structure against the API bounds
+// (#720): grounded criterion rows within count and field bounds, evidence
+// within its bound, a timestamp, and a UID that is checked against the
+// authenticated identity by the caller. Byte length is used for the ceilings
+// so the broker fails closed ahead of any apiserver truncation difference;
+// Unicode code points are used for the excerpt floor, mirroring the CRD's
+// MinLength.
+func validNoChange(proposal *courier.NoChangeClose) error {
+	if len(proposal.Criteria) < 1 || len(proposal.Criteria) > courier.MaxNoChangeCriteria {
+		return fmt.Errorf("no-change close criterion count is out of bounds")
+	}
+	if len(proposal.Evidence) > courier.MaxNoChangeEvidenceBytes {
+		return fmt.Errorf("no-change close evidence exceeds its bound")
+	}
+	if proposal.At.IsZero() {
+		return fmt.Errorf("no-change close carries no time")
+	}
+	if proposal.CoordinatorPodUID == "" || len(proposal.CoordinatorPodUID) > 128 {
+		return fmt.Errorf("no-change close UID is malformed")
+	}
+	for _, criterion := range proposal.Criteria {
+		if criterion.Criterion == "" || len(criterion.Criterion) > courier.MaxNoChangeCriterionBytes {
+			return fmt.Errorf("no-change close criterion text is out of bounds")
+		}
+		// The path ceiling mirrors the CRD MaxLength=1024; no named constant
+		// exists there.
+		if criterion.Path == "" || len(criterion.Path) > 1024 {
+			return fmt.Errorf("no-change close criterion path is out of bounds")
+		}
+		if utf8.RuneCountInString(criterion.Excerpt) < courier.MinNoChangeExcerptBytes ||
+			len(criterion.Excerpt) > courier.MaxNoChangeExcerptBytes {
+			return fmt.Errorf("no-change close excerpt is out of bounds")
+		}
+	}
+	return nil
+}
+
+// sameNoChange reports whether two records of one incarnation's close
+// proposal carry identical content. Timestamps compare as instants, so the
+// idempotent retry of one write resolves cleanly.
+func sameNoChange(a, b *courier.NoChangeClose) bool {
+	if a.CoordinatorPodUID != b.CoordinatorPodUID || !a.At.Equal(&b.At) || a.Evidence != b.Evidence {
+		return false
+	}
+	if len(a.Criteria) != len(b.Criteria) {
+		return false
+	}
+	for i := range a.Criteria {
+		if a.Criteria[i] != b.Criteria[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // maxActiveOperations bounds the per-run active-operation set. It is a fixed

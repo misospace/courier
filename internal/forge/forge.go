@@ -37,6 +37,7 @@ const (
 	CapabilityCreatePullRequest Capability = "create-pull-request"
 	CapabilityUpdatePullRequest Capability = "update-pull-request"
 	CapabilityComment           Capability = "comment"
+	CapabilityCommentWorkItem   Capability = "comment-work-item"
 
 	CapabilityListWorkItemsByLabel Capability = "list-work-items-by-label"
 	CapabilityRemoveWorkItemLabel  Capability = "remove-work-item-label"
@@ -55,6 +56,7 @@ var knownCapabilities = map[Capability]struct{}{
 	CapabilityCreatePullRequest:    {},
 	CapabilityUpdatePullRequest:    {},
 	CapabilityComment:              {},
+	CapabilityCommentWorkItem:      {},
 	CapabilityListWorkItemsByLabel: {},
 	CapabilityRemoveWorkItemLabel:  {},
 }
@@ -390,4 +392,6 @@ type Provider interface {
 	UpdatePullRequest(context.Context, PullRequestRef, UpdatePullRequestInput) (PullRequest, error)
 	// CommentPullRequest adds a comment to a pull/merge request.
 	CommentPullRequest(context.Context, PullRequestRef, string /* body */) (Comment, error)
+	// CommentWorkItem adds a comment to a work item (issue/ticket).
+	CommentWorkItem(context.Context, WorkItemRef, string /* body */) (Comment, error)
 }

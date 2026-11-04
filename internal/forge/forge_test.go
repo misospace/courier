@@ -119,6 +119,13 @@ func (s *stubProvider) CommentPullRequest(ctx context.Context, ref PullRequestRe
 	return c, nil
 }
 
+func (s *stubProvider) CommentWorkItem(ctx context.Context, ref WorkItemRef, body string) (Comment, error) {
+	if !s.caps.Has(CapabilityCommentWorkItem) {
+		return Comment{}, ErrUnsupported
+	}
+	return Comment{ID: "c1", Author: "stub", Body: body}, nil
+}
+
 func TestStubProviderSatisfiesContract(t *testing.T) {
 	stub := &stubProvider{
 		cfg: ProviderConfig{
@@ -314,6 +321,7 @@ func TestCapabilityVocabularyIsClosed(t *testing.T) {
 		CapabilityCreatePullRequest,
 		CapabilityUpdatePullRequest,
 		CapabilityComment,
+		CapabilityCommentWorkItem,
 	}
 	// Every exported constant is in the closed vocabulary.
 	for _, cap := range all {

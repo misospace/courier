@@ -40,6 +40,13 @@ type ReporterClient interface {
 	Report(context.Context, string, source.Lifecycle) error
 }
 
+// CloseReporterClient is the optional Dispatch API capability used to settle
+// evidence-grounded already-done close proposals (#720) through Dispatch's
+// close-gated task report.
+type CloseReporterClient interface {
+	ReportClose(context.Context, string, source.Lifecycle) (source.CloseResolution, error)
+}
+
 // PreLauncherClient is the optional Dispatch API capability used to revalidate
 // claimed work immediately before coordinator launch.
 type PreLauncherClient interface {
@@ -102,6 +109,7 @@ type DispatchAdapter = Adapter
 
 var _ source.Adapter = (*Adapter)(nil)
 var _ source.Reporter = (*Adapter)(nil)
+var _ source.CloseReporter = (*Adapter)(nil)
 var _ source.PreLauncher = (*Adapter)(nil)
 var _ source.HandoutAcker = (*Adapter)(nil)
 var _ source.WorkIdentifier = (*Adapter)(nil)
@@ -402,6 +410,22 @@ func (a *Adapter) Report(ctx context.Context, item source.WorkItem, lifecycle so
 		return errors.New("dispatch source: client does not support lifecycle reports")
 	}
 	return reporter.Report(ctx, item.ID, lifecycle)
+}
+
+// ReportClose settles an evidence-grounded already-done conclusion through
+// Dispatch's close policy. A client without the close-report seam cannot
+// authorize closure, so the adapter reports the missing capability instead
+// of imitating settlement with an ordinary lifecycle report, which the
+// source contract forbids.
+func (a *Adapter) ReportClose(ctx context.Context, item source.WorkItem, lifecycle source.Lifecycle) (source.CloseResolution, error) {
+	if err := a.validate(item); err != nil {
+		return source.CloseResolution{}, err
+	}
+	reporter, ok := a.client.(CloseReporterClient)
+	if !ok {
+		return source.CloseResolution{}, errors.New("dispatch source: client does not support close reports")
+	}
+	return reporter.ReportClose(ctx, item.ID, lifecycle)
 }
 
 // Resolve closes successfully completed work in Dispatch.

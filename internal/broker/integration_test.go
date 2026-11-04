@@ -100,6 +100,9 @@ func (f *integrationForge) UpdatePullRequest(_ context.Context, ref forge.PullRe
 func (f *integrationForge) CommentPullRequest(context.Context, forge.PullRequestRef, string) (forge.Comment, error) {
 	return forge.Comment{}, forge.ErrUnsupported
 }
+func (f *integrationForge) CommentWorkItem(context.Context, forge.WorkItemRef, string) (forge.Comment, error) {
+	return forge.Comment{}, forge.ErrUnsupported
+}
 func (f *integrationForge) ListPullRequestsByHead(_ context.Context, base forge.PullRequestRef, repo, ref string) ([]forge.PullRequest, error) {
 	var result []forge.PullRequest
 	for _, pr := range f.prs {

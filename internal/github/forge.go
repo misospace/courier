@@ -73,6 +73,7 @@ func NewProvider(cfg forge.ProviderConfig, client *Client) *Provider {
 			forge.CapabilityCreatePullRequest,
 			forge.CapabilityUpdatePullRequest,
 			forge.CapabilityComment,
+			forge.CapabilityCommentWorkItem,
 			forge.CapabilityListWorkItemsByLabel,
 			forge.CapabilityRemoveWorkItemLabel,
 		),
@@ -357,6 +358,23 @@ func (p *Provider) CommentPullRequest(ctx context.Context, ref forge.PullRequest
 		return forge.Comment{}, err
 	}
 	c, err := p.client.AddComment(ctx, owner, repo, ref.Number, body)
+	if err != nil {
+		return forge.Comment{}, boundaryError(err)
+	}
+	return forge.Comment{ID: strconv.FormatInt(c.ID, 10), Body: c.Body, URL: c.HTMLURL}, nil
+}
+
+// CommentWorkItem adds a comment to a work item (issue/ticket).
+func (p *Provider) CommentWorkItem(ctx context.Context, ref forge.WorkItemRef, body string) (forge.Comment, error) {
+	owner, repo, err := splitRepository(ref.Repo)
+	if err != nil {
+		return forge.Comment{}, err
+	}
+	number, err := strconv.Atoi(strings.TrimSpace(ref.ID))
+	if err != nil || number < 1 {
+		return forge.Comment{}, fmt.Errorf("GitHub work item ID must be a positive issue number, got %q", ref.ID)
+	}
+	c, err := p.client.AddComment(ctx, owner, repo, number, body)
 	if err != nil {
 		return forge.Comment{}, boundaryError(err)
 	}

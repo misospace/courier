@@ -506,7 +506,7 @@ func TestPersistTerminalResultWritesThroughTheTrustedPath(t *testing.T) {
 		persistTerminalResult(terminationFor(executor.HarnessResult{
 			Kind:   courierv1alpha1.NativeResultInfrastructureFailed,
 			Reason: result.Reason,
-		}), harness.NewStatusReporter(transport, "control-kube-uid", "worker", 0), identity)
+		}), nil, harness.NewStatusReporter(transport, "control-kube-uid", "worker", 0), identity)
 		if len(transport.patches) != 1 || transport.patches[0].TerminalResult == nil ||
 			transport.patches[0].TerminalResult.Kind != courierv1alpha1.NativeResultInfrastructureFailed ||
 			transport.patches[0].TerminalResult.CoordinatorPodUID != "control-kube-uid" {
@@ -518,14 +518,14 @@ func TestPersistTerminalResultWritesThroughTheTrustedPath(t *testing.T) {
 		persistTerminalResult(terminationFor(executor.HarnessResult{
 			Kind:   courierv1alpha1.NativeResultInfrastructureFailed,
 			Reason: result.Reason,
-		}), harness.NewStatusReporter(transport, "control-kube-uid", "worker", 0), identity)
+		}), nil, harness.NewStatusReporter(transport, "control-kube-uid", "worker", 0), identity)
 		if len(transport.patches) == 0 {
 			t.Fatal("no write attempt was made")
 		}
 	})
 	t.Run("kindless payload writes nothing", func(t *testing.T) {
 		transport := &recordingTransport{}
-		persistTerminalResult(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "x"}, harness.NewStatusReporter(transport, "control-kube-uid", "worker", 0), identity)
+		persistTerminalResult(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "x"}, nil, harness.NewStatusReporter(transport, "control-kube-uid", "worker", 0), identity)
 		if len(transport.patches) != 0 {
 			t.Fatalf("patches = %d, want none for a legacy-shaped payload", len(transport.patches))
 		}
@@ -578,7 +578,7 @@ func TestPersistTerminalResultKeepsModelTextOutOfDurableReason(t *testing.T) {
 				t.Fatalf("handoff reason %q lost the coordinator's declared text — the termination handoff is the surface for it", payload.Reason)
 			}
 			transport := &recordingTransport{}
-			persistTerminalResult(payload, harness.NewStatusReporter(transport, "control-kube-uid", "worker", 0), identity)
+			persistTerminalResult(payload, nil, harness.NewStatusReporter(transport, "control-kube-uid", "worker", 0), identity)
 			if len(transport.patches) != 1 || transport.patches[0].TerminalResult == nil {
 				t.Fatalf("persisted patches = %#v, want exactly one terminal result", transport.patches)
 			}

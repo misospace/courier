@@ -175,6 +175,13 @@ type HarnessResult struct {
 	Reason          string
 	Err             error
 	WorkspaceSafety *WorkspaceSafetyEvidence
+	// NoChange carries a grounded close proposal parsed from a
+	// no_change_needed declaration (#720): the per-criterion excerpts and the
+	// declared free-form evidence, already bounds-checked by the parser. It is
+	// model data, never closure authorization: trusted control persists it to
+	// status.noChange only for a resolve-issue no-change ending, and the
+	// source re-verifies every excerpt itself.
+	NoChange *courierv1alpha1.NoChangeClose
 }
 
 // WorkspaceSafetyEvidence is trusted executor evidence, never a model claim.
@@ -236,6 +243,15 @@ const publicationContract = "Publish only to the run branch: commit on, push, an
 // outcomeContract tells the coordinator to declare how the run ended in the
 // supplied per-run scratch file, keeping the handoff outside the target repo.
 const outcomeContract = "You own this run's completion end to end, and you exercise it by declaring an outcome: write JSON to %s — {\"outcome\":\"changes\"} once your work is committed and pushed to the run branch; {\"outcome\":\"no_change_needed\",\"evidence\":\"...\"} when the work is already done, citing the evidence; {\"outcome\":\"needs_decision\",\"question\":\"...\"} only for a decision you cannot make yourself; {\"outcome\":\"blocked_external\",\"missing\":\"...\"} when something outside this run is missing. A run that ends without a valid declaration fails as incomplete."
+
+// noChangeCloseContract documents the optional grounded close proposal a
+// resolve-issue coordinator may attach to a no_change_needed declaration
+// (#720): each acceptance criterion pinned to a verbatim repository excerpt
+// the source re-reads at its current default-branch HEAD and re-verifies
+// itself. It renders only into the resolve-issue goal; every other mode's
+// goal stays byte-identical, and the proposal is model data that authorizes
+// nothing on its own.
+const noChangeCloseContract = "When you declare no_change_needed because the ask is already satisfied by existing work, ground the conclusion with \"close\":{\"criteria\":[{\"criterion\":\"<acceptance criterion this row grounds>\",\"path\":\"<repo-relative file path>\",\"excerpt\":\"<24-300 character excerpt taken verbatim from that file at the default-branch HEAD>\"}]}: re-read each file at its current default-branch HEAD and quote the excerpt verbatim, because the source re-reads the file and re-verifies every excerpt itself; free-form evidence alone authorizes nothing."
 
 const outcomeFilename = "outcome.json"
 
@@ -327,7 +343,7 @@ func GoalWithContribution(run *courierv1alpha1.CoderRun, contribution Contributi
 	assignment := assignmentContextContract(run)
 	switch run.Spec.Mode {
 	case courierv1alpha1.ModeResolveIssue:
-		return fmt.Sprintf("Open a PR to address issue #%d.%s %s %s %s%s %s %s", run.Spec.Ref, assignment, forgeContract, completionContract, localValidationContract, publication, publicationBlockGrammar, fmt.Sprintf(outcomeContract, outcomeFile)) + repairContract(run), nil
+		return fmt.Sprintf("Open a PR to address issue #%d.%s %s %s %s%s %s %s %s", run.Spec.Ref, assignment, forgeContract, completionContract, localValidationContract, publication, publicationBlockGrammar, fmt.Sprintf(outcomeContract, outcomeFile), noChangeCloseContract) + repairContract(run), nil
 	case courierv1alpha1.ModeFixPR:
 		return fmt.Sprintf("Take over PR #%d.%s Inspect the current pull request state, CI/checks, and existing review feedback to determine what work is needed; address feedback already present without repeatedly searching for new reviews. %s %s %s%s %s", run.Spec.Ref, assignment, forgeContract, completionContract, localValidationContract, publication, fmt.Sprintf(outcomeContract, outcomeFile)) + repairContract(run), nil
 	case courierv1alpha1.ModeRebase:

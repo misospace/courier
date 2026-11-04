@@ -80,6 +80,10 @@ func (f *fakeProvider) CommentPullRequest(context.Context, forge.PullRequestRef,
 	return forge.Comment{}, forge.ErrUnsupported
 }
 
+func (f *fakeProvider) CommentWorkItem(context.Context, forge.WorkItemRef, string) (forge.Comment, error) {
+	return forge.Comment{}, forge.ErrUnsupported
+}
+
 func (f *fakeProvider) ListWorkItemsByLabel(_ context.Context, repo, label string, kind forge.WorkItemKind) ([]forge.WorkItem, error) {
 	if !f.caps.Has(forge.CapabilityListWorkItemsByLabel) {
 		return nil, forge.ErrUnsupported
@@ -146,6 +150,9 @@ func (plainProvider) UpdatePullRequest(context.Context, forge.PullRequestRef, fo
 }
 
 func (plainProvider) CommentPullRequest(context.Context, forge.PullRequestRef, string) (forge.Comment, error) {
+	return forge.Comment{}, forge.ErrUnsupported
+}
+func (plainProvider) CommentWorkItem(context.Context, forge.WorkItemRef, string) (forge.Comment, error) {
 	return forge.Comment{}, forge.ErrUnsupported
 }
 

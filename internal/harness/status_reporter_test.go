@@ -243,6 +243,12 @@ func TestStatusPatchWireContract(t *testing.T) {
 			CoordinatorPodUID: testControlUID,
 			At:                metav1Now(),
 		},
+		NoChange: &courierv1alpha1.NoChangeClose{
+			Criteria:          []courierv1alpha1.NoChangeCloseCriterion{{Criterion: "ask is met", Path: "docs/why.md", Excerpt: "an excerpt of at least twenty-four bytes"}},
+			Evidence:          "already implemented",
+			CoordinatorPodUID: testControlUID,
+			At:                metav1Now(),
+		},
 	}
 	raw, err := json.Marshal(patch)
 	if err != nil {
@@ -269,6 +275,10 @@ func TestStatusPatchWireContract(t *testing.T) {
 	if decoded.TerminalResult == nil || decoded.TerminalResult.Kind != courierv1alpha1.NativeResultPublished ||
 		decoded.TerminalResult.CoordinatorPodUID != testControlUID {
 		t.Fatalf("decoded terminal result = %#v, want the fenced published kind", decoded.TerminalResult)
+	}
+	if decoded.NoChange == nil || len(decoded.NoChange.Criteria) != 1 ||
+		decoded.NoChange.Criteria[0].Path != "docs/why.md" || decoded.NoChange.CoordinatorPodUID != testControlUID {
+		t.Fatalf("decoded no-change close = %#v, want the fenced grounded proposal", decoded.NoChange)
 	}
 }
 
@@ -710,7 +720,7 @@ func TestStatusReporterTerminalResultPersistsBeforeExit(t *testing.T) {
 		CoordinatorPodUID: testControlUID,
 		At:                metav1Now(),
 	}
-	if err := reporter.TerminalResult(context.Background(), result); err != nil {
+	if err := reporter.TerminalResult(context.Background(), result, nil); err != nil {
 		t.Fatalf("TerminalResult after one transient failure: %v", err)
 	}
 	sent := transport.sent()
@@ -729,7 +739,7 @@ func TestStatusReporterTerminalResultPersistsBeforeExit(t *testing.T) {
 	// An unset kind is the legacy shape: nothing is written, so the absence
 	// of a persisted result never pretends to be one.
 	empty := &recordingStatusTransport{}
-	if err := testReporter(empty).TerminalResult(context.Background(), courierv1alpha1.NativeResult{Reason: "undeclared"}); err != nil {
+	if err := testReporter(empty).TerminalResult(context.Background(), courierv1alpha1.NativeResult{Reason: "undeclared"}, nil); err != nil {
 		t.Fatalf("TerminalResult with no kind: %v", err)
 	}
 	if got := empty.sent(); len(got) != 0 {
@@ -821,7 +831,7 @@ func TestFinishClassifiesTrustedTerminalResults(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			result := coordinator.finish(context.Background(), invocation, tt.outcome, tt.summary)
+			result := coordinator.finish(context.Background(), invocation, tt.outcome, tt.summary, nil)
 			if result.Kind != tt.wantKind {
 				t.Fatalf("kind = %q, want %q (result %+v)", result.Kind, tt.wantKind, result)
 			}

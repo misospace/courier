@@ -53,6 +53,9 @@ func (f *adapterForge) UpdatePullRequest(context.Context, forge.PullRequestRef, 
 func (f *adapterForge) CommentPullRequest(context.Context, forge.PullRequestRef, string) (forge.Comment, error) {
 	return forge.Comment{}, forge.ErrUnsupported
 }
+func (f *adapterForge) CommentWorkItem(context.Context, forge.WorkItemRef, string) (forge.Comment, error) {
+	return forge.Comment{}, forge.ErrUnsupported
+}
 func (f *adapterForge) ListPullRequestsByHead(_ context.Context, base forge.PullRequestRef, repo, ref string) ([]forge.PullRequest, error) {
 	if f.pulls != nil {
 		return f.pulls, nil

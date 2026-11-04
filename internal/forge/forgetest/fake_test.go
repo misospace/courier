@@ -472,6 +472,9 @@ func TestUnregisteredVerbsRefuseAllOperations(t *testing.T) {
 	if _, err := f.CommentPullRequest(ctx, ref, "x"); !errors.Is(err, forge.ErrUnsupported) {
 		t.Fatalf("CommentPullRequest err = %v, want ErrUnsupported", err)
 	}
+	if _, err := f.CommentWorkItem(ctx, forge.WorkItemRef{Repo: "r", ID: "1"}, "x"); !errors.Is(err, forge.ErrUnsupported) {
+		t.Fatalf("CommentWorkItem err = %v, want ErrUnsupported", err)
+	}
 	if _, err := f.ReadPullRequest(ctx, ref); !errors.Is(err, forge.ErrUnsupported) {
 		t.Fatalf("ReadPullRequest err = %v, want ErrUnsupported", err)
 	}
@@ -483,8 +486,36 @@ func TestUnregisteredVerbsRefuseAllOperations(t *testing.T) {
 		t.Fatalf("stored request mutated: %+v", f.PullRequests()[0])
 	}
 	// Refused calls are still recorded.
-	if got := f.WriteCount(); got != 3 {
-		t.Fatalf("WriteCount = %d, want 3 recorded attempts", got)
+	if got := f.WriteCount(); got != 4 {
+		t.Fatalf("WriteCount = %d, want 4 recorded attempts", got)
+	}
+}
+
+func TestCommentWorkItemRecordsAndGates(t *testing.T) {
+	f := forgetest.New(forgetest.Config{
+		Capabilities: []forge.Capability{forge.CapabilityCommentWorkItem},
+		WorkItems: map[forge.WorkItemRef]forge.WorkItem{
+			{Repo: "r", ID: "1"}: {ID: "1", Repo: "r", Title: "t"},
+		},
+	})
+	ctx := context.Background()
+	ref := forge.WorkItemRef{Repo: "r", ID: "1"}
+	comment, err := f.CommentWorkItem(ctx, ref, "run settled")
+	if err != nil {
+		t.Fatalf("CommentWorkItem: %v", err)
+	}
+	if comment.Body != "run settled" || comment.Author != "forgetest" || comment.ID == "" {
+		t.Fatalf("CommentWorkItem = %#v, want body run settled by forgetest with an ID", comment)
+	}
+	want := []forgetest.Op{{Kind: forgetest.OpCommentWorkItem, Repo: "r", WorkItem: ref, Body: "run settled"}}
+	if got := f.OpsOf(forgetest.OpCommentWorkItem); !reflect.DeepEqual(got, want) {
+		t.Fatalf("OpsOf(CommentWorkItem) = %+v, want %+v", got, want)
+	}
+	if got := f.WriteCount(); got != 1 {
+		t.Fatalf("WriteCount = %d, want 1", got)
+	}
+	if _, err := f.CommentWorkItem(ctx, forge.WorkItemRef{Repo: "r", ID: "404"}, "x"); !errors.Is(err, forgetest.ErrNotFound) {
+		t.Fatalf("CommentWorkItem on missing work item err = %v, want ErrNotFound", err)
 	}
 }
 
