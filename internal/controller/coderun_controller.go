@@ -1385,6 +1385,15 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		if run.Spec.Mode == courierv1alpha1.ModeResolveIssue && hasTrusted && trusted.Kind == courierv1alpha1.NativeResultNoChange {
 			var grounded bool
 			phase, grounded = resolveIssueNoChangePhase(run, string(pod.UID))
+			if !grounded {
+				// The fenced pre-exit write can outrun this informer's cache;
+				// consult the API server before declaring the conclusion
+				// evidence-incomplete.
+				grounded = r.refreshFencedNoChange(ctx, run, string(pod.UID))
+				if grounded {
+					phase = courierv1alpha1.PhaseAlreadyDone
+				}
+			}
 			noChangeHold = !grounded
 		}
 		if phase == courierv1alpha1.PhaseVerifying {

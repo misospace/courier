@@ -2,7 +2,6 @@ package controller
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -10,6 +9,7 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
@@ -26,12 +26,17 @@ import (
 const (
 	sourceCloseCondition = "SourceClose"
 
-	sourceCloseClosedReason         = "Closed"
-	sourceCloseRefusedReason        = "Refused"
-	sourceCloseFailedReason         = "Failed"
-	sourceCloseSkippedReason        = "Skipped"
-	sourceCloseUnsupportedReason    = "Unsupported"
-	sourceCloseOwnershipMovedReason = "OwnershipMoved"
+	sourceCloseClosedReason      = "Closed"
+	sourceCloseRefusedReason     = "Refused"
+	sourceCloseFailedReason      = "Failed"
+	sourceCloseSkippedReason     = "Skipped"
+	sourceCloseUnsupportedReason = "Unsupported"
+	// sourceCloseRefusedPermanentlyReason names a durable source refusal of
+	// the close report (a permanent 400/403 classification — which includes
+	// the scope gate's moved-ownership denial among other durable refusals).
+	// The source's own message, kept in the condition and comment detail,
+	// identifies which durable reason it was.
+	sourceCloseRefusedPermanentlyReason = "RefusedPermanently"
 
 	// sourceCloseCommentedCondition marks that the run's settled close
 	// outcome was announced on the source work item. It is set only after a
@@ -86,15 +91,17 @@ func (r *CoderRunReconciler) alreadyDoneLifecycle(run *courierv1alpha1.CoderRun,
 		Error:          intent.error,
 		IdempotencyKey: lifecycleIdempotencyKey(run, courierv1alpha1.PhaseAlreadyDone),
 	}
+	if run.Status.StartedAt != nil {
+		// The reported duration belongs to the settlement path exactly as it
+		// does to every other lifecycle report; copy the time so the lifecycle
+		// never aliases live status.
+		t := run.Status.StartedAt.Time
+		lifecycle.StartedAt = &t
+	}
 	if nc := run.Status.NoChange; nc != nil {
 		lifecycle.Close = &source.CloseProposal{
 			Criteria: toSourceCloseCriteria(nc.Criteria),
 			Evidence: nc.Evidence,
-		}
-	}
-	if run.Status.Telemetry != nil {
-		if raw, err := json.Marshal(run.Status.Telemetry); err == nil {
-			lifecycle.Telemetry = raw
 		}
 	}
 	return lifecycle
@@ -153,7 +160,7 @@ func (r *CoderRunReconciler) settleAlreadyDoneClose(ctx context.Context, run *co
 	case errors.Is(err, source.ErrUnsupportedOutcome):
 		return r.parkAlreadyDoneClose(ctx, run, adapter, item, sourceCloseUnsupportedReason, err.Error())
 	case errors.Is(err, source.ErrPermanentRefusal):
-		return r.parkAlreadyDoneClose(ctx, run, adapter, item, sourceCloseOwnershipMovedReason, err.Error())
+		return r.parkAlreadyDoneClose(ctx, run, adapter, item, sourceCloseRefusedPermanentlyReason, err.Error())
 	default:
 		log.FromContext(ctx).Info("already-done close report failed; will retry",
 			"run", run.Name, "error", err.Error())
@@ -238,7 +245,16 @@ func (r *CoderRunReconciler) commentAlreadyDone(ctx context.Context, run *courie
 			"run", run.Name, "error", err.Error())
 		return
 	}
+	// Persist the announce-once marker immediately, through its own patch and
+	// again through whichever transition or settlement patch follows: a failed
+	// later write must not reopen an unbounded repost loop, so the worst case
+	// is the one duplicate a crash between post and marker patch allows.
+	before := run.DeepCopy()
 	r.markAlreadyDoneCommented(run)
+	if err := r.patchStatus(ctx, before, run); err != nil {
+		log.FromContext(ctx).V(1).Info("recording the already-done announcement failed",
+			"run", run.Name, "error", err.Error())
+	}
 }
 
 // commentAlreadyDoneHold announces an evidence-incomplete no-change hold on
@@ -252,7 +268,13 @@ func (r *CoderRunReconciler) commentAlreadyDoneHold(ctx context.Context, run *co
 	if alreadyDoneCommented(run) {
 		return
 	}
-	body := "Courier will not open a pull request for this issue and did not attempt to close it: the run concluded the request was already satisfied but recorded no grounded close evidence, so the conclusion is held for a human. No publication is claimed."
+	// Name the actual deficiency: nothing grounded, or a proposal left over
+	// from a superseded execution whose fence cannot authorize this ending.
+	deficiency := "recorded no grounded close evidence"
+	if run.Status.NoChange != nil {
+		deficiency = "its recorded close proposal belongs to a superseded execution and cannot authorize this ending"
+	}
+	body := "Courier will not open a pull request for this issue and did not attempt to close it: the run concluded the request was already satisfied but " + deficiency + ", so the conclusion is held for a human. No publication is claimed."
 	before := run.DeepCopy()
 	if err := r.WorkItemComments.CommentWorkItem(ctx, run, body); err != nil {
 		log.FromContext(ctx).V(1).Info("source-issue hold comment failed",
@@ -264,6 +286,24 @@ func (r *CoderRunReconciler) commentAlreadyDoneHold(ctx context.Context, run *co
 		log.FromContext(ctx).V(1).Info("recording the source-issue hold comment failed",
 			"run", run.Name, "error", err.Error())
 	}
+}
+
+// refreshFencedNoChange re-reads the run through the uncached reader and
+// adopts a close proposal fenced to the terminating coordinator pod when the
+// cached object has not yet caught up with the control incarnation's fenced
+// pre-exit write. It reports whether a valid proposal for this incarnation is
+// then present, so a cache-lagging reconcile never mistakes a grounded
+// conclusion for an evidence-incomplete one.
+func (r *CoderRunReconciler) refreshFencedNoChange(ctx context.Context, run *courierv1alpha1.CoderRun, podUID string) bool {
+	live := &courierv1alpha1.CoderRun{}
+	if err := r.reader().Get(ctx, client.ObjectKeyFromObject(run), live); err != nil {
+		return false
+	}
+	if nc := live.Status.NoChange; nc != nil && nc.CoordinatorPodUID == podUID {
+		run.Status.NoChange = nc
+		return true
+	}
+	return false
 }
 
 // alreadyDoneCommented reports whether this run's outcome was already

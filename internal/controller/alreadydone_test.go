@@ -190,7 +190,7 @@ func TestSettleAlreadyDoneClose(t *testing.T) {
 			name:        "permanent refusal moves ownership",
 			closeErr:    source.ErrPermanentRefusal,
 			wantPhase:   courierv1alpha1.PhaseNeedsHuman,
-			wantClose:   sourceCloseOwnershipMovedReason,
+			wantClose:   sourceCloseRefusedPermanentlyReason,
 			wantComment: true,
 		},
 		{
@@ -375,8 +375,167 @@ func TestAlreadyDoneGroundedReconcile(t *testing.T) {
 	}
 }
 
-// TestEvidenceIncompleteNoChangeHoldsAndAnnounces drives the exit path for a
-// resolve-issue trusted no_change ending whose proposal is absent: the run
+// TestRefusedCloseParksWithBlockedReport proves the parked hold is published:
+// a refused close parks NeedsHuman and the source then receives the ordinary
+// blocked lifecycle report, so the work item is never left in an unexplained
+// state and the already_done report is never re-attempted.
+func TestRefusedCloseParksWithBlockedReport(t *testing.T) {
+	podUID := "pod-uid-refused"
+	run := admissionRun("refused", "pool-a", courierv1alpha1.PhaseRunning)
+	run.UID = types.UID("run-uid-refused")
+	run.Spec.Source = "test"
+	run.Spec.WorkItemID = "refused-work"
+	run.Status.NativeResult = &courierv1alpha1.NativeResult{
+		Kind:              courierv1alpha1.NativeResultNoChange,
+		Reason:            "coordinator declared no change needed",
+		CoordinatorPodUID: podUID,
+		At:                metav1.NewTime(time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)),
+	}
+	run.Status.NoChange = groundedNoChange(podUID)
+	lane := admissionLaneWithCoordinator("pool-a", 1)
+	pod := coordinatorPodWithOutcome(run, exitDeclaredNoChange, "no_change_needed", "the request looks satisfied")
+	pod.UID = types.UID(podUID)
+	pod.Status.Phase = corev1.PodFailed
+	c := capacityTestClient(t, lane, run, pod)
+	s := &closeReportingSource{admissionSource: &admissionSource{}, closeResolution: source.CloseResolution{
+		Action:  source.CloseActionRefused,
+		Reason:  "close policy not satisfied",
+		Reasons: []string{"excerpt does not occur in the file at the pinned head"},
+	}}
+	commenter := &fakeWorkItemCommenter{}
+	r := &CoderRunReconciler{
+		Client:           c,
+		APIReader:        c,
+		Sources:          NewSourceRegistry(map[string]source.Adapter{"test": s}),
+		Now:              func() time.Time { return time.Date(2026, 10, 26, 12, 0, 1, 0, time.UTC) },
+		WorkItemComments: commenter,
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := r.Reconcile(context.Background(), admissionRequest("refused")); err != nil {
+			t.Fatalf("Reconcile[%d] error = %v", i, err)
+		}
+	}
+	stored := &courierv1alpha1.CoderRun{}
+	if err := c.Get(context.Background(), admissionKey("refused"), stored); err != nil {
+		t.Fatalf("re-read run: %v", err)
+	}
+	if stored.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("phase = %s; want NeedsHuman", stored.Status.Phase)
+	}
+	if len(s.closeCalls) != 1 {
+		t.Fatalf("close calls = %d; want exactly one already_done attempt", len(s.closeCalls))
+	}
+	var blocked *source.Lifecycle
+	for i := range s.reports {
+		if s.reports[i].Result == source.ResultBlocked {
+			blocked = &s.reports[i]
+		}
+	}
+	if blocked == nil {
+		t.Fatalf("reports = %v; want the parked hold published as a blocked report", s.events)
+	}
+	if !strings.Contains(blocked.Error, "excerpt does not occur") {
+		t.Fatalf("blocked report error = %q; want the source's specific refusal", blocked.Error)
+	}
+	if blocked.IdempotencyKey == s.closeCalls[0].IdempotencyKey {
+		t.Fatal("the blocked hold must carry its own report identity, not the close key")
+	}
+	if len(commenter.bodies) != 1 {
+		t.Fatalf("comment bodies = %d; want one refusal announcement", len(commenter.bodies))
+	}
+	if cond := apimeta.FindStatusCondition(stored.Status.Conditions, sourceCloseCommentedCondition); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("SourceCloseCommented = %#v; want the announcement marker persisted", cond)
+	}
+}
+
+// TestAlreadyDonePendingReportRepresentsThroughReconcile covers the crash
+// window where the AlreadyDone phase patch landed but the close report never
+// published: a plain reconcile (no coordinator pod) must re-present the same
+// grounded proposal under the same stable idempotency key.
+func TestAlreadyDonePendingReportRepresentsThroughReconcile(t *testing.T) {
+	run := runWithNoChange("pod-1")
+	run.Spec.Source = "test"
+	run.UID = types.UID("run-uid-pending")
+	apimeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
+		Type:               "LifecycleReported",
+		Status:             metav1.ConditionFalse,
+		Reason:             "Pending",
+		Message:            "pending",
+		LastTransitionTime: metav1.NewTime(time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)),
+	})
+	kube := capacityTestClient(t, admissionLane("local", 1), run)
+	s := &closeReportingSource{admissionSource: &admissionSource{}, closeResolution: source.CloseResolution{Action: source.CloseActionClosed}}
+	r := &CoderRunReconciler{
+		Client:    kube,
+		APIReader: kube,
+		Sources:   NewSourceRegistry(map[string]source.Adapter{"test": s}),
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), admissionRequest(run.Name)); err != nil {
+			t.Fatalf("Reconcile[%d] error = %v", i, err)
+		}
+	}
+	if len(s.closeCalls) != 1 {
+		t.Fatalf("close calls = %d; want the settled close published exactly once", len(s.closeCalls))
+	}
+	key := s.closeCalls[0].IdempotencyKey
+	if !strings.Contains(key, "/AlreadyDone/") || !strings.Contains(key, "run-uid-pending") {
+		t.Fatalf("idempotency key = %q; want the phase- and UID-scoped key", key)
+	}
+	if s.closeCalls[0].Close == nil || len(s.closeCalls[0].Close.Criteria) != 1 {
+		t.Fatalf("re-presented proposal = %#v; want the durable grounded criteria", s.closeCalls[0].Close)
+	}
+}
+
+// TestGroundedNoChangeSurvivesCacheLag proves the exit path consults the API
+// server before declaring a conclusion evidence-incomplete: when the cached
+// run has not yet observed the incarnation's fenced pre-exit write but the
+// API server has, the ending still upgrades to AlreadyDone.
+func TestGroundedNoChangeSurvivesCacheLag(t *testing.T) {
+	podUID := "pod-uid-lag"
+	cached := admissionRun("lagging", "pool-a", courierv1alpha1.PhaseRunning)
+	cached.UID = types.UID("run-uid-lag")
+	cached.Spec.Source = "test"
+	cached.Spec.WorkItemID = "lagging-work"
+	cached.Status.NativeResult = &courierv1alpha1.NativeResult{
+		Kind:              courierv1alpha1.NativeResultNoChange,
+		Reason:            "coordinator declared no change needed",
+		CoordinatorPodUID: podUID,
+		At:                metav1.NewTime(time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)),
+	}
+	live := cached.DeepCopy()
+	live.Status.NoChange = groundedNoChange(podUID)
+	lane := admissionLaneWithCoordinator("pool-a", 1)
+	pod := coordinatorPodWithOutcome(cached, exitDeclaredNoChange, "no_change_needed", "the request looks satisfied")
+	pod.UID = types.UID(podUID)
+	pod.Status.Phase = corev1.PodFailed
+	cachedClient := capacityTestClient(t, lane, cached, pod)
+	liveClient := capacityTestClient(t, lane, live, pod)
+	s := &closeReportingSource{admissionSource: &admissionSource{}, closeResolution: source.CloseResolution{Action: source.CloseActionClosed}}
+	commenter := &fakeWorkItemCommenter{}
+	r := &CoderRunReconciler{
+		Client:           cachedClient,
+		APIReader:        liveClient,
+		Sources:          NewSourceRegistry(map[string]source.Adapter{"test": s}),
+		Now:              func() time.Time { return time.Date(2026, 10, 26, 12, 0, 1, 0, time.UTC) },
+		WorkItemComments: commenter,
+	}
+	if _, err := r.Reconcile(context.Background(), admissionRequest("lagging")); err != nil {
+		t.Fatalf("Reconcile error = %v", err)
+	}
+	if len(s.closeCalls) != 1 {
+		t.Fatalf("close calls = %d; want the API-server proposal honored despite the cache lag", len(s.closeCalls))
+	}
+	stored := &courierv1alpha1.CoderRun{}
+	if err := cachedClient.Get(context.Background(), admissionKey("lagging"), stored); err != nil {
+		t.Fatalf("re-read run: %v", err)
+	}
+	if stored.Status.Phase != courierv1alpha1.PhaseAlreadyDone {
+		t.Fatalf("phase = %s; want AlreadyDone", stored.Status.Phase)
+	}
+}
+
+// TestEvidenceIncompleteNoChangeHoldsAndAnnounces drives the exit path for a// resolve-issue trusted no_change ending whose proposal is absent: the run
 // parks NeedsHuman (never AwaitingReview), the source's close path is never
 // called, and the source work item receives exactly one explanation that no
 // PR is coming and no closure was attempted.
