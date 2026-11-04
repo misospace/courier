@@ -448,8 +448,10 @@ Outcome comments are human-attention requests the executor can authoritatively
 stand behind: `needs_decision` and `blocked_external` preserve the full declared
 question or missing explanation after redaction; they are not shortened to the
 termination reason. The executor never publishes a comment for a success claim
-(`no_change_needed`) — the controller settles that ending against the world
-(#474). Comment
+(`no_change_needed`) — the controller owns that settlement: against the world
+for fix-pr, through the source's evidence-gated close policy or a human hold
+for resolve-issue, with any work-item announcement written by the controller
+(#474, #720). Comment
 posting is best-effort: failures are logged as `outcome.comment` and do not change
 the run ending. The separate termination reason is bounded and redacted before it
 is published. An undeclared ending is not interpreted as a coordinator's human
@@ -2879,8 +2881,11 @@ legitimate cluster-wide Node List per launch pass.
   process shutdown (#341).
   feedback/conflict → the source spawns a fresh `fix-pr` run without reusing the
   previous run. A `no_change_needed`
-  resolve-issue run also waits here with its evidence posted for human review;
-  Courier does not resolve that source from the coordinator's declaration. A
+  resolve-issue run never reaches this phase: a grounded, fenced close proposal
+  settles through **AlreadyDone** and the source's evidence-gated close policy,
+  and an ungrounded ending — including every legacy shim ending — parks
+  **NeedsHuman** with the hold explained on the work item (#720). Courier does
+  not resolve that source from the coordinator's declaration. A
   `no_change_needed` **fix-pr** run instead waits in **BlockedExternal** on an
   open green PR: neither CI nor a clean workspace proves review feedback was
   addressed. Only a verified merge can settle that attempt successfully. A

@@ -763,6 +763,56 @@ func TestLegacyNoChangeEndingHoldsAndAnnounces(t *testing.T) {
 	}
 }
 
+// TestTrustedPublishedResultNotHijackedByNoChangeExit pins the guard on the
+// legacy no-change route: when a trusted native result fences to the
+// terminating pod, it classifies the ending — a published result on an exit-3
+// termination still routes to Verifying, never the human hold, the close
+// path, or an announcement. The exit code alone never reclassifies a trusted
+// ending.
+func TestTrustedPublishedResultNotHijackedByNoChangeExit(t *testing.T) {
+	podUID := "pod-uid-published-exit3"
+	run := admissionRun("published-exit3", "pool-a", courierv1alpha1.PhaseRunning)
+	run.UID = types.UID("run-uid-published-exit3")
+	run.Spec.Source = "test"
+	run.Spec.WorkItemID = "published-exit3-work"
+	run.Status.NativeResult = &courierv1alpha1.NativeResult{
+		Kind:              courierv1alpha1.NativeResultPublished,
+		Reason:            "published through the broker",
+		CoordinatorPodUID: podUID,
+		At:                metav1.NewTime(time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)),
+	}
+	lane := admissionLaneWithCoordinator("pool-a", 1)
+	pod := coordinatorPod(run, exitDeclaredNoChange)
+	pod.UID = types.UID(podUID)
+	pod.Status.Phase = corev1.PodFailed
+	c := capacityTestClient(t, lane, run, pod)
+	s := &closeReportingSource{admissionSource: &admissionSource{}}
+	commenter := &fakeWorkItemCommenter{}
+	r := &CoderRunReconciler{
+		Client:           c,
+		APIReader:        c,
+		Sources:          NewSourceRegistry(map[string]source.Adapter{"test": s}),
+		Now:              func() time.Time { return time.Date(2026, 10, 26, 12, 0, 1, 0, time.UTC) },
+		WorkItemComments: commenter,
+	}
+	if _, err := r.Reconcile(context.Background(), admissionRequest("published-exit3")); err != nil {
+		t.Fatalf("Reconcile error = %v", err)
+	}
+	stored := &courierv1alpha1.CoderRun{}
+	if err := c.Get(context.Background(), admissionKey("published-exit3"), stored); err != nil {
+		t.Fatalf("re-read run: %v", err)
+	}
+	if stored.Status.Phase != courierv1alpha1.PhaseVerifying {
+		t.Fatalf("phase = %s; want Verifying — the trusted published result classifies, the exit code does not", stored.Status.Phase)
+	}
+	if len(s.closeCalls) != 0 || len(commenter.bodies) != 0 {
+		t.Fatalf("close calls = %d comment bodies = %q; want neither for a published ending", len(s.closeCalls), commenter.bodies)
+	}
+	if cond := apimeta.FindStatusCondition(stored.Status.Conditions, sourceCloseCommentedCondition); cond != nil {
+		t.Fatalf("SourceCloseCommented = %#v; want none", cond)
+	}
+}
+
 // TestAlreadyDoneCommentAnnouncesOnce verifies the announce-once marker: a
 // settled outcome is announced at most once per run even when the settlement
 // path runs twice (for example after a crash between post and write).

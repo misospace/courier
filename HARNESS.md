@@ -1864,9 +1864,12 @@ Outcome comments are human-attention requests the executor can authoritatively
 stand behind: `needs_decision` and `blocked_external` carry the full declared
 question or missing explanation after redaction, never shortened to the
 termination reason. The executor publishes no comment for `no_change_needed`:
-the controller settles that success claim against the world (#474), and the
-evidence rides the bounded, redacted termination reason in `run.exit` telemetry
-and the `COURIER_TERMINATION` handoff. Comment posting is best-effort: failures
+the controller owns that settlement — against the world for fix-pr, through
+the source's evidence-gated close policy or a human hold for resolve-issue,
+with any work-item announcement written by the controller (#474, #720) — and
+the evidence rides the bounded, redacted termination reason in
+`run.exit` telemetry and the `COURIER_TERMINATION` handoff. Comment posting is
+best-effort: failures
 are logged as `outcome.comment` and do not change the run ending.
 
 The criterion-evidence contract (#249, §4) adds one classification: a
