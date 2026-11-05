@@ -237,16 +237,16 @@ func runArgs(args []string) error {
 			// a blocked-external ending so the source re-offers the work once
 			// capacity returns (#320).
 			if exhaustedGate(err) {
-				emitModelTelemetry(modelEvents, invocation, modelTally.Summary())
+				emitModelTelemetry(modelEvents, invocation, modelTally.Summary(), "")
 				return declareBlockedExternal(reason, caps, reporter, identity)
 			}
-			emitModelTelemetry(modelEvents, invocation, modelTally.Summary())
+			emitModelTelemetry(modelEvents, invocation, modelTally.Summary(), "")
 			return declareNeedsHuman(reason, caps, reporter, identity)
 		}
 		fmt.Printf("transient capability failure, re-probing: %s\n", reason)
 		select {
 		case <-ctx.Done():
-			emitModelTelemetry(modelEvents, invocation, modelTally.Summary())
+			emitModelTelemetry(modelEvents, invocation, modelTally.Summary(), "")
 			return declareNeedsHuman(reason, caps, reporter, identity)
 		case <-time.After(probeRetryDelay):
 		}
@@ -266,7 +266,7 @@ func runArgs(args []string) error {
 		// The gate already passed, so the tally holds the run's probe
 		// requests: the summary is emitted before the failure returns, on
 		// the same best-effort terms as every other exit (#738).
-		emitModelTelemetry(modelEvents, invocation, modelTally.Summary())
+		emitModelTelemetry(modelEvents, invocation, modelTally.Summary(), "")
 		return fmt.Errorf("courier-control: publication engine: %w", err)
 	}
 
@@ -283,7 +283,7 @@ func runArgs(args []string) error {
 		// The gate already passed, so the tally holds the run's probe
 		// requests: the summary is emitted before the declare, on the same
 		// best-effort terms as every other exit (#738).
-		emitModelTelemetry(modelEvents, invocation, modelTally.Summary())
+		emitModelTelemetry(modelEvents, invocation, modelTally.Summary(), "")
 		var skillsErr *skillLoadError
 		if errors.As(err, &skillsErr) {
 			return declareNeedsHuman(skillsErr.reason(), append(caps, skillsErr.capability()), reporter, identity)
@@ -351,11 +351,37 @@ func runArgs(args []string) error {
 		// A coordinator that failed construction already made its gate's
 		// probe requests: the summary is emitted before the failure returns,
 		// on the same best-effort terms as every other exit (#738).
-		emitModelTelemetry(modelEvents, invocation, modelTally.Summary())
+		emitModelTelemetry(modelEvents, invocation, modelTally.Summary(), "")
 		return fmt.Errorf("courier-control: %w", err)
 	}
+
+	// The run's model-surface provenance digest (#730): computed from the
+	// coordinator's own assembled surface and the run's admitted inputs,
+	// emitted on the structured event log, and persisted through the
+	// broker's trusted status path — all before any model execution. The
+	// persist-before-execution contract is the same one dispatch evidence
+	// rides: a run whose provenance never landed durably does not run a
+	// model. A computation or persistence failure is an infrastructure
+	// failure the relaunch owns, bounded by the crashloop backstop.
+	surface, err := coordinator.ModelSurface(harness.ModelSurfaceInputs{
+		GatewayTransport: invocation.GatewayTransport,
+		LaneFraming:      invocation.Framing,
+		ContextPolicy:    invocation.Context,
+		SkillsJSON:       invocation.Skills,
+		CriteriaJSON:     invocation.Criteria,
+	})
+	if err != nil {
+		emitModelTelemetry(modelEvents, invocation, modelTally.Summary(), "")
+		return fmt.Errorf("courier-control: model-surface provenance: %w", err)
+	}
+	emitRunSurface(modelEvents, invocation, surface)
+	if err := reporter.ModelSurface(ctx, surface.SchemaVersion, surface.Digest); err != nil {
+		emitModelTelemetry(modelEvents, invocation, modelTally.Summary(), "")
+		return fmt.Errorf("courier-control: persist model-surface provenance: %w", err)
+	}
+
 	result := coordinator.Run(ctx, invocation)
-	emitModelTelemetry(modelEvents, invocation, modelTally.Summary())
+	emitModelTelemetry(modelEvents, invocation, modelTally.Summary(), surface.Digest)
 	return declare(result, invocation.Mode, reporter, identity)
 }
 
@@ -387,10 +413,13 @@ func exhaustedGate(err error) bool {
 // peaks, and the compaction account. The provider's token fields appear only
 // when some provider reported usage — a run with no reported usage carries
 // the counts that are always known, never zero token sums that could read as
-// a free run. The event is Verbose so the summary reaches the log store at
+// a free run. modelSurface, when non-empty, is the run's model-surface
+// provenance digest (#730): the digest string only, so the run's model spend
+// and the model-visible contract that produced it correlate in one line. The
+// event is Verbose so the summary reaches the log store at
 // info level on every finished run, like run.summary. Emission is
 // best-effort: a dropped event is noted on stderr and the run continues.
-func emitModelTelemetry(emitter *courierlog.Emitter, invocation executor.Invocation, summary harness.ModelTelemetrySummary) {
+func emitModelTelemetry(emitter *courierlog.Emitter, invocation executor.Invocation, summary harness.ModelTelemetrySummary, modelSurface string) {
 	cells := make([]map[string]any, 0, len(summary.ByRoleModel))
 	for _, cell := range summary.ByRoleModel {
 		cells = append(cells, map[string]any{
@@ -416,6 +445,9 @@ func emitModelTelemetry(emitter *courierlog.Emitter, invocation executor.Invocat
 		"last_compaction_before":      summary.LastCompactionBefore,
 		"last_compaction_after":       summary.LastCompactionAfter,
 	}
+	if modelSurface != "" {
+		detail["model_surface"] = modelSurface
+	}
 	if summary.UsageReported > 0 {
 		detail["input_tokens"] = summary.InputTokens
 		detail["output_tokens"] = summary.OutputTokens
@@ -436,6 +468,37 @@ func emitModelTelemetry(emitter *courierlog.Emitter, invocation executor.Invocat
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "courier-control: dropped %s event: %v\n", courierlog.EventModelTelemetry, err)
+	}
+}
+
+// emitRunSurface records the run's model-surface provenance (#730) on the
+// structured event log: one run.surface line carrying the schema version,
+// the digest, and the canonical encoding that produced the digest — the
+// input identities, carried as names and digests only. Prompt bodies, skill
+// instruction bodies, model output, workspace contents, and secret material
+// are never part of the encoding, so emitting it whole exposes nothing the
+// digest does not already name. The event is Verbose so the identities reach
+// the log store at info level on every finished run that computed them, like
+// run.summary. Emission is best-effort: a dropped event is noted on stderr
+// and the run continues.
+func emitRunSurface(emitter *courierlog.Emitter, invocation executor.Invocation, surface *harness.ModelSurface) {
+	err := emitter.Emit(courierlog.Event{
+		Type:  courierlog.EventRunSurface,
+		RunID: invocation.RunName,
+		Repo:  invocation.Repo,
+		Ref:   invocation.Ref,
+		Mode:  string(invocation.Mode),
+		// No status: like model.telemetry, the provenance is observability,
+		// never a liveness or completion claim about the run.
+		Detail: map[string]any{
+			"schema_version": surface.SchemaVersion,
+			"digest":         surface.Digest,
+			"encoding":       json.RawMessage(surface.Encoding),
+		},
+		Verbose: true,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "courier-control: dropped %s event: %v\n", courierlog.EventRunSurface, err)
 	}
 }
 

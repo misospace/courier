@@ -613,7 +613,7 @@ func TestEmitModelTelemetry(t *testing.T) {
 		CompactionsNetSaved:      800,
 		LastCompactionBefore:     1000,
 		LastCompactionAfter:      600,
-	})
+	}, "")
 	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
 	if len(lines) != 1 {
 		t.Fatalf("emitted %d lines, want exactly one: %q", len(lines), stdout.String())
@@ -634,6 +634,9 @@ func TestEmitModelTelemetry(t *testing.T) {
 	detail, ok := event["detail"].(map[string]any)
 	if !ok {
 		t.Fatalf("detail = %v, want the summary fields at info level", event["detail"])
+	}
+	if _, present := detail["model_surface"]; present {
+		t.Fatalf("model.telemetry carries model_surface %v when no digest was computed", detail["model_surface"])
 	}
 	for key, want := range map[string]float64{
 		"requests": 5, "probe_requests": 2, "work_requests": 3, "retries": 1,
@@ -677,7 +680,7 @@ func TestEmitModelTelemetryWithNoReportedUsageOmitsTokenSums(t *testing.T) {
 		WorkRequests:             1,
 		UsageMissing:             2,
 		MaxEstimatedPromptTokens: 300,
-	})
+	}, "sha256:0000000000000000000000000000000000000000000000000000000000000000")
 	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
 	var event map[string]any
 	if err := json.Unmarshal([]byte(lines[0]), &event); err != nil {
@@ -686,6 +689,9 @@ func TestEmitModelTelemetryWithNoReportedUsageOmitsTokenSums(t *testing.T) {
 	detail := event["detail"].(map[string]any)
 	if detail["usage_missing"] != float64(2) || detail["usage_reported"] != float64(0) {
 		t.Fatalf("usage split = %v/%v, want 2 missing / 0 reported", detail["usage_missing"], detail["usage_reported"])
+	}
+	if detail["model_surface"] != "sha256:0000000000000000000000000000000000000000000000000000000000000000" {
+		t.Fatalf("model_surface = %v, want the run's digest string", detail["model_surface"])
 	}
 	for _, key := range []string{"input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "max_input_tokens"} {
 		if _, present := detail[key]; present {

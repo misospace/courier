@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
@@ -56,6 +57,11 @@ type HarnessPatch struct {
 	// incarnation's recorded proposal is final, and replacement incarnation
 	// records its own.
 	NoChange *courier.NoChangeClose `json:"noChange,omitempty"`
+	// ModelSurface persists the run's model-surface provenance digest (#730)
+	// before model execution. It is fenced exactly like TerminalResult: the
+	// authenticated incarnation's UID, one digest final per incarnation,
+	// and a replacement incarnation records its own.
+	ModelSurface *courier.ModelSurfaceProvenance `json:"modelSurface,omitempty"`
 }
 
 // OperationAddition carries the operation ID (the map key) and the entry.
@@ -105,7 +111,8 @@ func (w *StatusWriter) Write(ctx context.Context, identity StatusIdentity, patch
 	}
 	if patch.Checkpoint == nil && patch.Heartbeat == nil && patch.LastCommit == nil &&
 		patch.AddOperation == nil && patch.ClearOperation == "" && !patch.ReconcileOperations &&
-		patch.ControlRequestAck == nil && patch.TerminalResult == nil && patch.NoChange == nil {
+		patch.ControlRequestAck == nil && patch.TerminalResult == nil && patch.NoChange == nil &&
+		patch.ModelSurface == nil {
 		return fmt.Errorf("empty harness status patch")
 	}
 	// An acknowledgement names the request it acknowledges and carries its
@@ -138,6 +145,18 @@ func (w *StatusWriter) Write(ctx context.Context, identity StatusIdentity, patch
 		}
 		if patch.NoChange.CoordinatorPodUID != string(identity.ControlPodUID) {
 			return fmt.Errorf("no-change close UID does not match the authenticated control incarnation")
+		}
+	}
+	// A model-surface provenance record must carry a digest, a known schema
+	// version, its own time, and the authenticated control incarnation's
+	// UID (#730). The set-once check against the fresh run runs inside the
+	// CAS loop below.
+	if patch.ModelSurface != nil {
+		if err := validModelSurface(patch.ModelSurface); err != nil {
+			return err
+		}
+		if patch.ModelSurface.CoordinatorPodUID != string(identity.ControlPodUID) {
+			return fmt.Errorf("model-surface provenance UID does not match the authenticated control incarnation")
 		}
 	}
 	if patch.LastCommit != nil && validate == nil {
@@ -260,6 +279,19 @@ func (w *StatusWriter) Write(ctx context.Context, identity StatusIdentity, patch
 			}
 			run.Status.NoChange = patch.NoChange.DeepCopy()
 		}
+		if patch.ModelSurface != nil {
+			// Set-once per incarnation, mirroring the terminal result (#730):
+			// the identical rewrite is the idempotent retry, a different
+			// digest for the same incarnation is refused — one control
+			// process cannot honestly assemble two model surfaces — and a
+			// replacement incarnation records its own.
+			if existing := run.Status.ModelSurface; existing != nil && existing.CoordinatorPodUID == patch.ModelSurface.CoordinatorPodUID {
+				if !sameModelSurface(existing, patch.ModelSurface) {
+					return fmt.Errorf("a model-surface provenance is already recorded for this control incarnation")
+				}
+			}
+			run.Status.ModelSurface = patch.ModelSurface.DeepCopy()
+		}
 		if patch.ReconcileOperations {
 			run.Status.ActiveOperations = nil
 		}
@@ -357,6 +389,39 @@ func validTerminalResult(result *courier.NativeResult) error {
 // so the idempotent retry of one write resolves cleanly.
 func sameTerminalResult(a, b *courier.NativeResult) bool {
 	return a.Kind == b.Kind && a.Reason == b.Reason && a.CoordinatorPodUID == b.CoordinatorPodUID && a.At.Equal(&b.At)
+}
+
+// modelSurfaceDigestPattern is the digest shape the CRD validation enforces
+// on ModelSurfaceProvenance.Digest; the broker enforces the same shape so a
+// malformed record fails closed ahead of the apiserver.
+var modelSurfaceDigestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+// validModelSurface checks one model-surface provenance record's structure
+// (#730): a known schema version, a digest in the canonical shape, a
+// timestamp, and a UID that the caller checks against the authenticated
+// identity.
+func validModelSurface(record *courier.ModelSurfaceProvenance) error {
+	if record.SchemaVersion < courier.ModelSurfaceSchemaV1 {
+		return fmt.Errorf("model-surface provenance carries an unknown schema version")
+	}
+	if !modelSurfaceDigestPattern.MatchString(record.Digest) {
+		return fmt.Errorf("model-surface provenance digest is malformed")
+	}
+	if record.At.IsZero() {
+		return fmt.Errorf("model-surface provenance carries no time")
+	}
+	if record.CoordinatorPodUID == "" || len(record.CoordinatorPodUID) > 128 {
+		return fmt.Errorf("model-surface provenance UID is malformed")
+	}
+	return nil
+}
+
+// sameModelSurface reports whether two records of one incarnation's
+// model-surface provenance carry identical evidence. Timestamps compare as
+// instants, so the idempotent retry of one write resolves cleanly.
+func sameModelSurface(a, b *courier.ModelSurfaceProvenance) bool {
+	return a.SchemaVersion == b.SchemaVersion && a.Digest == b.Digest &&
+		a.CoordinatorPodUID == b.CoordinatorPodUID && a.At.Equal(&b.At)
 }
 
 // validNoChange checks one close proposal's structure against the API bounds

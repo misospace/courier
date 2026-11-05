@@ -600,3 +600,128 @@ func TestStatusWriterBoundsTerminalResultReason(t *testing.T) {
 		t.Fatal("a reason over the shared bound was accepted")
 	}
 }
+
+// testModelSurface returns a well-formed provenance record attributed to the
+// given incarnation.
+func testModelSurface(uid types.UID, digest string) *courier.ModelSurfaceProvenance {
+	return &courier.ModelSurfaceProvenance{
+		SchemaVersion:     courier.ModelSurfaceSchemaV1,
+		Digest:            digest,
+		CoordinatorPodUID: string(uid),
+		At:                metav1.NewTime(metav1.Now().Rfc3339Copy().Time),
+	}
+}
+
+// TestStatusWriterAppliesModelSurface proves the model-surface provenance
+// digest (#730) lands on the run's status through the same fenced write as
+// every other harness field, and the idempotent rewrite of the identical
+// record succeeds — a lost acknowledgment must resolve, not deny.
+func TestStatusWriterAppliesModelSurface(t *testing.T) {
+	w, c, identity := statusFixture(t)
+	digest := "sha256:" + strings.Repeat("a", 64)
+	record := testModelSurface(identity.ControlPodUID, digest)
+	if err := w.Write(context.Background(), identity, HarnessPatch{ModelSurface: record}, nil); err != nil {
+		t.Fatalf("write model-surface provenance: %v", err)
+	}
+	if err := w.Write(context.Background(), identity, HarnessPatch{ModelSurface: record.DeepCopy()}, nil); err != nil {
+		t.Fatalf("idempotent rewrite of the identical record: %v", err)
+	}
+	var run courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: testRunName}, &run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Status.ModelSurface == nil || run.Status.ModelSurface.Digest != digest ||
+		run.Status.ModelSurface.SchemaVersion != courier.ModelSurfaceSchemaV1 ||
+		run.Status.ModelSurface.CoordinatorPodUID != string(identity.ControlPodUID) {
+		t.Fatalf("persisted record = %#v, want the fenced digest record", run.Status.ModelSurface)
+	}
+}
+
+// TestStatusWriterModelSurfaceIsSetOncePerIncarnation proves one control
+// incarnation cannot honestly assemble two model surfaces: a different digest
+// for the same incarnation is refused, and the recorded one stands.
+func TestStatusWriterModelSurfaceIsSetOncePerIncarnation(t *testing.T) {
+	w, c, identity := statusFixture(t)
+	first := testModelSurface(identity.ControlPodUID, "sha256:"+strings.Repeat("a", 64))
+	if err := w.Write(context.Background(), identity, HarnessPatch{ModelSurface: first}, nil); err != nil {
+		t.Fatalf("write first record: %v", err)
+	}
+	conflicting := testModelSurface(identity.ControlPodUID, "sha256:"+strings.Repeat("b", 64))
+	if err := w.Write(context.Background(), identity, HarnessPatch{ModelSurface: conflicting}, nil); err == nil {
+		t.Fatal("conflicting digest for the same incarnation was accepted")
+	}
+	var run courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: testRunName}, &run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Status.ModelSurface == nil || run.Status.ModelSurface.Digest != first.Digest {
+		t.Fatalf("recorded digest = %#v, want the first record left standing", run.Status.ModelSurface)
+	}
+}
+
+// TestStatusWriterModelSurfaceReplacedByNewIncarnation proves a replacement
+// incarnation records its own provenance over the stale one: a relaunch may
+// run a different image, and its assembled surface is its own to record (#730).
+func TestStatusWriterModelSurfaceReplacedByNewIncarnation(t *testing.T) {
+	w, c, identity := statusFixture(t)
+	stale := testModelSurface(identity.ControlPodUID, "sha256:"+strings.Repeat("a", 64))
+	if err := w.Write(context.Background(), identity, HarnessPatch{ModelSurface: stale}, nil); err != nil {
+		t.Fatalf("write stale-incarnation record: %v", err)
+	}
+	controller := true
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: testNamespace, Name: "control-b", UID: "pod-uid-b",
+		Labels:          map[string]string{"courier.misospace.dev/coderrun": testRunName, "courier.misospace.dev/component": "coordinator"},
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: courier.GroupVersion.String(), Kind: "CoderRun", Name: testRunName, UID: identity.RunUID, Controller: &controller}},
+	}, Spec: corev1.PodSpec{ServiceAccountName: "control-sa"}}
+	if err := c.Create(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	var run courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: testRunName}, &run); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Delete(context.Background(), &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: "control-a"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: testRunName}, &run); err != nil {
+		t.Fatal(err)
+	}
+	fresh := testModelSurface("pod-uid-b", "sha256:"+strings.Repeat("b", 64))
+	if err := w.Write(context.Background(), StatusIdentity{RunUID: identity.RunUID, ControlPod: "control-b", ControlPodUID: "pod-uid-b", ControlServiceAccount: "control-sa"}, HarnessPatch{ModelSurface: fresh}, nil); err != nil {
+		t.Fatalf("new incarnation recording its own provenance: %v", err)
+	}
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: testRunName}, &run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Status.ModelSurface == nil || run.Status.ModelSurface.CoordinatorPodUID != "pod-uid-b" ||
+		run.Status.ModelSurface.Digest != fresh.Digest {
+		t.Fatalf("recorded record = %#v, want the new incarnation's record", run.Status.ModelSurface)
+	}
+}
+
+// TestStatusWriterFencesModelSurfaceIdentity proves the fence and the
+// structural validation (#730): a record attributing itself to any other
+// incarnation is refused, an unknown schema version, a malformed digest, and
+// a record with no time are refused.
+func TestStatusWriterFencesModelSurfaceIdentity(t *testing.T) {
+	w, _, identity := statusFixture(t)
+	foreign := testModelSurface("pod-uid-not-this-incarnation", "sha256:"+strings.Repeat("a", 64))
+	if err := w.Write(context.Background(), identity, HarnessPatch{ModelSurface: foreign}, nil); err == nil {
+		t.Fatal("a foreign incarnation's provenance record was accepted")
+	}
+	unknownVersion := testModelSurface(identity.ControlPodUID, "sha256:"+strings.Repeat("a", 64))
+	unknownVersion.SchemaVersion = 0
+	if err := w.Write(context.Background(), identity, HarnessPatch{ModelSurface: unknownVersion}, nil); err == nil {
+		t.Fatal("an unknown schema version was accepted")
+	}
+	malformed := testModelSurface(identity.ControlPodUID, "sha256:zz")
+	if err := w.Write(context.Background(), identity, HarnessPatch{ModelSurface: malformed}, nil); err == nil {
+		t.Fatal("a malformed digest was accepted")
+	}
+	noTime := testModelSurface(identity.ControlPodUID, "sha256:"+strings.Repeat("a", 64))
+	noTime.At = metav1.Time{}
+	if err := w.Write(context.Background(), identity, HarnessPatch{ModelSurface: noTime}, nil); err == nil {
+		t.Fatal("a record with no time was accepted")
+	}
+}
