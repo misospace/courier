@@ -133,6 +133,14 @@ const (
 	// identities are inspectable in run telemetry; instruction bodies are
 	// not logged.
 	EventSkillsLoaded = "skills.loaded"
+	// EventRebaseModelAssist reports the model-assisted conflict-resolution
+	// turns one rebase attempt ran (#732): the model that served them, the
+	// turn count, the files they resolved, and the token spend. It is the
+	// task/session evidence that the configured model actually executed on
+	// the task — distinct from run.start's configured model field, which
+	// names a binding, never an invocation. It is Verbose so the evidence
+	// reaches the log store on every run that ran the assist.
+	EventRebaseModelAssist = "rebase.model.assist"
 )
 
 // Status values for the status field.

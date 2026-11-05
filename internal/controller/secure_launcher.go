@@ -291,6 +291,12 @@ func (s *SecureControl) controlInvocation(ctx context.Context, run *courier.Code
 	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Lane}, lane); err != nil {
 		return executor.Invocation{}, fmt.Errorf("secure topology: read lane profile %q: %w", run.Spec.Lane, err)
 	}
+	// The mechanical-only rebase goal rendered here is contingent on the
+	// secure topology not running the rebase engine: the control pod never
+	// invokes the mechanical resolver, so the narrower contract stays true
+	// for what it launches. If secure mode gains rebase support, this call
+	// must become assist-aware — the executor pod builder is the
+	// assist-aware path today.
 	invocation, err := executor.NewInvocationWithContribution(run, lane, topology.ControlWorkspacePath, contribution)
 	if err != nil {
 		return executor.Invocation{}, err

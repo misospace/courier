@@ -3138,6 +3138,50 @@ issue text, the token, and any credential never appear in a response or a
 log line. Dispatch consumes this API (misospace/dispatch#1349) instead of
 writing CoderRuns directly, and Courier stays fully usable without it.
 
+### Rebase lane
+
+A Dispatch-classified `REBASE` followup materializes as a CoderRun with
+`spec.mode: rebase` and runs on a dedicated trusted deterministic path, never as
+fix-pr work: the executor adopts the PR branch verbatim (no base merge),
+re-identifies fork/head/base ownership, and replays the branch onto the PR's
+live base with closed mechanical rules that stop for a human on anything they
+cannot prove. Publication stays the trusted path — head-lease force-push to the
+existing PR branch plus bounded repository checks — regardless of who resolved
+a conflict. The versioned rebase-only intake contract with Dispatch and the
+supported release combinations are documented in
+[docs/rebase-lane.md](./docs/rebase-lane.md).
+
+Model-assisted conflict resolution (#732) is an explicit operator-selected
+capability, off by default. When enabled, the engine hands the episode's first
+mechanically-rejected file set to the configured coordinator model for exactly
+one validated resolution attempt per rebase episode — one coordinator,
+sequential, no delegation. The trust boundary stays where it was: the engine
+owns the prompt (repository text only, no credentials) and the validation (the
+resolution must name exactly the rejected paths, carry marker-free full file
+content, and fit the content bound), and publication authority never moves —
+the model changes only who writes the conflicted bytes, never what may land. A
+disabled resolver is the same closed-rules engine with one deliberate
+refinement: a conflicted path that is not a regular file — or not a name the
+filesystem accepts at all — stops the attempt for a human instead of being read
+or written through, and no model-assisted code runs on that path. The resolver
+transport is a thin gateway adapter: malformed answers are refusals (a semantic
+stop for a human) and transport failures are `failed` attempts governed by the
+source's failure policy, never human escalation. When the conflict set
+implicates `go.mod`/`go.sum`, the allowlisted `go mod tidy` runs once inside
+the workspace — a tool invocation with its own bounded timeout, not a model
+constraint. The model turn itself runs on the run's context with no
+executor-side output bound, matching the platform's model-turn discipline.
+Enablement variables are rendered into rebase-run coordinator pods only; a
+gateway API key rides a SecretKeyRef in the shared credential enumeration the
+evidence intake re-scans, and enabled-but-unconfigured configuration fails at
+startup, at pod build, and in the executor — never a silent half-capability.
+Model invocation is task/session evidence (the `rebase.model.assist` run
+event), never the `run.start` model field, and a deterministic-only run is
+never reported as model execution. The cross-repository capability negotiation
+that would let Dispatch route model-backed rebase work is not yet settled
+(misospace/dispatch#1540); the wire contract stays `rebase-executor:1` and the
+mode stays an explicit operator choice until it lands.
+
 ## Terminal retention and closed-unmerged PRs
 
 **The leak:** `reapDone` (`internal/controller/reap.go`) deletes only resolved `Done` runs after a default five minutes. `HandedOff`, `NeedsHuman`, and `Failed` are never reaped: `Reconcile` (`internal/controller/coderun_controller.go`) revisits a terminal phase only to retry a pending lifecycle report and otherwise returns without a timer. `AwaitingReview` was part of the same gap — the controller never re-observed a PR after a run settled — until #250 added the slow, bounded read of the recorded pull request that turns a confirmed merge into `Done`; a PR closed without merge still keeps its run indefinitely, which this design fixes below. The #179 dogfood deployment left 26 `AwaitingReview`, 6 `NeedsHuman`, 1 `Failed`, and 17 retained coordinator pods. `source.Runner.Poll` (`internal/source/runner.go`) lists every CoderRun on every poll to build its dedupe set, so the list grows without bound.
@@ -3754,6 +3798,19 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   response may retain — its text, arguments, identity, and events — not what a
   completion may cost the control pod in any other way, and never how much work
   the model may do.
+- **Rebase model-assist keeps the trust boundary in the engine.** The
+  configured model is an untrusted writer of conflicted-file bytes only: its
+  answer must resolve exactly the rejected paths with marker-free full content
+  within the engine's content bound, non-regular or unnameable conflicted paths
+  are refused on both the assist and the mechanical path, and publication —
+  lease, force-with-lease, bounded checks — is untouched. A conflicted path
+  that is not a clean repository-relative path inside the workspace — empty,
+  absolute, or carrying an empty, `.`, or `..` component — is refused on the
+  same terms, and conflicted paths travel to git as literal anchored
+  pathspecs. The gateway
+  credential is scoped to rebase-run pods through the shared credential
+  enumeration, and a deterministic-only run is never reported as model
+  execution.
 - Secrets are redacted from logs before stdout.
 - **Failure-evidence surfaces (#115):** the operator serves an authenticated,
   write-only evidence intake listener (in-cluster, token-gated, no read path)

@@ -1068,6 +1068,43 @@ func TestDefaultProbeImageMatchesChartValue(t *testing.T) {
 	}
 }
 
+func TestValidateRebaseModelAssistFlags(t *testing.T) {
+	tests := []struct {
+		name       string
+		enabled    bool
+		gatewayURL string
+		wantErr    string // substring required in the error; empty means no error
+	}{
+		{name: "disabled needs no gateway"},
+		{name: "enabled with gateway", enabled: true, gatewayURL: "http://gateway:4000/v1"},
+		{
+			name:    "enabled without gateway",
+			enabled: true,
+			wantErr: "--rebase-model-gateway-url is not set",
+		},
+		{
+			name:       "enabled with blank gateway",
+			enabled:    true,
+			gatewayURL: "   ",
+			wantErr:    "--rebase-model-gateway-url is not set",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateRebaseModelAssistFlags(test.enabled, test.gatewayURL)
+			if test.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateRebaseModelAssistFlags() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("validateRebaseModelAssistFlags() error = %v, want it to contain %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
 func TestValidateEvidenceFlags(t *testing.T) {
 	tests := []struct {
 		name      string

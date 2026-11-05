@@ -120,6 +120,15 @@ type config struct {
 	// (even of an empty set) is meaningful and turns the criterion check
 	// into a vacuous pass instead of a no-op (#249).
 	Criteria string
+	// RebaseAssist is the raw COURIER_REBASE_MODEL_ASSIST enable flag for
+	// model-assisted conflict resolution (#732); parsed by the resolver
+	// adapter, not here, so the on/off vocabulary lives beside the transport.
+	RebaseAssist string
+	// ModelGatewayURL/ModelGatewayAPIKey are the OpenAI-compatible gateway
+	// the rebase assist resolves through. The key is credential material:
+	// it reaches only the gateway adapter's HTTP header.
+	ModelGatewayURL    string
+	ModelGatewayAPIKey string
 }
 
 // evidenceEnabled reports whether failure-evidence capture is armed for this
@@ -231,6 +240,9 @@ func readConfig(getenv func(string) string) (config, error) {
 		ExhaustionCodes:        getenv("COURIER_MODEL_EXHAUSTION_CODES"),
 		ExhaustionTypes:        getenv("COURIER_MODEL_EXHAUSTION_TYPES"),
 		Criteria:               strings.TrimSpace(getenv(executor.EnvCriteria)),
+		RebaseAssist:           getenv("COURIER_REBASE_MODEL_ASSIST"),
+		ModelGatewayURL:        strings.TrimSpace(getenv("COURIER_MODEL_GATEWAY_URL")),
+		ModelGatewayAPIKey:     getenv("COURIER_MODEL_GATEWAY_API_KEY"),
 	}
 	if strings.TrimSpace(cfg.GitHubToken) == "" {
 		cfg.GitHubToken = cfg.GitToken
@@ -1736,17 +1748,19 @@ func (r reporter) guardFixPRBase(ctx context.Context) int {
 	return 0
 }
 
-// runRebaseMode is the rebase execution path (#715). It runs entirely in
-// trusted deterministic code: the workspace is adopted without the fix-pr
-// base-sync merge, the trusted mechanical rebase engine replays the PR
-// branch onto the pull request's live base, and the outcome maps onto the
-// operator's termination contract exactly like every other ending. No model
-// session starts, so only the engine's closed mechanical rules can ever
-// change a byte, and the publication is leased to the head observed at
-// admission. The rebase outcome decides the phase: published and up-to-date
-// hand off to the operator's world verification, a semantic conflict parks
-// for a human, and writer contention or an unattributable failure ends the
-// attempt Failed for the source's attempt cap to govern.
+// runRebaseMode is the rebase execution path (#715). It runs in trusted
+// deterministic code: the workspace is adopted without the fix-pr base-sync
+// merge, the trusted mechanical rebase engine replays the PR branch onto the
+// pull request's live base, and the outcome maps onto the operator's
+// termination contract exactly like every other ending. No model session
+// starts, so only the engine's closed mechanical rules — plus, when
+// explicitly configured, the one-attempt-per-episode model-assisted
+// resolution the engine validates itself (#732) — can ever change a byte,
+// and the publication is leased to the head observed at admission. The
+// rebase outcome decides the phase: published and up-to-date hand off to
+// the operator's world verification, a semantic conflict parks for a human,
+// and writer contention or an unattributable failure ends the attempt
+// Failed for the source's attempt cap to govern.
 func runRebaseMode(ctx context.Context, report reporter, cfg config) int {
 	workspace, err := git.Prepare(ctx, git.PrepareOptions{
 		RemoteURL:     cfg.RemoteURL,
@@ -1766,18 +1780,44 @@ func runRebaseMode(ctx context.Context, report reporter, cfg config) int {
 		"branch":        cfg.Branch,
 		"baseSyncSkips": true,
 	})
+	resolver, err := newRebaseAssistResolver(cfg)
+	if err != nil {
+		// Enabled but unconfigured fails closed, never silently mechanical:
+		// a deployment that turned the capability on and misconfigured its
+		// transport must see the run fail, not get outcomes produced under
+		// different rules than it asked for.
+		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: exitFailed, Reason: "configure model-assisted conflict resolution: " + err.Error(), Category: terminalCategoryExecutorCrash})
+		return exitFailed
+	}
 	outcome, err := rebase.Execute(ctx, rebase.Options{
-		Repo:          cfg.Repo,
-		Base:          cfg.Base,
-		Branch:        cfg.Branch,
-		ExpectedHead:  cfg.HeadSHA,
-		Workspace:     cfg.Directory,
-		RemoteURL:     cfg.RemoteURL,
-		BaseRemoteURL: cfg.BaseRemoteURL,
+		Repo:            cfg.Repo,
+		Base:            cfg.Base,
+		Branch:          cfg.Branch,
+		ExpectedHead:    cfg.HeadSHA,
+		Workspace:       cfg.Directory,
+		RemoteURL:       cfg.RemoteURL,
+		BaseRemoteURL:   cfg.BaseRemoteURL,
+		Goal:            cfg.Goal,
+		ModelResolver:   resolver,
+		LockfileTimeout: rebase.DefaultLockfileTimeout,
 	})
 	if err != nil {
 		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: exitFailed, Reason: err.Error(), Category: terminalCategoryExecutorCrash})
 		return exitFailed
+	}
+	if outcome.Assist != nil && outcome.Assist.Attempted {
+		// The per-turn evidence that the configured model actually ran on
+		// this task: distinct from run.start's configured model field, and
+		// emitted for published and unresolved endings alike, because the
+		// attempt's spend is real whatever the outcome was. Verbose so the
+		// evidence reaches the log store on every run that ran the assist.
+		report.eventVerbose(courierlog.EventRebaseModelAssist, courierlog.StatusOK, map[string]any{
+			"model":          outcome.Assist.Model,
+			"turns":          outcome.Assist.Turns,
+			"files_resolved": outcome.Assist.FilesResolved,
+			"input_tokens":   outcome.Assist.InputTokens,
+			"output_tokens":  outcome.Assist.OutputTokens,
+		})
 	}
 	switch outcome.Outcome {
 	case rebase.OutcomePublished:

@@ -101,7 +101,7 @@ func observerEnvironment(config PodConfig, invocation Invocation, podName, runUI
 		{Name: "POD_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}},
 		{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},
 	}
-	for _, ref := range CredentialEnvRefs(config) {
+	for _, ref := range CredentialEnvRefs(config, invocation.Mode) {
 		if ref.Name == "COURIER_GIT_USERNAME" || ref.Name == "COURIER_GIT_TOKEN" {
 			envs = append(envs, corev1.EnvVar{Name: ref.Name, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: ref.Secret}, Key: ref.Key}}})
 		}

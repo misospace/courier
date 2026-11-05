@@ -23,6 +23,37 @@ func (e *semanticError) Error() string {
 	return fmt.Sprintf("semantic conflict in %d file(s): %s", len(e.files), e.reason)
 }
 
+// validateConflictedPaths refuses any conflicted path that is not a clean
+// repository-relative path inside the workspace. Every conflicted path comes
+// from git's own output (UnmergedPaths), so such a name should never appear;
+// the engine's reads and writes are keyed on these names, though, and a name
+// that is empty, absolute, or carries an empty, ".", or ".." component would
+// read or write through a path the workspace does not contain. This is
+// defense in depth, not a trust boundary: the path is refused as a semantic
+// conflict with the path named, before anything is read or written through
+// it — the mechanical path and the assist path alike.
+func validateConflictedPaths(paths []string) error {
+	for _, path := range paths {
+		slash := filepath.ToSlash(path)
+		rejected := slash == "" || filepath.IsAbs(slash)
+		if !rejected {
+			for _, component := range strings.Split(slash, "/") {
+				if component == "" || component == "." || component == ".." {
+					rejected = true
+					break
+				}
+			}
+		}
+		if rejected {
+			return &semanticError{
+				files:  []string{path},
+				reason: fmt.Sprintf("conflicted path %q is not a repository-relative path inside the workspace; the engine will not read or write through it", path),
+			}
+		}
+	}
+	return nil
+}
+
 // resolveConflicts classifies every conflicted path of an in-progress rebase
 // with the closed mechanical rules and, when every hunk across every file
 // classifies, stages the resolutions and continues the rebase until it
@@ -30,6 +61,16 @@ func (e *semanticError) Error() string {
 // semantic conflict: mechanical resolution is all-or-nothing, because a
 // replay that resolves some hunks and stops midway leaves a half-written
 // branch no better than it started.
+//
+// When opts.ModelResolver is nil the rules are the entire story, with one
+// deliberate refinement: a conflicted path that is not a regular file — or
+// not a name the filesystem accepts at all — stops the attempt for a human
+// instead of being read or written through. When one is configured, the
+// episode's first rejected set goes to exactly one model-assisted attempt
+// (see assistRound); a later round in the same episode that rejects again
+// has already spent that single attempt, and the attempt stops for a human
+// with the new conflicts named. The fast path, the all-or-nothing property,
+// and the closed rules themselves are untouched.
 //
 // The rules are deliberately narrow. A hunk resolves mechanically only when
 // the base-side content proves which side moved:
@@ -44,16 +85,34 @@ func (e *semanticError) Error() string {
 // lockfile regeneration, version strings — needs a decision, and the attempt
 // stops for a human with the file list. The rules never pick a "likely" side
 // for code and never merge code text.
-func resolveConflicts(ctx context.Context, w *git.Workspace, paths []string) error {
+func resolveConflicts(ctx context.Context, w *git.Workspace, opts Options, origHead string, paths []string, assist *AssistReport) error {
 	if len(paths) == 0 {
 		return errors.New("rebase stopped without reporting conflicted paths")
 	}
+	if err := validateConflictedPaths(paths); err != nil {
+		return err
+	}
 	sort.Strings(paths)
+	// The episode's single model-assisted attempt (#732): spent on the first
+	// round whose rejected set reaches the resolver, and never renewed
+	// within the same Execute.
+	assistSpent := false
 	for round := 0; round < maxRebaseRounds; round++ {
 		var rejected []string
 		for _, path := range paths {
 			resolved, err := resolveFile(w.Directory, path)
 			if err != nil {
+				var nonRegular *nonRegularConflictError
+				if errors.As(err, &nonRegular) {
+					// A conflicted path that can never be classified — not
+					// a regular file, or not a name the filesystem accepts
+					// — stops the attempt for a human with the path named,
+					// exactly as a non-mechanical hunk would.
+					return &semanticError{
+						files:  []string{path},
+						reason: nonRegular.Error(),
+					}
+				}
 				return fmt.Errorf("classify conflict in %s: %w", path, err)
 			}
 			if !resolved {
@@ -65,20 +124,43 @@ func resolveConflicts(ctx context.Context, w *git.Workspace, paths []string) err
 			}
 		}
 		if len(rejected) > 0 {
-			return &semanticError{
-				files:  rejected,
-				reason: "the conflicts need a decision a mechanical rule cannot make; no side was picked",
+			if opts.ModelResolver == nil {
+				return &semanticError{
+					files:  rejected,
+					reason: "the conflicts need a decision a mechanical rule cannot make; no side was picked",
+				}
+			}
+			// The mechanical rules rejected this round's set and a resolver
+			// is configured. The episode's single model-assisted attempt was
+			// already spent on an earlier round: a new rejected set is a new
+			// conflict the one bounded attempt cannot answer, so the attempt
+			// stops for a human with the new conflicts named honestly.
+			if assistSpent {
+				return &semanticError{
+					files:  rejected,
+					reason: "the episode's single model-assisted attempt was already spent on an earlier conflict round; the new conflicts need a human decision",
+				}
+			}
+			assistSpent = true
+			if err := assistRound(ctx, w, opts, origHead, rejected, assist); err != nil {
+				return err
 			}
 		}
 		// Every conflict in this round resolved and staged: continue the
 		// replay. The continue itself can stop again on the next replayed
 		// commit, which loops as another round.
-		if err := w.RebaseContinue(ctx); err != nil {
+		if err := w.RebaseContinue(ctx, w.BaseRevisionRef()); err != nil {
 			var conflictErr *git.RebaseConflictError
 			if !errors.As(err, &conflictErr) {
 				return err
 			}
 			paths = conflictErr.Paths
+			// A later round's paths are the same kind of git output as the
+			// first round's: the same repository-relative guard applies
+			// before anything reads or writes through them.
+			if err := validateConflictedPaths(paths); err != nil {
+				return err
+			}
 			continue
 		}
 		return nil
@@ -89,12 +171,22 @@ func resolveConflicts(ctx context.Context, w *git.Workspace, paths []string) err
 // resolveFile rewrites one conflicted file's hunks in place. It returns false
 // without touching the file when any hunk is non-mechanical, so a rejected
 // file keeps git's markers exactly as the rebase left them for the human
-// summary.
+// summary. A conflicted path that is not a regular file — git leaves the
+// symlink itself in the worktree on a symlink content conflict — or not a
+// name the filesystem accepts at all (a NUL byte or an over-long name, which
+// git cannot produce as a tree entry) is refused as a
+// nonRegularConflictError: reading or writing through the link would reach a
+// path outside the workspace, a mechanical rule never writes bytes it cannot
+// see the provenance of, and an unnamable path is anomalous rather than an
+// infrastructure fault to leak.
 func resolveFile(directory, path string) (bool, error) {
 	full := filepath.Join(directory, filepath.FromSlash(path))
-	info, err := os.Stat(full)
+	info, err := os.Lstat(full)
 	if err != nil {
-		return false, err
+		return false, lstatRefusal(path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return false, nonRegularConflict(path)
 	}
 	if info.Size() > maxConflictFileBytes {
 		return false, nil

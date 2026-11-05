@@ -101,6 +101,23 @@ type Options struct {
 	// work-branch remote (fork topology). Empty means Base lives on
 	// RemoteName.
 	BaseRemoteURL string
+	// Goal is the run's goal text, carried into a model-assisted resolution
+	// request as context for why the pull request exists; reason text only.
+	Goal string
+	// ModelResolver, when non-nil, is consulted at most once per rebase
+	// episode for the files the mechanical rules rejected (the first round
+	// that rejects; a later round that rejects again stops for a human with
+	// its own conflicts). nil means the same closed-rules engine with one
+	// deliberate refinement: a conflicted path that is not a regular file —
+	// or not a name the filesystem accepts at all — stops the attempt for a
+	// human instead of being read or written through. Every such episode
+	// still ends parked for a human, and no model-assisted code can run on
+	// that path.
+	ModelResolver ModelResolver
+	// LockfileTimeout bounds the allowlisted lockfile regeneration inside a
+	// model-assisted episode; zero uses DefaultLockfileTimeout. It never
+	// bounds a model-assisted turn — the run's own context governs that.
+	LockfileTimeout time.Duration
 	// CheckTimeout bounds each bounded repository check invocation; zero uses
 	// DefaultCheckTimeout.
 	CheckTimeout time.Duration
@@ -131,13 +148,36 @@ type Result struct {
 	// LeaseHead is the remote head this attempt read at start and leased its
 	// publication to.
 	LeaseHead string
+	// Assist records the model-assisted resolution turns when a resolver was
+	// configured and at least one turn ran; nil otherwise, including every
+	// nil-resolver attempt.
+	Assist *AssistReport
 }
 
 // Execute runs one rebase attempt. It is deterministic, bounded, and
 // side-effect-free on the remote until the final leased push. An error return
 // means the attempt could not be classified at all (infrastructure); a
 // classified ending — including failure — comes back as a Result.
+//
+// The model-assisted report rides the Result whenever a configured resolver
+// ran at least one turn, whatever the ending: the attempt's evidence belongs
+// to the attempt, not to its success.
 func Execute(ctx context.Context, opts Options) (Result, error) {
+	var assist *AssistReport
+	if opts.ModelResolver != nil {
+		assist = &AssistReport{}
+	}
+	result, err := executeAttempt(ctx, opts, assist)
+	if err == nil && assist != nil && assist.Attempted {
+		result.Assist = assist
+	}
+	return result, err
+}
+
+// executeAttempt is Execute's body; the wrapper exists so every ending of
+// one attempt — published, semantic, contended, failed — can carry the same
+// assist report without each return site repeating the attach.
+func executeAttempt(ctx context.Context, opts Options, assist *AssistReport) (Result, error) {
 	if err := validateOptions(opts); err != nil {
 		return Result{}, err
 	}
@@ -225,9 +265,10 @@ func Execute(ctx context.Context, opts Options) (Result, error) {
 			}
 			return classifyInfra(ctx, w, "rebase onto "+opts.Base, err)
 		}
-		// The replay stopped: classify every hunk mechanically or stop for a
-		// human. Either way the remote is untouched until publication.
-		if resolveErr := resolveConflicts(ctx, w, conflictErr.Paths); resolveErr != nil {
+		// The replay stopped: classify every hunk mechanically, hand the
+		// rejected set to the configured resolver, or stop for a human.
+		// Either way the remote is untouched until publication.
+		if resolveErr := resolveConflicts(ctx, w, opts, origHead, conflictErr.Paths, assist); resolveErr != nil {
 			var semantic *semanticError
 			if errors.As(resolveErr, &semantic) {
 				// Abort restores the branch exactly; the episode stays at one
@@ -239,6 +280,17 @@ func Execute(ctx context.Context, opts Options) (Result, error) {
 					Reason:   semantic.reason,
 					Conflict: &ConflictReport{Base: opts.Base, Files: semantic.files, Reason: semantic.reason},
 				}, nil
+			}
+			var unavailable *resolverUnavailableError
+			if errors.As(resolveErr, &unavailable) {
+				// A resolver that cannot be reached is infrastructure, not a
+				// semantic verdict: the attempt fails, the rebase is aborted,
+				// and the ending stays distinct from NeedsHuman so the
+				// source's failure policy — not a human queue — governs it.
+				if abortErr := w.RebaseAbort(ctx); abortErr != nil {
+					return classifyInfra(ctx, w, "abort the failed resolution", abortErr)
+				}
+				return Result{Outcome: OutcomeFailed, Reason: unavailable.Error()}, nil
 			}
 			if abortErr := w.RebaseAbort(ctx); abortErr != nil {
 				return classifyInfra(ctx, w, "abort the failed resolution", abortErr)

@@ -777,16 +777,24 @@ func (w *Workspace) SyncToBase(ctx context.Context) error {
 	return &MergeConflictError{Base: w.baseRemoteRef(w.Base), Paths: paths}
 }
 
-// UnmergedPaths lists the paths git still considers conflicted.
+// UnmergedPaths lists the paths git still considers conflicted. The paths are
+// repository-controlled names that feed the engine's reads, writes, and error
+// summaries, so they must arrive exactly as git holds them: with -z each entry
+// is NUL-separated and never C-quoted, where git's default output quotes a
+// name carrying non-ASCII or special bytes (a conflicted "café.txt" would
+// arrive as the literal string "caf\303\251.txt") and a newline split plus a
+// trim would also strip a genuine leading space. The -z form keeps the parse
+// exact even for paths git would otherwise quote; only truly empty entries
+// are dropped, never a trim.
 func (w *Workspace) UnmergedPaths(ctx context.Context) ([]string, error) {
-	out, err := run(ctx, w.Directory, "diff", "--name-only", "--diff-filter=U")
+	out, err := run(ctx, w.Directory, "diff", "--name-only", "--diff-filter=U", "-z")
 	if err != nil {
 		return nil, err
 	}
 	var paths []string
-	for _, line := range strings.Split(string(out), "\n") {
-		if line = strings.TrimSpace(line); line != "" {
-			paths = append(paths, line)
+	for _, entry := range strings.Split(string(out), "\x00") {
+		if entry != "" {
+			paths = append(paths, entry)
 		}
 	}
 	return paths, nil
@@ -900,10 +908,21 @@ func (w *Workspace) Rebase(ctx context.Context, upstreamRef string) error {
 
 // RebaseContinue resumes an in-progress rebase after the resolver staged its
 // mechanical resolutions. The editor is pinned to true so the continue never
-// opens one.
-func (w *Workspace) RebaseContinue(ctx context.Context) error {
+// opens one. A continue that stops again — the next replayed commit conflicts
+// — is classified exactly like Rebase's stop: *RebaseConflictError with the
+// unmerged paths, so the resolver's round loop can classify the new round
+// instead of seeing an unattributable plain error. Anything else fails
+// closed. upstreamRef names the rebase's upstream for the error record only.
+func (w *Workspace) RebaseContinue(ctx context.Context, upstreamRef string) error {
 	_, err := runWithEnv(ctx, w.Directory, []string{"GIT_EDITOR=true"}, "rebase", "--continue")
-	return err
+	if err == nil {
+		return nil
+	}
+	paths, pathsErr := w.UnmergedPaths(ctx)
+	if pathsErr != nil || len(paths) == 0 {
+		return err
+	}
+	return &RebaseConflictError{Upstream: upstreamRef, Paths: paths}
 }
 
 // RebaseAbort stops an in-progress rebase and restores the branch to its
@@ -913,10 +932,23 @@ func (w *Workspace) RebaseAbort(ctx context.Context) error {
 	return err
 }
 
+// LiteralPathspec renders a repository-relative path as a git pathspec that
+// selects exactly that file. Git pathspec entries that begin with ':' are
+// read as magic (exclusion, globs, and the rest), so a repository-controlled
+// name whose first byte is ':' would change meaning instead of naming the
+// file; the ":(top,literal)" form anchors at the repository top and treats
+// the remainder as a literal path. Every path the repository itself
+// produced — and only such a path — goes through this.
+func LiteralPathspec(path string) string {
+	return ":(top,literal)" + path
+}
+
 // Stage records a resolved path in the index so a scripted rebase continue
-// can commit it.
+// can commit it. The path is a repository-controlled name, so it is passed
+// as a literal anchored pathspec: a name whose first byte is ':' would
+// otherwise activate pathspec magic instead of selecting exactly that file.
 func (w *Workspace) Stage(ctx context.Context, path string) error {
-	_, err := run(ctx, w.Directory, "add", "--", path)
+	_, err := run(ctx, w.Directory, "add", "--", LiteralPathspec(path))
 	return err
 }
 
