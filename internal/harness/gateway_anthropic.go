@@ -325,13 +325,78 @@ type anthropicStreamEvent struct {
 	Index        *int                       `json:"index,omitempty"`
 	ContentBlock *anthropicContentBlockHead `json:"content_block,omitempty"`
 	Delta        *anthropicStreamDelta      `json:"delta,omitempty"`
-	Error        *anthropicErrorBody        `json:"error,omitempty"`
+	// Usage is the message_delta's cumulative output count for the turn,
+	// raw because a report telemetry cannot read as exact whole-token
+	// counts is an absence, never a turn failure (#738).
+	Usage json.RawMessage     `json:"usage,omitempty"`
+	Error *anthropicErrorBody `json:"error,omitempty"`
 }
 
+// anthropicDeltaUsage is the output count a Messages message_delta carries,
+// decoded leniently. The count is cumulative within the message, not a
+// per-delta increment: each delta's value replaces the previous one.
+type anthropicDeltaUsage struct {
+	OutputTokens json.Number `json:"output_tokens"`
+}
+
+// anthropicMessageStart is the message's opening envelope. Its usage is the
+// only place the Messages stream names the input and prompt-cache counts
+// (#738). The usage object is raw because a report telemetry cannot read as
+// exact whole-token counts is an absence, never a turn failure; a provider
+// that did not report usage omits it, and an absent report is an explicit
+// absence the terminal records as nil, never a zero.
 type anthropicMessageStart struct {
-	Usage struct {
-		InputTokens int `json:"input_tokens"`
-	} `json:"usage"`
+	Usage json.RawMessage `json:"usage"`
+}
+
+// decodeMessageStartUsage decodes the opening envelope's usage leniently
+// (#738): a provider or proxy that reports a fractional or otherwise
+// non-integer count has not reported an exact token count, so the report is
+// treated as absent — the turn is never failed for telemetry's sake, and no
+// fractional count the provider did not report is invented. The envelope's
+// mandatory total input count — input_tokens, the only place the stream
+// names the input accepted — must be present and exact before an exact
+// report is decoded: a present object missing it names no exact usage at
+// all, and an absent field is never an invented zero (#738). The
+// prompt-cache counts are optional and take their documented default of
+// zero when the provider omits them. The last return reports whether an
+// exact report was decoded.
+func decodeMessageStartUsage(raw json.RawMessage) (input, cacheRead, cacheWrite int64, ok bool) {
+	if trimmed := bytes.TrimSpace(raw); len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return 0, 0, 0, false
+	}
+	var wire struct {
+		InputTokens              json.Number `json:"input_tokens"`
+		CacheReadInputTokens     json.Number `json:"cache_read_input_tokens"`
+		CacheCreationInputTokens json.Number `json:"cache_creation_input_tokens"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return 0, 0, 0, false
+	}
+	input, inputOK := wholeCount(wire.InputTokens)
+	cacheRead, readOK := optionalWholeCount(wire.CacheReadInputTokens)
+	cacheWrite, writeOK := optionalWholeCount(wire.CacheCreationInputTokens)
+	if !inputOK || !readOK || !writeOK {
+		return 0, 0, 0, false
+	}
+	return input, cacheRead, cacheWrite, true
+}
+
+// decodeDeltaUsage decodes the message_delta's cumulative output count
+// leniently (#738), under the same exactness rule as the opening envelope's:
+// the delta's mandatory total output count — output_tokens, the only place
+// the stream names the output produced — must be present and exact before
+// an exact report is decoded, and an absent field is never an invented
+// zero (#738).
+func decodeDeltaUsage(raw json.RawMessage) (output int64, ok bool) {
+	if trimmed := bytes.TrimSpace(raw); len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return 0, false
+	}
+	var wire anthropicDeltaUsage
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return 0, false
+	}
+	return wholeCount(wire.OutputTokens)
 }
 
 type anthropicContentBlockHead struct {
@@ -456,9 +521,26 @@ func normalizeAnthropicStream(body io.Reader, signals ExhaustionSignals) ([]Even
 	var contentBytes, argumentBytes, identityBytes int
 	var stopReason string
 	var sawMessageStop bool
+	// usage is the provider's report for the turn, assembled from the
+	// message's opening envelope (input and prompt-cache counts) and the
+	// cumulative output count the message_delta events carry (#738).
+	// usageSeen distinguishes "the provider reported usage" from a nil
+	// report: absence is recorded as absence, never a zero.
+	// usageUnusable marks a usage object the provider sent that is not an
+	// exact whole-token count: a report telemetry cannot honor is no
+	// report, so it voids the turn's whole account — the partial counts
+	// already decoded are discarded with it — and no later exact object
+	// resurrects it (#738).
+	var usage *Usage
+	usageSeen := false
+	usageUnusable := false
 
 	terminal := func(err error) ([]Event, error) {
-		events = append(events, Event{Kind: KindError, Err: err})
+		event := Event{Kind: KindError, Err: err}
+		if usageSeen {
+			event.Usage = usage
+		}
+		events = append(events, event)
 		return events, nil
 	}
 
@@ -476,7 +558,34 @@ func normalizeAnthropicStream(body io.Reader, signals ExhaustionSignals) ([]Even
 			return terminal(errors.New("harness: undecodable stream chunk"))
 		}
 		switch event.Type {
-		case "ping", "message_start":
+		case "ping":
+			continue
+		case "message_start":
+			// The opening envelope's usage is the only place the stream
+			// names the input and prompt-cache counts (#738); the event
+			// itself carries no other payload. A present usage object that
+			// is not an exact whole-token count is not a report: it voids
+			// the turn's whole account, never a turn failure, and never a
+			// partial one. An exact envelope fills in the input-side counts
+			// without discarding what the turn already recorded exactly —
+			// an output count an earlier delta named stays, so no exact
+			// count the provider reported is ever lost to a zero.
+			if event.Message != nil {
+				if input, cacheRead, cacheWrite, ok := decodeMessageStartUsage(event.Message.Usage); ok {
+					if !usageUnusable {
+						if usage == nil {
+							usage = &Usage{}
+						}
+						usage.InputTokens = input
+						usage.CacheReadTokens = cacheRead
+						usage.CacheWriteTokens = cacheWrite
+						usageSeen = true
+					}
+				} else if usageReported(event.Message.Usage) {
+					usageUnusable = true
+					usage, usageSeen = nil, false
+				}
+			}
 			continue
 		case "content_block_start":
 			if event.Index == nil || event.ContentBlock == nil {
@@ -556,6 +665,27 @@ func normalizeAnthropicStream(body io.Reader, signals ExhaustionSignals) ([]Even
 			if event.Delta != nil && event.Delta.StopReason != "" {
 				stopReason = event.Delta.StopReason
 			}
+			// The Messages stream's output count arrives here, cumulative
+			// within the message: each value replaces the previous one, so
+			// the last one is the turn's (#738). A present count that is
+			// not an exact whole-token count is not a report: it voids
+			// the turn's whole account, discarding the partial counts
+			// already decoded beside it — a partial zero-valued report is
+			// worse than no report at all — and never fails the turn. An
+			// absent usage object changes nothing: a report assembled
+			// from what the provider exactly named stands.
+			if output, ok := decodeDeltaUsage(event.Usage); ok {
+				if !usageUnusable {
+					if usage == nil {
+						usage = &Usage{}
+					}
+					usage.OutputTokens = output
+					usageSeen = true
+				}
+			} else if usageReported(event.Usage) {
+				usageUnusable = true
+				usage, usageSeen = nil, false
+			}
 		case "message_stop":
 			sawMessageStop = true
 		case "error":
@@ -633,6 +763,13 @@ func normalizeAnthropicStream(body io.Reader, signals ExhaustionSignals) ([]Even
 			return terminal(ErrStreamEventOverflow)
 		}
 		events = next
+	}
+	// The terminal event is the last one in both success branches: the last
+	// assembled tool request or the final. It carries the provider's usage
+	// report for the turn when the provider sent one (#738); a stream the
+	// provider counted is the request the run's telemetry accounts for.
+	if usageSeen {
+		events[len(events)-1].Usage = usage
 	}
 	return events, nil
 }

@@ -644,3 +644,411 @@ func TestAnthropicSingleSystemMessageBecomesTheUserTurn(t *testing.T) {
 		t.Fatalf("promoted turn block = %s; want the pinned message verbatim", blockJSON)
 	}
 }
+
+// TestAnthropicStreamCarriesUsageFromStartAndDelta pins the Messages usage
+// assembly (#738): the input and prompt-cache counts come from the message's
+// opening envelope, and the output count is the cumulative value the last
+// message_delta carries. The assembled report rides the turn's final terminal.
+func TestAnthropicStreamCarriesUsageFromStartAndDelta(t *testing.T) {
+	transport, _, cleanup := anthropicFor(t, anthropicSSE(
+		anthropicPayload(t, map[string]any{
+			"type":    "message_start",
+			"message": map[string]any{"id": "msg_1", "usage": map[string]any{"input_tokens": 250, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 20}},
+		}),
+		anthropicPayload(t, map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}}),
+		anthropicPayload(t, map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "done"}}),
+		anthropicPayload(t, map[string]any{"type": "content_block_stop", "index": 0}),
+		// Cumulative within the message: each value replaces the previous.
+		anthropicPayload(t, map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn"}, "usage": map[string]any{"output_tokens": 30}}),
+		anthropicPayload(t, map[string]any{"type": "message_delta", "delta": map[string]any{}, "usage": map[string]any{"output_tokens": 45}}),
+		anthropicPayload(t, map[string]any{"type": "message_stop"}),
+	))
+	defer cleanup()
+	events, err := transport.StreamChat(context.Background(), ChatRequest{Model: "MiniMax-M3.1-Flash", Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := events[len(events)-1]
+	if last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final", last)
+	}
+	if last.Usage == nil {
+		t.Fatal("the final terminal carries no usage, but the provider reported some")
+	}
+	if last.Usage.InputTokens != 250 {
+		t.Fatalf("input tokens = %d, want 250 (from message_start)", last.Usage.InputTokens)
+	}
+	if last.Usage.CacheReadTokens != 100 {
+		t.Fatalf("cache-read tokens = %d, want 100 (from message_start)", last.Usage.CacheReadTokens)
+	}
+	if last.Usage.CacheWriteTokens != 20 {
+		t.Fatalf("cache-write tokens = %d, want 20 (from message_start)", last.Usage.CacheWriteTokens)
+	}
+	if last.Usage.OutputTokens != 45 {
+		t.Fatalf("output tokens = %d, want 45 (the last cumulative message_delta)", last.Usage.OutputTokens)
+	}
+}
+
+// TestAnthropicStreamWithoutUsageRecordsNil pins the explicit-absence rule for
+// the Messages stream: a stream that never reports usage carries a nil usage on
+// its terminal, never an invented zero.
+func TestAnthropicStreamWithoutUsageRecordsNil(t *testing.T) {
+	transport, _, cleanup := anthropicFor(t, anthropicSSE(
+		anthropicPayload(t, map[string]any{"type": "message_start", "message": map[string]any{"id": "msg_1"}}),
+		anthropicPayload(t, map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}}),
+		anthropicPayload(t, map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "done"}}),
+		anthropicPayload(t, map[string]any{"type": "content_block_stop", "index": 0}),
+		anthropicPayload(t, map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn"}}),
+		anthropicPayload(t, map[string]any{"type": "message_stop"}),
+	))
+	defer cleanup()
+	events, err := transport.StreamChat(context.Background(), ChatRequest{Model: "MiniMax-M3.1-Flash", Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := events[len(events)-1]
+	if last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final", last)
+	}
+	if last.Usage != nil {
+		t.Fatalf("terminal usage = %+v, want nil (the provider reported none)", last.Usage)
+	}
+}
+
+// TestAnthropicStreamCarriesUsageOnAnError pins that a usage the provider
+// reported before an in-stream failure is not discarded: the error terminal
+// rides the input and cache counts the opening envelope already named.
+func TestAnthropicStreamCarriesUsageOnAnError(t *testing.T) {
+	transport, _, cleanup := anthropicFor(t, anthropicSSE(
+		anthropicPayload(t, map[string]any{
+			"type":    "message_start",
+			"message": map[string]any{"id": "msg_1", "usage": map[string]any{"input_tokens": 250, "cache_read_input_tokens": 100}},
+		}),
+		anthropicPayload(t, map[string]any{"type": "error", "error": map[string]any{"type": "overloaded_error", "message": "overloaded"}}),
+	))
+	defer cleanup()
+	events, err := transport.StreamChat(context.Background(), ChatRequest{Model: "MiniMax-M3.1-Flash", Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := events[len(events)-1]
+	if last.Kind != KindError {
+		t.Fatalf("terminal event = %+v, want error", last)
+	}
+	if last.Usage == nil || last.Usage.InputTokens != 250 || last.Usage.CacheReadTokens != 100 {
+		t.Fatalf("error-terminal usage = %+v, want the provider's pre-failure report", last.Usage)
+	}
+}
+
+// TestAnthropicStreamStartOnlyUsage pins the partial-report convention: a
+// stream whose provider names the input count in message_start and never
+// sends a message_delta usage reports what was given — the request counts as
+// reported, and the unreported output reads as zero inside a reported usage,
+// never as an unreported request.
+func TestAnthropicStreamStartOnlyUsage(t *testing.T) {
+	transport, _, cleanup := anthropicFor(t, anthropicSSE(
+		anthropicPayload(t, map[string]any{
+			"type":    "message_start",
+			"message": map[string]any{"id": "msg_1", "usage": map[string]any{"input_tokens": 250}},
+		}),
+		anthropicPayload(t, map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}}),
+		anthropicPayload(t, map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "done"}}),
+		anthropicPayload(t, map[string]any{"type": "content_block_stop", "index": 0}),
+		anthropicPayload(t, map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn"}}),
+		anthropicPayload(t, map[string]any{"type": "message_stop"}),
+	))
+	defer cleanup()
+	events, err := transport.StreamChat(context.Background(), ChatRequest{Model: "MiniMax-M3.1-Flash", Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := events[len(events)-1]
+	if last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final", last)
+	}
+	if last.Usage == nil || last.Usage.InputTokens != 250 || last.Usage.OutputTokens != 0 {
+		t.Fatalf("terminal usage = %+v, want the start envelope's report with output unreported", last.Usage)
+	}
+}
+
+// TestAnthropicStreamUnreadableUsageIsAnAbsenceNotAFailure pins the
+// tolerance rule (#738): a proxy that reports a fractional output count has
+// not reported an exact count, so the turn's whole report is an absence — a
+// report telemetry cannot honor is no report, never a partial one whose
+// unavailable counts read as zeros — and the turn succeeds: on the Messages
+// path as on the OpenAI-compatible one, telemetry must never fail a stream
+// the provider produced.
+func TestAnthropicStreamUnreadableUsageIsAnAbsenceNotAFailure(t *testing.T) {
+	transport, _, cleanup := anthropicFor(t, anthropicSSE(
+		anthropicPayload(t, map[string]any{
+			"type":    "message_start",
+			"message": map[string]any{"id": "msg_1", "usage": map[string]any{"input_tokens": 250}},
+		}),
+		anthropicPayload(t, map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}}),
+		anthropicPayload(t, map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "done"}}),
+		anthropicPayload(t, map[string]any{"type": "content_block_stop", "index": 0}),
+		anthropicPayload(t, json.RawMessage(`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":12.5}}`)),
+		anthropicPayload(t, map[string]any{"type": "message_stop"}),
+	))
+	defer cleanup()
+	events, err := transport.StreamChat(context.Background(), ChatRequest{Model: "MiniMax-M3.1-Flash", Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := events[len(events)-1]
+	if last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final (a non-exact usage report must not fail the turn)", last)
+	}
+	if last.Usage != nil {
+		t.Fatalf("terminal usage = %+v, want nil: a non-exact count voids the whole report, never a partial one with a zero output", last.Usage)
+	}
+}
+
+// TestAnthropicStreamUnreadableStartUsageIsAnAbsenceToo pins the mirror of
+// the delta rule (#738): an opening envelope whose usage object is not an
+// exact whole-token count is not a report either, and a later exact
+// message_delta count cannot resurrect the report the envelope voided — the
+// turn's whole report stays an absence.
+func TestAnthropicStreamUnreadableStartUsageIsAnAbsenceToo(t *testing.T) {
+	transport, _, cleanup := anthropicFor(t, anthropicSSE(
+		anthropicPayload(t, map[string]any{
+			"type":    "message_start",
+			"message": map[string]any{"id": "msg_1", "usage": map[string]any{"input_tokens": 250.5}},
+		}),
+		anthropicPayload(t, map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}}),
+		anthropicPayload(t, map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "done"}}),
+		anthropicPayload(t, map[string]any{"type": "content_block_stop", "index": 0}),
+		anthropicPayload(t, map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn"}, "usage": map[string]any{"output_tokens": 30}}),
+		anthropicPayload(t, map[string]any{"type": "message_stop"}),
+	))
+	defer cleanup()
+	events, err := transport.StreamChat(context.Background(), ChatRequest{Model: "MiniMax-M3.1-Flash", Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := events[len(events)-1]
+	if last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final (a non-exact envelope report must not fail the turn)", last)
+	}
+	if last.Usage != nil {
+		t.Fatalf("terminal usage = %+v, want nil: a non-exact envelope voids the report a later exact delta cannot resurrect", last.Usage)
+	}
+}
+
+// TestAnthropicStreamLaterUnreadableUsageVoidsTheReport pins that the
+// non-exact rule is not first-wins filtering (#738): a stream whose exact
+// reports already assembled a partial account still loses the whole report
+// when a later message_delta count is not exact — the partial counts
+// already decoded are discarded with it.
+func TestAnthropicStreamLaterUnreadableUsageVoidsTheReport(t *testing.T) {
+	transport, _, cleanup := anthropicFor(t, anthropicSSE(
+		anthropicPayload(t, map[string]any{
+			"type":    "message_start",
+			"message": map[string]any{"id": "msg_1", "usage": map[string]any{"input_tokens": 250}},
+		}),
+		anthropicPayload(t, map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}}),
+		anthropicPayload(t, map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "done"}}),
+		anthropicPayload(t, map[string]any{"type": "content_block_stop", "index": 0}),
+		anthropicPayload(t, map[string]any{"type": "message_delta", "delta": map[string]any{}, "usage": map[string]any{"output_tokens": 30}}),
+		anthropicPayload(t, json.RawMessage(`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":30.5}}`)),
+		anthropicPayload(t, map[string]any{"type": "message_stop"}),
+	))
+	defer cleanup()
+	events, err := transport.StreamChat(context.Background(), ChatRequest{Model: "MiniMax-M3.1-Flash", Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := events[len(events)-1]
+	if last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final", last)
+	}
+	if last.Usage != nil {
+		t.Fatalf("terminal usage = %+v, want nil: a later non-exact count voids the partial report already assembled", last.Usage)
+	}
+}
+
+// TestAnthropicStreamOutOfOrderStartKeepsAnExactOutput pins the assembly
+// robustness (#738): a stream whose exact output delta precedes its exact
+// opening envelope keeps both counts — the envelope fills in the input-side
+// counts without discarding the output count already recorded exactly, so
+// no count the provider reported is ever lost to a zero.
+func TestAnthropicStreamOutOfOrderStartKeepsAnExactOutput(t *testing.T) {
+	transport, _, cleanup := anthropicFor(t, anthropicSSE(
+		anthropicPayload(t, map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn"}, "usage": map[string]any{"output_tokens": 30}}),
+		anthropicPayload(t, map[string]any{
+			"type":    "message_start",
+			"message": map[string]any{"id": "msg_1", "usage": map[string]any{"input_tokens": 250}},
+		}),
+		anthropicPayload(t, map[string]any{"type": "message_stop"}),
+	))
+	defer cleanup()
+	events, err := transport.StreamChat(context.Background(), ChatRequest{Model: "MiniMax-M3.1-Flash", Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := events[len(events)-1]
+	if last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final", last)
+	}
+	if last.Usage == nil || last.Usage.InputTokens != 250 || last.Usage.OutputTokens != 30 {
+		t.Fatalf("terminal usage = %+v, want the assembled report: the envelope's input beside the delta's exact output", last.Usage)
+	}
+}
+
+// TestAnthropicStreamEmptyStartUsageIsNotAnExactReport pins the absence rule
+// for a present-but-empty envelope (#738): a message_start usage object that
+// names no counts at all is not an exact report of zero input tokens, and it
+// voids the turn's whole account exactly as a fractional envelope does — a
+// later exact output count cannot resurrect the report the envelope voided.
+func TestAnthropicStreamEmptyStartUsageIsNotAnExactReport(t *testing.T) {
+	transport, _, cleanup := anthropicFor(t, anthropicSSE(
+		anthropicPayload(t, map[string]any{
+			"type":    "message_start",
+			"message": map[string]any{"id": "msg_1", "usage": map[string]any{}},
+		}),
+		anthropicPayload(t, map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}}),
+		anthropicPayload(t, map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "done"}}),
+		anthropicPayload(t, map[string]any{"type": "content_block_stop", "index": 0}),
+		anthropicPayload(t, map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn"}, "usage": map[string]any{"output_tokens": 30}}),
+		anthropicPayload(t, map[string]any{"type": "message_stop"}),
+	))
+	defer cleanup()
+	events, err := transport.StreamChat(context.Background(), ChatRequest{Model: "MiniMax-M3.1-Flash", Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := events[len(events)-1]
+	if last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final (an empty envelope usage must not fail the turn)", last)
+	}
+	if last.Usage != nil {
+		t.Fatalf("terminal usage = %+v, want nil: an envelope naming no counts is not an exact zero report a later delta can resurrect", last.Usage)
+	}
+}
+
+// TestAnthropicStreamStartUsageMissingInputIsNotAnExactReport pins the
+// required-count rule on the opening envelope (#738): a present usage
+// object that names only the optional prompt-cache counts and omits the
+// mandatory input total is not an exact report — an absent input_tokens is
+// no report at all, never a zero the provider did not state.
+func TestAnthropicStreamStartUsageMissingInputIsNotAnExactReport(t *testing.T) {
+	transport, _, cleanup := anthropicFor(t, anthropicSSE(
+		anthropicPayload(t, map[string]any{
+			"type":    "message_start",
+			"message": map[string]any{"id": "msg_1", "usage": map[string]any{"cache_read_input_tokens": 100}},
+		}),
+		anthropicPayload(t, map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}}),
+		anthropicPayload(t, map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "done"}}),
+		anthropicPayload(t, map[string]any{"type": "content_block_stop", "index": 0}),
+		anthropicPayload(t, map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn"}, "usage": map[string]any{"output_tokens": 30}}),
+		anthropicPayload(t, map[string]any{"type": "message_stop"}),
+	))
+	defer cleanup()
+	events, err := transport.StreamChat(context.Background(), ChatRequest{Model: "MiniMax-M3.1-Flash", Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := events[len(events)-1]
+	if last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final (an envelope missing its required count must not fail the turn)", last)
+	}
+	if last.Usage != nil {
+		t.Fatalf("terminal usage = %+v, want nil: a report missing the input total is not exact zero input", last.Usage)
+	}
+}
+
+// TestAnthropicStreamEmptyDeltaUsageIsNotAnExactReport pins the required-count
+// rule on the cumulative output count (#738): a message_delta usage object
+// that omits output_tokens is not an exact report of zero output — and it
+// voids the input-side counts the exact envelope already assembled, discarding
+// the partial report with it, exactly as a fractional delta count does.
+func TestAnthropicStreamEmptyDeltaUsageIsNotAnExactReport(t *testing.T) {
+	transport, _, cleanup := anthropicFor(t, anthropicSSE(
+		anthropicPayload(t, map[string]any{
+			"type":    "message_start",
+			"message": map[string]any{"id": "msg_1", "usage": map[string]any{"input_tokens": 250}},
+		}),
+		anthropicPayload(t, map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}}),
+		anthropicPayload(t, map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "done"}}),
+		anthropicPayload(t, map[string]any{"type": "content_block_stop", "index": 0}),
+		anthropicPayload(t, map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn"}, "usage": map[string]any{}}),
+		anthropicPayload(t, map[string]any{"type": "message_stop"}),
+	))
+	defer cleanup()
+	events, err := transport.StreamChat(context.Background(), ChatRequest{Model: "MiniMax-M3.1-Flash", Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := events[len(events)-1]
+	if last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final (a delta usage missing its required count must not fail the turn)", last)
+	}
+	if last.Usage != nil {
+		t.Fatalf("terminal usage = %+v, want nil: a delta naming no counts voids the partial report already assembled", last.Usage)
+	}
+}
+
+// TestAnthropicStreamOptionalCacheCountsDefaultToZero pins the optional-field
+// rule (#738): an envelope that omits the prompt-cache counts entirely still
+// reports exact usage, the omitted subsets reading as their documented
+// default of zero, never voiding the report and never standing in for a
+// total the provider did not name.
+func TestAnthropicStreamOptionalCacheCountsDefaultToZero(t *testing.T) {
+	transport, _, cleanup := anthropicFor(t, anthropicSSE(
+		anthropicPayload(t, map[string]any{
+			"type":    "message_start",
+			"message": map[string]any{"id": "msg_1", "usage": map[string]any{"input_tokens": 250}},
+		}),
+		anthropicPayload(t, map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}}),
+		anthropicPayload(t, map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "done"}}),
+		anthropicPayload(t, map[string]any{"type": "content_block_stop", "index": 0}),
+		anthropicPayload(t, map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn"}, "usage": map[string]any{"output_tokens": 30}}),
+		anthropicPayload(t, map[string]any{"type": "message_stop"}),
+	))
+	defer cleanup()
+	events, err := transport.StreamChat(context.Background(), ChatRequest{Model: "MiniMax-M3.1-Flash", Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := events[len(events)-1]
+	if last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final", last)
+	}
+	if last.Usage == nil {
+		t.Fatal("the final terminal carries no usage, but the provider reported both mandatory totals")
+	}
+	if last.Usage.InputTokens != 250 || last.Usage.OutputTokens != 30 || last.Usage.CacheReadTokens != 0 || last.Usage.CacheWriteTokens != 0 {
+		t.Fatalf("terminal usage = %+v, want the report with the omitted cache subsets at zero", last.Usage)
+	}
+}
+
+// TestAnthropicStreamUnreadableCacheCountVoidsTheReport pins the optional
+// count's exactness rule (#738): a present-but-fractional prompt-cache count
+// voids the opening envelope's report exactly as a fractional input_tokens
+// does — optional in presence, not in exactness — and the turn still
+// succeeds: telemetry must never fail a stream the provider counted.
+func TestAnthropicStreamUnreadableCacheCountVoidsTheReport(t *testing.T) {
+	transport, _, cleanup := anthropicFor(t, anthropicSSE(
+		anthropicPayload(t, map[string]any{
+			"type":    "message_start",
+			"message": map[string]any{"id": "msg_1", "usage": map[string]any{"input_tokens": 250, "cache_read_input_tokens": 12.5}},
+		}),
+		anthropicPayload(t, map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}}),
+		anthropicPayload(t, map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "done"}}),
+		anthropicPayload(t, map[string]any{"type": "content_block_stop", "index": 0}),
+		anthropicPayload(t, map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn"}, "usage": map[string]any{"output_tokens": 30}}),
+		anthropicPayload(t, map[string]any{"type": "message_stop"}),
+	))
+	defer cleanup()
+	events, err := transport.StreamChat(context.Background(), ChatRequest{Model: "MiniMax-M3.1-Flash", Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := events[len(events)-1]
+	if last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final (an unreadable cache count must not fail the turn)", last)
+	}
+	if last.Usage != nil {
+		t.Fatalf("terminal usage = %+v, want nil: a present non-exact cache count is not an exact report", last.Usage)
+	}
+}

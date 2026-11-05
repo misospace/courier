@@ -177,6 +177,21 @@ func runArgs(args []string) error {
 	// Transient probe failures (a broker pod still starting, one gateway
 	// hiccup) are re-probed for bounded rounds before declaring, so a
 	// slow-to-start dependency does not park the run with a human.
+	//
+	// The run's model telemetry (#738): one shared emitter serves both the
+	// per-request model.call lines and the terminal model.telemetry summary,
+	// and the tally tallies every request observation and applied compaction
+	// the native harness produces — the capability probe's and the
+	// coordinator's sessions' alike — so the summary next to the terminal
+	// handoff accounts for the run's whole model spend. Telemetry is
+	// observability only: a run without provider-reported usage is tallied
+	// with an explicit absence, never a zero.
+	modelEvents := courierlog.NewEmitter(os.Stdout, courierlog.ParseLevel(os.Getenv("COURIER_LOG_LEVEL")))
+	modelTally := harness.NewModelTelemetry(modelRequestSink{
+		emitter:    modelEvents,
+		stderr:     os.Stderr,
+		invocation: invocation,
+	})
 	deps := harness.ProbeDeps{
 		Transport:          gateway,
 		Bindings:           bindings,
@@ -199,9 +214,12 @@ func runArgs(args []string) error {
 		ProbeWorker: func(probeCtx context.Context) harness.Capability {
 			return identity.probeWorker(probeCtx)
 		},
-		ModelProbe: func(probeCtx context.Context, model string) error {
+		ModelProbe: func(probeCtx context.Context, model string) ([]harness.Event, error) {
 			return probeModel(probeCtx, gateway, model)
 		},
+		// The gate's model spend rides the run's model telemetry: one probe
+		// observation per unique bound model (#738).
+		Requests: modelTally,
 	}
 	var caps []harness.Capability
 	for attempt := 0; ; attempt++ {
@@ -219,13 +237,16 @@ func runArgs(args []string) error {
 			// a blocked-external ending so the source re-offers the work once
 			// capacity returns (#320).
 			if exhaustedGate(err) {
+				emitModelTelemetry(modelEvents, invocation, modelTally.Summary())
 				return declareBlockedExternal(reason, caps, reporter, identity)
 			}
+			emitModelTelemetry(modelEvents, invocation, modelTally.Summary())
 			return declareNeedsHuman(reason, caps, reporter, identity)
 		}
 		fmt.Printf("transient capability failure, re-probing: %s\n", reason)
 		select {
 		case <-ctx.Done():
+			emitModelTelemetry(modelEvents, invocation, modelTally.Summary())
 			return declareNeedsHuman(reason, caps, reporter, identity)
 		case <-time.After(probeRetryDelay):
 		}
@@ -242,6 +263,10 @@ func runArgs(args []string) error {
 		filepath.Join(topology.ControlWorkspacePath, "integration"), nil)
 	engine, err := harness.NewPublicationEngine(identity.brokerClient(), integrator)
 	if err != nil {
+		// The gate already passed, so the tally holds the run's probe
+		// requests: the summary is emitted before the failure returns, on
+		// the same best-effort terms as every other exit (#738).
+		emitModelTelemetry(modelEvents, invocation, modelTally.Summary())
 		return fmt.Errorf("courier-control: publication engine: %w", err)
 	}
 
@@ -255,6 +280,10 @@ func runArgs(args []string) error {
 	// infrastructure the relaunch owns.
 	skillSet, err := loadRunSkills(ctx, invocation, engine)
 	if err != nil {
+		// The gate already passed, so the tally holds the run's probe
+		// requests: the summary is emitted before the declare, on the same
+		// best-effort terms as every other exit (#738).
+		emitModelTelemetry(modelEvents, invocation, modelTally.Summary())
 		var skillsErr *skillLoadError
 		if errors.As(err, &skillsErr) {
 			return declareNeedsHuman(skillsErr.reason(), append(caps, skillsErr.capability()), reporter, identity)
@@ -306,6 +335,11 @@ func runArgs(args []string) error {
 			stderr:     os.Stderr,
 			invocation: invocation,
 		},
+		// The run's model telemetry (#738): the sessions it opens report each
+		// request attempt through it and their applied compactions chain its
+		// tally beside the primary compaction sink, so the terminal
+		// model.telemetry summary accounts for the whole run's model spend.
+		Telemetry: modelTally,
 		BootstrapReceipts: bootstrapReceiptSink{
 			emitter:    courierlog.NewEmitter(os.Stdout, courierlog.ParseLevel(os.Getenv("COURIER_LOG_LEVEL"))),
 			stderr:     os.Stderr,
@@ -314,9 +348,14 @@ func runArgs(args []string) error {
 		Skills: skillSet,
 	})
 	if err != nil {
+		// A coordinator that failed construction already made its gate's
+		// probe requests: the summary is emitted before the failure returns,
+		// on the same best-effort terms as every other exit (#738).
+		emitModelTelemetry(modelEvents, invocation, modelTally.Summary())
 		return fmt.Errorf("courier-control: %w", err)
 	}
 	result := coordinator.Run(ctx, invocation)
+	emitModelTelemetry(modelEvents, invocation, modelTally.Summary())
 	return declare(result, invocation.Mode, reporter, identity)
 }
 
@@ -339,6 +378,65 @@ func classifyGateFailure(err error) (reason string, retryable bool) {
 func exhaustedGate(err error) bool {
 	var gateErr *harness.GateError
 	return errors.As(err, &gateErr) && gateErr.Exhausted()
+}
+
+// emitModelTelemetry records the run's model-telemetry summary (#738) on the
+// structured event log: one model.telemetry line carrying the request
+// tallies by class and by role/model cell, the split between provider-
+// reported and missing usage, the token sums the provider reported, the
+// peaks, and the compaction account. The provider's token fields appear only
+// when some provider reported usage — a run with no reported usage carries
+// the counts that are always known, never zero token sums that could read as
+// a free run. The event is Verbose so the summary reaches the log store at
+// info level on every finished run, like run.summary. Emission is
+// best-effort: a dropped event is noted on stderr and the run continues.
+func emitModelTelemetry(emitter *courierlog.Emitter, invocation executor.Invocation, summary harness.ModelTelemetrySummary) {
+	cells := make([]map[string]any, 0, len(summary.ByRoleModel))
+	for _, cell := range summary.ByRoleModel {
+		cells = append(cells, map[string]any{
+			"role":           cell.Role,
+			"model":          cell.Model,
+			"requests":       cell.Requests,
+			"retries":        cell.Retries,
+			"usage_reported": cell.UsageReported,
+			"usage_missing":  cell.UsageMissing,
+		})
+	}
+	detail := map[string]any{
+		"requests":                    summary.TotalRequests,
+		"probe_requests":              summary.ProbeRequests,
+		"work_requests":               summary.WorkRequests,
+		"retries":                     summary.Retries,
+		"by_role_model":               cells,
+		"usage_reported":              summary.UsageReported,
+		"usage_missing":               summary.UsageMissing,
+		"max_estimated_prompt_tokens": summary.MaxEstimatedPromptTokens,
+		"compactions":                 summary.Compactions,
+		"compactions_net_saved":       summary.CompactionsNetSaved,
+		"last_compaction_before":      summary.LastCompactionBefore,
+		"last_compaction_after":       summary.LastCompactionAfter,
+	}
+	if summary.UsageReported > 0 {
+		detail["input_tokens"] = summary.InputTokens
+		detail["output_tokens"] = summary.OutputTokens
+		detail["cache_read_tokens"] = summary.CacheReadTokens
+		detail["cache_write_tokens"] = summary.CacheWriteTokens
+		detail["max_input_tokens"] = summary.MaxInputTokens
+	}
+	// No status: like session.compacted, the summary is observability, never
+	// a liveness or completion claim about the run.
+	err := emitter.Emit(courierlog.Event{
+		Type:    courierlog.EventModelTelemetry,
+		RunID:   invocation.RunName,
+		Repo:    invocation.Repo,
+		Ref:     invocation.Ref,
+		Mode:    string(invocation.Mode),
+		Detail:  detail,
+		Verbose: true,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "courier-control: dropped %s event: %v\n", courierlog.EventModelTelemetry, err)
+	}
 }
 
 // declare maps the harness result onto the operator's exit contract:
@@ -446,6 +544,60 @@ func (s compactionSink) SessionCompacted(event harness.CompactEvent) {
 	})
 	if err != nil {
 		fmt.Fprintf(s.stderr, "courier-control: dropped %s event: %v\n", courierlog.EventSessionCompacted, err)
+	}
+}
+
+// modelRequestSink adapts the harness's per-request model telemetry (#738)
+// onto the run's structured event log: one model.call line per model request
+// the native harness sent — a capability-gate probe or a session turn
+// attempt, retries included — carrying the role, its bound model, the
+// attempt number, and the usage the provider reported when it did.
+//
+// A failed request sets Status to error: the attempt is a fact about the
+// provider, reported alongside the capability table's own vocabulary, never
+// a run-status claim. When the provider reported no usage, the detail says
+// so (usage_reported false) and carries no token counts: an absence is
+// recorded as an absence, never a zero. Detail is Verbose so the counts
+// reach the log store at info level. Emission is best-effort: a dropped
+// event is noted on stderr and the run continues.
+type modelRequestSink struct {
+	emitter    *courierlog.Emitter
+	stderr     io.Writer
+	invocation executor.Invocation
+}
+
+// ModelRequestObserved implements harness.ModelRequestSink.
+func (s modelRequestSink) ModelRequestObserved(observation harness.RequestObservation) {
+	status := courierlog.StatusOK
+	if !observation.OK {
+		status = courierlog.StatusError
+	}
+	detail := map[string]any{
+		"class":                   string(observation.Class),
+		"attempt":                 observation.Attempt,
+		"usage_reported":          observation.Usage != nil,
+		"estimated_prompt_tokens": observation.EstimatedPromptTokens,
+	}
+	if observation.Usage != nil {
+		detail["input_tokens"] = observation.Usage.InputTokens
+		detail["output_tokens"] = observation.Usage.OutputTokens
+		detail["cache_read_tokens"] = observation.Usage.CacheReadTokens
+		detail["cache_write_tokens"] = observation.Usage.CacheWriteTokens
+	}
+	err := s.emitter.Emit(courierlog.Event{
+		Type:    courierlog.EventModelCall,
+		RunID:   s.invocation.RunName,
+		Repo:    s.invocation.Repo,
+		Ref:     s.invocation.Ref,
+		Mode:    string(s.invocation.Mode),
+		Role:    observation.Role,
+		Model:   observation.Model,
+		Status:  status,
+		Detail:  detail,
+		Verbose: true,
+	})
+	if err != nil {
+		fmt.Fprintf(s.stderr, "courier-control: dropped %s event: %v\n", courierlog.EventModelCall, err)
 	}
 }
 
@@ -875,20 +1027,23 @@ func gatewayKey(keyFile string) string {
 	return string(key)
 }
 
-// probeModel performs one cheap completion probe for a role binding. The
-// diagnostic is a fixed category: provider response bodies are never echoed.
-func probeModel(ctx context.Context, gateway harness.ModelTransport, model string) error {
+// probeModel performs one cheap completion probe for a role binding and
+// returns the probe stream's normalized events alongside the result. The
+// events carry the usage the provider reported on the probe's terminal event
+// (#738). The diagnostic is a fixed category: provider response bodies are
+// never echoed.
+func probeModel(ctx context.Context, gateway harness.ModelTransport, model string) ([]harness.Event, error) {
 	events, err := gateway.StreamChat(ctx, harness.ChatRequest{
 		Model:    model,
 		Messages: []harness.Message{{Role: "user", Content: "Reply with the single word: ready"}},
 	})
 	if err != nil {
-		return errors.New("model probe request could not be built")
+		return nil, errors.New("model probe request could not be built")
 	}
 	for _, event := range events {
 		if event.Kind == harness.KindError {
-			return event.Err
+			return events, event.Err
 		}
 	}
-	return nil
+	return events, nil
 }

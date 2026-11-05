@@ -123,7 +123,7 @@ func wiredBudgets(t *testing.T, values map[string]string, gateway *harness.Gatew
 				budgetInputs[role] = input
 			}
 		},
-		ModelProbe: func(context.Context, string) error { return nil },
+		ModelProbe: func(context.Context, string) ([]harness.Event, error) { return nil, nil },
 	}
 	caps := harness.ProbeCapabilities(context.Background(), deps)
 	if _, err := harness.Gate(caps); err != nil {
@@ -329,7 +329,7 @@ func TestControlWiringDefaultedLaneFailsClosedOnUnverifiableCoordinator(t *testi
 		PublicationPresent: true,
 		SnapshotPresent:    true,
 		Context:            wired,
-		ModelProbe:         func(context.Context, string) error { return nil },
+		ModelProbe:         func(context.Context, string) ([]harness.Event, error) { return nil, nil },
 	}
 	caps := harness.ProbeCapabilities(context.Background(), deps)
 	_, gateErr := harness.Gate(caps)
@@ -371,7 +371,7 @@ func TestControlWiringInvalidDeclarationFailsTheGate(t *testing.T) {
 		PublicationPresent: true,
 		SnapshotPresent:    true,
 		Context:            wired,
-		ModelProbe:         func(context.Context, string) error { return nil },
+		ModelProbe:         func(context.Context, string) ([]harness.Event, error) { return nil, nil },
 	}
 	caps := harness.ProbeCapabilities(context.Background(), deps)
 	if _, err := harness.Gate(caps); err == nil {

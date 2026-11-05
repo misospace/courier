@@ -461,6 +461,239 @@ func TestCompactionSinkEmitsSessionCompacted(t *testing.T) {
 	}
 }
 
+// TestModelRequestSinkEmitsModelCall pins #738's per-request telemetry
+// contract: one model.call line per model request the native harness sent,
+// carrying the run identity, the role and bound model, the request class and
+// attempt, and — when the provider reported usage — the token counts. The
+// event marks itself Verbose so the counts reach the store at info level.
+func TestModelRequestSinkEmitsModelCall(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	sink := modelRequestSink{
+		emitter: courierlog.NewEmitter(&stdout, courierlog.LevelInfo),
+		stderr:  &stderr,
+		invocation: executor.Invocation{
+			RunName: "run-1",
+			Repo:    "owner/name",
+			Ref:     7,
+			Mode:    courierv1alpha1.ModeResolveIssue,
+		},
+	}
+	sink.ModelRequestObserved(harness.RequestObservation{
+		Class:                 harness.RequestWork,
+		Role:                  "coordinator",
+		Model:                 "test/coordinator",
+		Attempt:               0,
+		OK:                    true,
+		Usage:                 &harness.Usage{InputTokens: 120, OutputTokens: 30, CacheReadTokens: 80, CacheWriteTokens: 5},
+		EstimatedPromptTokens: 150,
+	})
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want a clean emission", stderr.String())
+	}
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("emitted %d lines, want exactly one: %q", len(lines), stdout.String())
+	}
+	var event map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &event); err != nil {
+		t.Fatalf("emitted line is not JSON: %v: %q", err, lines[0])
+	}
+	if event["event"] != courierlog.EventModelCall {
+		t.Fatalf("event = %v, want %q", event["event"], courierlog.EventModelCall)
+	}
+	if event["run_id"] != "run-1" || event["repo"] != "owner/name" || event["mode"] != string(courierv1alpha1.ModeResolveIssue) {
+		t.Fatalf("run identity = %v/%v/%v, want the invocation's", event["run_id"], event["repo"], event["mode"])
+	}
+	if event["role"] != "coordinator" || event["model"] != "test/coordinator" {
+		t.Fatalf("role/model = %v/%v, want the observation's", event["role"], event["model"])
+	}
+	if event["status"] != courierlog.StatusOK {
+		t.Fatalf("status = %v, want ok (a successful attempt)", event["status"])
+	}
+	detail, ok := event["detail"].(map[string]any)
+	if !ok {
+		t.Fatalf("detail = %v, want the per-request fields at info level", event["detail"])
+	}
+	if detail["class"] != "work" || detail["attempt"] != float64(0) {
+		t.Fatalf("class/attempt = %v/%v, want work/0", detail["class"], detail["attempt"])
+	}
+	if detail["usage_reported"] != true {
+		t.Fatalf("usage_reported = %v, want true", detail["usage_reported"])
+	}
+	if detail["estimated_prompt_tokens"] != float64(150) {
+		t.Fatalf("estimated_prompt_tokens = %v, want 150 (the harness's account, separate from provider usage)", detail["estimated_prompt_tokens"])
+	}
+	for key, want := range map[string]float64{"input_tokens": 120, "output_tokens": 30, "cache_read_tokens": 80, "cache_write_tokens": 5} {
+		if detail[key] != want {
+			t.Fatalf("detail[%q] = %v, want %v (the provider's report)", key, detail[key], want)
+		}
+	}
+}
+
+// TestModelRequestSinkFailedAttemptReportsAbsence pins the explicit-absence
+// rule at the log boundary: a request whose provider did not report usage is
+// recorded with usage_reported false and no token fields, and a failed attempt
+// carries an error status that is scoped to that one request, never the run.
+func TestModelRequestSinkFailedAttemptReportsAbsence(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	sink := modelRequestSink{
+		emitter: courierlog.NewEmitter(&stdout, courierlog.LevelInfo),
+		stderr:  &stderr,
+		invocation: executor.Invocation{
+			RunName: "run-1",
+			Repo:    "owner/name",
+			Ref:     7,
+			Mode:    courierv1alpha1.ModeResolveIssue,
+		},
+	}
+	sink.ModelRequestObserved(harness.RequestObservation{
+		Class:                 harness.RequestWork,
+		Role:                  "coder",
+		Model:                 "test/coder",
+		Attempt:               1,
+		OK:                    false,
+		Usage:                 nil,
+		EstimatedPromptTokens: 200,
+	})
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("emitted %d lines, want exactly one: %q", len(lines), stdout.String())
+	}
+	var event map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &event); err != nil {
+		t.Fatalf("emitted line is not JSON: %v: %q", err, lines[0])
+	}
+	if event["event"] != courierlog.EventModelCall {
+		t.Fatalf("event = %v, want %q", event["event"], courierlog.EventModelCall)
+	}
+	if event["status"] != courierlog.StatusError {
+		t.Fatalf("status = %v, want error (a failed attempt)", event["status"])
+	}
+	detail, ok := event["detail"].(map[string]any)
+	if !ok {
+		t.Fatalf("detail = %v, want the per-request fields", event["detail"])
+	}
+	if detail["usage_reported"] != false {
+		t.Fatalf("usage_reported = %v, want false (the provider reported none)", detail["usage_reported"])
+	}
+	if detail["attempt"] != float64(1) {
+		t.Fatalf("attempt = %v, want 1 (a retry)", detail["attempt"])
+	}
+	for _, key := range []string{"input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"} {
+		if _, present := detail[key]; present {
+			t.Fatalf("detail carries %q for a request with no usage; absence must not become a zero", key)
+		}
+	}
+}
+
+// TestEmitModelTelemetry pins #738's per-run summary contract: one
+// model.telemetry line carrying the request tallies by class, the per
+// role/model table, the usage split, the token sums (present only when some
+// provider reported usage), and the compaction account. It sets no status:
+// the summary is observability, never a run-outcome claim.
+func TestEmitModelTelemetry(t *testing.T) {
+	var stdout bytes.Buffer
+	emitter := courierlog.NewEmitter(&stdout, courierlog.LevelInfo)
+	invocation := executor.Invocation{RunName: "run-1", Repo: "owner/name", Ref: 7, Mode: courierv1alpha1.ModeResolveIssue}
+	emitModelTelemetry(emitter, invocation, harness.ModelTelemetrySummary{
+		TotalRequests:            5,
+		ProbeRequests:            2,
+		WorkRequests:             3,
+		Retries:                  1,
+		ByRoleModel:              []harness.RoleModelRequests{{Role: "coder", Model: "test/coder", Requests: 3, Retries: 1, UsageReported: 1, UsageMissing: 2}},
+		UsageReported:            2,
+		UsageMissing:             3,
+		InputTokens:              400,
+		OutputTokens:             30,
+		CacheReadTokens:          5,
+		CacheWriteTokens:         3,
+		MaxInputTokens:           300,
+		MaxEstimatedPromptTokens: 400,
+		Compactions:              1,
+		CompactionsNetSaved:      800,
+		LastCompactionBefore:     1000,
+		LastCompactionAfter:      600,
+	})
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("emitted %d lines, want exactly one: %q", len(lines), stdout.String())
+	}
+	var event map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &event); err != nil {
+		t.Fatalf("emitted line is not JSON: %v: %q", err, lines[0])
+	}
+	if event["event"] != courierlog.EventModelTelemetry {
+		t.Fatalf("event = %v, want %q", event["event"], courierlog.EventModelTelemetry)
+	}
+	if event["run_id"] != "run-1" || event["repo"] != "owner/name" {
+		t.Fatalf("run identity = %v/%v, want the invocation's", event["run_id"], event["repo"])
+	}
+	if _, ok := event["status"]; ok {
+		t.Fatalf("model.telemetry carries status %v; the summary is observability, never a run-outcome claim", event["status"])
+	}
+	detail, ok := event["detail"].(map[string]any)
+	if !ok {
+		t.Fatalf("detail = %v, want the summary fields at info level", event["detail"])
+	}
+	for key, want := range map[string]float64{
+		"requests": 5, "probe_requests": 2, "work_requests": 3, "retries": 1,
+		"usage_reported": 2, "usage_missing": 3,
+		"max_estimated_prompt_tokens": 400,
+		"compactions":                 1, "compactions_net_saved": 800,
+		"last_compaction_before": 1000, "last_compaction_after": 600,
+	} {
+		if detail[key] != want {
+			t.Fatalf("detail[%q] = %v, want %v", key, detail[key], want)
+		}
+	}
+	// The provider token sums appear because some provider reported usage.
+	for key, want := range map[string]float64{"input_tokens": 400, "output_tokens": 30, "cache_read_tokens": 5, "cache_write_tokens": 3, "max_input_tokens": 300} {
+		if detail[key] != want {
+			t.Fatalf("detail[%q] = %v, want %v (provider-reported, some provider reported)", key, detail[key], want)
+		}
+	}
+	// The per role/model table is present and carries the cell's split.
+	cells, ok := detail["by_role_model"].([]any)
+	if !ok || len(cells) != 1 {
+		t.Fatalf("by_role_model = %v, want one cell", detail["by_role_model"])
+	}
+	cell := cells[0].(map[string]any)
+	if cell["role"] != "coder" || cell["model"] != "test/coder" || cell["requests"] != float64(3) || cell["retries"] != float64(1) {
+		t.Fatalf("cell = %v, want the coder cell's tallies", cell)
+	}
+}
+
+// TestEmitModelTelemetryWithNoReportedUsageOmitsTokenSums pins the explicit
+// absence rule at the summary boundary: a run whose providers never reported
+// usage carries no token-sum fields (they would read as a free run), while the
+// always-known counts — including the usage-missing tally — are still present.
+func TestEmitModelTelemetryWithNoReportedUsageOmitsTokenSums(t *testing.T) {
+	var stdout bytes.Buffer
+	emitter := courierlog.NewEmitter(&stdout, courierlog.LevelInfo)
+	invocation := executor.Invocation{RunName: "run-1", Repo: "owner/name", Ref: 7, Mode: courierv1alpha1.ModeResolveIssue}
+	emitModelTelemetry(emitter, invocation, harness.ModelTelemetrySummary{
+		TotalRequests:            2,
+		ProbeRequests:            1,
+		WorkRequests:             1,
+		UsageMissing:             2,
+		MaxEstimatedPromptTokens: 300,
+	})
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	var event map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &event); err != nil {
+		t.Fatalf("emitted line is not JSON: %v: %q", err, lines[0])
+	}
+	detail := event["detail"].(map[string]any)
+	if detail["usage_missing"] != float64(2) || detail["usage_reported"] != float64(0) {
+		t.Fatalf("usage split = %v/%v, want 2 missing / 0 reported", detail["usage_missing"], detail["usage_reported"])
+	}
+	for _, key := range []string{"input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "max_input_tokens"} {
+		if _, present := detail[key]; present {
+			t.Fatalf("summary carries %q when no provider reported usage; absence must not become a zero", key)
+		}
+	}
+}
+
 // TestTerminationForCarriesTrustedResultKind proves the trusted native
 // terminal result kind (#127) rides the handoff line alongside the legacy
 // phase/result/exit vocabulary, so an infrastructure failure stays

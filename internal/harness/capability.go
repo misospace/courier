@@ -276,8 +276,17 @@ type ProbeDeps struct {
 	// ProbeWorker optionally probes the signed worker protocol end to end.
 	// The probe task is inert; a nil probe skips the capability.
 	ProbeWorker func(context.Context) Capability
-	// ModelProbe performs one cheap model call for a role binding.
-	ModelProbe func(context.Context, string) error
+	// ModelProbe performs one cheap model call for a role binding and
+	// returns the normalized events the probe's stream produced, alongside
+	// the failure when the stream terminalized as one. The events carry the
+	// usage the provider reported on the probe's terminal event (#738); a
+	// probe that reported none carries a nil Usage.
+	ModelProbe func(context.Context, string) ([]Event, error)
+	// Requests, when set, receives one probe observation per bound model
+	// the capability gate completion-probes (#738): the gate's model spend
+	// rides the same run telemetry as the sessions'. A nil sink records
+	// nothing.
+	Requests ModelRequestSink
 	// Context is the context budget the lane declared per role. The zero
 	// value declares nothing, in which case the probe still reports the
 	// per-role budget capability but never requires it.
@@ -420,8 +429,45 @@ func probeModelBindings(ctx context.Context, deps ProbeDeps) []Capability {
 		model := deps.Bindings.Model(role)
 		err, done := probed[model]
 		if !done {
-			err = deps.ModelProbe(ctx, model)
+			var events []Event
+			events, err = deps.ModelProbe(ctx, model)
 			probed[model] = err
+			// One probe observation per provider request the probe's
+			// transport sent (#738), in the order the provider saw them,
+			// attributed to the first sorted role bound to the model: the
+			// probe is the model's, not any one role's, and the roles
+			// sharing a model share the probe. Each rejected pre-retry
+			// request the probe's terminal names on RejectedRequests is
+			// recorded first, as a non-OK request with an explicit usage
+			// absence; the probe's own request carries the usage the
+			// provider reported on the terminal event when it did. The
+			// /model/info reads are gateway metadata, not model requests,
+			// and are never recorded. The delivery is isolated: telemetry
+			// is observability only.
+			if deps.Requests != nil {
+				usage := (*Usage)(nil)
+				rejected := 0
+				if len(events) > 0 {
+					usage = events[len(events)-1].Usage
+					rejected = events[len(events)-1].RejectedRequests
+				}
+				for r := 0; r < rejected; r++ {
+					deliverRequest(deps.Requests, RequestObservation{
+						Class:    RequestProbe,
+						Role:     role,
+						Model:    model,
+						OK:       false,
+						Rejected: true,
+					})
+				}
+				deliverRequest(deps.Requests, RequestObservation{
+					Class: RequestProbe,
+					Role:  role,
+					Model: model,
+					OK:    err == nil,
+					Usage: usage,
+				})
+			}
 		}
 		if err != nil {
 			capability := unavailable("model-binding:"+role, role == RoleCoordinator, err.Error())
