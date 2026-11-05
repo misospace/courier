@@ -353,8 +353,14 @@ type anthropicMessageStart struct {
 // (#738): a provider or proxy that reports a fractional or otherwise
 // non-integer count has not reported an exact token count, so the report is
 // treated as absent — the turn is never failed for telemetry's sake, and no
-// fractional count the provider did not report is invented. The last return
-// reports whether an exact report was decoded.
+// fractional count the provider did not report is invented. The envelope's
+// mandatory total input count — input_tokens, the only place the stream
+// names the input accepted — must be present and exact before an exact
+// report is decoded: a present object missing it names no exact usage at
+// all, and an absent field is never an invented zero (#738). The
+// prompt-cache counts are optional and take their documented default of
+// zero when the provider omits them. The last return reports whether an
+// exact report was decoded.
 func decodeMessageStartUsage(raw json.RawMessage) (input, cacheRead, cacheWrite int64, ok bool) {
 	if trimmed := bytes.TrimSpace(raw); len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return 0, 0, 0, false
@@ -368,8 +374,8 @@ func decodeMessageStartUsage(raw json.RawMessage) (input, cacheRead, cacheWrite 
 		return 0, 0, 0, false
 	}
 	input, inputOK := wholeCount(wire.InputTokens)
-	cacheRead, readOK := wholeCount(wire.CacheReadInputTokens)
-	cacheWrite, writeOK := wholeCount(wire.CacheCreationInputTokens)
+	cacheRead, readOK := optionalWholeCount(wire.CacheReadInputTokens)
+	cacheWrite, writeOK := optionalWholeCount(wire.CacheCreationInputTokens)
 	if !inputOK || !readOK || !writeOK {
 		return 0, 0, 0, false
 	}
@@ -377,7 +383,11 @@ func decodeMessageStartUsage(raw json.RawMessage) (input, cacheRead, cacheWrite 
 }
 
 // decodeDeltaUsage decodes the message_delta's cumulative output count
-// leniently (#738), under the same exactness rule as the opening envelope's.
+// leniently (#738), under the same exactness rule as the opening envelope's:
+// the delta's mandatory total output count — output_tokens, the only place
+// the stream names the output produced — must be present and exact before
+// an exact report is decoded, and an absent field is never an invented
+// zero (#738).
 func decodeDeltaUsage(raw json.RawMessage) (output int64, ok bool) {
 	if trimmed := bytes.TrimSpace(raw); len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return 0, false

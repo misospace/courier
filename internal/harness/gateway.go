@@ -570,8 +570,11 @@ type wireChunk struct {
 // wireUsage is the provider's token accounting for one completion, in the
 // shape the OpenAI-compatible stream carries: the input accepted (with the
 // prompt-cache subset the provider served from its cache, reported
-// alongside) and the output produced. Counts decode as JSON numbers, and a
-// value that is not a whole number fails the count, not the turn.
+// alongside) and the output produced. Prompt and completion counts are the
+// report's mandatory totals — a present usage object missing either is not
+// an exact report — while the cache subset is optional and defaults to zero
+// when the provider omits it. Counts decode as JSON numbers, and a value
+// that is not a whole number fails the count, not the turn.
 type wireUsage struct {
 	PromptTokens        json.Number `json:"prompt_tokens"`
 	CompletionTokens    json.Number `json:"completion_tokens"`
@@ -584,8 +587,14 @@ type wireUsage struct {
 // provider or proxy that reports a fractional or otherwise non-integer
 // count has not reported an exact token count, so the report is treated as
 // absent — the turn is never failed for telemetry's sake, and no
-// fractional count the provider did not report is invented. The second
-// return reports whether an exact report was decoded.
+// fractional count the provider did not report is invented. The report's
+// mandatory total counts — prompt_tokens and completion_tokens, the input
+// accepted and the output produced — must be present and exact before an
+// exact report is decoded: a present object missing either names no exact
+// usage at all, and an absent field is never an invented zero (#738). The
+// prompt-cache subset is optional and takes its documented default of zero
+// when the provider omits it. The second return reports whether an exact
+// report was decoded.
 func decodeUsage(raw json.RawMessage) (*Usage, bool) {
 	if trimmed := bytes.TrimSpace(raw); len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return nil, false
@@ -596,7 +605,7 @@ func decodeUsage(raw json.RawMessage) (*Usage, bool) {
 	}
 	prompt, promptOK := wholeCount(wire.PromptTokens)
 	completion, completionOK := wholeCount(wire.CompletionTokens)
-	cached, cachedOK := wholeCount(wire.PromptTokensDetails.Cached)
+	cached, cachedOK := optionalWholeCount(wire.PromptTokensDetails.Cached)
 	if !promptOK || !completionOK || !cachedOK {
 		return nil, false
 	}
@@ -620,17 +629,33 @@ func usageReported(raw json.RawMessage) bool {
 }
 
 // wholeCount reads one provider-reported count as an exact integer token
-// count. An absent field is a zero the provider did not contradict; a
-// fractional or malformed value is not a report at all.
+// count. The field must be present: an absent number is no report at all,
+// and a zero the provider did not state is not an exact one (#738) — a
+// usage object missing a required count voids the report exactly as a
+// fractional one does. A fractional or malformed value is likewise not a
+// report.
 func wholeCount(number json.Number) (int64, bool) {
 	if number == "" {
-		return 0, true
+		return 0, false
 	}
 	value, err := number.Int64()
 	if err != nil {
 		return 0, false
 	}
 	return value, true
+}
+
+// optionalWholeCount reads one provider-reported count whose presence the
+// transport does not require: the prompt-cache subsets some providers omit
+// entirely. An absent field takes its documented transport default — the
+// provider named no cache activity, so zero — while a present value must
+// still be an exact whole-token count, and absence never stands in for a
+// total the provider did not report.
+func optionalWholeCount(number json.Number) (int64, bool) {
+	if number == "" {
+		return 0, true
+	}
+	return wholeCount(number)
 }
 
 type wireChoice struct {

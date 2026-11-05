@@ -345,6 +345,108 @@ func TestGatewayStreamUnreadableUsageChunkVoidsAnEarlierExactReport(t *testing.T
 	}
 }
 
+// TestGatewayStreamEmptyUsageObjectIsNotAnExactReport pins the absence rule
+// for a present-but-empty report (#738): a usage object that names no counts
+// at all is not an exact report of zero tokens — an exact chunk it follows
+// is voided with it, exactly as a fractional one voids — and the turn still
+// succeeds: telemetry must never fail a stream the provider counted.
+func TestGatewayStreamEmptyUsageObjectIsNotAnExactReport(t *testing.T) {
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(
+		contentChunk("answer"),
+		finishChunk("stop"),
+		usageChunk(120, 30, 0),
+		`{"usage":{}}`,
+	)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m", Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := events[len(events)-1]
+	if last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final (an empty usage object must not fail the turn)", last)
+	}
+	if last.Usage != nil {
+		t.Fatalf("terminal usage = %+v, want nil: a usage object naming no counts is not an exact zero report", last.Usage)
+	}
+}
+
+// TestGatewayStreamUsageMissingCompletionIsNotAnExactReport pins the
+// required-count rule (#738): a present usage object that names the input
+// total but omits the output total is not an exact report — an absent field
+// is no report at all, never a zero the provider did not state — so the
+// turn's whole usage report is an absence.
+func TestGatewayStreamUsageMissingCompletionIsNotAnExactReport(t *testing.T) {
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(
+		contentChunk("answer"),
+		finishChunk("stop"),
+		`{"usage":{"prompt_tokens":120}}`,
+	)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m", Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := events[len(events)-1]
+	if last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final (a usage object missing a required count must not fail the turn)", last)
+	}
+	if last.Usage != nil {
+		t.Fatalf("terminal usage = %+v, want nil: a report missing the output total is not exact zero output", last.Usage)
+	}
+}
+
+// TestGatewayStreamUsageMissingPromptIsNotAnExactReport pins the mirror of
+// the required-count rule (#738): a present usage object that names the
+// output total but omits the input total is not an exact report either.
+func TestGatewayStreamUsageMissingPromptIsNotAnExactReport(t *testing.T) {
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(
+		contentChunk("answer"),
+		finishChunk("stop"),
+		`{"usage":{"completion_tokens":30}}`,
+	)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m", Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := events[len(events)-1]
+	if last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final (a usage object missing a required count must not fail the turn)", last)
+	}
+	if last.Usage != nil {
+		t.Fatalf("terminal usage = %+v, want nil: a report missing the input total is not exact zero input", last.Usage)
+	}
+}
+
+// TestGatewayStreamOptionalCacheSubsetDefaultsToZero pins the optional-field
+// rule (#738): a provider that omits the prompt-cache subset entirely — no
+// prompt_tokens_details at all — still reports exact usage, the omitted
+// subset reading as its documented default of zero, never voiding the
+// report and never standing in for a total the provider did not name.
+func TestGatewayStreamOptionalCacheSubsetDefaultsToZero(t *testing.T) {
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(
+		contentChunk("answer"),
+		finishChunk("stop"),
+		`{"usage":{"prompt_tokens":120,"completion_tokens":30}}`,
+	)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m", Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := events[len(events)-1]
+	if last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final", last)
+	}
+	if last.Usage == nil {
+		t.Fatal("the final terminal carries no usage, but the provider reported its mandatory totals")
+	}
+	if last.Usage.InputTokens != 120 || last.Usage.OutputTokens != 30 || last.Usage.CacheReadTokens != 0 {
+		t.Fatalf("terminal usage = %+v, want the report with the omitted cache subset at zero", last.Usage)
+	}
+}
+
 // TestGatewayStreamRetriesWithoutUsageWhenRetryTransportFails pins that the
 // rejected request is accounted even when the retry dies at the transport
 // layer: the provider received both requests — the rejected usage-field
