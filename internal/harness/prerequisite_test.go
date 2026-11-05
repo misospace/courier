@@ -270,11 +270,10 @@ func TestCoordinatorLocalBrokerFailureIsNeverBlockedExternal(t *testing.T) {
 		Worker:    delegator,
 		Snapshot: func(context.Context) (Snapshot, error) {
 			// The production shape: the publication engine classifies the
-			// non-retryable local failure as a blocked read, and the local
-			// error rides in the chain.
-			return Snapshot{}, &PublicationBlockedError{
-				Reason: "the broker denied the seed snapshot read (snapshot exceeds the bundle bound)",
-				Err:    &BrokerCallError{Category: "snapshot exceeds the bundle bound"},
+			// local construction failure as an infrastructure failure —
+			// never a denial — and the local error rides in the chain.
+			return Snapshot{}, &TransientPublicationError{
+				Err: &BrokerCallError{Category: "snapshot exceeds the bundle bound"},
 			}
 		},
 	})
@@ -340,11 +339,10 @@ func TestCoordinatorBoundsTurnsOnRecurringLocalBrokerFailure(t *testing.T) {
 		Worker:    delegator,
 		Snapshot: func(context.Context) (Snapshot, error) {
 			// The production shape: the publication engine classifies the
-			// non-retryable local failure as a blocked read, and the local
-			// error rides in the chain.
-			return Snapshot{}, &PublicationBlockedError{
-				Reason: "the broker denied the seed snapshot read (snapshot exceeds the bundle bound)",
-				Err:    &BrokerCallError{Category: "snapshot exceeds the bundle bound"},
+			// local construction failure as an infrastructure failure —
+			// never a denial — and the local error rides in the chain.
+			return Snapshot{}, &TransientPublicationError{
+				Err: &BrokerCallError{Category: "snapshot exceeds the bundle bound"},
 			}
 		},
 	})
@@ -920,14 +918,21 @@ func TestClassifyPrerequisite(t *testing.T) {
 		}
 	}
 	// The production shape of an oversized snapshot read: the publication
-	// engine wraps the local failure in its blocked error, and the
-	// classifier still sees the local failure, not a refusal.
-	localRead := classifyPrerequisite(&PublicationBlockedError{
-		Reason: "the broker denied the seed snapshot read (snapshot exceeds the bundle bound)",
-		Err:    &BrokerCallError{Category: "snapshot exceeds the bundle bound"},
+	// engine classifies the local failure as its transient error, and the
+	// classifier still sees the local failure, not a refusal. A blocked
+	// wrapper around a status-less broker error — a shape the engine no
+	// longer produces (#743) — must never read as a refusal either.
+	localRead := classifyPrerequisite(&TransientPublicationError{
+		Err: &BrokerCallError{Category: "snapshot exceeds the bundle bound"},
 	})
 	if localRead == nil || localRead.class != prerequisiteLocalFailure {
 		t.Fatalf("classified = %v, want the local-failure class: a local snapshot failure is not a refusal", localRead)
+	}
+	if got := classifyPrerequisite(&PublicationBlockedError{
+		Reason: "a snapshot read failed locally",
+		Err:    &BrokerCallError{Category: "snapshot exceeds the bundle bound"},
+	}); got == nil || got.class != prerequisiteLocalFailure {
+		t.Fatalf("classified = %v, want the local-failure class: a blocked wrapper never upgrades a local failure to a refusal", got)
 	}
 	// A non-retryable status outside the definite-denial range is not a
 	// refusal — the rule is the same 4xx rule the worker side applies — and
