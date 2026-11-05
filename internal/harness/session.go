@@ -366,7 +366,8 @@ func (s *Session) Turn(ctx context.Context, tools []ToolDef) []Event {
 		if delay, retry := turnRetryDelay(terminal.Err); retry && attempt < maxStreamRetries {
 			// Infra retry backoff: bounded, transport-class, not a model cap.
 			// The delay honors an authoritative Retry-After hint when it is
-			// short enough to wait out in-process.
+			// short enough to wait out in-process; a rate limit without one
+			// is never retried here (#736).
 			select {
 			case <-ctx.Done():
 				return events
@@ -731,10 +732,13 @@ func messagesAt(messages []Message, indexes []int) []Message {
 
 // turnRetryDelay reports whether a terminal stream error is worth retrying
 // in-process and how long to wait first. Transport failures and retryable
-// gateway statuses (5xx, request timeout, a plain 429) retry; a confirmed
-// allowance exhaustion or other classified permanent failure does not. An
-// authoritative Retry-After hint longer than maxInProcessRetryAfter is not
-// waited on in-process — the run ends recoverable and the source re-offers.
+// gateway statuses (5xx, request timeout) retry with the bounded backoff. A
+// rate limit (429) is retried in-process only when the provider supplied an
+// authoritative Retry-After hint short enough to wait out: an unhinted 429
+// gets no in-process retries — a sub-second multi-request burst is hostile to
+// provider rate-limit recovery — and a hint longer than maxInProcessRetryAfter
+// is not waited on in-process. Both unhinted and long-hinted rate limits end
+// the turn as deferred availability conditions the source re-offers (#736).
 func turnRetryDelay(err error) (time.Duration, bool) {
 	var transportErr *GatewayTransportError
 	if errors.As(err, &transportErr) {
@@ -750,6 +754,11 @@ func turnRetryDelay(err error) (time.Duration, bool) {
 	}
 	if classification.RetryAfter > 0 {
 		return classification.RetryAfter, true
+	}
+	if classification.Availability == ProviderTransientRateLimit {
+		// An unhinted rate limit names no safe spacing, so the retry belongs
+		// to the source re-offer, not to an in-process burst.
+		return 0, false
 	}
 	return retryBackoff, true
 }
