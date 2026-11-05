@@ -288,16 +288,22 @@ func metav1Now() metav1.Time {
 
 // TestStatusPersistenceFailurePreventsDispatch replays §6's ordering rule: a
 // broker that will not acknowledge the active-operation entry means the task
-// is never dispatched — the worker sees nothing, and the failure is the
-// tool-visible result.
+// is never dispatched — the worker sees nothing. A definite refusal of the
+// write is also the #741 breaker's terminal fact: the run ends as an
+// infrastructure failure at that tool boundary with the fixed status-path
+// reason, before the model can take a further turn to re-ask for the same
+// refused operation.
 func TestStatusPersistenceFailurePreventsDispatch(t *testing.T) {
 	delegateOK := gatewayResponse{body: sse(
 		contentChunk("delegating"),
 		toolCallChunk(0, "call-1", toolDelegate, `{"id":"b1","role":"coder","objective":"Do the work","successCheck":"tests pass"}`),
 		finishChunk("tool_calls"),
 	)}
-	gateway, _, cleanup := gatewayFor(
+	gateway, gatewayMock, cleanup := gatewayFor(
 		delegateOK,
+		// Scripted but never consumed: the refusal ends the run at the tool
+		// boundary that witnessed it (#741), so the model never declares an
+		// outcome over it.
 		gatewayResponse{body: sse(contentChunk(`{"outcome":"blocked_external","missing":"status path refused the operation"}`), finishChunk("stop"))},
 	)
 	defer cleanup()
@@ -317,8 +323,17 @@ func TestStatusPersistenceFailurePreventsDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := coordinator.Run(context.Background(), testInvocation())
-	if result.Outcome != executor.OutcomeBlockedExternal {
-		t.Fatalf("outcome = %q (%v)", result.Outcome, result.Err)
+	if result.Outcome == executor.OutcomeBlockedExternal {
+		t.Fatalf("outcome = %q, a definite status-path refusal is never blocked-external", result.Outcome)
+	}
+	if result.Kind != courierv1alpha1.NativeResultInfrastructureFailed {
+		t.Fatalf("kind = %q, want infrastructure: a recording failure of trusted control's own plumbing is not an external prerequisite", result.Kind)
+	}
+	if result.Err == nil || !strings.Contains(result.Err.Error(), prerequisiteStatusRefusedReason) {
+		t.Fatalf("err = %v, want the fixed status-path reason %q", result.Err, prerequisiteStatusRefusedReason)
+	}
+	if got := gatewayMock.requestCount(); got != 1 {
+		t.Fatalf("gateway requests = %d, want 1: the model takes no further turn after the refusal", got)
 	}
 	if got := worker.dispatchRequests; got != 0 {
 		t.Fatalf("worker dispatch requests = %d, want 0; an operation without persisted dispatch evidence must never be sent", got)

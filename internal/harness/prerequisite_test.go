@@ -143,6 +143,207 @@ func TestCoordinatorStopsModelTurnsOnRefusedPrerequisite(t *testing.T) {
 	}
 }
 
+// refusedStatusTransport refuses every trusted status write with the broker's
+// definite denial, so a test can hold the run's own status path down the way
+// a misconfigured or cross-run caller earns: the write never lands, and no
+// retry of it can.
+type refusedStatusTransport struct{}
+
+func (refusedStatusTransport) PostStatus(context.Context, StatusPatch) error {
+	return brokerDenied()
+}
+
+// refusedShellBeginTransport serves the trusted status path honestly except
+// for one operation kind's begin write, which it refuses definitively — the
+// shape of a broker that accepts the preparation records and refuses the
+// model-influenced operation's record.
+type refusedShellBeginTransport struct{}
+
+func (refusedShellBeginTransport) PostStatus(_ context.Context, patch StatusPatch) error {
+	if patch.AddOperation != nil && strings.HasPrefix(patch.AddOperation.OpID, "shell.") {
+		return brokerDenied()
+	}
+	return nil
+}
+
+// TestCoordinatorStopsModelTurnsOnDefiniteStatusPathRefusal is the #741
+// regression: the trusted status path definitively refused to persist the
+// operation's status record, so the operation never dispatched. The run must
+// end as an infrastructure failure at the first turn's tool boundary — the
+// model never gets a second turn to re-ask for the same refused operation
+// through shell commands, tracked checks, or a delegated brief. A recording
+// failure of trusted control's own plumbing is never blocked-external: the
+// world did not refuse the work, the run's own status plumbing did.
+//
+// Both refusal sites are covered: the preparation dispatch's own record, and
+// the shell dispatch's record after honest preparation. The second is the
+// one that matters — only the dispatch boundary itself witnesses it, so a
+// breaker that observed at the preparation callers alone would let the model
+// take another turn over it.
+func TestCoordinatorStopsModelTurnsOnDefiniteStatusPathRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		transport      StatusTransport
+		wantDispatches int
+	}{
+		{
+			name:           "the preparation dispatch's record is refused",
+			transport:      refusedStatusTransport{},
+			wantDispatches: 0,
+		},
+		{
+			name:           "the shell dispatch's record is refused after honest preparation",
+			transport:      refusedShellBeginTransport{},
+			wantDispatches: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+			defer cleanupWorker()
+			worker.snapshotTip = "snap-tip"
+			worker.completeAll = true
+
+			gateway, gatewayMock, cleanup := gatewayFor(
+				// Coordinator: one shell command. Whichever write is
+				// refused, the operation behind it never dispatches.
+				gatewayResponse{body: sse(
+					toolCallChunk(0, "call-1", toolShell, `{"command":"echo one"}`),
+					finishChunk("tool_calls"),
+				)},
+				// Scripted but never consumed: had the run continued, the
+				// model would have re-asked for the same refused operation
+				// through shell commands and tracked checks.
+				gatewayResponse{body: sse(
+					toolCallChunk(0, "call-2", toolShell, `{"command":"echo two"}`),
+					finishChunk("tool_calls"),
+				)},
+				// Scripted but never consumed: the latch outranks the
+				// model's own outcome declaration, whatever it declared
+				// over the refusal.
+				gatewayResponse{body: sse(contentChunk(`{"outcome":"changes"}`), finishChunk("stop"))},
+			)
+			defer cleanup()
+
+			coordinator, err := NewCoordinator(CoordinatorConfig{
+				Transport: gateway,
+				Bindings:  testBindings(),
+				Worker:    delegator,
+				Snapshot:  snapshotProvider("snap-tip"),
+				Status:    NewStatusReporter(tc.transport, testControlUID, testWorkerUID, 0),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := coordinator.Run(context.Background(), testInvocation())
+			if result.Outcome == executor.OutcomeBlockedExternal {
+				t.Fatalf("outcome = %q, a status-path refusal is never blocked-external", result.Outcome)
+			}
+			if result.Kind != courierv1alpha1.NativeResultInfrastructureFailed {
+				t.Fatalf("kind = %q, want infrastructure: a recording failure of trusted control's own plumbing is not an external prerequisite", result.Kind)
+			}
+			if result.Err == nil || !strings.Contains(result.Err.Error(), prerequisiteStatusRefusedReason) {
+				t.Fatalf("err = %v, want the fixed status-path reason %q", result.Err, prerequisiteStatusRefusedReason)
+			}
+			if text := result.Err.Error(); strings.Contains(text, "\n") || strings.Contains(text, "echo one") {
+				t.Fatalf("err = %q, must be single-line fixed text carrying neither model prose nor worker output", text)
+			}
+			// One gateway request: the run ended inside the first turn's
+			// tool boundary, before any further model request.
+			if got := gatewayMock.requestCount(); got != 1 {
+				t.Fatalf("gateway requests = %d, want 1", got)
+			}
+			// The refused operation never dispatched: the unpack may have
+			// run on the honest-preparation path, the shell never did.
+			if got := worker.dispatchRequests; got != tc.wantDispatches {
+				t.Fatalf("worker dispatch requests = %d, want %d", got, tc.wantDispatches)
+			}
+		})
+	}
+}
+
+// flakyBeginTransport fails the active-operation writes with a retryable
+// unavailability until the reporter's own bounded retry rounds are exhausted,
+// then serves every write — including the retry — successfully. The failure
+// budget is exactly one BeginOperation's retry rounds, so the test holds the
+// status path down for one operation's begin and no further.
+type flakyBeginTransport struct {
+	inner    *recordingStatusTransport
+	failures int
+}
+
+func (t *flakyBeginTransport) PostStatus(ctx context.Context, patch StatusPatch) error {
+	if patch.AddOperation != nil && t.failures > 0 {
+		t.failures--
+		return brokerUnavailable()
+	}
+	return t.inner.PostStatus(ctx, patch)
+}
+
+// TestCoordinatorDoesNotTripOnRetryableStatusPathFailure pins the transient
+// half of #741: a retryable status-path failure — the broker momentarily
+// unavailable through the reporter's own bounded retry rounds — is an
+// ordinary tool error, the latch never trips, and the model's legitimate
+// retry stands: its next turn re-runs the operation and the run reaches its
+// declared ending.
+func TestCoordinatorDoesNotTripOnRetryableStatusPathFailure(t *testing.T) {
+	shrinkRetryDelays(t)
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.snapshotTip = "snap-tip"
+	worker.completeAll = true
+
+	transport := &flakyBeginTransport{
+		inner:    &recordingStatusTransport{},
+		failures: statusRetryRounds + 1,
+	}
+
+	gateway, gatewayMock, cleanup := gatewayFor(
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-1", toolShell, `{"command":"echo one"}`),
+			finishChunk("tool_calls"),
+		)},
+		// The model's legitimate retry: the same operation again, against a
+		// status path that now serves the write.
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-2", toolShell, `{"command":"echo two"}`),
+			finishChunk("tool_calls"),
+		)},
+		gatewayResponse{body: sse(contentChunk(`{"outcome":"no_change_needed","evidence":"nothing to do"}`), finishChunk("stop"))},
+	)
+	defer cleanup()
+
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Transport: gateway,
+		Bindings:  testBindings(),
+		Worker:    delegator,
+		Snapshot:  snapshotProvider("snap-tip"),
+		Status:    NewStatusReporter(transport, testControlUID, testWorkerUID, 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := coordinator.Run(context.Background(), testInvocation())
+	if result.Outcome != executor.OutcomeNoChangeNeeded {
+		t.Fatalf("outcome = %q (%+v), want the declared no-change ending", result.Outcome, result)
+	}
+	if result.Kind != courierv1alpha1.NativeResultNoChange {
+		t.Fatalf("kind = %q, want no_change", result.Kind)
+	}
+	if coordinator.prerequisite.peek() != nil {
+		t.Fatal("a retryable status-path failure must never trip the latch")
+	}
+	// Three requests: the retryable failure surfaced as an ordinary tool
+	// error, the model took its legitimate retry, and the run reached its
+	// declared ending.
+	if got := gatewayMock.requestCount(); got != 3 {
+		t.Fatalf("gateway requests = %d, want 3 (the model's legitimate retry stands)", got)
+	}
+	// The retried operation ran: the write landed and the dispatch followed.
+	if got := worker.dispatchRequests; got != 2 {
+		t.Fatalf("worker dispatch requests = %d, want 2 (the retried unpack and the shell)", got)
+	}
+}
+
 // TestCoordinatorBoundsTurnsOnRepeatedTaskFailure pins the recurrence rule
 // for the task-failed class: the first failure of the fixed preparation task
 // may be transient and earns one legitimate retry, the second establishes
@@ -963,11 +1164,41 @@ func TestClassifyPrerequisite(t *testing.T) {
 	if got := classifyPrerequisite(unverifiedWithRejection); got != nil {
 		t.Fatalf("classified = %v, want nil: an unverified termination outranks the rejection it carries", got)
 	}
-	// A status-path refusal is a recording failure, not a refusal of the
-	// workspace preparation: the reason must never name the workspace.
+	// A definite status-path refusal is a recording failure of trusted
+	// control's own plumbing: it is its own class, and the ending is an
+	// infrastructure failure — never the blocked-external wait on an
+	// external prerequisite, and never a refusal of the workspace the model
+	// could rediscover (#741). The classifier reads the wrapped error's
+	// retryability, so a refused write and a locally unwritable one are the
+	// same class: the status path definitively did not land, whatever
+	// refused it.
 	statusRefused := &statusPersistFailure{opID: "op-1", err: &BrokerCallError{StatusCode: 403, Category: "denied the operation"}}
-	if got := classifyPrerequisite(statusRefused); got != nil {
-		t.Fatalf("classified = %v, want nil: a status-path refusal is not a workspace refusal", got)
+	got := classifyPrerequisite(statusRefused)
+	if got == nil || got.class != prerequisiteStatusRefused {
+		t.Fatalf("classified = %v, want the status-refused class", got)
+	}
+	if got.kind != courierv1alpha1.NativeResultInfrastructureFailed {
+		t.Fatalf("class %q kind = %q, want infrastructure: a recording failure is never blocked-external", got.class, got.kind)
+	}
+	if got.reason != prerequisiteStatusRefusedReason {
+		t.Fatalf("class %q reason = %q, want the fixed status-path reason", got.class, got.reason)
+	}
+	localStatus := &statusPersistFailure{opID: "op-2", err: &BrokerCallError{Category: "status request is malformed"}}
+	if got := classifyPrerequisite(localStatus); got == nil || got.class != prerequisiteStatusRefused {
+		t.Fatalf("classified = %v, want the status-refused class: a definite recording failure ends the run whatever refused it", got)
+	}
+	// A status-path failure that is not even a broker error is definite too:
+	// the trusted plumbing failed in a way nothing can call transient, and
+	// failing closed is the breaker's contract.
+	if got := classifyPrerequisite(&statusPersistFailure{opID: "op-3", err: errors.New("recorder stopped")}); got == nil || got.class != prerequisiteStatusRefused {
+		t.Fatalf("classified = %v, want the status-refused class: an unknown status-path failure is never transient", got)
+	}
+	// A retryable status-path failure is transient: the broker is momentarily
+	// unreachable, the write already retried inside the reporter's bounded
+	// rounds, and the model's legitimate retry stands (#741).
+	retryableStatus := &statusPersistFailure{opID: "op-4", err: brokerUnavailable()}
+	if got := classifyPrerequisite(retryableStatus); got != nil {
+		t.Fatalf("classified = %v, want nil: a retryable status-path failure still retries", got)
 	}
 	if got := classifyPrerequisite(errors.New("something else entirely")); got != nil {
 		t.Fatalf("classified = %v, want nil: an unclassified failure never trips", got)
@@ -1132,13 +1363,14 @@ func TestPrerequisiteLatchTripsAndSticks(t *testing.T) {
 }
 
 // TestPrerequisiteLatchTripsOnFinalFacts pins the one-observation classes:
-// a refusal, a mismatch, and a fence are final facts, each tripping the
-// latch on its own.
+// a refusal, a mismatch, a fence, and a definite status-path refusal are
+// final facts, each tripping the latch on its own.
 func TestPrerequisiteLatchTripsOnFinalFacts(t *testing.T) {
 	for _, failure := range []*prerequisiteFailure{
 		refusedPrerequisite(),
 		mismatchedPrerequisite(),
 		fencedPrerequisite(),
+		statusPathRefused(),
 	} {
 		var latch prerequisiteLatch
 		latch.observe(failure)
