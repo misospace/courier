@@ -368,6 +368,13 @@ const harnessFraming = `You are the trusted coordinator running in Courier's con
 // existing contract — rather than looping forever in-process.
 const maxOutcomeClarifications = 1
 
+// outcomeClarification is the fixed user message injected when the
+// coordinator's final message is not a valid outcome declaration. It is a
+// named constant so the model-visible surface contract
+// (surface_contract_test.go) validates the exact bytes this loop injects
+// rather than a transcription of them.
+const outcomeClarification = `Your final message was not a valid outcome declaration. Reply with exactly one JSON object: {"outcome":"changes"}, {"outcome":"no_change_needed","evidence":"..."} (optionally with "close":{"criteria":[{"criterion":"...","path":"<repo file>","excerpt":"<24-300 char excerpt verbatim from that file at the default-branch HEAD"}]} when the ask is already satisfied by existing work), {"outcome":"needs_decision","question":"..."}, or {"outcome":"blocked_external","missing":"..."}.`
+
 // subagentFraming is the bounded delegate's contract. Unlike the
 // coordinator, a subagent owns nothing terminal: it cannot publish, write
 // status, delegate further, or declare the run's outcome, and its final
@@ -459,7 +466,7 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 			}
 			if clarifications < maxOutcomeClarifications {
 				clarifications++
-				session.Append(Message{Role: "user", Content: "Your final message was not a valid outcome declaration. Reply with exactly one JSON object: {\"outcome\":\"changes\"}, {\"outcome\":\"no_change_needed\",\"evidence\":\"...\"} (optionally with \"close\":{\"criteria\":[{\"criterion\":\"...\",\"path\":\"<repo file>\",\"excerpt\":\"<24-300 char excerpt verbatim from that file at the default-branch HEAD>\"}]} when the ask is already satisfied by existing work), {\"outcome\":\"needs_decision\",\"question\":\"...\"}, or {\"outcome\":\"blocked_external\",\"missing\":\"...\"}."})
+				session.Append(Message{Role: "user", Content: outcomeClarification})
 				continue
 			}
 			return executor.HarnessResult{
@@ -471,11 +478,11 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 }
 
 // availabilityEnding maps a deferred model-provider availability failure — a
-// confirmed allowance exhaustion, or a transient failure whose authoritative
-// reset hint is longer than this incarnation should spin on — to a recoverable
-// blocked-external ending. It is not a human decision, a code failure, or a
-// claim of no progress: the source re-offers the work when capacity returns
-// (#320).
+// confirmed allowance exhaustion, or a transient rate limit the in-process
+// policy does not retry (an unhinted 429, or one whose reset hint exceeds this
+// incarnation's bound) — to a recoverable blocked-external ending. It is not a
+// human decision, a code failure, or a claim of no progress: the source
+// re-offers the work when capacity returns (#320).
 func availabilityEnding(err error) (executor.HarnessResult, bool) {
 	classification, ok := providerClassificationOf(err)
 	if !ok || !classification.Deferred() {
