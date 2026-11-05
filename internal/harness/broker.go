@@ -340,13 +340,21 @@ func (b *BrokerClient) Publish(ctx context.Context, expectedWorkOID, proposedOID
 // destination. It is a NeedsHuman classification, not an infrastructure
 // failure, and its reason names identities and categories — never credential
 // or provider response data.
+//
+// Err carries the trusted failure behind the block when there is one — the
+// broker's own refusal of the call. It rides the error chain so the
+// prerequisite classifier (#737) still sees that the trusted world refused,
+// instead of reading a refused snapshot read as an ordinary failure.
 type PublicationBlockedError struct {
 	Reason string
+	Err    error
 }
 
 func (e *PublicationBlockedError) Error() string {
 	return "harness: publication blocked: " + e.Reason
 }
+
+func (e *PublicationBlockedError) Unwrap() error { return e.Err }
 
 // TransientPublicationError reports publication transport-class failure that
 // persisted past bounded retries: relaunching the coordinator reconciles

@@ -395,7 +395,7 @@ func (e *PublicationEngine) classify(err error, what string) error {
 	}
 	var callErr *BrokerCallError
 	if errors.As(err, &callErr) && !callErr.Retryable {
-		return &PublicationBlockedError{Reason: fmt.Sprintf("the broker denied %s (%s)", what, callErr.Category)}
+		return &PublicationBlockedError{Reason: fmt.Sprintf("the broker denied %s (%s)", what, callErr.Category), Err: err}
 	}
 	return &TransientPublicationError{Err: err}
 }

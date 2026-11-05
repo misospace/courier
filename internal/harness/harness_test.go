@@ -163,6 +163,10 @@ type mockWorker struct {
 	snapshotTip  string
 	packArtifact []byte
 	snapshotTips []string
+	// unpackExit is the exit status the scripted unpack task completes
+	// with; zero is the honest path. A nonzero status stands in for a
+	// preparation task that ran and failed.
+	unpackExit int
 	// bootstrapResults are consumed in order by the scripted bootstrap task;
 	// with none scripted, a bootstrap task completes with an empty capture.
 	bootstrapResults []protocol.Result
@@ -388,9 +392,15 @@ func (m *mockWorker) handleDispatch(w http.ResponseWriter, r *http.Request) {
 			tip = m.snapshotTips[0]
 			m.snapshotTips = m.snapshotTips[1:]
 		}
+		status := protocol.ResultCompleted
+		if m.unpackExit != 0 {
+			// A nonzero exit is a failed run, the way the real worker
+			// reports one.
+			status = protocol.ResultFailed
+		}
 		m.results[req.Envelope.OpID] = protocol.ResultState{
-			Status: protocol.ResultCompleted,
-			Result: &protocol.Result{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: tip},
+			Status: status,
+			Result: &protocol.Result{Status: status, ExitCode: m.unpackExit, StdoutTail: tip},
 		}
 	case isWorkerPackTask(task):
 		m.results[req.Envelope.OpID] = protocol.ResultState{
@@ -2737,6 +2747,10 @@ func TestUnboundRoleDoesNotBurnBriefID(t *testing.T) {
 	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
 	defer cleanupWorker()
 	worker.completeAll = true
+	// The worker's workspace holds the dispatched tip: an echoed tip that
+	// differs from it is the workspace mismatch trusted control treats as a
+	// final condition, not an ordinary tool error.
+	worker.snapshotTip = "snap-tip"
 	gateway, _, cleanup := gatewayFor(
 		// Coordinator delegates to a role no model is bound to.
 		gatewayResponse{body: sse(
@@ -2777,6 +2791,19 @@ func TestUnboundRoleDoesNotBurnBriefID(t *testing.T) {
 	}
 	if worker.dispatchCount() != 2 {
 		t.Fatalf("worker dispatches = %d, want 2 (the corrected delegation's unpack and shell)", worker.dispatchCount())
+	}
+	// The two dispatches are the corrected delegation's unpack and its
+	// shell: the brief's workspace was prepared, and the delegated work
+	// ran in it.
+	if len(worker.dispatches) != 2 {
+		t.Fatalf("worker dispatches = %d, want 2", len(worker.dispatches))
+	}
+	if !isWorkerUnpackTask(worker.dispatches[0].task) {
+		t.Fatalf("first dispatch = %+v, want the unpack", worker.dispatches[0].task)
+	}
+	shell := worker.dispatches[1].task
+	if len(shell.Command) != 3 || shell.Command[0] != "sh" || shell.Command[1] != "-c" {
+		t.Fatalf("second dispatch = %+v, want the delegated shell task", shell)
 	}
 }
 

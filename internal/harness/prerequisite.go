@@ -1,0 +1,225 @@
+package harness
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+
+	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/protocol"
+)
+
+// prerequisiteClass is the bounded, code-owned vocabulary of workspace
+// prerequisite failures. It names what trusted control observed about the
+// workspace, never what the model said about it, and it never carries worker
+// output: every class is a fact the harness itself witnessed.
+type prerequisiteClass string
+
+const (
+	// prerequisiteRefused: the trusted world or the worker definitively
+	// refused the preparation. A refusal is final — an immediate retry
+	// cannot change it.
+	prerequisiteRefused prerequisiteClass = "refused"
+	// prerequisiteMismatch: the materialized workspace does not hold the
+	// snapshot control dispatched. Nothing may be dispatched against it.
+	prerequisiteMismatch prerequisiteClass = "mismatch"
+	// prerequisiteTaskFailed: the fixed preparation task ran and failed.
+	// One failure may be a legitimate transient, so it is observed but
+	// never decisive on its own.
+	prerequisiteTaskFailed prerequisiteClass = "task_failed"
+	// prerequisiteFenced: the worker is fenced — no further workspace
+	// operation may run against it, whatever the model asks for.
+	prerequisiteFenced prerequisiteClass = "fenced"
+)
+
+// The fixed reason texts every prerequisite failure carries. They are
+// single-line, code-owned, and never an excerpt of untrusted worker output:
+// the only variable part is the fixed task's own exit status, a number the
+// worker reported about its own execution.
+const (
+	prerequisiteRefusedReason    = "the workspace snapshot prerequisite was refused by the trusted world"
+	prerequisiteMismatchReason   = "the worker workspace does not hold the dispatched snapshot"
+	prerequisiteFencedReason     = "the worker is fenced: no further workspace operation may run against it"
+	prerequisiteTaskFailedFormat = "the fixed workspace preparation task failed with exit code %d"
+)
+
+// prerequisiteFailureTripCount is the number of stable preparation failures
+// that establish a condition for the task-failed class: one failure may be a
+// transient the next attempt clears, so recurrence — not a single failure —
+// is what makes it terminal.
+const prerequisiteFailureTripCount = 2
+
+// prerequisiteFailure is a typed workspace-prerequisite failure: the class
+// trusted control observed, the fixed reason the run ends with, and the
+// terminal kind that reason implies.
+type prerequisiteFailure struct {
+	class  prerequisiteClass
+	reason string
+	kind   courierv1alpha1.NativeResultKind
+}
+
+func (f *prerequisiteFailure) Error() string { return f.reason }
+
+// refusedPrerequisite is the refusal class: the trusted world or the worker
+// definitively refused the preparation.
+func refusedPrerequisite() *prerequisiteFailure {
+	return &prerequisiteFailure{
+		class:  prerequisiteRefused,
+		reason: prerequisiteRefusedReason,
+		kind:   courierv1alpha1.NativeResultBlockedExternal,
+	}
+}
+
+// mismatchedPrerequisite is the mismatch class: the worker workspace does
+// not hold the snapshot control dispatched.
+func mismatchedPrerequisite() *prerequisiteFailure {
+	return &prerequisiteFailure{
+		class:  prerequisiteMismatch,
+		reason: prerequisiteMismatchReason,
+		kind:   courierv1alpha1.NativeResultBlockedExternal,
+	}
+}
+
+// failedPrerequisiteTask is the task-failed class: the fixed preparation task
+// ran and failed with its own exit status.
+func failedPrerequisiteTask(exitCode int) *prerequisiteFailure {
+	return &prerequisiteFailure{
+		class:  prerequisiteTaskFailed,
+		reason: fmt.Sprintf(prerequisiteTaskFailedFormat, exitCode),
+		kind:   courierv1alpha1.NativeResultBlockedExternal,
+	}
+}
+
+// fencedPrerequisite is the fenced class: the worker may still be running
+// repository-authored work, so no further workspace operation may run against
+// it. The honest recovery is worker replacement, not another turn.
+func fencedPrerequisite() *prerequisiteFailure {
+	return &prerequisiteFailure{
+		class:  prerequisiteFenced,
+		reason: prerequisiteFencedReason,
+		kind:   courierv1alpha1.NativeResultInfrastructureFailed,
+	}
+}
+
+// workerFence is the sticky worker fence (#414 review): once an operation's
+// termination could not be observed, no further dispatch may run against that
+// worker. It is a typed error so the prerequisite classifier can name it as
+// the fence it is, while its text stays exactly what the run's handoff has
+// always carried.
+type workerFence struct {
+	reason string
+}
+
+func (f *workerFence) Error() string { return f.reason }
+
+// classifyPrerequisite maps one preparation failure to the prerequisite
+// class it establishes, or nil when it establishes none. The order is the
+// contract: a typed failure is itself, the #414 bootstrap blocker owns its
+// own case and is never double-handled, the fence is final, an unverified
+// termination is not a prerequisite failure in its own right (the fence it
+// set is), a status-path refusal is a recording failure rather than a
+// workspace condition, a retryable broker failure is transient, a definite
+// worker rejection is a refusal, and anything unclassified never trips the
+// breaker.
+//
+// The unverified check precedes the refusal checks on purpose: an unverified
+// termination can carry the worker's own rejection inside its chain, and a
+// termination the harness could not verify is never a refusal — the run must
+// fail closed, not call the world done.
+func classifyPrerequisite(err error) *prerequisiteFailure {
+	if err == nil {
+		return nil
+	}
+	var failure *prerequisiteFailure
+	if errors.As(err, &failure) {
+		return failure
+	}
+	var blocker *bootstrapBlocker
+	if errors.As(err, &blocker) {
+		return nil
+	}
+	var fence *workerFence
+	if errors.As(err, &fence) {
+		return fencedPrerequisite()
+	}
+	if errors.Is(err, ErrTerminationUnverified) {
+		return nil
+	}
+	var persist *statusPersistFailure
+	if errors.As(err, &persist) {
+		return nil
+	}
+	var callErr *BrokerCallError
+	if errors.As(err, &callErr) {
+		if callErr.Retryable {
+			return nil
+		}
+		return refusedPrerequisite()
+	}
+	var transportErr *protocol.TransportError
+	if errors.As(err, &transportErr) {
+		if definiteWorkerRejectionStatus(transportErr.StatusCode) {
+			return refusedPrerequisite()
+		}
+		return nil
+	}
+	return nil
+}
+
+// prerequisiteLatch is the incarnation's circuit breaker for workspace
+// prerequisites. It counts the stable preparation failures the incarnation
+// observed and trips once trusted control knows the condition cannot clear:
+// a refusal, a mismatch, or a fence is one observation enough, because each
+// is a final fact; recurrence — across any class, so alternating classes
+// cannot evade it — establishes the task-failed class. The latch never
+// un-trips and never forgets a trip.
+type prerequisiteLatch struct {
+	mu       sync.Mutex
+	failures int
+	trip     *prerequisiteFailure
+	consumed bool
+}
+
+// observe records one stable preparation failure. A nil failure is not a
+// failure at all and changes nothing.
+func (l *prerequisiteLatch) observe(failure *prerequisiteFailure) {
+	if failure == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.failures++
+	if l.trip != nil {
+		return
+	}
+	switch failure.class {
+	case prerequisiteRefused, prerequisiteMismatch, prerequisiteFenced:
+		l.trip = failure
+	default:
+		if l.failures >= prerequisiteFailureTripCount {
+			l.trip = failure
+		}
+	}
+}
+
+// peek reports the trip without consuming it: a sub-agent may look, but only
+// the coordinator's own loop ends the run.
+func (l *prerequisiteLatch) peek() *prerequisiteFailure {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.trip
+}
+
+// take hands the trip to the one consumer that ends the run. The trip itself
+// is never forgotten — peek keeps reporting it — but only the first
+// consumer takes it. A latch that has not tripped yet is not consumed: the
+// trip may still arrive.
+func (l *prerequisiteLatch) take() *prerequisiteFailure {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.trip == nil || l.consumed {
+		return nil
+	}
+	l.consumed = true
+	return l.trip
+}
