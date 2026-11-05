@@ -153,6 +153,15 @@ func (refusedStatusTransport) PostStatus(context.Context, StatusPatch) error {
 	return brokerDenied()
 }
 
+// localStatusTransport fails every status write with the real PostStatus
+// local-malformed shape: a locally malformed request the broker never
+// answered — plumbing, not a denial.
+type localStatusTransport struct{}
+
+func (localStatusTransport) PostStatus(context.Context, StatusPatch) error {
+	return &BrokerCallError{Category: "status request is malformed"}
+}
+
 // refusedShellBeginTransport serves the trusted status path honestly except
 // for one operation kind's begin write, which it refuses definitively — the
 // shape of a broker that accepts the preparation records and refuses the
@@ -166,35 +175,47 @@ func (refusedShellBeginTransport) PostStatus(_ context.Context, patch StatusPatc
 	return nil
 }
 
-// TestCoordinatorStopsModelTurnsOnDefiniteStatusPathRefusal is the #741
-// regression: the trusted status path definitively refused to persist the
-// operation's status record, so the operation never dispatched. The run must
-// end as an infrastructure failure at the first turn's tool boundary — the
-// model never gets a second turn to re-ask for the same refused operation
-// through shell commands, tracked checks, or a delegated brief. A recording
-// failure of trusted control's own plumbing is never blocked-external: the
-// world did not refuse the work, the run's own status plumbing did.
+// TestCoordinatorStopsModelTurnsOnDefiniteStatusPathFailure is the #741
+// regression: a definite — non-retryable — status-path failure, a broker
+// denial of the operation's status record or the local failure that states
+// none, means the operation never dispatched. The run must end as an
+// infrastructure failure at the first turn's tool boundary — the model
+// never gets a second turn to re-ask for the same refused operation through
+// shell commands, tracked checks, or a delegated brief. A recording failure
+// of trusted control's own plumbing is never blocked-external: the world
+// did not refuse the work, the run's own status plumbing failed.
 //
-// Both refusal sites are covered: the preparation dispatch's own record, and
-// the shell dispatch's record after honest preparation. The second is the
-// one that matters — only the dispatch boundary itself witnesses it, so a
-// breaker that observed at the preparation callers alone would let the model
-// take another turn over it.
-func TestCoordinatorStopsModelTurnsOnDefiniteStatusPathRefusal(t *testing.T) {
+// Every site is covered: the preparation dispatch's own record, and the
+// shell dispatch's record after honest preparation — the one that matters,
+// only the dispatch boundary itself witnesses it, so a breaker that
+// observed at the preparation callers alone would let the model take
+// another turn over it. The local plumbing failure ends the run the same
+// one-turn way, but its ending carries the honest local reason, never the
+// refusal wording the broker never stated (#741 review).
+func TestCoordinatorStopsModelTurnsOnDefiniteStatusPathFailure(t *testing.T) {
 	for _, tc := range []struct {
 		name           string
 		transport      StatusTransport
 		wantDispatches int
+		wantReason     string
 	}{
 		{
 			name:           "the preparation dispatch's record is refused",
 			transport:      refusedStatusTransport{},
 			wantDispatches: 0,
+			wantReason:     prerequisiteStatusRefusedReason,
 		},
 		{
 			name:           "the shell dispatch's record is refused after honest preparation",
 			transport:      refusedShellBeginTransport{},
 			wantDispatches: 1,
+			wantReason:     prerequisiteStatusRefusedReason,
+		},
+		{
+			name:           "the preparation dispatch's record fails locally",
+			transport:      localStatusTransport{},
+			wantDispatches: 0,
+			wantReason:     prerequisiteStatusLocalReason,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -241,8 +262,14 @@ func TestCoordinatorStopsModelTurnsOnDefiniteStatusPathRefusal(t *testing.T) {
 			if result.Kind != courierv1alpha1.NativeResultInfrastructureFailed {
 				t.Fatalf("kind = %q, want infrastructure: a recording failure of trusted control's own plumbing is not an external prerequisite", result.Kind)
 			}
-			if result.Err == nil || !strings.Contains(result.Err.Error(), prerequisiteStatusRefusedReason) {
-				t.Fatalf("err = %v, want the fixed status-path reason %q", result.Err, prerequisiteStatusRefusedReason)
+			if result.Err == nil || !strings.Contains(result.Err.Error(), tc.wantReason) {
+				t.Fatalf("err = %v, want the fixed status-path reason %q", result.Err, tc.wantReason)
+			}
+			// The honest class is load-bearing (#741 review): the local
+			// plumbing ending must not claim the refusal the broker never
+			// stated.
+			if tc.wantReason == prerequisiteStatusLocalReason && strings.Contains(result.Err.Error(), prerequisiteStatusRefusedReason) {
+				t.Fatalf("err = %v, the local status-path ending must not claim a refusal", result.Err)
 			}
 			if text := result.Err.Error(); strings.Contains(text, "\n") || strings.Contains(text, "echo one") {
 				t.Fatalf("err = %q, must be single-line fixed text carrying neither model prose nor worker output", text)
@@ -1164,34 +1191,62 @@ func TestClassifyPrerequisite(t *testing.T) {
 	if got := classifyPrerequisite(unverifiedWithRejection); got != nil {
 		t.Fatalf("classified = %v, want nil: an unverified termination outranks the rejection it carries", got)
 	}
-	// A definite status-path refusal is a recording failure of trusted
-	// control's own plumbing: it is its own class, and the ending is an
-	// infrastructure failure — never the blocked-external wait on an
-	// external prerequisite, and never a refusal of the workspace the model
-	// could rediscover (#741). The classifier reads the wrapped error's
-	// retryability, so a refused write and a locally unwritable one are the
-	// same class: the status path definitively did not land, whatever
-	// refused it.
+	// A status-path failure the broker definitively denied — a real
+	// non-retryable 4xx — is a recording refusal of trusted control's own
+	// plumbing: its own class, and the ending is an infrastructure failure —
+	// never the blocked-external wait on an external prerequisite, and never
+	// a refusal of the workspace the model could rediscover (#741). The
+	// refusal is a fact the broker stated, never one control inferred (#741
+	// review): the predicate is the same positive 4xx rule the workspace
+	// path applies.
 	statusRefused := &statusPersistFailure{opID: "op-1", err: &BrokerCallError{StatusCode: 403, Category: "denied the operation"}}
 	got := classifyPrerequisite(statusRefused)
 	if got == nil || got.class != prerequisiteStatusRefused {
 		t.Fatalf("classified = %v, want the status-refused class", got)
 	}
 	if got.kind != courierv1alpha1.NativeResultInfrastructureFailed {
-		t.Fatalf("class %q kind = %q, want infrastructure: a recording failure is never blocked-external", got.class, got.kind)
+		t.Fatalf("class %q kind = %q, want infrastructure: a recording refusal is never blocked-external", got.class, got.kind)
 	}
 	if got.reason != prerequisiteStatusRefusedReason {
-		t.Fatalf("class %q reason = %q, want the fixed status-path reason", got.class, got.reason)
+		t.Fatalf("class %q reason = %q, want the fixed status-path refusal reason", got.class, got.reason)
 	}
+	// A non-retryable status-path failure that states no denial is the local
+	// status-path failure class: a locally malformed request is not the
+	// broker's answer, and a reason that claimed a refusal would overclaim
+	// what was observed (#741 review). The record cannot land either way, so
+	// the class still trips the latch — its ending is the same
+	// infrastructure failure, without the refusal wording.
 	localStatus := &statusPersistFailure{opID: "op-2", err: &BrokerCallError{Category: "status request is malformed"}}
-	if got := classifyPrerequisite(localStatus); got == nil || got.class != prerequisiteStatusRefused {
-		t.Fatalf("classified = %v, want the status-refused class: a definite recording failure ends the run whatever refused it", got)
+	got = classifyPrerequisite(localStatus)
+	if got == nil || got.class != prerequisiteStatusLocal {
+		t.Fatalf("classified = %v, want the status-local class: a locally malformed request is not a broker denial", got)
 	}
-	// A status-path failure that is not even a broker error is definite too:
-	// the trusted plumbing failed in a way nothing can call transient, and
-	// failing closed is the breaker's contract.
-	if got := classifyPrerequisite(&statusPersistFailure{opID: "op-3", err: errors.New("recorder stopped")}); got == nil || got.class != prerequisiteStatusRefused {
-		t.Fatalf("classified = %v, want the status-refused class: an unknown status-path failure is never transient", got)
+	if got.kind != courierv1alpha1.NativeResultInfrastructureFailed {
+		t.Fatalf("class %q kind = %q, want infrastructure: the record cannot land whatever a turn does", got.class, got.kind)
+	}
+	if got.reason != prerequisiteStatusLocalReason {
+		t.Fatalf("class %q reason = %q, want the fixed status-path local reason", got.class, got.reason)
+	}
+	// A non-retryable status outside the denial range states no denial
+	// either: the same positive 4xx rule sorts it into the local class, not
+	// a refusal.
+	if got := classifyPrerequisite(&statusPersistFailure{opID: "op-2b", err: &BrokerCallError{StatusCode: http.StatusFound, Category: "denied the operation"}}); got == nil || got.class != prerequisiteStatusLocal {
+		t.Fatalf("classified = %v, want the status-local class: a status outside the denial range is not a refusal", got)
+	}
+	// The broker client's other local plumbing failure — the unreadable CA
+	// that never lets a request leave — states no denial either.
+	if got := classifyPrerequisite(&statusPersistFailure{opID: "op-2c", err: &BrokerCallError{Category: "CA is unreadable"}}); got == nil || got.class != prerequisiteStatusLocal {
+		t.Fatalf("classified = %v, want the status-local class: an unreadable CA never reaches the broker", got)
+	}
+	// A status-path failure that is not even a broker error is definite too —
+	// the trusted plumbing failed in a way nothing can call transient — and
+	// it is honest the same way: the local class, never the refusal wording.
+	unknownStatus := classifyPrerequisite(&statusPersistFailure{opID: "op-3", err: errors.New("recorder stopped")})
+	if unknownStatus == nil || unknownStatus.class != prerequisiteStatusLocal {
+		t.Fatalf("classified = %v, want the status-local class: an unknown status-path failure is never transient", unknownStatus)
+	}
+	if unknownStatus.reason != prerequisiteStatusLocalReason {
+		t.Fatalf("class %q reason = %q, want the fixed status-path local reason", unknownStatus.class, unknownStatus.reason)
 	}
 	// A retryable status-path failure is transient: the broker is momentarily
 	// unreachable, the write already retried inside the reporter's bounded
@@ -1363,14 +1418,17 @@ func TestPrerequisiteLatchTripsAndSticks(t *testing.T) {
 }
 
 // TestPrerequisiteLatchTripsOnFinalFacts pins the one-observation classes:
-// a refusal, a mismatch, a fence, and a definite status-path refusal are
-// final facts, each tripping the latch on its own.
+// a refusal, a mismatch, a fence, a definite status-path refusal, and the
+// local status-path failure that states no denial are final facts, each
+// tripping the latch on its own — the record cannot land whatever a model
+// turn does.
 func TestPrerequisiteLatchTripsOnFinalFacts(t *testing.T) {
 	for _, failure := range []*prerequisiteFailure{
 		refusedPrerequisite(),
 		mismatchedPrerequisite(),
 		fencedPrerequisite(),
 		statusPathRefused(),
+		statusPathLocalFailure(),
 	} {
 		var latch prerequisiteLatch
 		latch.observe(failure)

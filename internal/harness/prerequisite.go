@@ -36,15 +36,27 @@ const (
 	// infrastructure failure: the world never refused, so the condition is
 	// never blocked-external and never a refusal (#744).
 	prerequisiteLocalFailure prerequisiteClass = "local_failure"
-	// prerequisiteStatusRefused: the run's trusted status path definitively
-	// refused to persist the operation's status record, so the operation
-	// never dispatched. A recording failure of trusted control's own
-	// plumbing is not a workspace condition and not an external prerequisite
-	// the world could still satisfy, so the ending is an infrastructure
-	// failure, never blocked-external (#741). A retryable status-path
-	// failure — the broker momentarily unreachable — is not this class: it
-	// is transient and still retries through the ordinary tool error.
+	// prerequisiteStatusRefused: the run's broker definitively refused to
+	// persist the operation's status record — a non-retryable failure that
+	// positively states a denial, the same 4xx rule the workspace path
+	// applies — so the operation never dispatched. A recording refusal of
+	// trusted control's own plumbing is not a workspace condition and not an
+	// external prerequisite the world could still satisfy, so the ending is
+	// an infrastructure failure, never blocked-external (#741). A retryable
+	// status-path failure — the broker momentarily unreachable — is not this
+	// class: it is transient and still retries through the ordinary tool
+	// error. A non-retryable failure that states no denial is not this class
+	// either: it is the local status-path failure below.
 	prerequisiteStatusRefused prerequisiteClass = "status_refused"
+	// prerequisiteStatusLocal: the run's trusted status path failed to
+	// persist the operation's status record without stating a denial — a
+	// locally malformed request, or a response that is no API answer — so
+	// the operation never dispatched and the world never refused (#741
+	// review). The record cannot land, so another model turn cannot help:
+	// like the refusal it is distinguished from, one observation establishes
+	// the condition, and the ending is an infrastructure failure that never
+	// carries the refusal wording.
+	prerequisiteStatusLocal prerequisiteClass = "status_local"
 	// prerequisiteFenced: the worker is fenced — no further workspace
 	// operation may run against it, whatever the model asks for.
 	prerequisiteFenced prerequisiteClass = "fenced"
@@ -61,6 +73,7 @@ const (
 	prerequisiteTaskFailedFormat    = "the fixed workspace preparation task failed with exit code %d"
 	prerequisiteLocalFailReason     = "the workspace snapshot could not be prepared: the broker call failed locally and the failure recurred"
 	prerequisiteStatusRefusedReason = "the trusted status path refused the operation's status record; no operation can be dispatched"
+	prerequisiteStatusLocalReason   = "the trusted status path failed to persist the operation's status record; no operation can be dispatched"
 )
 
 // prerequisiteFailureTripCount is the number of stable preparation failures
@@ -135,17 +148,34 @@ func fencedPrerequisite() *prerequisiteFailure {
 	}
 }
 
-// statusPathRefused is the status-path class: the run's trusted status path
-// definitively refused to persist the operation's status record, so the
-// operation never dispatched. The ending is an infrastructure failure — a
-// recording failure of trusted control's own plumbing is never the
-// blocked-external wait on an external prerequisite the world could still
-// satisfy (#741); the honest recovery is operator relaunch once the run's
-// own status plumbing is fixed.
+// statusPathRefused is the status-path refusal class: the run's broker
+// definitively refused to persist the operation's status record — a
+// non-retryable failure that positively states a denial — so the operation
+// never dispatched. The ending is an infrastructure failure — a recording
+// refusal of trusted control's own plumbing is never the blocked-external
+// wait on an external prerequisite the world could still satisfy (#741);
+// the honest recovery is operator relaunch once the run's own status
+// plumbing is fixed.
 func statusPathRefused() *prerequisiteFailure {
 	return &prerequisiteFailure{
 		class:  prerequisiteStatusRefused,
 		reason: prerequisiteStatusRefusedReason,
+		kind:   courierv1alpha1.NativeResultInfrastructureFailed,
+	}
+}
+
+// statusPathLocalFailure is the status-path local-failure class: the run's
+// trusted status path failed to persist the operation's status record
+// without stating a denial — a locally malformed request, or a response
+// that is no API answer (#741 review). The world never refused, so the
+// reason never says so; the record cannot land either way, so like the
+// refusal one observation establishes the condition and the ending is an
+// infrastructure failure for the operator to relaunch once the run's own
+// status plumbing is fixed.
+func statusPathLocalFailure() *prerequisiteFailure {
+	return &prerequisiteFailure{
+		class:  prerequisiteStatusLocal,
+		reason: prerequisiteStatusLocalReason,
 		kind:   courierv1alpha1.NativeResultInfrastructureFailed,
 	}
 }
@@ -166,9 +196,11 @@ func (f *workerFence) Error() string { return f.reason }
 // contract: a typed failure is itself, the #414 bootstrap blocker owns its
 // own case and is never double-handled, the fence is final, an unverified
 // termination is not a prerequisite failure in its own right (the fence it
-// set is), a definite status-path refusal is a recording failure of trusted
-// control's own plumbing — its own class, an infrastructure failure, never a
-// workspace refusal (#741) — while a retryable status-path failure and a
+// set is), a status-path failure the broker definitively denied is a
+// recording refusal of trusted control's own plumbing — its own class, an
+// infrastructure failure, never a workspace refusal (#741) — while a
+// status-path failure that states no denial is the local status-path
+// failure class and a retryable status-path failure and a
 // retryable broker failure are transient, a broker
 // error that positively states a denial is a refusal while a non-retryable
 // broker error that states no denial is a local failure — a construction or
@@ -202,17 +234,28 @@ func classifyPrerequisite(err error) *prerequisiteFailure {
 	}
 	var persist *statusPersistFailure
 	if errors.As(err, &persist) {
-		// A definite status-path refusal ends the run (#741): the operation
+		// A definite status-path failure ends the run (#741): the operation
 		// never dispatched, nothing a model turn can change will make the
 		// next write land, and a recording failure of trusted control's own
 		// plumbing is an infrastructure failure, never the blocked-external
 		// wait on an external prerequisite. A retryable status-path failure
 		// — the broker momentarily unreachable — is transient: it keeps the
 		// ordinary tool-error path, so the model's legitimate retry stands.
+		// What the world stated decides the class (#741 review): a
+		// non-retryable failure that positively states a definite denial —
+		// the same predicate the workspace path applies — is the broker's
+		// refusal of the record, while a non-retryable failure that states
+		// no denial — a locally malformed request, or a response that is no
+		// API answer — is the local status-path failure class, whose reason
+		// never claims a refusal.
 		if isBrokerRetryable(persist.err) {
 			return nil
 		}
-		return statusPathRefused()
+		var callErr *BrokerCallError
+		if errors.As(persist.err, &callErr) && definiteWorkerRejectionStatus(callErr.StatusCode) {
+			return statusPathRefused()
+		}
+		return statusPathLocalFailure()
 	}
 	var callErr *BrokerCallError
 	if errors.As(err, &callErr) {
@@ -248,8 +291,10 @@ func classifyPrerequisite(err error) *prerequisiteFailure {
 // prerequisiteLatch is the incarnation's circuit breaker for workspace
 // prerequisites. It counts the stable preparation failures the incarnation
 // observed and trips once trusted control knows the condition cannot clear:
-// a refusal, a mismatch, a fence, or a definite status-path refusal is one
-// observation enough, because each is a final fact; recurrence — across any
+// a refusal, a mismatch, a fence, or a definite status-path failure — the
+// broker's denial of the record or the local failure that states none — is
+// one observation enough, because each is a final fact and the record
+// cannot land whatever a model turn does; recurrence — across any
 // class, so alternating classes
 // cannot evade it — establishes the task-failed and local-failure classes.
 // The latch never un-trips and never forgets a trip.
@@ -273,7 +318,7 @@ func (l *prerequisiteLatch) observe(failure *prerequisiteFailure) {
 		return
 	}
 	switch failure.class {
-	case prerequisiteRefused, prerequisiteMismatch, prerequisiteFenced, prerequisiteStatusRefused:
+	case prerequisiteRefused, prerequisiteMismatch, prerequisiteFenced, prerequisiteStatusRefused, prerequisiteStatusLocal:
 		l.trip = failure
 	default:
 		if l.failures >= prerequisiteFailureTripCount {

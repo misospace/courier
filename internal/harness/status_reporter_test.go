@@ -48,8 +48,12 @@ func brokerUnavailable() error {
 	return &BrokerCallError{Category: "is temporarily unavailable", Retryable: true}
 }
 
+// brokerDenied is a real broker denial: a non-retryable 4xx the broker
+// stated, the shape brokerStatusError returns for a refused write. A local
+// failure where the broker never answered is a different error and never
+// this one.
 func brokerDenied() error {
-	return &BrokerCallError{Category: "denied the operation"}
+	return &BrokerCallError{StatusCode: http.StatusForbidden, Category: "denied the operation"}
 }
 
 const (

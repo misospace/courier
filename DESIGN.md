@@ -2034,15 +2034,23 @@ facts it witnessed itself:
   wait on an external prerequisite; recurrence establishes it, and the run
   ends as an infrastructure failure for the operator to relaunch once the
   run's own broker plumbing is fixed (#744).
-- **Status refused.** The run's trusted status path definitively refused to
-  persist the operation's status record, so the operation never dispatched.
-  A recording failure of trusted control's own plumbing is not a workspace
-  condition and not an external prerequisite the world could still satisfy:
-  one observation establishes the condition, and the run ends as an
-  infrastructure failure for the operator to relaunch once the run's own
-  status plumbing is fixed (#741). A retryable status-path failure — the
-  broker momentarily unreachable — stays outside the vocabulary and keeps
-  the ordinary tool-error path, so the model's legitimate retry stands.
+- **Status refused.** The run's broker definitively refused to persist the
+  operation's status record — a non-retryable failure that states a definite
+  denial — so the operation never dispatched. A recording refusal of trusted
+  control's own plumbing is not a workspace condition and not an external
+  prerequisite the world could still satisfy: one observation establishes
+  the condition, and the run ends as an infrastructure failure for the
+  operator to relaunch once the run's own status plumbing is fixed (#741).
+  A retryable status-path failure — the broker momentarily unreachable —
+  stays outside the vocabulary and keeps the ordinary tool-error path, so
+  the model's legitimate retry stands.
+- **Status local.** The trusted status path failed to persist the
+  operation's status record without stating a denial — a locally malformed
+  request, or a response that is no API answer (#741 review). The world
+  never refused, so the reason never says so; the record cannot land either
+  way, so like the refusal one observation establishes the condition, and
+  the run ends as the same infrastructure failure for the operator to
+  relaunch once the run's own status plumbing is fixed.
 - **Fenced.** One operation's termination could not be observed, so the worker
   is fenced and no further workspace operation may run against it. The honest
   recovery is worker replacement, not another model turn.
@@ -2053,7 +2061,9 @@ worker timeout or rate limit, an unclassified error, and an unverified
 termination never establish a condition, and the #414 bootstrap blocker keeps
 its own mechanism and is never counted here. A broker error establishes a
 refusal only when it states a definite denial — everything else it reports
-about a failed preparation call is the local-failure class above.
+about a failed preparation call is the local-failure class above, and the
+same rule sorts the status path's own failures into the status-refused and
+status-local classes.
 
 The latch counts stable failures for the incarnation and trips once the
 condition is established. The count is a total across classes and across
@@ -2074,9 +2084,11 @@ infrastructure failure too: the trusted world never answered, so the failure
 is the run's own plumbing failing, not an external prerequisite the world
 could still satisfy, and an unbounded retry would burn provider capacity
 rediscovering a condition no turn can repair (#744). A definite status-path
-refusal ends the run as an infrastructure failure as well, and the dispatch
-boundary that refuses the record observes it there — on every dispatch path,
-not one preparation later (#741). All of these reasons are
+failure — the broker's denial of the record, or the local failure that
+states none — ends the run as an infrastructure failure as well, and the
+dispatch boundary that witnesses it observes it there — on every dispatch
+path, not one preparation later (#741); the local class's reason never
+claims a refusal the broker never stated (#741 review). All of these reasons are
 fixed code-owned text. They never carry model prose, and they never carry
 worker output beyond the fixed preparation task's own exit status.
 
