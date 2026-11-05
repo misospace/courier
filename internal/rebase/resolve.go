@@ -23,6 +23,37 @@ func (e *semanticError) Error() string {
 	return fmt.Sprintf("semantic conflict in %d file(s): %s", len(e.files), e.reason)
 }
 
+// validateConflictedPaths refuses any conflicted path that is not a clean
+// repository-relative path inside the workspace. Every conflicted path comes
+// from git's own output (UnmergedPaths), so such a name should never appear;
+// the engine's reads and writes are keyed on these names, though, and a name
+// that is empty, absolute, or carries an empty, ".", or ".." component would
+// read or write through a path the workspace does not contain. This is
+// defense in depth, not a trust boundary: the path is refused as a semantic
+// conflict with the path named, before anything is read or written through
+// it — the mechanical path and the assist path alike.
+func validateConflictedPaths(paths []string) error {
+	for _, path := range paths {
+		slash := filepath.ToSlash(path)
+		rejected := slash == "" || filepath.IsAbs(slash)
+		if !rejected {
+			for _, component := range strings.Split(slash, "/") {
+				if component == "" || component == "." || component == ".." {
+					rejected = true
+					break
+				}
+			}
+		}
+		if rejected {
+			return &semanticError{
+				files:  []string{path},
+				reason: fmt.Sprintf("conflicted path %q is not a repository-relative path inside the workspace; the engine will not read or write through it", path),
+			}
+		}
+	}
+	return nil
+}
+
 // resolveConflicts classifies every conflicted path of an in-progress rebase
 // with the closed mechanical rules and, when every hunk across every file
 // classifies, stages the resolutions and continues the rebase until it
@@ -57,6 +88,9 @@ func (e *semanticError) Error() string {
 func resolveConflicts(ctx context.Context, w *git.Workspace, opts Options, origHead string, paths []string, assist *AssistReport) error {
 	if len(paths) == 0 {
 		return errors.New("rebase stopped without reporting conflicted paths")
+	}
+	if err := validateConflictedPaths(paths); err != nil {
+		return err
 	}
 	sort.Strings(paths)
 	// The episode's single model-assisted attempt (#732): spent on the first
@@ -121,6 +155,12 @@ func resolveConflicts(ctx context.Context, w *git.Workspace, opts Options, origH
 				return err
 			}
 			paths = conflictErr.Paths
+			// A later round's paths are the same kind of git output as the
+			// first round's: the same repository-relative guard applies
+			// before anything reads or writes through them.
+			if err := validateConflictedPaths(paths); err != nil {
+				return err
+			}
 			continue
 		}
 		return nil

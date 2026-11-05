@@ -384,6 +384,95 @@ func TestAssistSubsetResolutionIsRejected(t *testing.T) {
 	}
 }
 
+// A resolution that still carries git's diff3 base marker ("|||||||") is
+// not a resolution: Rebase pins merge.conflictstyle=diff3, so a model answer
+// that copies the marked file back with the base section intact would
+// otherwise pass validation and be published. Validation treats it as a
+// refusal — nothing is written, the replay stops for a human, and the
+// remote stays at the lease head.
+func TestAssistResolutionWithDiff3BaseMarkerIsRejected(t *testing.T) {
+	f := newFixture(t,
+		map[string]string{"code.go": "package main\n\nfunc main() {\n\tx := 3\n\t_ = x\n}\n"},
+		map[string]string{"code.go": "package main\n\nfunc main() {\n\tx := 2\n\t_ = x\n}\n"},
+	)
+	resolver := &fakeResolver{res: &AssistResolution{
+		Files: map[string]string{"code.go": "package main\n\nfunc main() {\n\tx := 5\n\t_ = x\n}\n||||||| base content\n"},
+		Model: "litellm/test-model",
+	}}
+	result := executeAssisted(t, f, f.head, resolver)
+	if result.Outcome != OutcomeSemanticConflict {
+		t.Fatalf("outcome = %q (%s), want the stop-for-human ending", result.Outcome, result.Reason)
+	}
+	if got := remoteHead(t, f); got != f.head {
+		t.Fatalf("remote head = %q, want the untouched lease head", got)
+	}
+	if !strings.Contains(result.Reason, `still carries the ||||||| conflict marker`) {
+		t.Fatalf("reason = %q, want the base marker named", result.Reason)
+	}
+	// Nothing was written: after the abort the worktree is the adopted PR
+	// branch again, so the file still holds its full PR-side content, never
+	// the resolution that still carried the base marker.
+	data, err := os.ReadFile(filepath.Join(f.workspace, "code.go"))
+	if err != nil || string(data) != "package main\n\nfunc main() {\n\tx := 2\n\t_ = x\n}\n" {
+		t.Fatalf("code.go = %q (%v), want the untouched PR-side content", data, err)
+	}
+}
+
+// Every marker the engine refuses, including the diff3 base marker the
+// rebase's own conflict style writes.
+func TestConflictMarkersInCoversDiff3BaseMarker(t *testing.T) {
+	for _, marker := range []string{"<<<<<<<", "|||||||", "=======", ">>>>>>>"} {
+		content := "clean line\n" + marker + " marker text\nmore\n"
+		if got := conflictMarkersIn(content); got != marker {
+			t.Fatalf("conflictMarkersIn(%q) = %q, want %q", content, got, marker)
+		}
+	}
+	if got := conflictMarkersIn("clean content\nwithout markers\n"); got != "" {
+		t.Fatalf("conflictMarkersIn = %q, want empty", got)
+	}
+}
+
+// A conflicted path that is not a clean repository-relative path inside the
+// workspace never reaches the resolver or the filesystem: the engine refuses
+// it as a semantic conflict naming the path before anything is read or
+// written, and the outside target the path would reach is untouched.
+func TestTraversalConflictedPathStopsForHuman(t *testing.T) {
+	f := newFixture(t,
+		map[string]string{"code.go": "package main\n\nfunc main() {\n\tx := 3\n\t_ = x\n}\n"},
+		map[string]string{"code.go": "package main\n\nfunc main() {\n\tx := 2\n\t_ = x\n}\n"},
+	)
+	// The file "../outside" would name, one level above the workspace,
+	// holds a sentinel: if anything read or wrote through the traversal
+	// path, the sentinel would move.
+	outside := filepath.Join(filepath.Dir(f.workspace), "outside")
+	writeFile(t, outside, "outside-sentinel\n")
+	resolver := &fakeResolver{res: &AssistResolution{
+		Files: map[string]string{"../outside": "should never be written"},
+		Model: "litellm/test-model",
+	}}
+	err := resolveConflicts(context.Background(),
+		&git.Workspace{Directory: f.workspace, Base: f.base},
+		Options{ModelResolver: resolver}, f.head,
+		[]string{"../outside"}, &AssistReport{})
+	var semantic *semanticError
+	if !errors.As(err, &semantic) {
+		t.Fatalf("err = %v, want a semantic conflict — the NeedsHuman-classified ending", err)
+	}
+	if len(semantic.files) != 1 || semantic.files[0] != "../outside" {
+		t.Fatalf("conflict files = %v, want the traversal path named", semantic.files)
+	}
+	if !strings.Contains(semantic.reason, "not a repository-relative path inside the workspace") {
+		t.Fatalf("reason = %q, want the repository-relative verdict", semantic.reason)
+	}
+	if resolver.calls != 0 {
+		t.Fatalf("resolver calls = %d, want no model turn at all", resolver.calls)
+	}
+	data, err := os.ReadFile(outside)
+	if err != nil || string(data) != "outside-sentinel\n" {
+		t.Fatalf("outside target = %q (%v), want the sentinel untouched", data, err)
+	}
+}
+
 // A symlink content conflict leaves the link itself in the worktree: the
 // engine must refuse to read or write through it, stop the round for a
 // human as an unresolved semantic conflict, and leave the link's outside

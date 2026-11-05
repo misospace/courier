@@ -327,7 +327,24 @@ func Goal(run *courierv1alpha1.CoderRun) (string, error) {
 // repository authority, mutates no policy, selects no credential, and moves no
 // publication target. No acceptance-criteria grammar is included: a contribution
 // pins no criteria, so COURIER_CRITERIA is never set for it.
+//
+// The rebase goal it renders states the mechanical-only contract; use
+// GoalWithContributionAndRebaseAssist when the deployment enables the
+// model-assisted conflict resolution for rebase runs.
 func GoalWithContribution(run *courierv1alpha1.CoderRun, contribution ContributionExecution) (string, error) {
+	return GoalWithContributionAndRebaseAssist(run, contribution, false)
+}
+
+// GoalWithContributionAndRebaseAssist renders the coordinator goal like
+// GoalWithContribution and, when rebaseModelAssist is enabled, renders the
+// rebase goal that authorizes the engine's one model-assisted conflict
+// resolution attempt instead of the mechanical-only one. The flag must be
+// the same value the deployment wires to the executor: the goal travels to
+// the assist model as context, so a goal that forbids what the assist is
+// authorized to do would make the model refuse legitimate work, and a goal
+// that authorizes it while the engine runs mechanical-only would misstate
+// the run's contract.
+func GoalWithContributionAndRebaseAssist(run *courierv1alpha1.CoderRun, contribution ContributionExecution, rebaseModelAssist bool) (string, error) {
 	if run == nil {
 		return "", ErrNilRun
 	}
@@ -348,12 +365,19 @@ func GoalWithContribution(run *courierv1alpha1.CoderRun, contribution Contributi
 		return fmt.Sprintf("Take over PR #%d.%s Inspect the current pull request state, CI/checks, and existing review feedback to determine what work is needed; address feedback already present without repeatedly searching for new reviews. %s %s %s%s %s", run.Spec.Ref, assignment, forgeContract, completionContract, localValidationContract, publication, fmt.Sprintf(outcomeContract, outcomeFile)) + repairContract(run), nil
 	case courierv1alpha1.ModeRebase:
 		// The goal of a rebase run is contract documentation, not model work
-		// (#715): execution is the trusted, deterministic rebase path, and no
-		// model session runs. The rendered text states the mechanical-only
-		// walls so any reader of the run — a human inspecting COURIER_GOAL, an
-		// audit trail, a future harness — sees exactly what this mode may and
-		// may not do, and the outcome declaration stays uniform with the other
-		// modes.
+		// (#715): execution is the trusted, deterministic rebase path. The
+		// rendered text states the walls this mode may and may not work
+		// within so any reader of the run — a human inspecting
+		// COURIER_GOAL, an audit trail, a future harness — sees exactly what
+		// the mode does, and the outcome declaration stays uniform with the
+		// other modes. With the model-assisted conflict resolution enabled
+		// (#732) the contract widens by exactly the one bounded attempt the
+		// engine makes; without it the mechanical-only text is unchanged,
+		// because the secure launcher renders goals without assist
+		// configuration and must keep the narrower contract.
+		if rebaseModelAssist {
+			return fmt.Sprintf("Mechanically rebase PR #%d onto its base (#715). This run is trusted deterministic execution: it rebases the existing pull-request branch onto the pull request's live base, runs the bounded repository checks, and publishes only to the existing pull-request branch through a force-with-lease tied to the head observed at admission. The engine resolves provably mechanical conflicts (one-sided edits and comment-only overlaps) by its own closed rules. When a conflict is not mechanical, the engine makes one model-assisted resolution attempt through the configured coordinator model and validates the answer before use; a conflict that attempt does not resolve stops the run for a human decision with the conflict summary. It never merges, never opens, retargets, or creates a pull request or branch.%s %s", run.Spec.Ref, publication, fmt.Sprintf(outcomeContract, outcomeFile)), nil
+		}
 		return fmt.Sprintf("Mechanically rebase PR #%d onto its base (#715). This run is trusted deterministic execution: it rebases the existing pull-request branch onto the pull request's live base, resolves nothing but provably mechanical conflicts (one-sided edits and comment-only overlaps), runs the bounded repository checks, and publishes only to the existing pull-request branch through a force-with-lease tied to the head observed at admission. It never merges, never edits code semantics, never resolves a two-sided code conflict — a semantic conflict stops the run for a human decision with the conflict summary — and never opens, retargets, or creates a pull request or branch.%s %s", run.Spec.Ref, publication, fmt.Sprintf(outcomeContract, outcomeFile)), nil
 	case courierv1alpha1.ModeContribute:
 		if run.Spec.Ref != 0 {
@@ -565,8 +589,18 @@ func NewInvocation(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.LaneProf
 // executor, carrying the source-neutral contribution input a contribute-mode
 // run needs to render its coordinator goal. The rendered goal is the only
 // channel for that input: it is folded into the Invocation goal, never a
-// second prompt or environment field.
+// second prompt or environment field. It renders the mechanical-only rebase
+// contract; use NewInvocationWithContributionAndRebaseAssist when the
+// deployment wires the model-assisted conflict resolution.
 func NewInvocationWithContribution(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.LaneProfile, workspace string, contribution ContributionExecution) (Invocation, error) {
+	return NewInvocationWithContributionAndRebaseAssist(run, lane, workspace, contribution, false)
+}
+
+// NewInvocationWithContributionAndRebaseAssist assembles the run and lane
+// data passed to an executor like NewInvocationWithContribution and renders
+// the assist-authorized rebase goal when rebaseModelAssist is enabled. Only
+// the goal rendering differs.
+func NewInvocationWithContributionAndRebaseAssist(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.LaneProfile, workspace string, contribution ContributionExecution, rebaseModelAssist bool) (Invocation, error) {
 	if run == nil {
 		return Invocation{}, ErrNilRun
 	}
@@ -582,7 +616,7 @@ func NewInvocationWithContribution(run *courierv1alpha1.CoderRun, lane *courierv
 	if strings.TrimSpace(workspace) == "" {
 		return Invocation{}, ErrMissingWorkspace
 	}
-	goal, err := GoalWithContribution(run, contribution)
+	goal, err := GoalWithContributionAndRebaseAssist(run, contribution, rebaseModelAssist)
 	if err != nil {
 		return Invocation{}, err
 	}

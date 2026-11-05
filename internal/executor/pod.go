@@ -194,7 +194,7 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 	if strings.TrimSpace(executorImpl.Name()) == "" {
 		return nil, ErrMissingCommandName
 	}
-	invocation, err := NewInvocationWithContribution(run, lane, config.WorkspacePath, config.Contribution)
+	invocation, err := NewInvocationWithContributionAndRebaseAssist(run, lane, config.WorkspacePath, config.Contribution, config.RebaseModelAssist)
 	if err != nil {
 		return nil, err
 	}

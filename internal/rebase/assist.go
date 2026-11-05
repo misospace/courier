@@ -389,11 +389,12 @@ func invalidResolutionReason(res *AssistResolution, rejected []string) string {
 }
 
 // conflictMarkersIn returns the first git conflict marker the content
-// carries at a line start, empty when none. A resolution that still holds
-// a marker is not a resolution.
+// carries at a line start, empty when none. The list covers diff3 as well
+// as merge: Rebase pins merge.conflictstyle=diff3, so a resolution that
+// still carries the base section marker is not a resolution either.
 func conflictMarkersIn(content string) string {
 	for _, line := range strings.Split(content, "\n") {
-		for _, marker := range []string{"<<<<<<<", "=======", ">>>>>>>"} {
+		for _, marker := range []string{"<<<<<<<", "|||||||", "=======", ">>>>>>>"} {
 			if strings.HasPrefix(line, marker) {
 				return marker
 			}
@@ -415,8 +416,15 @@ func buildAssistRequest(ctx context.Context, w *git.Workspace, opts Options, ori
 	}
 	// The base-side diff is three-dot from the replayed head: it shows the
 	// base tip's changes since the merge base, restricted to the paths the
-	// round rejected, which is exactly the movement the PR must absorb.
-	args := append([]string{"diff", "--no-color", "--no-ext-diff", origHead + "..." + w.BaseRevisionRef(), "--"}, rejected...)
+	// round rejected, which is exactly the movement the PR must absorb. The
+	// rejected paths are repository-controlled names, so they travel as
+	// literal anchored pathspecs — a name whose first byte is ':' must not
+	// become pathspec magic.
+	args := make([]string, 0, len(rejected)+5)
+	args = append(args, "diff", "--no-color", "--no-ext-diff", origHead+"..."+w.BaseRevisionRef(), "--")
+	for _, path := range rejected {
+		args = append(args, git.LiteralPathspec(path))
+	}
 	baseDiff, err := boundedDiff(ctx, w.Directory, args...)
 	if err != nil {
 		return AssistRequest{}, fmt.Errorf("read the base-side diff: %w", err)

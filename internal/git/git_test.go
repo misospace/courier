@@ -856,6 +856,34 @@ func TestStatusPorcelainReturnsChangePathsNotRawLines(t *testing.T) {
 	}
 }
 
+// Stage must select a tracked file by exact name even when the name's first
+// byte would otherwise activate pathspec magic: a plain pathspec that begins
+// with ':' is read as magic and never names the file, and the engine stages
+// repository-controlled conflicted names verbatim.
+func TestStageStagesColonPrefixedPathVerbatim(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	initRepo(t, root)
+	writeFile(t, filepath.Join(root, ":odd.txt"), "base\n")
+	writeFile(t, filepath.Join(root, "plain.txt"), "base\n")
+	// Seed without naming the odd path, so the pathspec under test is only
+	// ever the one Stage renders.
+	commit(t, root, "base: initial")
+	writeFile(t, filepath.Join(root, ":odd.txt"), "resolved\n")
+
+	workspace := &Workspace{Directory: root}
+	if err := workspace.Stage(ctx, ":odd.txt"); err != nil {
+		t.Fatalf("Stage: %v", err)
+	}
+	status, err := gitOutput(root, "status", "--porcelain")
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if got := strings.TrimSpace(string(status)); got != "M  :odd.txt" {
+		t.Fatalf("status = %q, want exactly the staged :odd.txt modification", got)
+	}
+}
+
 func TestCurrentBranchDistinguishesAttachedAndDetached(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

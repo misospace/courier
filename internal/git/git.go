@@ -924,10 +924,23 @@ func (w *Workspace) RebaseAbort(ctx context.Context) error {
 	return err
 }
 
+// LiteralPathspec renders a repository-relative path as a git pathspec that
+// selects exactly that file. Git pathspec entries that begin with ':' are
+// read as magic (exclusion, globs, and the rest), so a repository-controlled
+// name whose first byte is ':' would change meaning instead of naming the
+// file; the ":(top,literal)" form anchors at the repository top and treats
+// the remainder as a literal path. Every path the repository itself
+// produced — and only such a path — goes through this.
+func LiteralPathspec(path string) string {
+	return ":(top,literal)" + path
+}
+
 // Stage records a resolved path in the index so a scripted rebase continue
-// can commit it.
+// can commit it. The path is a repository-controlled name, so it is passed
+// as a literal anchored pathspec: a name whose first byte is ':' would
+// otherwise activate pathspec magic instead of selecting exactly that file.
 func (w *Workspace) Stage(ctx context.Context, path string) error {
-	_, err := run(ctx, w.Directory, "add", "--", path)
+	_, err := run(ctx, w.Directory, "add", "--", LiteralPathspec(path))
 	return err
 }
 
