@@ -1,0 +1,408 @@
+package rebase
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/misospace/courier/internal/git"
+)
+
+// The model-assisted seam extends the mechanical rebase engine with one
+// bounded escape hatch (#732): when the closed mechanical rules reject a
+// conflicted file, a configured coordinator model may be asked — once per
+// conflict round, by the engine, from trusted text only — to produce the
+// full resolved content of exactly those rejected files. The seam changes
+// who writes the bytes, never what may land: the resolution is validated
+// against the rejected set, the published head is still leased, and the
+// bounded repository checks still run before any push. A nil ModelResolver
+// in Options is exactly the mechanical-only engine this package shipped
+// first; nothing in the nil path may gain behavior.
+
+// ModelResolver is the engine's one seam to a model. It is satisfied by an
+// adapter over the harness gateway (cmd/courier-executor) so the trusted
+// engine never imports a transport. A nil interface value in Options means
+// deterministic-only resolution: today's behavior, byte for byte.
+type ModelResolver interface {
+	Resolve(ctx context.Context, req AssistRequest) (*AssistResolution, error)
+}
+
+// DefaultAssistTimeout bounds one model-assisted resolution turn — the
+// resolver call and the allowlisted lockfile regeneration alike. A turn
+// that exceeds it fails that turn, never the lease.
+const DefaultAssistTimeout = 10 * time.Minute
+
+// DefaultAssistMaxFileBytes bounds one conflicted file's content included
+// in the prompt. It is a prompt bound, not a resolution bound: a file
+// larger than this is included truncated, and the mechanical parser's own
+// maxConflictFileBytes still governs what the engine will accept back.
+const DefaultAssistMaxFileBytes = 64 << 10
+
+// DefaultAssistMaxDiffBytes bounds one side's diff included in the prompt.
+// The prompt is evidence for the model's decision, not a full transcript;
+// a diff past the bound is truncated, never silently widened.
+const DefaultAssistMaxDiffBytes = 32 << 10
+
+// maxAssistReasonBytes bounds a model refusal or validation verdict that
+// reaches the semantic-conflict reason text: the reason is a human
+// diagnostic, never an unbounded echo of model output.
+const maxAssistReasonBytes = 512
+
+// AssistRequest is the trusted evidence one resolution turn carries. Every
+// field is repository content, diff text, or fixed instruction text
+// assembled by the engine; the request carries no credentials of any kind,
+// because the engine holds none — git authentication lives in the
+// executor's askpass environment and never crosses this boundary.
+type AssistRequest struct {
+	// Goal is the run's goal text, context for why the pull request exists.
+	Goal string
+	// Base and Branch name the replay's endpoints; reason text only.
+	Base   string
+	Branch string
+	// PRDiff is the bounded diff of the replayed commits against the merge
+	// base — what the pull request changes.
+	PRDiff string
+	// BaseDiff is the bounded diff of the base-side changes restricted to
+	// the conflicted paths — what the base moved underneath them.
+	BaseDiff string
+	// Conflicts are the mechanically-rejected conflicted files, content
+	// with git's markers exactly as the rebase left them.
+	Conflicts []ConflictFile
+	// ToolHint names the recognized lockfile tool whose regeneration the
+	// prompt explicitly permits, empty when none applies.
+	ToolHint string
+}
+
+// ConflictFile is one conflicted path and its marked worktree content.
+type ConflictFile struct {
+	Path    string
+	Content string
+}
+
+// AssistResolution is the model's answer for one turn. Files maps each
+// resolved path to the full resolved file content; Refusal non-empty means
+// the model declined with an honest reason, and Files are then ignored.
+// Model and the token counts ride back so the engine's AssistReport records
+// what actually served the turn — the engine holds no model identity of
+// its own.
+type AssistResolution struct {
+	Files   map[string]string
+	Refusal string
+	Model   string
+	// InputTokens/OutputTokens are the provider's usage report for the
+	// turn when the transport received one; zero is an explicit absence,
+	// never an invented count.
+	InputTokens  int64
+	OutputTokens int64
+}
+
+// AssistReport is the evidence one attempt's model-assisted turns left on
+// the Result: which model served them, how many were asked, which files
+// they resolved, and the token spend. Attempted is the honest boundary —
+// a report with Attempted false names an attempt that never happened, and
+// the engine records the report only when it is true.
+type AssistReport struct {
+	Model         string
+	Turns         int
+	FilesResolved []string
+	InputTokens   int64
+	OutputTokens  int64
+	Attempted     bool
+}
+
+// resolverUnavailableError marks a resolver transport or infrastructure
+// failure. It stays distinct from a semantic conflict: an unavailable
+// resolver is a failed attempt, not a request for a human decision, and
+// must never be classified as NeedsHuman.
+type resolverUnavailableError struct{ err error }
+
+func (e *resolverUnavailableError) Error() string {
+	return fmt.Sprintf("model-assisted resolver unavailable: %v", e.err)
+}
+
+func (e *resolverUnavailableError) Unwrap() error { return e.err }
+
+// runLockfileTidy is the allowlisted lockfile-regeneration seam. It is a
+// variable so tests can stub the tool invocation without a Go toolchain
+// or network; the production value runs `go mod tidy` inside the workspace.
+var runLockfileTidy = func(ctx context.Context, directory string, timeout time.Duration) error {
+	tidyCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(tidyCtx, "go", "mod", "tidy")
+	cmd.Dir = directory
+	// -mod=readonly forbids the tidy from editing go.mod's requirement
+	// graph beyond what the resolved imports need, and GOWORK=off pins
+	// the module context to the workspace alone — the same environment
+	// the bounded Go build check runs under.
+	cmd.Env = append(os.Environ(), "GOFLAGS=-mod=readonly", "GOWORK=off")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("go mod tidy: %v: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+// lockfileToolHint names the recognized lockfile tool a rejected set
+// implicates, empty when none. The hint is what the prompt permits the
+// model to regenerate and what the engine re-runs after writing the
+// resolution; it is deliberately the only tool seam in the engine.
+func lockfileToolHint(paths []string) string {
+	for _, path := range paths {
+		switch filepath.ToSlash(path) {
+		case "go.mod", "go.sum":
+			if _, err := exec.LookPath("go"); err == nil {
+				return "go mod tidy"
+			}
+			return ""
+		}
+	}
+	return ""
+}
+
+// assistRound asks the configured resolver once for this round's rejected
+// set and, on a valid resolution, writes and stages the files and lets the
+// caller continue the replay. The invariant is one coordinator, sequential,
+// no delegation: the engine asks exactly one model exactly one question per
+// round — there is no subagent fan-out on the rebase path, because every
+// extra model turn widens the surface a replay must trust before it may
+// publish.
+func assistRound(ctx context.Context, w *git.Workspace, opts Options, origHead string, rejected []string, report *AssistReport) error {
+	report.Attempted = true
+	report.Turns++
+	req, err := buildAssistRequest(ctx, w, opts, origHead, rejected)
+	if err != nil {
+		return fmt.Errorf("assemble the model-assist request: %w", err)
+	}
+	res, err := opts.ModelResolver.Resolve(ctx, req)
+	if err != nil {
+		return &resolverUnavailableError{err}
+	}
+	report.Model = res.Model
+	report.InputTokens += res.InputTokens
+	report.OutputTokens += res.OutputTokens
+	refusal := strings.TrimSpace(res.Refusal)
+	if refusal == "" {
+		if why := invalidResolutionReason(res, rejected); why != "" {
+			refusal = "the resolution was rejected before use: " + why
+		}
+	}
+	if refusal != "" {
+		// A refusal — honest or enforced by validation — is the model
+		// declining to decide: the attempt stops for a human exactly as a
+		// non-mechanical hunk would, with the attempt named honestly.
+		return &semanticError{
+			files:  rejected,
+			reason: assistUnresolvedReason(refusal),
+		}
+	}
+	for _, path := range rejected {
+		content := res.Files[path]
+		full := filepath.Join(w.Directory, filepath.FromSlash(path))
+		info, err := os.Stat(full)
+		if err != nil {
+			return fmt.Errorf("rewrite resolved %s: %w", path, err)
+		}
+		if err := os.WriteFile(full, []byte(content), info.Mode().Perm()); err != nil {
+			return fmt.Errorf("rewrite resolved %s: %w", path, err)
+		}
+		if err := w.Stage(ctx, path); err != nil {
+			return fmt.Errorf("stage resolved %s: %w", path, err)
+		}
+		report.FilesResolved = append(report.FilesResolved, path)
+	}
+	// When the rejected set implicated a recognized lockfile tool, the
+	// resolution may not have regenerated the lockfile consistently with
+	// the module graph the resolved content now names. The allowlisted
+	// regeneration runs once, bounded, and its outputs are staged again;
+	// a failure leaves the conflict unresolved — the engine never
+	// publishes a lockfile it could not regenerate.
+	if hint := lockfileToolHint(rejected); hint == "go mod tidy" {
+		timeout := opts.AssistTimeout
+		if timeout <= 0 {
+			timeout = DefaultAssistTimeout
+		}
+		if err := runLockfileTidy(ctx, w.Directory, timeout); err != nil {
+			return &semanticError{
+				files:  rejected,
+				reason: assistUnresolvedReason(fmt.Sprintf("the allowlisted %s failed after the resolution was written: %v", hint, err)),
+			}
+		}
+		for _, path := range rejected {
+			switch filepath.ToSlash(path) {
+			case "go.mod", "go.sum":
+				if err := w.Stage(ctx, path); err != nil {
+					return fmt.Errorf("stage regenerated %s: %w", path, err)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// assistUnresolvedReason is the honest semantic-conflict reason for a round
+// the resolver could not close: the model-assisted attempt happened and did
+// not resolve, and the bounded cause rides along for the human.
+func assistUnresolvedReason(cause string) string {
+	return "model-assisted conflict resolution was attempted and did not resolve the conflict: " + boundText(cause, maxAssistReasonBytes)
+}
+
+// invalidResolutionReason validates a resolution against the round's
+// rejected set and returns why it is unusable, empty when it is valid.
+// Validation is the trust boundary: the model's answer is data, and only
+// content that provably addresses exactly the rejected files, carries no
+// conflict markers, and stays within the engine's own content bound is
+// written — anything else is treated as a refusal, never as partial input.
+func invalidResolutionReason(res *AssistResolution, rejected []string) string {
+	if len(res.Files) == 0 {
+		return "the resolution named no files"
+	}
+	allowed := make(map[string]struct{}, len(rejected))
+	for _, path := range rejected {
+		allowed[path] = struct{}{}
+	}
+	for path, content := range res.Files {
+		if _, ok := allowed[path]; !ok {
+			return fmt.Sprintf("the resolution named %q, which is not one of the conflicted files", path)
+		}
+		if int64(len(content)) > maxConflictFileBytes {
+			return fmt.Sprintf("the resolution for %q is %d bytes, over the %d-byte content bound", path, len(content), maxConflictFileBytes)
+		}
+		if markers := conflictMarkersIn(content); markers != "" {
+			return fmt.Sprintf("the resolution for %q still carries the %s conflict marker", path, markers)
+		}
+	}
+	return ""
+}
+
+// conflictMarkersIn returns the first git conflict marker the content
+// carries at a line start, empty when none. A resolution that still holds
+// a marker is not a resolution.
+func conflictMarkersIn(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		for _, marker := range []string{"<<<<<<<", "=======", ">>>>>>>"} {
+			if strings.HasPrefix(line, marker) {
+				return marker
+			}
+		}
+	}
+	return ""
+}
+
+// buildAssistRequest assembles the trusted evidence for one resolution
+// turn: the bounded PR diff, the base-side diff restricted to the rejected
+// paths, and the marked conflict contents read from the worktree. Every
+// byte comes from the repository, the diffs, or fixed instruction text.
+// origHead is the pre-rebase PR head recorded at attempt start — the
+// conflict-time HEAD is the replay's detached state, not the PR's commits.
+func buildAssistRequest(ctx context.Context, w *git.Workspace, opts Options, origHead string, rejected []string) (AssistRequest, error) {
+	prDiff, err := boundedDiff(ctx, w.Directory, "diff", "--no-color", "--no-ext-diff", w.BaseRevisionRef()+"..."+origHead)
+	if err != nil {
+		return AssistRequest{}, fmt.Errorf("read the PR diff: %w", err)
+	}
+	// The base-side diff is three-dot from the replayed head: it shows the
+	// base tip's changes since the merge base, restricted to the paths the
+	// round rejected, which is exactly the movement the PR must absorb.
+	args := append([]string{"diff", "--no-color", "--no-ext-diff", origHead + "..." + w.BaseRevisionRef(), "--"}, rejected...)
+	baseDiff, err := boundedDiff(ctx, w.Directory, args...)
+	if err != nil {
+		return AssistRequest{}, fmt.Errorf("read the base-side diff: %w", err)
+	}
+	conflicts := make([]ConflictFile, 0, len(rejected))
+	for _, path := range rejected {
+		content, err := boundedFileContent(w.Directory, path)
+		if err != nil {
+			return AssistRequest{}, fmt.Errorf("read the conflict in %s: %w", path, err)
+		}
+		conflicts = append(conflicts, ConflictFile{Path: path, Content: content})
+	}
+	return AssistRequest{
+		Goal:      opts.Goal,
+		Base:      opts.Base,
+		Branch:    opts.Branch,
+		PRDiff:    prDiff,
+		BaseDiff:  baseDiff,
+		Conflicts: conflicts,
+		ToolHint:  lockfileToolHint(rejected),
+	}, nil
+}
+
+// boundedDiff runs one hardened, read-only git diff and bounds its output.
+// The diff is prompt evidence, and its bound is the prompt bound: the
+// hardened boundary's own capture cap stays the outer wall.
+func boundedDiff(ctx context.Context, directory string, args ...string) (string, error) {
+	out, err := git.Hardened(ctx, directory, args...)
+	if err != nil {
+		return "", err
+	}
+	return boundText(string(out), DefaultAssistMaxDiffBytes), nil
+}
+
+// boundedFileContent reads one conflicted worktree file for the prompt,
+// truncated at the per-file prompt bound with the truncation named, so the
+// model knows it saw a prefix rather than the whole file.
+func boundedFileContent(directory, path string) (string, error) {
+	full := filepath.Join(directory, filepath.FromSlash(path))
+	raw, err := os.ReadFile(full)
+	if err != nil {
+		return "", err
+	}
+	if len(raw) <= DefaultAssistMaxFileBytes {
+		return string(raw), nil
+	}
+	return string(raw[:DefaultAssistMaxFileBytes]) +
+		fmt.Sprintf("\n[... truncated: the file is %d bytes, the prompt bound is %d ...]", len(raw), DefaultAssistMaxFileBytes), nil
+}
+
+// boundText truncates s to limit bytes.
+func boundText(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	return s[:limit]
+}
+
+// assistPromptInstructions is the fixed instruction half of the prompt. It
+// states the only two answer shapes, permits lockfile regeneration for the
+// recognized tool, and tells the model the trusted engine re-checks the
+// tree afterward — the model's answer is content to be validated, never a
+// verdict to be trusted.
+const assistPromptInstructions = `You are resolving the conflicts of one git rebase round inside a trusted, bounded engine.
+Answer with exactly one JSON object and nothing else:
+  {"files":[{"path":"...","content":"..."}]}
+where content is the FULL resolved file content for each conflicted path, or
+  {"refusal":"reason"}
+when you cannot resolve the conflict honestly from the material below.
+You may regenerate lockfile or version-pinned content for the recognized tool named below. The engine validates your answer, writes only the files you name, and runs the repository's own checks afterward; do not guess at content the material below does not determine.`
+
+// Prompt renders the full prompt text for one resolution turn: the fixed
+// instructions followed by the trusted evidence. The engine owns the text
+// so the adapter stays a transport; nothing here carries credentials,
+// because the request was assembled from repository content alone.
+func (req AssistRequest) Prompt() string {
+	var b strings.Builder
+	b.WriteString(assistPromptInstructions)
+	fmt.Fprintf(&b, "\n\nBase ref: %s\nPull request branch: %s\n", req.Base, req.Branch)
+	if goal := strings.TrimSpace(req.Goal); goal != "" {
+		fmt.Fprintf(&b, "\nRun goal:\n%s\n", goal)
+	}
+	if hint := strings.TrimSpace(req.ToolHint); hint != "" {
+		fmt.Fprintf(&b, "\nRecognized tool: %s — you may regenerate its lockfile and version-pinned content.\n", hint)
+	}
+	if diff := strings.TrimSpace(req.PRDiff); diff != "" {
+		fmt.Fprintf(&b, "\nDiff of the pull request's commits against the merge base:\n%s\n", diff)
+	}
+	if diff := strings.TrimSpace(req.BaseDiff); diff != "" {
+		fmt.Fprintf(&b, "\nBase-side changes restricted to the conflicted paths:\n%s\n", diff)
+	}
+	for _, conflict := range req.Conflicts {
+		fmt.Fprintf(&b, "\nConflicted file %q, content with git conflict markers:\n%s\n", conflict.Path, conflict.Content)
+	}
+	return b.String()
+}

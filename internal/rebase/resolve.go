@@ -31,6 +31,12 @@ func (e *semanticError) Error() string {
 // replay that resolves some hunks and stops midway leaves a half-written
 // branch no better than it started.
 //
+// When opts.ModelResolver is nil the rules are the entire story and the
+// behavior is exactly the mechanical-only engine. When one is configured,
+// a round's rejected set goes to exactly one model-assisted turn (see
+// assistRound) before the round is declared semantic: the fast path, its
+// all-or-nothing property, and the closed rules themselves are untouched.
+//
 // The rules are deliberately narrow. A hunk resolves mechanically only when
 // the base-side content proves which side moved:
 //
@@ -44,7 +50,7 @@ func (e *semanticError) Error() string {
 // lockfile regeneration, version strings — needs a decision, and the attempt
 // stops for a human with the file list. The rules never pick a "likely" side
 // for code and never merge code text.
-func resolveConflicts(ctx context.Context, w *git.Workspace, paths []string) error {
+func resolveConflicts(ctx context.Context, w *git.Workspace, opts Options, origHead string, paths []string, assist *AssistReport) error {
 	if len(paths) == 0 {
 		return errors.New("rebase stopped without reporting conflicted paths")
 	}
@@ -65,9 +71,18 @@ func resolveConflicts(ctx context.Context, w *git.Workspace, paths []string) err
 			}
 		}
 		if len(rejected) > 0 {
-			return &semanticError{
-				files:  rejected,
-				reason: "the conflicts need a decision a mechanical rule cannot make; no side was picked",
+			if opts.ModelResolver == nil {
+				return &semanticError{
+					files:  rejected,
+					reason: "the conflicts need a decision a mechanical rule cannot make; no side was picked",
+				}
+			}
+			// The mechanical rules rejected this round's set and a resolver
+			// is configured: one model-assisted turn answers for the whole
+			// set, then the shared continue below runs. A later round may
+			// conflict again and get its own single turn.
+			if err := assistRound(ctx, w, opts, origHead, rejected, assist); err != nil {
+				return err
 			}
 		}
 		// Every conflict in this round resolved and staged: continue the
