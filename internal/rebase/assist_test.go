@@ -384,6 +384,37 @@ func TestAssistSubsetResolutionIsRejected(t *testing.T) {
 	}
 }
 
+// The base-side diff in the assist request must name exactly the rejected
+// path, even when a sibling whose name the path would glob-match also moved
+// on the base side: the rejected paths travel as literal anchored pathspecs,
+// so a conflicted "glob*.txt" must not sweep a sibling "globA.txt" into the
+// prompt as if the PR had to absorb it too.
+func TestAssistBaseDiffRestrictedToRejectedGlobPath(t *testing.T) {
+	f := newFixture(t,
+		map[string]string{
+			"glob*.txt": "base move\n",
+			"globA.txt": "sibling base move\n",
+		},
+		map[string]string{
+			"glob*.txt": "pr move\n",
+		},
+	)
+	resolver := &fakeResolver{res: &AssistResolution{Refusal: "the sides are irreconcilable"}}
+	result := executeAssisted(t, f, f.head, resolver)
+	if result.Outcome != OutcomeSemanticConflict {
+		t.Fatalf("outcome = %q (%s)", result.Outcome, result.Reason)
+	}
+	if resolver.calls != 1 {
+		t.Fatalf("resolver calls = %d, want exactly one turn", resolver.calls)
+	}
+	if !strings.Contains(resolver.last.BaseDiff, "base move") {
+		t.Fatalf("base-side diff is missing the rejected path's changes: %q", resolver.last.BaseDiff)
+	}
+	if strings.Contains(resolver.last.BaseDiff, "sibling base move") {
+		t.Fatalf("base-side diff swept in the glob-matching sibling: %q", resolver.last.BaseDiff)
+	}
+}
+
 // A resolution that still carries git's diff3 base marker ("|||||||") is
 // not a resolution: Rebase pins merge.conflictstyle=diff3, so a model answer
 // that copies the marked file back with the base section intact would

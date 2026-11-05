@@ -212,7 +212,10 @@ rejected set the mechanical rules produce; a later conflict round in the
 same episode has already spent that one attempt, and the attempt stops for
 a human with the new conflicts named. The request carries repository
 content only: the bounded PR diff, the base-side diff restricted to the
-conflicted paths, the marked conflict files, and the run goal. No
+conflicted paths, the marked conflict files, and the run goal. The
+conflicted paths travel to git as literal anchored pathspecs, and conflicted
+paths that are not clean repository-relative paths inside the workspace stop
+the attempt for a human before any read or write. No
 credentials ever cross the engine boundary. The answer must be one JSON
 object resolving exactly the rejected files with marker-free full file
 content. No executor-side token ceiling or model-turn timer governs the

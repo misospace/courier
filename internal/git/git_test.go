@@ -268,6 +268,43 @@ func TestPrepareHandsConflictedBaseSyncToCoordinator(t *testing.T) {
 	}
 }
 
+// UnmergedPaths must return the exact on-disk names of the conflicted paths.
+// Git C-quotes special names in its default output — a non-ASCII name arrives
+// as the literal string with octal escapes — and a newline split plus a trim
+// strips a genuine leading space, so either would hand the engine a name that
+// names a different file than the one on disk. A conflicted repository with
+// such names pins the exact parse.
+func TestUnmergedPathsReturnsExactRepositoryNames(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	initRepo(t, root)
+	writeFile(t, filepath.Join(root, "caf\u00e9.txt"), "base\n")
+	writeFile(t, filepath.Join(root, " lead.txt"), "base\n")
+	commit(t, root, "base: initial")
+	git(t, root, "checkout", "-b", "side")
+	writeFile(t, filepath.Join(root, "caf\u00e9.txt"), "side\n")
+	writeFile(t, filepath.Join(root, " lead.txt"), "side\n")
+	commit(t, root, "side: edit both")
+	git(t, root, "checkout", "-")
+	writeFile(t, filepath.Join(root, "caf\u00e9.txt"), "main\n")
+	writeFile(t, filepath.Join(root, " lead.txt"), "main\n")
+	commit(t, root, "main: edit both")
+	if _, err := gitOutput(root, "merge", "--no-edit", "side"); err == nil {
+		t.Fatal("merge should have conflicted")
+	}
+
+	paths, err := (&Workspace{Directory: root}).UnmergedPaths(ctx)
+	if err != nil {
+		t.Fatalf("UnmergedPaths: %v", err)
+	}
+	slices.Sort(paths)
+	want := []string{" lead.txt", "caf\u00e9.txt"}
+	if !reflect.DeepEqual(paths, want) {
+		t.Fatalf("UnmergedPaths() = %q, want the exact on-disk names %q (git's C-quoted or trimmed forms would be different files)", paths, want)
+	}
+}
+
 func TestSyncToBaseNonConflictFailureFailsClosed(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -881,6 +918,33 @@ func TestStageStagesColonPrefixedPathVerbatim(t *testing.T) {
 	}
 	if got := strings.TrimSpace(string(status)); got != "M  :odd.txt" {
 		t.Fatalf("status = %q, want exactly the staged :odd.txt modification", got)
+	}
+}
+
+// Stage must select a tracked file by exact name even when the name would
+// otherwise be read as a glob pattern: a plain pathspec like "glob*.txt"
+// matches every file the pattern names, so a conflicted name bearing glob
+// characters would sweep an unrelated sibling into the stage. The engine
+// stages repository-controlled names verbatim.
+func TestStageStagesGlobBearingPathExactly(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	initRepo(t, root)
+	writeFile(t, filepath.Join(root, "glob*.txt"), "base\n")
+	writeFile(t, filepath.Join(root, "globA.txt"), "base\n")
+	commit(t, root, "base: initial")
+	writeFile(t, filepath.Join(root, "glob*.txt"), "resolved\n")
+
+	workspace := &Workspace{Directory: root}
+	if err := workspace.Stage(ctx, "glob*.txt"); err != nil {
+		t.Fatalf("Stage: %v", err)
+	}
+	status, err := gitOutput(root, "status", "--porcelain")
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if got := strings.TrimSpace(string(status)); got != "M  glob*.txt" {
+		t.Fatalf("status = %q, want exactly the staged glob*.txt modification, not the globA.txt sibling", got)
 	}
 }
 

@@ -108,3 +108,54 @@ func TestBuildCoordinatorPodCarriesRebaseModelAssistEnv(t *testing.T) {
 		}
 	}
 }
+
+// The assist flag must reach the rendered goal, not just the environment:
+// the goal the pod carries is what the coordinator model reads as its
+// contract, so an assist-enabled rebase pod must carry the assist-authorized
+// goal and a pod built without the flag the mechanical-only one (#732). The
+// goal travels as COURIER_GOAL through RunContextEnvironment.
+func TestBuildCoordinatorPodCarriesRebaseAssistGoal(t *testing.T) {
+	run := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run-1", Namespace: "runs", UID: types.UID("uid-1")},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeRebase, Repo: "acme/widgets", Ref: 42, Lane: "local",
+		},
+	}
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "runs"},
+		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "test/model"}},
+	}
+	goalOf := func(pod *corev1.Pod) string {
+		for _, env := range pod.Spec.Containers[0].Env {
+			if env.Name == "COURIER_GOAL" {
+				return env.Value
+			}
+		}
+		return ""
+	}
+
+	enabled, err := BuildCoordinatorPod(run, lane, PodConfig{
+		Image:             "example/test",
+		RebaseModelAssist: true,
+		ModelGatewayURL:   "http://gateway:4000/v1",
+	})
+	if err != nil {
+		t.Fatalf("BuildCoordinatorPod() enabled error = %v", err)
+	}
+	goal := goalOf(enabled)
+	if !strings.Contains(goal, "model-assisted resolution attempt") {
+		t.Fatalf("an assist-enabled rebase pod must carry the assist-authorized goal:\n%s", goal)
+	}
+	if strings.Contains(goal, "never resolves a two-sided code conflict") {
+		t.Fatalf("an assist-enabled rebase pod must not forbid the authorized resolution:\n%s", goal)
+	}
+
+	disabled, err := BuildCoordinatorPod(run, lane, PodConfig{Image: "example/test"})
+	if err != nil {
+		t.Fatalf("BuildCoordinatorPod() disabled error = %v", err)
+	}
+	goal = goalOf(disabled)
+	if !strings.Contains(goal, "never resolves a two-sided code conflict") {
+		t.Fatalf("a rebase pod built without the flag must carry the mechanical-only goal:\n%s", goal)
+	}
+}

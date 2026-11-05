@@ -777,16 +777,24 @@ func (w *Workspace) SyncToBase(ctx context.Context) error {
 	return &MergeConflictError{Base: w.baseRemoteRef(w.Base), Paths: paths}
 }
 
-// UnmergedPaths lists the paths git still considers conflicted.
+// UnmergedPaths lists the paths git still considers conflicted. The paths are
+// repository-controlled names that feed the engine's reads, writes, and error
+// summaries, so they must arrive exactly as git holds them: with -z each entry
+// is NUL-separated and never C-quoted, where git's default output quotes a
+// name carrying non-ASCII or special bytes (a conflicted "café.txt" would
+// arrive as the literal string "caf\303\251.txt") and a newline split plus a
+// trim would also strip a genuine leading space. The -z form keeps the parse
+// exact even for paths git would otherwise quote; only truly empty entries
+// are dropped, never a trim.
 func (w *Workspace) UnmergedPaths(ctx context.Context) ([]string, error) {
-	out, err := run(ctx, w.Directory, "diff", "--name-only", "--diff-filter=U")
+	out, err := run(ctx, w.Directory, "diff", "--name-only", "--diff-filter=U", "-z")
 	if err != nil {
 		return nil, err
 	}
 	var paths []string
-	for _, line := range strings.Split(string(out), "\n") {
-		if line = strings.TrimSpace(line); line != "" {
-			paths = append(paths, line)
+	for _, entry := range strings.Split(string(out), "\x00") {
+		if entry != "" {
+			paths = append(paths, entry)
 		}
 	}
 	return paths, nil

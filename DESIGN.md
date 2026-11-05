@@ -3803,7 +3803,11 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   answer must resolve exactly the rejected paths with marker-free full content
   within the engine's content bound, non-regular or unnameable conflicted paths
   are refused on both the assist and the mechanical path, and publication —
-  lease, force-with-lease, bounded checks — is untouched. The gateway
+  lease, force-with-lease, bounded checks — is untouched. A conflicted path
+  that is not a clean repository-relative path inside the workspace — empty,
+  absolute, or carrying an empty, `.`, or `..` component — is refused on the
+  same terms, and conflicted paths travel to git as literal anchored
+  pathspecs. The gateway
   credential is scoped to rebase-run pods through the shared credential
   enumeration, and a deterministic-only run is never reported as model
   execution.
