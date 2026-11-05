@@ -27,6 +27,14 @@ const (
 	// One failure may be a legitimate transient, so it is observed but
 	// never decisive on its own.
 	prerequisiteTaskFailed prerequisiteClass = "task_failed"
+	// prerequisiteLocalFailure: the broker call that prepares the workspace
+	// failed without the trusted world stating anything — a local
+	// construction or decoding failure, or a response that is no API
+	// answer. The failure is usually permanent, but recurrence — not a
+	// single observation — establishes it, and the ending is an
+	// infrastructure failure: the world never refused, so the condition is
+	// never blocked-external and never a refusal (#744).
+	prerequisiteLocalFailure prerequisiteClass = "local_failure"
 	// prerequisiteFenced: the worker is fenced — no further workspace
 	// operation may run against it, whatever the model asks for.
 	prerequisiteFenced prerequisiteClass = "fenced"
@@ -41,6 +49,7 @@ const (
 	prerequisiteMismatchReason   = "the worker workspace does not hold the dispatched snapshot"
 	prerequisiteFencedReason     = "the worker is fenced: no further workspace operation may run against it"
 	prerequisiteTaskFailedFormat = "the fixed workspace preparation task failed with exit code %d"
+	prerequisiteLocalFailReason  = "the workspace snapshot could not be prepared: the broker call failed locally and the failure recurred"
 )
 
 // prerequisiteFailureTripCount is the number of stable preparation failures
@@ -90,6 +99,20 @@ func failedPrerequisiteTask(exitCode int) *prerequisiteFailure {
 	}
 }
 
+// localBrokerFailure is the local-failure class: the broker call that
+// prepares the workspace failed without the trusted world stating a denial.
+// The honest recovery is operator relaunch once the run's own broker
+// plumbing is fixed, so the ending is an infrastructure failure — never a
+// refusal, and never the blocked-external wait on an external prerequisite
+// the world could still satisfy (#744).
+func localBrokerFailure() *prerequisiteFailure {
+	return &prerequisiteFailure{
+		class:  prerequisiteLocalFailure,
+		reason: prerequisiteLocalFailReason,
+		kind:   courierv1alpha1.NativeResultInfrastructureFailed,
+	}
+}
+
 // fencedPrerequisite is the fenced class: the worker may still be running
 // repository-authored work, so no further workspace operation may run against
 // it. The honest recovery is worker replacement, not another turn.
@@ -120,9 +143,11 @@ func (f *workerFence) Error() string { return f.reason }
 // set is), a status-path refusal is a recording failure rather than a
 // workspace condition, a retryable broker failure is transient, a broker
 // error that positively states a denial is a refusal while a non-retryable
-// broker error without a status is a local construction or decoding failure
-// the trusted world never refused, a definite worker rejection is a refusal,
-// and anything unclassified never trips the breaker.
+// broker error that states no denial is a local failure — a construction or
+// decoding failure, or a response that is no API answer, that the trusted
+// world never refused — established by recurrence like a task failure, a
+// definite worker rejection is a refusal, and anything unclassified never
+// trips the breaker.
 //
 // The unverified check precedes the refusal checks on purpose: an unverified
 // termination can carry the worker's own rejection inside its chain, and a
@@ -159,14 +184,18 @@ func classifyPrerequisite(err error) *prerequisiteFailure {
 		// A refusal is a fact the broker stated, never one control inferred:
 		// a non-retryable error that states a definite denial — the same 4xx
 		// rule the worker side applies — is the broker's own refusal, while
-		// a non-retryable error without a status is a local construction or
-		// decoding failure — an unreadable CA, a malformed request or
-		// response, an oversized snapshot — that the trusted world never
-		// refused (#737 review).
+		// a non-retryable error that states no denial is a local
+		// construction or decoding failure — an unreadable CA, a malformed
+		// request or response, an oversized snapshot — or a response that is
+		// no API answer: the trusted world never refused (#737 review). The
+		// failure is usually permanent, so it is observed as the
+		// local-failure class and the latch decides whether it has become a
+		// condition (#744): the ending after recurrence is an infrastructure
+		// failure, never a refusal of the broker's world-state.
 		if definiteWorkerRejectionStatus(callErr.StatusCode) {
 			return refusedPrerequisite()
 		}
-		return nil
+		return localBrokerFailure()
 	}
 	var transportErr *protocol.TransportError
 	if errors.As(err, &transportErr) {
@@ -183,8 +212,8 @@ func classifyPrerequisite(err error) *prerequisiteFailure {
 // observed and trips once trusted control knows the condition cannot clear:
 // a refusal, a mismatch, or a fence is one observation enough, because each
 // is a final fact; recurrence — across any class, so alternating classes
-// cannot evade it — establishes the task-failed class. The latch never
-// un-trips and never forgets a trip.
+// cannot evade it — establishes the task-failed and local-failure classes.
+// The latch never un-trips and never forgets a trip.
 type prerequisiteLatch struct {
 	mu       sync.Mutex
 	failures int

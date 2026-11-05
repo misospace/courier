@@ -240,13 +240,16 @@ func TestCoordinatorDoesNotTripOnTransientPrerequisiteFailure(t *testing.T) {
 	}
 }
 
-// TestCoordinatorDoesNotTerminalizeLocalBrokerFailures pins the refusal
-// narrowing (#737 review): a non-retryable broker failure without a status —
-// an unreadable CA, a malformed request or response, an oversized snapshot —
-// is a local construction or decoding failure the trusted world never
-// refused. It surfaces as an ordinary tool error and the model takes its
-// next turn; the run never ends blocked-external over it.
-func TestCoordinatorDoesNotTerminalizeLocalBrokerFailures(t *testing.T) {
+// TestCoordinatorLocalBrokerFailureIsNeverBlockedExternal pins the refusal
+// narrowing (#737 review) on the first observation: a non-retryable broker
+// failure without a status — an unreadable CA, a malformed request or
+// response, an oversized snapshot — is a local construction or decoding
+// failure the trusted world never refused. It surfaces as an ordinary tool
+// error and the model takes its next turn; the run never ends
+// blocked-external over it, at the first failure or after recurrence
+// (#744 makes the recurring disposition an infrastructure failure, pinned by
+// TestCoordinatorBoundsTurnsOnRecurringLocalBrokerFailure).
+func TestCoordinatorLocalBrokerFailureIsNeverBlockedExternal(t *testing.T) {
 	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
 	defer cleanupWorker()
 	worker.snapshotTip = "snap-tip"
@@ -289,6 +292,92 @@ func TestCoordinatorDoesNotTerminalizeLocalBrokerFailures(t *testing.T) {
 	// error and the model took its next turn.
 	if got := gatewayMock.requestCount(); got != 2 {
 		t.Fatalf("gateway requests = %d, want 2", got)
+	}
+}
+
+// TestCoordinatorBoundsTurnsOnRecurringLocalBrokerFailure is the #744
+// regression: a stable local broker failure — an oversized snapshot, an
+// unreadable CA, a malformed request or response — never becomes a refusal,
+// but it cannot be rediscovered indefinitely either. The first failure earns
+// one legitimate rediscovery turn; the second establishes the condition and
+// ends the run as an infrastructure failure at that turn's own tool
+// boundary, before any further model request. The ending's reason is the
+// fixed code-owned text: it never repeats the publication engine's "the
+// broker denied" framing, because the trusted world never answered.
+func TestCoordinatorBoundsTurnsOnRecurringLocalBrokerFailure(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.snapshotTip = "snap-tip"
+	worker.completeAll = true
+
+	gateway, gatewayMock, cleanup := gatewayFor(
+		// Coordinator: one shell command; its preparation fails locally.
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-1", toolShell, `{"command":"echo one"}`),
+			finishChunk("tool_calls"),
+		)},
+		// The model rediscovers the condition through the shell: the second
+		// preparation failure trips the latch at this turn's own tool
+		// boundary.
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-2", toolShell, `{"command":"echo two"}`),
+			finishChunk("tool_calls"),
+		)},
+		// Scripted but never consumed: the recurrence bound ends the run
+		// here — the model never takes a third turn to rediscover the same
+		// condition, and never gets to declare an outcome over it.
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-3", toolShell, `{"command":"echo three"}`),
+			finishChunk("tool_calls"),
+		)},
+		gatewayResponse{body: sse(contentChunk(`{"outcome":"changes"}`), finishChunk("stop"))},
+	)
+	defer cleanup()
+
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Transport: gateway,
+		Bindings:  testBindings(),
+		Worker:    delegator,
+		Snapshot: func(context.Context) (Snapshot, error) {
+			// The production shape: the publication engine classifies the
+			// non-retryable local failure as a blocked read, and the local
+			// error rides in the chain.
+			return Snapshot{}, &PublicationBlockedError{
+				Reason: "the broker denied the seed snapshot read (snapshot exceeds the bundle bound)",
+				Err:    &BrokerCallError{Category: "snapshot exceeds the bundle bound"},
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := coordinator.Run(context.Background(), testInvocation())
+	if result.Outcome == executor.OutcomeBlockedExternal {
+		t.Fatalf("outcome = %q, a local broker failure is never blocked-external", result.Outcome)
+	}
+	if result.Kind != courierv1alpha1.NativeResultInfrastructureFailed {
+		t.Fatalf("kind = %q, want infrastructure: the world never refused, so the run cannot wait on an external prerequisite either", result.Kind)
+	}
+	if result.Err == nil || !strings.Contains(result.Err.Error(), prerequisiteLocalFailReason) {
+		t.Fatalf("err = %v, want the fixed local-failure reason %q", result.Err, prerequisiteLocalFailReason)
+	}
+	if text := result.Err.Error(); strings.Contains(text, "denied") {
+		t.Fatalf("err = %q, must never call the broker's world-state a denial", text)
+	}
+	if strings.Contains(result.Err.Error(), "\n") {
+		t.Fatalf("err = %q, must be single-line", result.Err)
+	}
+	// Two requests: the first failure earned one legitimate rediscovery
+	// turn, the second ended the run at its own tool boundary. Without the
+	// recurrence bound the model would keep rediscovering the condition for
+	// as long as the gateway kept answering.
+	if got := gatewayMock.requestCount(); got != 2 {
+		t.Fatalf("gateway requests = %d, want 2 (bounded: one rediscovery turn)", got)
+	}
+	// The preparation fails before anything is dispatched: no worker
+	// dispatch ever runs against the never-prepared workspace.
+	if got := worker.dispatchRequests; got != 0 {
+		t.Fatalf("worker dispatch requests = %d, want 0", got)
 	}
 }
 
@@ -804,11 +893,13 @@ func TestClassifyPrerequisite(t *testing.T) {
 	if got := classifyPrerequisite(&BrokerCallError{StatusCode: 503, Category: "is temporarily unavailable", Retryable: true}); got != nil {
 		t.Fatalf("classified = %v, want nil for a retryable broker failure", got)
 	}
-	// A non-retryable broker error without a status is a local construction
-	// or decoding failure — an unreadable CA, a malformed request or
-	// response, an oversized snapshot — the trusted world never refused:
-	// it stays outside the vocabulary and never trips the breaker. Every
-	// category here is produced by the real client;
+	// A non-retryable broker error that states no denial is a local
+	// construction or decoding failure — an unreadable CA, a malformed
+	// request or response, an oversized snapshot — the trusted world never
+	// refused (#737 review). It is observed as the local-failure class so
+	// recurrence can establish it (#744), and it never becomes a refusal:
+	// the ending is an infrastructure failure, never blocked-external.
+	// Every category here is produced by the real client;
 	// TestBrokerLocalFailuresAreNeverPrerequisiteRefusals pins the producer
 	// side of that invariant.
 	for _, local := range []*BrokerCallError{
@@ -817,8 +908,15 @@ func TestClassifyPrerequisite(t *testing.T) {
 		{Category: "snapshot exceeds the bundle bound"},
 		{Category: "snapshot observation is malformed"},
 	} {
-		if got := classifyPrerequisite(local); got != nil {
-			t.Fatalf("classified = %v for %q, want nil: a local broker failure is not a refusal", got, local.Category)
+		got := classifyPrerequisite(local)
+		if got == nil || got.class != prerequisiteLocalFailure {
+			t.Fatalf("classified = %v for %q, want the local-failure class: a local broker failure is not a refusal", got, local.Category)
+		}
+		if got.kind != courierv1alpha1.NativeResultInfrastructureFailed {
+			t.Fatalf("class %q kind = %q, want infrastructure: the world never refused", got.class, got.kind)
+		}
+		if got.reason != prerequisiteLocalFailReason {
+			t.Fatalf("class %q reason = %q, want the fixed local-failure reason", got.class, got.reason)
 		}
 	}
 	// The production shape of an oversized snapshot read: the publication
@@ -828,13 +926,17 @@ func TestClassifyPrerequisite(t *testing.T) {
 		Reason: "the broker denied the seed snapshot read (snapshot exceeds the bundle bound)",
 		Err:    &BrokerCallError{Category: "snapshot exceeds the bundle bound"},
 	})
-	if localRead != nil {
-		t.Fatalf("classified = %v, want nil: a local snapshot failure is not a refusal", localRead)
+	if localRead == nil || localRead.class != prerequisiteLocalFailure {
+		t.Fatalf("classified = %v, want the local-failure class: a local snapshot failure is not a refusal", localRead)
 	}
 	// A non-retryable status outside the definite-denial range is not a
-	// refusal: the rule is the same 4xx rule the worker side applies.
-	if got := classifyPrerequisite(&BrokerCallError{StatusCode: http.StatusFound, Category: "denied the operation"}); got != nil {
-		t.Fatalf("classified = %v, want nil: a status outside the denial range is not a refusal", got)
+	// refusal — the rule is the same 4xx rule the worker side applies — and
+	// it is observed as the local-failure class too, so a broker that
+	// stably answers without an API answer cannot burn turns either
+	// (#744).
+	notRefused := classifyPrerequisite(&BrokerCallError{StatusCode: http.StatusFound, Category: "denied the operation"})
+	if notRefused == nil || notRefused.class != prerequisiteLocalFailure {
+		t.Fatalf("classified = %v, want the local-failure class: a status outside the denial range is not a refusal", notRefused)
 	}
 	if got := classifyPrerequisite(&protocol.TransportError{StatusCode: 403, Message: "refused"}); got == nil || got.class != prerequisiteRefused {
 		t.Fatalf("classified = %v, want the refused class for a definite worker rejection", got)
@@ -910,8 +1012,8 @@ func (b *zeroBody) Read(p []byte) (int, error) {
 // and decoding failures — an unreadable CA, a malformed request, an oversized
 // snapshot body, a malformed snapshot observation — carry no status and are
 // never retryable, because the trusted world never answered. Each error is
-// produced by the real client, and each stays outside the prerequisite
-// vocabulary.
+// produced by the real client, and each is observed as the local-failure
+// class (#744) — never a refusal.
 func TestBrokerLocalFailuresAreNeverPrerequisiteRefusals(t *testing.T) {
 	validTip := strings.Repeat("ab", 20)
 	serving := func(header http.Header, body io.ReadCloser) *BrokerClient {
@@ -977,8 +1079,8 @@ func TestBrokerLocalFailuresAreNeverPrerequisiteRefusals(t *testing.T) {
 			if callErr.StatusCode != 0 {
 				t.Fatalf("category %q carries status %d, want none: the trusted world never answered", callErr.Category, callErr.StatusCode)
 			}
-			if got := classifyPrerequisite(err); got != nil {
-				t.Fatalf("classified = %v for %q, want nil: a local broker failure is not a refusal", got, callErr.Category)
+			if got := classifyPrerequisite(err); got == nil || got.class != prerequisiteLocalFailure {
+				t.Fatalf("classified = %v for %q, want the local-failure class: a local broker failure is not a refusal", got, callErr.Category)
 			}
 		})
 	}
@@ -1038,5 +1140,38 @@ func TestPrerequisiteLatchTripsOnFinalFacts(t *testing.T) {
 		if latch.peek() == nil {
 			t.Fatalf("class %q must trip the latch on one observation", failure.class)
 		}
+	}
+}
+
+// TestPrerequisiteLatchTripsOnRecurringLocalFailure pins the recurrence rule
+// for the local-failure class (#744): one local broker failure may still be
+// a passing artifact and earns one rediscovery turn, the second establishes
+// the condition, and the trip carries the infrastructure ending — the world
+// never refused, so the latch's disposition is never blocked-external.
+func TestPrerequisiteLatchTripsOnRecurringLocalFailure(t *testing.T) {
+	var latch prerequisiteLatch
+	latch.observe(localBrokerFailure())
+	if latch.peek() != nil {
+		t.Fatal("one local broker failure must not trip the latch")
+	}
+	latch.observe(localBrokerFailure())
+	tripped := latch.peek()
+	if tripped == nil {
+		t.Fatal("recurrence must trip the latch")
+	}
+	if tripped.class != prerequisiteLocalFailure {
+		t.Fatalf("tripped class = %q, want %q", tripped.class, prerequisiteLocalFailure)
+	}
+	if tripped.kind != courierv1alpha1.NativeResultInfrastructureFailed {
+		t.Fatalf("tripped kind = %q, want infrastructure: the world never refused", tripped.kind)
+	}
+	// The count is a total across classes: a task failure and a local
+	// failure together establish the condition too, so alternating classes
+	// cannot keep the run alive.
+	var mixed prerequisiteLatch
+	mixed.observe(failedPrerequisiteTask(2))
+	mixed.observe(localBrokerFailure())
+	if mixed.peek() == nil {
+		t.Fatal("alternating recurrence classes must trip the latch")
 	}
 }

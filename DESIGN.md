@@ -2021,6 +2021,14 @@ facts it witnessed itself:
   dispatched. One observation establishes the condition.
 - **Task failed.** The fixed preparation task ran and failed. One failure may
   still be transient, so recurrence establishes the condition.
+- **Local failure.** The broker call that prepares the workspace failed
+  without the trusted world stating anything — a local construction or
+  decoding failure (an unreadable CA, a malformed request or response, an
+  oversized snapshot), or a response that is no API answer. The world never
+  refused, so the condition is never a refusal and never the blocked-external
+  wait on an external prerequisite; recurrence establishes it, and the run
+  ends as an infrastructure failure for the operator to relaunch once the
+  run's own broker plumbing is fixed (#744).
 - **Fenced.** One operation's termination could not be observed, so the worker
   is fenced and no further workspace operation may run against it. The honest
   recovery is worker replacement, not another model turn.
@@ -2028,12 +2036,11 @@ facts it witnessed itself:
 Everything else stays outside the vocabulary. A retryable broker failure, a
 worker timeout or rate limit, an unclassified error, and an unverified
 termination never establish a condition, and the #414 bootstrap blocker keeps
-its own mechanism and is never counted here. Nor does a non-retryable broker
-failure without a status: a broker error establishes a refusal only when it
-states a definite denial, so a local construction or decoding failure — an
-unreadable CA, a malformed request or response, an oversized snapshot — stays
-outside the vocabulary too. A status-path refusal is a recording failure
-rather than a workspace condition, so it is not a refusal either.
+its own mechanism and is never counted here. A broker error establishes a
+refusal only when it states a definite denial — everything else it reports
+about a failed preparation call is the local-failure class above. A
+status-path refusal is a recording failure rather than a workspace condition,
+so it is not a refusal either.
 
 The latch counts stable failures for the incarnation and trips once the
 condition is established. The count is a total across classes and across
@@ -2049,9 +2056,13 @@ model request. A refusal, a mismatch, or a repeated task failure ends the run
 blocked-external. A fence ends the run as an infrastructure failure, because a
 termination the harness could not verify is never blocked-external:
 repository-authored work may still be executing, and the operator's relaunch
-owns that recovery. Both reasons are fixed code-owned text. They never carry
-model prose, and they never carry worker output beyond the fixed preparation
-task's own exit status.
+owns that recovery. A local broker failure that recurs ends the run as an
+infrastructure failure too: the trusted world never answered, so the failure
+is the run's own plumbing failing, not an external prerequisite the world
+could still satisfy, and an unbounded retry would burn provider capacity
+rediscovering a condition no turn can repair (#744). All of these reasons are
+fixed code-owned text. They never carry model prose, and they never carry
+worker output beyond the fixed preparation task's own exit status.
 
 The model never decides whether a prerequisite is terminal. A tripped latch
 overrides the model's own outcome declaration, and a delegated brief aborts

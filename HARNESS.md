@@ -1214,15 +1214,17 @@ checks, and every delegated brief each prepare one. When a preparation fails,
 trusted control classifies the failure against a closed vocabulary of facts it
 witnessed itself: `refused` (the broker or the worker refused outright),
 `mismatch` (the workspace does not hold the dispatched snapshot), `task-failed`
-(the fixed preparation task ran and failed), and `fenced` (the worker is fenced,
+(the fixed preparation task ran and failed), `local-failed` (the broker call
+that prepares the workspace failed without the trusted world stating a denial
+— an unreadable CA, a malformed request or response, an oversized snapshot),
+and `fenced` (the worker is fenced,
 so no further workspace operation may run against it). A retryable broker
 failure, a worker timeout or rate limit, an unclassified error, and an
 unverified termination are never classified, and the #414 bootstrap blocker
-keeps its own mechanism; a non-retryable broker error without a status — an
-unreadable CA, a malformed request or response, an oversized snapshot — is
-never classified either, because a refusal is only ever a broker error that
-states a definite denial. A refusal, a mismatch, and a fence establish the
-condition on one observation; a task failure establishes it by recurrence. The
+keeps its own mechanism; a refusal is only ever a broker error that states a
+definite denial. A refusal, a mismatch, and a fence establish the
+condition on one observation; a task failure and a local broker failure
+establish it by recurrence. The
 count is a total for the incarnation, across classes and across preparation
 contexts, and a trip never un-trips.
 
@@ -1230,7 +1232,10 @@ When the condition is established, the run ends at that turn's tool boundary,
 before the next model request. A refusal, a mismatch, or a repeated task
 failure ends the run blocked-external with a fixed, code-owned reason. A fence
 ends the run as an infrastructure failure, because a termination the harness
-could not verify is never blocked-external. The reason never carries model
+could not verify is never blocked-external. A local broker failure that
+recurs ends the run as an infrastructure failure too: the trusted world never
+answered, so the failure is never a refusal of the broker's world-state and
+never the blocked-external wait on an external prerequisite (#744). The reason never carries model
 prose, and it never carries worker output beyond the fixed preparation task's
 own exit status. The model never decides whether a prerequisite is terminal: a
 tripped latch overrides the model's own outcome declaration, and a delegated
