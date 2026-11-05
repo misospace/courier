@@ -1218,7 +1218,10 @@ witnessed itself: `refused` (the broker or the worker refused outright),
 so no further workspace operation may run against it). A retryable broker
 failure, a worker timeout or rate limit, an unclassified error, and an
 unverified termination are never classified, and the #414 bootstrap blocker
-keeps its own mechanism. A refusal, a mismatch, and a fence establish the
+keeps its own mechanism; a non-retryable broker error without a status — an
+unreadable CA, a malformed request or response, an oversized snapshot — is
+never classified either, because a refusal is only ever a broker error that
+states a definite denial. A refusal, a mismatch, and a fence establish the
 condition on one observation; a task failure establishes it by recurrence. The
 count is a total for the incarnation, across classes and across preparation
 contexts, and a trip never un-trips.

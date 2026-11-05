@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -235,6 +237,58 @@ func TestCoordinatorDoesNotTripOnTransientPrerequisiteFailure(t *testing.T) {
 	}
 	if got := gatewayMock.requestCount(); got != 3 {
 		t.Fatalf("gateway requests = %d, want 3 (the transient failure cost no turn)", got)
+	}
+}
+
+// TestCoordinatorDoesNotTerminalizeLocalBrokerFailures pins the refusal
+// narrowing (#737 review): a non-retryable broker failure without a status —
+// an unreadable CA, a malformed request or response, an oversized snapshot —
+// is a local construction or decoding failure the trusted world never
+// refused. It surfaces as an ordinary tool error and the model takes its
+// next turn; the run never ends blocked-external over it.
+func TestCoordinatorDoesNotTerminalizeLocalBrokerFailures(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.snapshotTip = "snap-tip"
+	worker.completeAll = true
+
+	gateway, gatewayMock, cleanup := gatewayFor(
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-1", toolShell, `{"command":"echo one"}`),
+			finishChunk("tool_calls"),
+		)},
+		gatewayResponse{body: sse(contentChunk(`{"outcome":"no_change_needed","evidence":"nothing to do"}`), finishChunk("stop"))},
+	)
+	defer cleanup()
+
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Transport: gateway,
+		Bindings:  testBindings(),
+		Worker:    delegator,
+		Snapshot: func(context.Context) (Snapshot, error) {
+			// The production shape: the publication engine classifies the
+			// non-retryable local failure as a blocked read, and the local
+			// error rides in the chain.
+			return Snapshot{}, &PublicationBlockedError{
+				Reason: "the broker denied the seed snapshot read (snapshot exceeds the bundle bound)",
+				Err:    &BrokerCallError{Category: "snapshot exceeds the bundle bound"},
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := coordinator.Run(context.Background(), testInvocation())
+	if result.Outcome == executor.OutcomeBlockedExternal {
+		t.Fatalf("outcome = %q, a local broker failure is never blocked-external", result.Outcome)
+	}
+	if result.Outcome != executor.OutcomeNoChangeNeeded {
+		t.Fatalf("outcome = %q (%+v), want the declared no-change ending", result.Outcome, result)
+	}
+	// Two requests: the failing preparation surfaced as an ordinary tool
+	// error and the model took its next turn.
+	if got := gatewayMock.requestCount(); got != 2 {
+		t.Fatalf("gateway requests = %d, want 2", got)
 	}
 }
 
@@ -750,6 +804,38 @@ func TestClassifyPrerequisite(t *testing.T) {
 	if got := classifyPrerequisite(&BrokerCallError{StatusCode: 503, Category: "is temporarily unavailable", Retryable: true}); got != nil {
 		t.Fatalf("classified = %v, want nil for a retryable broker failure", got)
 	}
+	// A non-retryable broker error without a status is a local construction
+	// or decoding failure — an unreadable CA, a malformed request or
+	// response, an oversized snapshot — the trusted world never refused:
+	// it stays outside the vocabulary and never trips the breaker. Every
+	// category here is produced by the real client;
+	// TestBrokerLocalFailuresAreNeverPrerequisiteRefusals pins the producer
+	// side of that invariant.
+	for _, local := range []*BrokerCallError{
+		{Category: "CA is unreadable"},
+		{Category: "request is malformed"},
+		{Category: "snapshot exceeds the bundle bound"},
+		{Category: "snapshot observation is malformed"},
+	} {
+		if got := classifyPrerequisite(local); got != nil {
+			t.Fatalf("classified = %v for %q, want nil: a local broker failure is not a refusal", got, local.Category)
+		}
+	}
+	// The production shape of an oversized snapshot read: the publication
+	// engine wraps the local failure in its blocked error, and the
+	// classifier still sees the local failure, not a refusal.
+	localRead := classifyPrerequisite(&PublicationBlockedError{
+		Reason: "the broker denied the seed snapshot read (snapshot exceeds the bundle bound)",
+		Err:    &BrokerCallError{Category: "snapshot exceeds the bundle bound"},
+	})
+	if localRead != nil {
+		t.Fatalf("classified = %v, want nil: a local snapshot failure is not a refusal", localRead)
+	}
+	// A non-retryable status outside the definite-denial range is not a
+	// refusal: the rule is the same 4xx rule the worker side applies.
+	if got := classifyPrerequisite(&BrokerCallError{StatusCode: http.StatusFound, Category: "denied the operation"}); got != nil {
+		t.Fatalf("classified = %v, want nil: a status outside the denial range is not a refusal", got)
+	}
 	if got := classifyPrerequisite(&protocol.TransportError{StatusCode: 403, Message: "refused"}); got == nil || got.class != prerequisiteRefused {
 		t.Fatalf("classified = %v, want the refused class for a definite worker rejection", got)
 	}
@@ -778,6 +864,123 @@ func TestClassifyPrerequisite(t *testing.T) {
 	}
 	if got := classifyPrerequisite(errors.New("something else entirely")); got != nil {
 		t.Fatalf("classified = %v, want nil: an unclassified failure never trips", got)
+	}
+}
+
+// cannedTransport answers every request with one canned response, so a test
+// can drive the real broker client's decoding paths without a listener.
+type cannedTransport struct {
+	status int
+	header http.Header
+	body   io.ReadCloser
+}
+
+func (t *cannedTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: t.status,
+		Header:     t.header,
+		Body:       t.body,
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+	}, nil
+}
+
+// zeroBody is a body of n zero bytes without holding them in memory.
+type zeroBody struct {
+	remaining int64
+}
+
+func (b *zeroBody) Read(p []byte) (int, error) {
+	if b.remaining <= 0 {
+		return 0, io.EOF
+	}
+	n := int64(len(p))
+	if n > b.remaining {
+		n = b.remaining
+	}
+	for i := range p[:n] {
+		p[i] = 0
+	}
+	b.remaining -= n
+	return int(n), nil
+}
+
+// TestBrokerLocalFailuresAreNeverPrerequisiteRefusals pins the invariant the
+// classifier's refusal rule rests on: the broker client's local construction
+// and decoding failures — an unreadable CA, a malformed request, an oversized
+// snapshot body, a malformed snapshot observation — carry no status and are
+// never retryable, because the trusted world never answered. Each error is
+// produced by the real client, and each stays outside the prerequisite
+// vocabulary.
+func TestBrokerLocalFailuresAreNeverPrerequisiteRefusals(t *testing.T) {
+	validTip := strings.Repeat("ab", 20)
+	serving := func(header http.Header, body io.ReadCloser) *BrokerClient {
+		return &BrokerClient{
+			BaseURL:     "https://broker.invalid",
+			TokenSource: NewStaticBrokerTokenSource([]byte("token")),
+			HTTP:        &http.Client{Transport: &cannedTransport{status: http.StatusOK, header: header, body: body}},
+		}
+	}
+
+	tests := []struct {
+		name string
+		snap func(context.Context) (BrokerSnapshot, error)
+	}{
+		{
+			// Fails when the client builds its own transport, before any
+			// request exists.
+			name: "CA is unreadable",
+			snap: (&BrokerClient{
+				BaseURL:     "https://broker.invalid",
+				TokenSource: NewStaticBrokerTokenSource([]byte("token")),
+				CA:          []byte("not a pem block"),
+			}).Snapshot,
+		},
+		{
+			// The request builder cannot parse the base URL; the canned
+			// transport is wired so the CA failure cannot preempt it.
+			name: "request is malformed",
+			snap: (&BrokerClient{
+				BaseURL:     "https://broker.invalid/%zz",
+				TokenSource: NewStaticBrokerTokenSource([]byte("token")),
+				HTTP:        &http.Client{Transport: &cannedTransport{status: http.StatusOK}},
+			}).Snapshot,
+		},
+		{
+			name: "snapshot exceeds the bundle bound",
+			snap: serving(
+				http.Header{headerSnapshotTip: []string{validTip}, headerSnapshotBaseTip: []string{validTip}},
+				io.NopCloser(&zeroBody{remaining: MaxArtifactBundleBytes + 1<<20}),
+			).Snapshot,
+		},
+		{
+			name: "snapshot observation is malformed",
+			snap: serving(
+				http.Header{headerSnapshotTip: []string{"not-an-oid"}, headerSnapshotBaseTip: []string{"also-not"}},
+				io.NopCloser(strings.NewReader("bundle")),
+			).Snapshot,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.snap(context.Background())
+			var callErr *BrokerCallError
+			if !errors.As(err, &callErr) {
+				t.Fatalf("err = %v, want a BrokerCallError", err)
+			}
+			if callErr.Category != tc.name {
+				t.Fatalf("category = %q, want %q", callErr.Category, tc.name)
+			}
+			if callErr.Retryable {
+				t.Fatalf("category %q is retryable, want a permanent local failure", callErr.Category)
+			}
+			if callErr.StatusCode != 0 {
+				t.Fatalf("category %q carries status %d, want none: the trusted world never answered", callErr.Category, callErr.StatusCode)
+			}
+			if got := classifyPrerequisite(err); got != nil {
+				t.Fatalf("classified = %v for %q, want nil: a local broker failure is not a refusal", got, callErr.Category)
+			}
+		})
 	}
 }
 

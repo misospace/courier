@@ -2028,9 +2028,12 @@ facts it witnessed itself:
 Everything else stays outside the vocabulary. A retryable broker failure, a
 worker timeout or rate limit, an unclassified error, and an unverified
 termination never establish a condition, and the #414 bootstrap blocker keeps
-its own mechanism and is never counted here. A status-path refusal is a
-recording failure rather than a workspace condition, so it is not a refusal
-either.
+its own mechanism and is never counted here. Nor does a non-retryable broker
+failure without a status: a broker error establishes a refusal only when it
+states a definite denial, so a local construction or decoding failure — an
+unreadable CA, a malformed request or response, an oversized snapshot — stays
+outside the vocabulary too. A status-path refusal is a recording failure
+rather than a workspace condition, so it is not a refusal either.
 
 The latch counts stable failures for the incarnation and trips once the
 condition is established. The count is a total across classes and across

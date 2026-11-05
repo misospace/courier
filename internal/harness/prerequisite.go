@@ -118,9 +118,11 @@ func (f *workerFence) Error() string { return f.reason }
 // own case and is never double-handled, the fence is final, an unverified
 // termination is not a prerequisite failure in its own right (the fence it
 // set is), a status-path refusal is a recording failure rather than a
-// workspace condition, a retryable broker failure is transient, a definite
-// worker rejection is a refusal, and anything unclassified never trips the
-// breaker.
+// workspace condition, a retryable broker failure is transient, a broker
+// error that positively states a denial is a refusal while a non-retryable
+// broker error without a status is a local construction or decoding failure
+// the trusted world never refused, a definite worker rejection is a refusal,
+// and anything unclassified never trips the breaker.
 //
 // The unverified check precedes the refusal checks on purpose: an unverified
 // termination can carry the worker's own rejection inside its chain, and a
@@ -154,7 +156,17 @@ func classifyPrerequisite(err error) *prerequisiteFailure {
 		if callErr.Retryable {
 			return nil
 		}
-		return refusedPrerequisite()
+		// A refusal is a fact the broker stated, never one control inferred:
+		// a non-retryable error that states a definite denial — the same 4xx
+		// rule the worker side applies — is the broker's own refusal, while
+		// a non-retryable error without a status is a local construction or
+		// decoding failure — an unreadable CA, a malformed request or
+		// response, an oversized snapshot — that the trusted world never
+		// refused (#737 review).
+		if definiteWorkerRejectionStatus(callErr.StatusCode) {
+			return refusedPrerequisite()
+		}
+		return nil
 	}
 	var transportErr *protocol.TransportError
 	if errors.As(err, &transportErr) {
