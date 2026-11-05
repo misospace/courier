@@ -1217,12 +1217,21 @@ witnessed itself: `refused` (the broker or the worker refused outright),
 (the fixed preparation task ran and failed), `local-failed` (the broker call
 that prepares the workspace failed without the trusted world stating a denial
 — an unreadable CA, a malformed request or response, an oversized snapshot),
-and `fenced` (the worker is fenced,
+`status-refused` (the run's broker definitively refused to persist the
+operation's status record — a non-retryable failure that states a definite
+denial — so the operation never dispatched (#741)), `status-local` (the
+trusted status path failed to persist the record without stating a denial —
+a locally malformed request, or a response that is no API answer — so the
+operation never dispatched and the world never refused (#741 review)), and
+`fenced` (the worker is fenced,
 so no further workspace operation may run against it). A retryable broker
-failure, a worker timeout or rate limit, an unclassified error, and an
+failure, a retryable status-path failure, a worker timeout or rate limit, an
+unclassified error, and an
 unverified termination are never classified, and the #414 bootstrap blocker
 keeps its own mechanism; a refusal is only ever a broker error that states a
-definite denial. A refusal, a mismatch, and a fence establish the
+definite denial. A refusal, a mismatch, a fence, and a definite status-path
+failure — the broker's denial of the record or the local failure that states
+none — establish the
 condition on one observation; a task failure and a local broker failure
 establish it by recurrence. The
 count is a total for the incarnation, across classes and across preparation
@@ -1235,7 +1244,16 @@ ends the run as an infrastructure failure, because a termination the harness
 could not verify is never blocked-external. A local broker failure that
 recurs ends the run as an infrastructure failure too: the trusted world never
 answered, so the failure is never a refusal of the broker's world-state and
-never the blocked-external wait on an external prerequisite (#744). The reason never carries model
+never the blocked-external wait on an external prerequisite (#744). A
+definite status-path failure ends the run as an infrastructure failure as
+well: a recording failure of trusted control's own plumbing is not an
+external prerequisite the world could still satisfy, so the honest recovery
+is operator relaunch once the run's own status plumbing is fixed (#741), and
+the breaker observes it at the dispatch boundary that witnessed it — the
+operation never dispatched on any path, not only preparation (#741). The
+status-path classes stay honest about what was observed (#741 review): the
+refusal names the broker's own denial, and the local class's reason never
+claims a refusal the broker never stated. The reason never carries model
 prose, and it never carries worker output beyond the fixed preparation task's
 own exit status. The model never decides whether a prerequisite is terminal: a
 tripped latch overrides the model's own outcome declaration, and a delegated
@@ -2011,7 +2029,9 @@ ending's evidence.
 breaker (§5) adds one classification boundary of its own. A run whose workspace
 preparation has established a terminal condition ends `blocked_external` (a
 refusal, a mismatch, or a repeated preparation-task failure) or as an
-`infrastructure_failed` result (a fenced worker). Both endings settle the
+`infrastructure_failed` result (a fenced worker, or a definite refusal of the
+operation's status record — a recording failure of the run's own trusted
+status path is never an external prerequisite, #741). Both endings settle the
 run's durable status obligations before they report: a completed brief whose
 durable record never landed makes either ending an `infrastructure_failed`
 result carrying that settlement failure. Both endings carry a fixed,

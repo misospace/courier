@@ -1503,8 +1503,13 @@ const reconcileGrace = 30 * time.Second
 // persisted, so the operation was never dispatched. It is not a workspace
 // condition: the run's trusted status path is what failed, and the harness
 // classifies such a failure as an infrastructure failure elsewhere. It is
-// typed so the prerequisite classifier (#737) never counts it as a refusal
-// of the workspace preparation.
+// typed so the prerequisite classifier (#737) can tell the recording failure
+// apart from a refusal of the workspace preparation: what the world stated
+// decides the class (#741 review) — a definite broker denial of the write
+// and a non-retryable local failure that states none each trip the breaker
+// as an infrastructure failure with their own honest reason (#741), while a
+// retryable one stays an ordinary tool error the model's legitimate retry
+// may clear.
 type statusPersistFailure struct {
 	opID string
 	err  error
@@ -1535,7 +1540,17 @@ func (c *Coordinator) dispatchAndAwait(ctx context.Context, opID, briefID string
 		return protocol.Result{}, err
 	}
 	if err := c.status.BeginOperation(ctx, opID, briefID); err != nil {
-		return protocol.Result{}, &statusPersistFailure{opID: opID, err: err}
+		persist := &statusPersistFailure{opID: opID, err: err}
+		// A definite status-path failure — the broker's denial of the
+		// record, or the local failure that states none — is observed by
+		// the boundary that witnessed it (#741), like the fence: the
+		// operation never dispatched, the condition cannot change between
+		// turns, and the breaker — not the model — ends the run. A retryable
+		// failure classifies as no prerequisite failure and keeps the
+		// ordinary tool-error path. The preparation callers observe the same
+		// error again; observe is idempotent for a final fact.
+		c.observePrerequisite(persist)
+		return protocol.Result{}, persist
 	}
 	if _, err := c.worker.Dispatch(ctx, opID, briefID, task); err != nil {
 		if definiteWorkerRejection(err) {
