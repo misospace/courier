@@ -1754,7 +1754,7 @@ func (r reporter) guardFixPRBase(ctx context.Context) int {
 // pull request's live base, and the outcome maps onto the operator's
 // termination contract exactly like every other ending. No model session
 // starts, so only the engine's closed mechanical rules — plus, when
-// explicitly configured, the bounded one-turn-per-round model-assisted
+// explicitly configured, the one-attempt-per-episode model-assisted
 // resolution the engine validates itself (#732) — can ever change a byte,
 // and the publication is leased to the head observed at admission. The
 // rebase outcome decides the phase: published and up-to-date hand off to

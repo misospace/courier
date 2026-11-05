@@ -86,4 +86,25 @@ func TestBuildCoordinatorPodCarriesRebaseModelAssistEnv(t *testing.T) {
 		key.ValueFrom.SecretKeyRef.Name != "gateway-key" || key.ValueFrom.SecretKeyRef.Key != "api-key" {
 		t.Fatalf("%s = %+v, want the SecretKeyRef under the configured key name", gatewayKeyEnv, key)
 	}
+
+	// An enabled configuration never widens the credential to a pod of
+	// another mode: a credential only the rebase path reads stays off
+	// fix-pr, resolve-issue, and contribute pods.
+	otherRun := run.DeepCopy()
+	otherRun.Spec.Mode = courierv1alpha1.ModeFixPR
+	other, err := BuildCoordinatorPod(otherRun, lane, PodConfig{
+		Image:                 "example/test",
+		RebaseModelAssist:     true,
+		ModelGatewayURL:       "http://gateway:4000/v1",
+		ModelGatewayKeySecret: "gateway-key",
+	})
+	if err != nil {
+		t.Fatalf("BuildCoordinatorPod() non-rebase error = %v", err)
+	}
+	values = envByName(other)
+	for _, name := range []string{assistEnv, gatewayURLEnv, gatewayKeyEnv} {
+		if _, ok := values[name]; ok {
+			t.Fatalf("a non-rebase run must not carry %s", name)
+		}
+	}
 }

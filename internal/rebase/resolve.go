@@ -146,7 +146,7 @@ func resolveFile(directory, path string) (bool, error) {
 		return false, lstatRefusal(path, err)
 	}
 	if !info.Mode().IsRegular() {
-		return false, &nonRegularConflictError{path: path}
+		return false, nonRegularConflict(path)
 	}
 	if info.Size() > maxConflictFileBytes {
 		return false, nil

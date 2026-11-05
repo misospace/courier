@@ -1640,14 +1640,19 @@ func TestRenderedPodContainsEvidenceTokenExactlyOnce(t *testing.T) {
 }
 
 func TestCredentialEnvRefsMatchRenderedPodSecretRefs(t *testing.T) {
+	rebaseRun := evidenceTestRun("run-rebase")
+	rebaseRun.Spec.Mode = courierv1alpha1.ModeRebase
 	for _, test := range []struct {
 		name   string
 		config PodConfig
+		mode   courierv1alpha1.Mode
+		run    *courierv1alpha1.CoderRun
 		want   []CredentialEnvRef
 	}{
 		{
 			name:   "git only",
 			config: PodConfig{GitCredentialSecret: "courier-git"},
+			mode:   courierv1alpha1.ModeResolveIssue,
 			want: []CredentialEnvRef{
 				{Name: "COURIER_GIT_USERNAME", Secret: "courier-git", Key: "username"},
 				{Name: "COURIER_GIT_TOKEN", Secret: "courier-git", Key: "token"},
@@ -1657,6 +1662,7 @@ func TestCredentialEnvRefsMatchRenderedPodSecretRefs(t *testing.T) {
 		{
 			name:   "git plus distinct github",
 			config: PodConfig{GitCredentialSecret: "courier-git", GitTokenKey: "git-token", GitHubCredentialSecret: "courier-github-api", GitHubTokenKey: "api-token"},
+			mode:   courierv1alpha1.ModeResolveIssue,
 			want: []CredentialEnvRef{
 				{Name: "COURIER_GIT_USERNAME", Secret: "courier-git", Key: "username"},
 				{Name: "COURIER_GIT_TOKEN", Secret: "courier-git", Key: "git-token"},
@@ -1666,6 +1672,7 @@ func TestCredentialEnvRefsMatchRenderedPodSecretRefs(t *testing.T) {
 		{
 			name:   "api-only github secret",
 			config: PodConfig{GitHubCredentialSecret: "courier-github-api", GitHubTokenKey: "api-token"},
+			mode:   courierv1alpha1.ModeResolveIssue,
 			want:   []CredentialEnvRef{{Name: "GITHUB_TOKEN", Secret: "courier-github-api", Key: "api-token"}},
 		},
 		{
@@ -1676,7 +1683,21 @@ func TestCredentialEnvRefsMatchRenderedPodSecretRefs(t *testing.T) {
 				ModelGatewayKeySecret: "gateway-key",
 				ModelGatewayKeyName:   "api-key",
 			},
+			mode: courierv1alpha1.ModeRebase,
+			run:  rebaseRun,
 			want: []CredentialEnvRef{{Name: "COURIER_MODEL_GATEWAY_API_KEY", Secret: "gateway-key", Key: "api-key"}},
+		},
+		{
+			// A credential only the rebase path reads never rides a pod of
+			// another mode, whatever the deployment configuration says.
+			name: "rebase assist key never on a non-rebase run",
+			config: PodConfig{
+				RebaseModelAssist:     true,
+				ModelGatewayURL:       "http://gateway:4000/v1",
+				ModelGatewayKeySecret: "gateway-key",
+			},
+			mode: courierv1alpha1.ModeResolveIssue,
+			want: nil,
 		},
 		{
 			name: "rebase assist key disabled without the capability",
@@ -1684,6 +1705,8 @@ func TestCredentialEnvRefsMatchRenderedPodSecretRefs(t *testing.T) {
 				ModelGatewayURL:       "http://gateway:4000/v1",
 				ModelGatewayKeySecret: "gateway-key",
 			},
+			mode: courierv1alpha1.ModeRebase,
+			run:  rebaseRun,
 			want: nil,
 		},
 		{
@@ -1692,16 +1715,22 @@ func TestCredentialEnvRefsMatchRenderedPodSecretRefs(t *testing.T) {
 				RebaseModelAssist: true,
 				ModelGatewayURL:   "http://gateway:4000/v1",
 			},
+			mode: courierv1alpha1.ModeRebase,
+			run:  rebaseRun,
 			want: nil,
 		},
-		{name: "neither", config: PodConfig{}, want: nil},
+		{name: "neither", config: PodConfig{}, mode: courierv1alpha1.ModeResolveIssue, want: nil},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			refs := CredentialEnvRefs(test.config)
+			refs := CredentialEnvRefs(test.config, test.mode)
 			if !reflect.DeepEqual(refs, test.want) {
 				t.Fatalf("CredentialEnvRefs() = %#v, want %#v", refs, test.want)
 			}
-			pod, err := BuildCoordinatorPod(evidenceTestRun("run-refs"), evidenceTestLane(), test.config)
+			run := test.run
+			if run == nil {
+				run = evidenceTestRun("run-refs")
+			}
+			pod, err := BuildCoordinatorPod(run, evidenceTestLane(), test.config)
 			if err != nil {
 				t.Fatalf("BuildCoordinatorPod() error = %v", err)
 			}

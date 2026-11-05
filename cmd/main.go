@@ -178,7 +178,7 @@ func main() {
 	var rebaseModelGatewayKeyName string
 	flag.BoolVar(&rebaseModelAssist, "rebase-model-assist", false, "Enable model-assisted conflict resolution in rebase-run coordinator pods; requires --rebase-model-gateway-url.")
 	flag.StringVar(&rebaseModelGatewayURL, "rebase-model-gateway-url", "", "OpenAI-compatible model gateway API root the rebase assist resolves conflicts through; required when --rebase-model-assist is enabled.")
-	flag.StringVar(&rebaseModelGatewayKeySecret, "rebase-model-gateway-key-secret", "", "Secret containing the model-gateway API key, injected into rebase pods only when --rebase-model-assist is enabled; empty means an unauthenticated gateway.")
+	flag.StringVar(&rebaseModelGatewayKeySecret, "rebase-model-gateway-key-secret", "", "Bare name of a Secret in each run namespace holding the model-gateway API key, injected into rebase pods only when --rebase-model-assist is enabled; empty means an unauthenticated gateway.")
 	flag.StringVar(&rebaseModelGatewayKeyName, "rebase-model-gateway-key-name", "key", "Key within the model-gateway API key Secret.")
 	flag.BoolVar(&dispatchEnabled, "dispatch-enabled", false, "Enable Dispatch source discovery.")
 	flag.BoolVar(&dispatchPRFixExclusions, "dispatch-pr-fix-exclusions", false, "Enable Dispatch PR-fix exclusion acknowledgements.")
@@ -363,8 +363,8 @@ func main() {
 	// Fail fast on a rebase assist enabled without its transport rather than
 	// at the first rebase run: enabled-but-unconfigured must never silently
 	// publish under different rules than the deployment asked for (#732).
-	if rebaseModelAssist && strings.TrimSpace(rebaseModelGatewayURL) == "" {
-		setupLog.Error(fmt.Errorf("--rebase-model-assist is enabled but COURIER_MODEL_GATEWAY_URL is not set"), "unable to configure rebase model assist")
+	if err := validateRebaseModelAssistFlags(rebaseModelAssist, rebaseModelGatewayURL); err != nil {
+		setupLog.Error(err, "unable to configure rebase model assist")
 		os.Exit(1)
 	}
 	launcher := &controller.CoordinatorLauncher{
@@ -926,6 +926,16 @@ func (c alreadyDoneCommenter) CommentWorkItem(ctx context.Context, run *courierv
 	ref := forge.WorkItemRef{Repo: repo, ID: strconv.Itoa(run.Spec.Ref)}
 	_, err = provider.CommentWorkItem(ctx, ref, body)
 	return err
+}
+
+// validateRebaseModelAssistFlags fails fast on a rebase assist enabled
+// without its transport: enabled-but-unconfigured must never quietly
+// publish under different rules than the deployment asked for (#732).
+func validateRebaseModelAssistFlags(enabled bool, gatewayURL string) error {
+	if enabled && strings.TrimSpace(gatewayURL) == "" {
+		return fmt.Errorf("--rebase-model-assist is enabled but --rebase-model-gateway-url is not set")
+	}
+	return nil
 }
 
 // validateEvidenceFlags reports a clear error when the evidence intake flags

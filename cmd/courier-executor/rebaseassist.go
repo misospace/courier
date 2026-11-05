@@ -69,10 +69,13 @@ func newRebaseAssistResolver(cfg config) (rebase.ModelResolver, error) {
 // the streamed answer into an AssistResolution. One call, one turn, no
 // retry and no re-ask: the engine issues at most one model-assisted attempt
 // per episode, so a transport that retried or re-asked here would spend
-// model turns outside the engine's accounting. The request leaves MaxTokens
-// unset — the harness transport's own lane output reservation applies — and
-// the turn is bounded by the caller's context alone: the run's own context
-// (SIGTERM) governs it, with no executor-side timer on model behavior.
+// model turns outside the engine's accounting. The request carries no
+// executor-side output bound and no turn timer: the OpenAI-compatible
+// gateway request the harness Gateway builds sends no max_tokens field at
+// all, and the turn runs on the caller's context alone — the run's own
+// context (SIGTERM) governs it, exactly as every harness session model turn
+// does. What the executor binds is what may be written, not what the model
+// may say: the engine's content bound and validation still govern that.
 func (g *gatewayResolver) Resolve(ctx context.Context, req rebase.AssistRequest) (*rebase.AssistResolution, error) {
 	events, err := g.gateway.StreamChat(ctx, harness.ChatRequest{
 		Model:    g.model,

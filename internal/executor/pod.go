@@ -93,10 +93,12 @@ type PodConfig struct {
 	Contribution ContributionExecution
 	// RebaseModelAssist enables model-assisted conflict resolution in
 	// rebase-run coordinator pods (#732): the builder emits
-	// COURIER_REBASE_MODEL_ASSIST=enabled only when this is true. Absence of
+	// COURIER_REBASE_MODEL_ASSIST=enabled only when this is true and the run
+	// is a rebase run. Absence of
 	// the variable is the meaningful fail-closed default — the executor
 	// parses everything but an explicit affirmative as off — so a disabled
-	// configuration emits neither the flag nor its supporting variables.
+	// configuration or any non-rebase run emits neither the flag nor its
+	// supporting variables.
 	RebaseModelAssist bool
 	// ModelGatewayURL is the OpenAI-compatible model gateway API root the
 	// rebase assist resolves conflicts through, emitted as
@@ -355,8 +357,10 @@ type CredentialEnvRef struct {
 // the intake can never enumerate the same Secret keys differently. The
 // envFrom environment Secret (--executor-environment-secret) is deliberately
 // excluded: kubelet maps its keys 1:1 to env names the builder never
-// enumerates, so the intake registers it by a different route.
-func CredentialEnvRefs(config PodConfig) []CredentialEnvRef {
+// enumerates, so the intake registers it by a different route. mode gates
+// the mode-scoped entries: a credential only one execution mode uses never
+// widens its exposure to pods of other modes.
+func CredentialEnvRefs(config PodConfig, mode courierv1alpha1.Mode) []CredentialEnvRef {
 	var refs []CredentialEnvRef
 	if strings.TrimSpace(config.GitCredentialSecret) != "" {
 		usernameKey := config.GitUsernameKey
@@ -388,9 +392,10 @@ func CredentialEnvRefs(config PodConfig) []CredentialEnvRef {
 	}
 	// The rebase model-gateway key rides the same shared enumeration (#732):
 	// one SecretKeyRef the evidence intake re-scans, injected only when the
-	// capability is enabled and a Secret is configured; empty means an
-	// unauthenticated gateway.
-	if config.RebaseModelAssist && strings.TrimSpace(config.ModelGatewayKeySecret) != "" {
+	// capability is enabled for a rebase run and a Secret is configured;
+	// empty means an unauthenticated gateway. A credential only the rebase
+	// path reads never rides a fix-pr, resolve-issue, or contribute pod.
+	if config.RebaseModelAssist && mode == courierv1alpha1.ModeRebase && strings.TrimSpace(config.ModelGatewayKeySecret) != "" {
 		keyName := config.ModelGatewayKeyName
 		if keyName == "" {
 			keyName = "key"
@@ -433,10 +438,10 @@ func podEnvironment(invocation Invocation, executorName string, config PodConfig
 		corev1.EnvVar{Name: "COURIER_TOOLCHAIN_DIR", Value: ToolchainReferencePath},
 	)
 	// Rebase model assist is opt-in operator configuration (#732): the
-	// variables are emitted only when the capability is enabled, because
-	// their absence is the meaningful fail-closed default — the executor
-	// parses everything but an explicit affirmative as off.
-	if config.RebaseModelAssist {
+	// variables are emitted only on rebase-run pods when the capability is
+	// enabled, because their absence is the meaningful fail-closed default —
+	// the executor parses everything but an explicit affirmative as off.
+	if config.RebaseModelAssist && invocation.Mode == courierv1alpha1.ModeRebase {
 		values = append(values, corev1.EnvVar{Name: "COURIER_REBASE_MODEL_ASSIST", Value: "enabled"})
 		if gatewayURL := strings.TrimSpace(config.ModelGatewayURL); gatewayURL != "" {
 			values = append(values, corev1.EnvVar{Name: "COURIER_MODEL_GATEWAY_URL", Value: gatewayURL})
@@ -445,7 +450,7 @@ func podEnvironment(invocation Invocation, executorName string, config PodConfig
 	// Per-key credential references come from the shared helper so the pod
 	// builder and the evidence intake can never enumerate the same Secret keys
 	// differently.
-	for _, ref := range CredentialEnvRefs(config) {
+	for _, ref := range CredentialEnvRefs(config, invocation.Mode) {
 		values = append(values, corev1.EnvVar{
 			Name: ref.Name,
 			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{

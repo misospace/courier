@@ -197,13 +197,16 @@ agent allowlist, the serialized concurrency-one gate, and rebase-only intake):
 Off by default. The operator enables it on the coordinator launcher with
 `--rebase-model-assist` plus `--rebase-model-gateway-url` (the
 OpenAI-compatible gateway API root), optionally
-`--rebase-model-gateway-key-secret` (a Secret holding the API key; empty
-means an unauthenticated gateway) and `--rebase-model-gateway-key-name`.
-The pod builder renders the capability into rebase-run coordinator pods as
-exactly three environment variables — `COURIER_REBASE_MODEL_ASSIST=enabled`,
-`COURIER_MODEL_GATEWAY_URL`, and the `COURIER_MODEL_GATEWAY_API_KEY`
-SecretKeyRef — emitted only when the capability is enabled, because their
-absence is the meaningful fail-closed default. The engine consults the
+`--rebase-model-gateway-key-secret` (the bare name of a Secret in each run
+namespace holding the API key; empty means an unauthenticated gateway) and
+`--rebase-model-gateway-key-name`. The pod builder renders the capability
+into rebase-run coordinator pods — and only rebase-run pods, never a
+fix-pr, resolve-issue, or contribute pod — as up to three environment
+variables: `COURIER_REBASE_MODEL_ASSIST=enabled`,
+`COURIER_MODEL_GATEWAY_URL`, and, when a key Secret is configured, the
+`COURIER_MODEL_GATEWAY_API_KEY` SecretKeyRef. They are emitted only when
+the capability is enabled, because their absence is the meaningful
+fail-closed default. The engine consults the
 configured coordinator model exactly once per rebase episode for the first
 rejected set the mechanical rules produce; a later conflict round in the
 same episode has already spent that one attempt, and the attempt stops for
@@ -213,9 +216,13 @@ conflicted paths, the marked conflict files, and the run goal. No
 credentials ever cross the engine boundary. The answer must be one JSON
 object resolving exactly the rejected files with marker-free full file
 content. No executor-side token ceiling or model-turn timer governs the
-turn: the lane's own output reservation and the run's own context
-(SIGTERM) bound the model's behavior, while the engine's content bound and
-validation still govern what may be written. Anything else — a refusal, a
+turn — the gateway request carries no output bound and the turn runs on
+the run's own context (SIGTERM), exactly as every harness session model
+turn does; the engine's content bound and validation still govern what may
+be written. A gateway that stalls rather than answers holds the episode
+until the run's context ends; the lane accepts that exposure because it is
+the platform's model-turn discipline, not a rebase-specific decision.
+Anything else — a refusal, a
 foreign path, leftover markers, oversized content — is treated as a
 refusal, and the attempt stops for a human with the
 attempted-and-did-not-resolve summary. When the conflict set includes

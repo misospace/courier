@@ -558,7 +558,7 @@ func (i *EvidenceIntake) credentialScanner(ctx context.Context, run *courierv1al
 	scanner := evidence.NewScanner()
 
 	// Per-key references: only the named key of each secret is a credential.
-	for _, ref := range executor.CredentialEnvRefs(i.Pod) {
+	for _, ref := range executor.CredentialEnvRefs(i.Pod, run.Spec.Mode) {
 		value, err := readSecretKey(ctx, i.APIReader, run.Namespace, ref.Secret, ref.Key)
 		if err != nil {
 			return nil, fmt.Errorf("evidence intake: reading credential secret %s: %w", ref.Secret, err)

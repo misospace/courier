@@ -142,7 +142,7 @@ func (e *resolverUnavailableError) Unwrap() error { return e.err }
 // neither read nor write through: it is not a regular file — git leaves the
 // symlink itself in the worktree on a symlink content conflict — or it is
 // not a name the filesystem accepts at all (a NUL byte or an over-long
-// name, which lstat refuses with EINVAL or ENAMETOOLONG). Git cannot
+// name, which lstat refuses). Git cannot
 // produce such tree entries, so a conflicted path like the latter is
 // anomalous, and the episode stops for a human with the path named instead
 // of leaking an unclassified infrastructure error. Every file read or write
@@ -150,21 +150,35 @@ func (e *resolverUnavailableError) Unwrap() error { return e.err }
 // from, or land model bytes on, an arbitrary path outside the workspace.
 // Every such episode still ends parked for a human, and no model-assisted
 // code can run on that path.
-type nonRegularConflictError struct{ path string }
+type nonRegularConflictError struct {
+	path string
+	// reason is the per-instance why: "is not a regular file" for a symlink
+	// or other non-regular entry, "is not a name the filesystem accepts" for
+	// a name lstat refuses, so the human summary states the true cause.
+	reason string
+}
+
+func nonRegularConflict(path string) *nonRegularConflictError {
+	return &nonRegularConflictError{path: path, reason: "is not a regular file"}
+}
+
+func unnamableConflictPath(path string) *nonRegularConflictError {
+	return &nonRegularConflictError{path: path, reason: "is not a name the filesystem accepts"}
+}
 
 func (e *nonRegularConflictError) Error() string {
-	return fmt.Sprintf("conflicted path %s is not a regular file or not a name the filesystem accepts; the engine will not read or write through it", e.path)
+	return fmt.Sprintf("conflicted path %s %s; the engine will not read or write through it", e.path, e.reason)
 }
 
 // lstatRefusal classifies one os.Lstat failure on a conflicted path. A name
-// the operating system refuses outright — EINVAL for a NUL byte,
-// ENAMETOOLONG for an over-long component — cannot be a tree entry git
-// produced, so it gets the same non-regular stop-for-a-human verdict instead
-// of an unclassified infrastructure error; every other failure passes
-// through unchanged as the infrastructure error it is.
+// the operating system refuses outright — a NUL byte, or an over-long
+// component refused with ENAMETOOLONG — cannot be a tree entry git produced,
+// so it gets the same stop-for-a-human verdict instead of an unclassified
+// infrastructure error; every other failure passes through unchanged as the
+// infrastructure error it is.
 func lstatRefusal(path string, err error) error {
-	if errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENAMETOOLONG) {
-		return &nonRegularConflictError{path: path}
+	if strings.IndexByte(path, 0) >= 0 || errors.Is(err, syscall.ENAMETOOLONG) {
+		return unnamableConflictPath(path)
 	}
 	return err
 }
@@ -453,7 +467,7 @@ func boundedFileContent(directory, path string) (string, error) {
 		return "", lstatRefusal(path, err)
 	}
 	if !info.Mode().IsRegular() {
-		return "", &nonRegularConflictError{path: path}
+		return "", nonRegularConflict(path)
 	}
 	file, err := os.Open(full)
 	if err != nil {
