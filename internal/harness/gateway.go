@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -34,6 +35,14 @@ type Gateway struct {
 	// empty value falls back to the provider-neutral defaults; deployments
 	// extend the defaults through configuration.
 	ExhaustionSignals ExhaustionSignals
+	// usageUnsupported remembers a gateway that rejected the request because
+	// of the usage request's own field (#738): after one such rejection,
+	// every request this transport sends omits stream_options and the
+	// provider's usage stays an explicit absence. It is observability state:
+	// setting it never changes a request beyond dropping the telemetry
+	// field, so the run behaves exactly as it would without the usage
+	// request.
+	usageUnsupported atomic.Bool
 }
 
 func (g *Gateway) client() *http.Client {
@@ -130,11 +139,22 @@ type ChatRequest struct {
 	MaxTokens int
 }
 
+// wireStreamOptions is the streaming option the OpenAI-compatible request
+// carries so the gateway reports the turn's usage on the stream (#738): the
+// telemetry that accounts for the run's model spend reads the count the
+// provider actually sent. It is a request-shape requirement of that
+// telemetry contract, not a capability claim: a gateway that ignores it
+// simply reports no usage, and the absence is recorded, never invented.
+type wireStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
 type wireRequest struct {
-	Model    string        `json:"model"`
-	Messages []wireMessage `json:"messages"`
-	Tools    []wireTool    `json:"tools,omitempty"`
-	Stream   bool          `json:"stream"`
+	Model         string             `json:"model"`
+	Messages      []wireMessage      `json:"messages"`
+	Tools         []wireTool         `json:"tools,omitempty"`
+	Stream        bool               `json:"stream"`
+	StreamOptions *wireStreamOptions `json:"stream_options,omitempty"`
 }
 
 type wireTool struct {
@@ -149,28 +169,29 @@ type wireTool struct {
 // tool_calls finish ends the sequence with the assembled tool requests; the
 // trusted tool results start the next turn. A non-2xx response or an
 // unreadable stream is a KindError, never a partial success.
+//
+// Every streamed turn asks the gateway for its usage report with
+// stream_options.include_usage (#738). A gateway that does not know the
+// field must not be turned away by it: telemetry is observability only, so
+// a request-shape rejection that names the field is answered by one retry
+// without it, the transport remembers, and every later request on it omits
+// the field — the usage is then an explicit absence, and the run proceeds
+// exactly as it would have without the telemetry request. The rejected
+// attempt itself is bounded by the same memory: the field is dropped after
+// the first rejection, so only the requests in flight around that first
+// rejection can repeat it, and the session's request accounting stays
+// attempt-scoped — those are the only provider requests the per-run
+// request counts do not name.
 func (g *Gateway) StreamChat(ctx context.Context, req ChatRequest) ([]Event, error) {
-	body, err := json.Marshal(wireRequest{
-		Model:    req.Model,
-		Messages: toWireMessages(req.Messages),
-		Tools:    toolsToWire(req.Tools),
-		Stream:   true,
-	})
+	includeUsage := !g.usageUnsupported.Load()
+	resp, sent, err := g.post(ctx, req, includeUsage)
 	if err != nil {
-		return nil, fmt.Errorf("harness: encode chat request: %w", err)
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimSuffix(g.BaseURL, "/")+"/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("harness: build chat request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "text/event-stream")
-	if g.APIKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+g.APIKey)
-	}
-	resp, err := g.client().Do(httpReq)
-	if err != nil {
-		return []Event{{Kind: KindError, Err: &GatewayTransportError{Err: err}}}, nil
+		if !sent {
+			// The request was never built: not a provider request, reported
+			// as the harness's own failure.
+			return nil, err
+		}
+		return []Event{{Kind: KindError, Err: err}}, nil
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -179,9 +200,92 @@ func (g *Gateway) StreamChat(ctx context.Context, req ChatRequest) ([]Event, err
 		// may quote credentials, endpoints, or model-influenced text, and the
 		// capability contract requires a safe reason instead.
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxProviderErrorBody))
+		// A gateway that rejects the request shape because of the usage
+		// request (#738) must not fail the turn for telemetry's sake: the
+		// rejection is recognized from the bounded error prefix naming the
+		// field, the field is dropped for the rest of this transport's life,
+		// and the turn retries once without it. Any other rejection behaves
+		// exactly as before.
+		if includeUsage && rejectedUsageRequest(body) {
+			g.usageUnsupported.Store(true)
+			resp, sent, err = g.post(ctx, req, false)
+			if err != nil {
+				if !sent {
+					return nil, err
+				}
+				return []Event{{Kind: KindError, Err: err}}, nil
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, maxProviderErrorBody))
+				return []Event{{Kind: KindError, Err: gatewayStatusError(resp.StatusCode, resp.Header, body, g.signals())}}, nil
+			}
+			return normalizeStream(resp.Body, g.signals())
+		}
 		return []Event{{Kind: KindError, Err: gatewayStatusError(resp.StatusCode, resp.Header, body, g.signals())}}, nil
 	}
 	return normalizeStream(resp.Body, g.signals())
+}
+
+// post sends one chat-completions request and reports whether it was sent:
+// a request that failed to build never reached the provider, and the caller
+// reports it as the harness's own failure rather than a provider response
+// (#738). includeUsage decides whether the request carries
+// stream_options.include_usage. A sent-and-failed transport error returns
+// sent=true with a GatewayTransportError.
+func (g *Gateway) post(ctx context.Context, req ChatRequest, includeUsage bool) (*http.Response, bool, error) {
+	body, err := json.Marshal(wireRequest{
+		Model:    req.Model,
+		Messages: toWireMessages(req.Messages),
+		Tools:    toolsToWire(req.Tools),
+		Stream:   true,
+		// The provider's usage report rides the terminal event when the
+		// gateway sends one (#738); a gateway that sends none records an
+		// explicit absence.
+		StreamOptions: wireStreamOptionsFor(includeUsage),
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("harness: encode chat request: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimSuffix(g.BaseURL, "/")+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return nil, false, fmt.Errorf("harness: build chat request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "text/event-stream")
+	if g.APIKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+g.APIKey)
+	}
+	resp, err := g.client().Do(httpReq)
+	if err != nil {
+		return nil, true, &GatewayTransportError{Err: err}
+	}
+	return resp, true, nil
+}
+
+// wireStreamOptionsFor renders the request's stream_options field: the usage
+// request when telemetry asks for one, absent otherwise.
+func wireStreamOptionsFor(includeUsage bool) *wireStreamOptions {
+	if !includeUsage {
+		return nil
+	}
+	return &wireStreamOptions{IncludeUsage: true}
+}
+
+// rejectedUsageRequest reports whether a non-2xx response is the gateway
+// rejecting the request because of the usage request itself (#738): the
+// bounded error prefix names the field. The status class is not a gate —
+// gateways reject unknown fields with 4xx and, less conventionally, with
+// 5xx — because a false match costs only the usage (an explicit absence for
+// the rest of the transport's life), while a missed one would cost the run.
+// The prefix is inspected and never retained or echoed. A gateway may name
+// other rejected arguments in the same body; the check matches the field
+// name only, because that is the argument this transport added. A gateway
+// that rejects the field only inside an otherwise-acceptable 200 stream
+// cannot be helped here: that rejection stays a stream error, as it would
+// without the usage request's retry seam.
+func rejectedUsageRequest(body []byte) bool {
+	return bytes.Contains(body, []byte("stream_options"))
 }
 
 // wireModelInfo is the OpenAI/LiteLLM-compatible model-metadata envelope. An
@@ -445,6 +549,66 @@ const maxStreamToolIdentityBytes = 64 << 10
 type wireChunk struct {
 	Choices []wireChoice `json:"choices"`
 	Error   *wireError   `json:"error"`
+	// Usage is the provider's report for the whole turn, on a usage chunk
+	// whose choices are empty: the gateway's answer to the request's
+	// stream_options.include_usage. It is raw because a report telemetry
+	// cannot read as exact whole-token counts is an absence, never a turn
+	// failure (#738).
+	Usage json.RawMessage `json:"usage,omitempty"`
+}
+
+// wireUsage is the provider's token accounting for one completion, in the
+// shape the OpenAI-compatible stream carries: the input accepted (with the
+// prompt-cache subset the provider served from its cache, reported
+// alongside) and the output produced. Counts decode as JSON numbers, and a
+// value that is not a whole number fails the count, not the turn.
+type wireUsage struct {
+	PromptTokens        json.Number `json:"prompt_tokens"`
+	CompletionTokens    json.Number `json:"completion_tokens"`
+	PromptTokensDetails struct {
+		Cached json.Number `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+}
+
+// decodeUsage decodes the provider's usage report leniently (#738): a
+// provider or proxy that reports a fractional or otherwise non-integer
+// count has not reported an exact token count, so the report is treated as
+// absent — the turn is never failed for telemetry's sake, and no
+// fractional count the provider did not report is invented. The second
+// return reports whether an exact report was decoded.
+func decodeUsage(raw json.RawMessage) (*Usage, bool) {
+	if trimmed := bytes.TrimSpace(raw); len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, false
+	}
+	var wire wireUsage
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return nil, false
+	}
+	prompt, promptOK := wholeCount(wire.PromptTokens)
+	completion, completionOK := wholeCount(wire.CompletionTokens)
+	cached, cachedOK := wholeCount(wire.PromptTokensDetails.Cached)
+	if !promptOK || !completionOK || !cachedOK {
+		return nil, false
+	}
+	return &Usage{
+		InputTokens:     prompt,
+		OutputTokens:    completion,
+		CacheReadTokens: cached,
+	}, true
+}
+
+// wholeCount reads one provider-reported count as an exact integer token
+// count. An absent field is a zero the provider did not contradict; a
+// fractional or malformed value is not a report at all.
+func wholeCount(number json.Number) (int64, bool) {
+	if number == "" {
+		return 0, true
+	}
+	value, err := number.Int64()
+	if err != nil {
+		return 0, false
+	}
+	return value, true
 }
 
 type wireChoice struct {
@@ -502,6 +666,11 @@ func normalizeStream(body io.Reader, signals ExhaustionSignals) ([]Event, error)
 	fragments := map[int]*toolFragment{}
 	var contentBytes, argumentBytes, identityBytes int
 	var finish string
+	// usage is the provider's report for the turn, from the usage chunk the
+	// gateway sends in answer to stream_options.include_usage (#738). Nil is
+	// an explicit absence: the gateway sent no usage and the terminal event
+	// records that, never an invented zero.
+	var usage *Usage
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -518,29 +687,41 @@ func normalizeStream(body io.Reader, signals ExhaustionSignals) ([]Event, error)
 		}
 		var chunk wireChunk
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
-			return streamError(events, fmt.Errorf("harness: undecodable stream chunk"))
+			return streamError(events, usage, fmt.Errorf("harness: undecodable stream chunk"))
 		}
 		if chunk.Error != nil {
 			// The error object is provider-controlled body data; its type and
 			// message never reach the trusted error string, which can flow
 			// into capability diagnostics and termination reasons. Only a
 			// recognized structured code/type is retained as a classification.
-			return streamError(events, streamErrorClassification(chunk.Error, signals))
+			return streamError(events, usage, streamErrorClassification(chunk.Error, signals))
+		}
+		if chunk.Usage != nil {
+			// The usage chunk carries no deltas and no tool fragments, only
+			// the provider's count for the turn (#738). The choices loop
+			// below sees nothing in it. A report telemetry cannot read as
+			// exact whole-token counts is an absence, never a turn failure:
+			// the run must proceed exactly as it would have without the
+			// usage request. The gateway reports the turn's usage once, on
+			// a trailing chunk, so a later chunk replaces an earlier one.
+			if decoded, ok := decodeUsage(chunk.Usage); ok {
+				usage = decoded
+			}
 		}
 		for _, choice := range chunk.Choices {
 			if choice.Index != 0 {
 				// Requests carry n=1 implicitly; any other choice index is a
 				// wire shape this normalizer does not represent. Fail closed.
-				return streamError(events, fmt.Errorf("harness: unexpected stream choice index %d", choice.Index))
+				return streamError(events, usage, fmt.Errorf("harness: unexpected stream choice index %d", choice.Index))
 			}
 			if choice.Delta.Content != "" {
 				if contentBytes+len(choice.Delta.Content) > maxStreamContentBytes {
-					return streamError(events, ErrStreamContentOverflow)
+					return streamError(events, usage, ErrStreamContentOverflow)
 				}
 				contentBytes += len(choice.Delta.Content)
 				next, kept := appendBoundedEvent(events, Event{Kind: KindDelta, Text: choice.Delta.Content})
 				if !kept {
-					return streamError(events, ErrStreamEventOverflow)
+					return streamError(events, usage, ErrStreamEventOverflow)
 				}
 				events = next
 			}
@@ -548,7 +729,7 @@ func normalizeStream(body io.Reader, signals ExhaustionSignals) ([]Event, error)
 				fragment, ok := fragments[call.Index]
 				if !ok {
 					if len(fragments) >= maxStreamToolCallCount {
-						return streamError(events, ErrStreamToolCallOverflow)
+						return streamError(events, usage, ErrStreamToolCallOverflow)
 					}
 					fragment = &toolFragment{}
 					fragments[call.Index] = fragment
@@ -559,7 +740,7 @@ func normalizeStream(body io.Reader, signals ExhaustionSignals) ([]Event, error)
 				// this charges exactly the non-empty ID and Name.
 				identity := len(call.ID) + len(call.Function.Name)
 				if identityBytes+identity > maxStreamToolIdentityBytes {
-					return streamError(events, ErrStreamToolIdentityOverflow)
+					return streamError(events, usage, ErrStreamToolIdentityOverflow)
 				}
 				identityBytes += identity
 				if call.ID != "" {
@@ -570,7 +751,7 @@ func normalizeStream(body io.Reader, signals ExhaustionSignals) ([]Event, error)
 				}
 				if call.Function.Arguments != "" {
 					if argumentBytes+len(call.Function.Arguments) > maxStreamToolArgumentBytes {
-						return streamError(events, ErrStreamToolArgumentOverflow)
+						return streamError(events, usage, ErrStreamToolArgumentOverflow)
 					}
 					argumentBytes += len(call.Function.Arguments)
 					fragment.args = append(fragment.args, call.Function.Arguments...)
@@ -582,17 +763,17 @@ func normalizeStream(body io.Reader, signals ExhaustionSignals) ([]Event, error)
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return streamError(events, &GatewayTransportError{Err: err})
+		return streamError(events, usage, &GatewayTransportError{Err: err})
 	}
 	if finish == "" {
 		// A turn with no finish reason never terminalized: no content
 		// deserves to be treated as a completed answer.
-		return streamError(events, ErrStreamTruncated)
+		return streamError(events, usage, ErrStreamTruncated)
 	}
 	switch finish {
 	case "tool_calls":
 		if len(fragments) == 0 {
-			return streamError(events, fmt.Errorf("harness: tool_calls finish without any tool request"))
+			return streamError(events, usage, fmt.Errorf("harness: tool_calls finish without any tool request"))
 		}
 		// Requests are emitted atomically. Every fragment's completeness and
 		// the whole set's event capacity are checked before the first request
@@ -602,11 +783,11 @@ func normalizeStream(body io.Reader, signals ExhaustionSignals) ([]Event, error)
 		for _, index := range indexes {
 			fragment := fragments[index]
 			if fragment.call.Name == "" || fragment.call.ID == "" {
-				return streamError(events, fmt.Errorf("harness: incomplete tool request in provider stream"))
+				return streamError(events, usage, fmt.Errorf("harness: incomplete tool request in provider stream"))
 			}
 		}
 		if len(events)+len(indexes) > maxStreamEvents {
-			return streamError(events, ErrStreamEventOverflow)
+			return streamError(events, usage, ErrStreamEventOverflow)
 		}
 		for _, index := range indexes {
 			fragment := fragments[index]
@@ -616,13 +797,20 @@ func normalizeStream(body io.Reader, signals ExhaustionSignals) ([]Event, error)
 		}
 	default:
 		if len(fragments) > 0 {
-			return streamError(events, fmt.Errorf("harness: incomplete tool request in provider stream"))
+			return streamError(events, usage, fmt.Errorf("harness: incomplete tool request in provider stream"))
 		}
 		next, kept := appendBoundedEvent(events, Event{Kind: KindFinal, FinishReason: finish})
 		if !kept {
-			return streamError(events, ErrStreamEventOverflow)
+			return streamError(events, usage, ErrStreamEventOverflow)
 		}
 		events = next
+	}
+	// The terminal event is the last one in both success branches: the last
+	// assembled tool request or the final. It carries the provider's usage
+	// report for the turn when the gateway sent one (#738); a stream the
+	// provider counted is the request the run's telemetry accounts for.
+	if usage != nil {
+		events[len(events)-1].Usage = usage
 	}
 	return events, nil
 }
@@ -641,10 +829,16 @@ func appendBoundedEvent(events []Event, event Event) ([]Event, bool) {
 
 // streamError appends exactly one terminal error event to whatever events
 // already arrived. Deltas already emitted remain valid data; the turn failed
-// and is reported as such, never masked as a final. This one append is exempt
-// from maxStreamEvents on purpose: it is the report, not data.
-func streamError(events []Event, err error) ([]Event, error) {
-	return append(events, Event{Kind: KindError, Err: err}), nil
+// and is reported as such, never masked as a final. The usage the provider
+// reported before the failure rides the error event when it did (#738): a
+// stream the provider already counted is not free. This one append is
+// exempt from maxStreamEvents on purpose: it is the report, not data.
+func streamError(events []Event, usage *Usage, err error) ([]Event, error) {
+	event := Event{Kind: KindError, Err: err}
+	if usage != nil {
+		event.Usage = usage
+	}
+	return append(events, event), nil
 }
 
 func sortedFragmentIndexes(fragments map[int]*toolFragment) []int {

@@ -310,7 +310,7 @@ func budgetProbeDeps(gateway ModelTransport) ProbeDeps {
 			"git": map[string]any{"ready": true},
 		}, 0),
 		Mode:               "resolve-issue",
-		ModelProbe:         func(context.Context, string) error { return nil },
+		ModelProbe:         func(context.Context, string) ([]Event, error) { return nil, nil },
 		PublicationPresent: true,
 		SnapshotPresent:    true,
 	}

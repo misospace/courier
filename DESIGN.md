@@ -2208,6 +2208,18 @@ rich form reaches the (uncapped) log. Continuations are counted from the
 executor's own counter; the bounded token totals are exported as
 `courier_coderun_tokens_total`.
 
+The native harness reports its own model-consumption telemetry (#738) on the
+same event log: one `model.call` event per model request it sends (probe and
+work, retries included) with role/model attribution, the outcome, and the
+usage the provider reported for that request when it did — a request without
+a provider report is recorded as an explicit absence, and the harness's
+deterministic prompt estimate travels separately, never as usage — plus one
+`model.telemetry` summary next to the terminal handoff tallying requests by
+class and role/model, the reported/missing split, provider-reported token
+sums, the peak prompt size, and the compaction count with before/after
+context sizes. Both events are observability only and carry no credentials
+and no provider response text.
+
 ## Custom resources
 
 ### `CoderRun`

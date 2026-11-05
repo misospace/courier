@@ -366,11 +366,11 @@ func TestExhaustedModelBindingGateIsRecoverable(t *testing.T) {
 			"git": map[string]any{"ready": true},
 		}, 0),
 		Mode: "resolve-issue",
-		ModelProbe: func(_ context.Context, model string) error {
+		ModelProbe: func(_ context.Context, model string) ([]Event, error) {
 			if model == "test/coordinator" {
-				return gatewayStatusError(http.StatusTooManyRequests, nil, []byte(`{"error":{"type":"insufficient_quota"}}`), ExhaustionSignals{})
+				return nil, gatewayStatusError(http.StatusTooManyRequests, nil, []byte(`{"error":{"type":"insufficient_quota"}}`), ExhaustionSignals{})
 			}
-			return nil
+			return nil, nil
 		},
 		PublicationPresent: true,
 		SnapshotPresent:    true,

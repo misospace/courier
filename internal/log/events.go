@@ -60,7 +60,12 @@ const (
 	// resumed the same session with a short state message. It also marks a
 	// crash resume; the detail carries a kind distinguishing the two.
 	EventExecutorContinuation = "executor.continuation"
-	// EventModelCall reports one model invocation (future harness).
+	// EventModelCall reports one model request the native harness sent
+	// (#738) — a capability-gate completion probe or a session turn attempt,
+	// retries included — carrying the attempt number, the usage the provider
+	// reported when it did (an explicit absence when it did not), and the
+	// harness's estimated prompt size. The event is Verbose so the counts
+	// reach the log store at info level on every run, not only on debug runs.
 	EventModelCall = "model.call"
 	// EventToolCall reports one tool invocation (future harness).
 	EventToolCall = "tool.call"
@@ -95,6 +100,14 @@ const (
 	// handoff. Its detail is always included (Verbose) so the summary reaches
 	// the log store on every finished run, not only on debug runs.
 	EventRunSummary = "run.summary"
+	// EventModelTelemetry reports the run's per-run model-telemetry summary
+	// (#738): the request counts by class and by role/model cell, the split
+	// between requests whose provider reported usage and those whose did
+	// not, the token sums the provider reported, the peaks, and the
+	// compaction account, emitted next to the terminal handoff. The event is
+	// Verbose so the summary reaches the log store at info level on every
+	// finished run, not only on debug runs, like run.summary.
+	EventModelTelemetry = "model.telemetry"
 	// EventEvidenceCapture reports the best-effort failure-evidence capture
 	// taken at a gated moment (#198). It carries trigger, totals, and outcome
 	// only — never paths or content (#198).

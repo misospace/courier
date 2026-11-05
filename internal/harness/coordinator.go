@@ -78,6 +78,10 @@ type Coordinator struct {
 	budgets map[string]ContextBudget
 	// compactions receives applied-compaction telemetry.
 	compactions CompactionSink
+	// telemetry tallies the run's model requests and applied compactions
+	// for the per-run model-telemetry summary (#738); nil disables the
+	// tally and the run's behavior never changes.
+	telemetry *ModelTelemetry
 	// bootstrapReceipts receives one structured receipt per bounded
 	// bootstrap execution.
 	bootstrapReceipts BootstrapReceiptSink
@@ -253,6 +257,14 @@ type CoordinatorConfig struct {
 	// step-boundary compaction (#243). Emission is best-effort and
 	// observability only: it never changes a transcript or a run outcome.
 	Compactions CompactionSink
+	// Telemetry optionally tallies the run's model requests and applied
+	// compactions for the per-run model-telemetry summary (#738). Every
+	// session the coordinator opens reports each request attempt through
+	// it, and its compaction tally chains the run's primary compaction sink
+	// alongside: the primary keeps exactly what it received before, and the
+	// tally gains the compaction account. Nil disables the tally; the run's
+	// behavior never changes.
+	Telemetry *ModelTelemetry
 	// BootstrapReceipts optionally receives one structured receipt per
 	// bounded bootstrap execution (#414): statuses, per-task elapsed
 	// times, exit codes, the environment-key count, and the validated
@@ -297,6 +309,7 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 		activity:                config.Activity,
 		budgets:                 budgets,
 		compactions:             config.Compactions,
+		telemetry:               config.Telemetry,
 		bootstrapReceipts:       config.BootstrapReceipts,
 		briefs:                  NewBriefRegistry(),
 		checks:                  newCheckRegistry(),
@@ -475,13 +488,27 @@ type turnResult struct {
 }
 
 // newSession opens one role-bound session carrying that role's resolved
-// context policy and the compaction telemetry sink. A role with no resolved
-// budget gets a session that owns no policy and never compacts.
+// context policy, the compaction telemetry sink, and the run's model
+// telemetry (#738). A role with no resolved budget gets a session that owns
+// no policy and never compacts. When the run carries a model telemetry, the
+// session's compaction sink chains the run's primary sink beside the tally:
+// the primary keeps exactly what it received before, and the tally gains the
+// compaction account; without one the primary stands alone.
 func (c *Coordinator) newSession(role string) (*Session, error) {
-	return NewSession(c.gateway, c.bindings, role, c.activity,
+	var compactions CompactionSink
+	if c.telemetry != nil {
+		compactions = chainedCompactions{primary: c.compactions, tally: c.telemetry}
+	} else {
+		compactions = c.compactions
+	}
+	options := []SessionOption{
 		WithContextBudget(c.budgets[role]),
-		WithCompactionSink(c.compactions),
-	)
+		WithCompactionSink(compactions),
+	}
+	if c.telemetry != nil {
+		options = append(options, WithRequestSink(c.telemetry))
+	}
+	return NewSession(c.gateway, c.bindings, role, c.activity, options...)
 }
 
 // pump drives one model turn through the normalized event contract: the

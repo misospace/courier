@@ -57,6 +57,34 @@ type ToolResult struct {
 	IsError    bool   `json:"isError,omitempty"`
 }
 
+// Usage is the provider's own token accounting for one model request
+// (#738): the input tokens accepted, the output tokens produced, and the
+// prompt-cache tokens read from and written to the provider's cache. The
+// transports normalize the provider's wire shape into this struct and ride
+// it on the turn's terminal event when the provider reports one; a nil
+// Usage on a terminal event is an explicit absence — the provider said
+// nothing — never a zero an average might mistake for a free request.
+//
+// Two conventions the reader must keep in mind. First, InputTokens is the
+// provider's own headline input figure, and providers define it
+// differently: the OpenAI-compatible prompt_tokens includes the cached
+// subset it reports beside it, while the Anthropic input_tokens excludes
+// the cache reads and writes it reports beside it. Totals therefore sum
+// each provider's own definition, and comparisons across transports must
+// consult the provider's definition — the harness deliberately never
+// derives a number the provider did not report. Second, a sub-count the
+// provider did not send within a reported usage reads as zero in this
+// struct: the request-level report is exact, the field-level report is the
+// provider's, and the run's `usage_reported` split stays the boundary
+// between "the provider said something" and "the provider said nothing".
+// It is observability data and never feeds any policy decision.
+type Usage struct {
+	InputTokens      int64
+	OutputTokens     int64
+	CacheReadTokens  int64
+	CacheWriteTokens int64
+}
+
 // Event is one normalized stream event. Exactly the fields named by Kind are
 // meaningful; consumers must switch on Kind rather than guessing from fields.
 type Event struct {
@@ -76,6 +104,11 @@ type Event struct {
 	// Err is the redacted failure for KindError. It is safe to log or
 	// surface: the gateway normalizer never echoes provider response bodies.
 	Err error
+	// Usage carries the provider's token report for the request on the
+	// turn's terminal event when the provider reported one (#738). Nil is
+	// an explicit absence: the provider said nothing, and the run's
+	// telemetry records that absence rather than inventing a zero.
+	Usage *Usage
 }
 
 // ErrStreamTruncated reports a stream that ended without a terminal event.

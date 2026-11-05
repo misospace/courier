@@ -233,6 +233,10 @@ type Session struct {
 
 	budget      ContextBudget
 	compactions CompactionSink
+	// requests receives one observation per model request the session
+	// sends (#738): every attempt, with the usage the provider reported on
+	// the terminal event when it did. Nil sends no observations.
+	requests ModelRequestSink
 
 	// pinned is the number of leading messages compaction must never digest:
 	// the run's objective plus the harness's own framing, and the brief plus
@@ -262,6 +266,13 @@ func WithContextBudget(budget ContextBudget) SessionOption {
 // WithCompactionSink installs the applied-compaction telemetry sink.
 func WithCompactionSink(sink CompactionSink) SessionOption {
 	return func(s *Session) { s.compactions = sink }
+}
+
+// WithRequestSink installs the session's per-request model-telemetry sink
+// (#738): one observation per model request the session sends, every
+// attempt, carrying the usage the provider reported when it did.
+func WithRequestSink(sink ModelRequestSink) SessionOption {
+	return func(s *Session) { s.requests = sink }
 }
 
 // NewSession opens a session for one role's bound model.
@@ -310,7 +321,25 @@ func (s *Session) Settle(text string) {
 // (final or tool requests) earns its chunks as activity (HARNESS.md §6:
 // retries are active, not alive). The returned events always end with a
 // terminal event (final, tool requests, or error).
+//
+// Every attempt the session sends — the first and each in-process retry — is
+// observed as one work request by the session's request sink (#738): the
+// sink is observability only, and a failed observation never changes the
+// turn's outcome.
 func (s *Session) Turn(ctx context.Context, tools []ToolDef) []Event {
+	// The harness's deterministic estimate of the request's prompt size:
+	// the transcript plus the tool declarations, the same account the
+	// compaction boundary measures requests with. It is measured once per
+	// call, before any retry: every attempt this call sends is the same
+	// request, so the estimate does not change between them. A session with
+	// no request sink spends nothing on the measurement (#738).
+	estimated := 0
+	if s.requests != nil {
+		estimated = estimateToolTokens(tools)
+		for _, message := range s.Messages {
+			estimated += estimateMessageTokens(message)
+		}
+	}
 	for attempt := 0; ; attempt++ {
 		events, err := s.gateway.StreamChat(ctx, ChatRequest{
 			Model:     s.binding,
@@ -320,10 +349,12 @@ func (s *Session) Turn(ctx context.Context, tools []ToolDef) []Event {
 		})
 		if err != nil {
 			// A request-build failure is the harness's own bug, not the
-			// gateway's; report it once without retry theater.
+			// gateway's; report it once without retry theater. It is not a
+			// model request and is not observed as one.
 			return []Event{{Kind: KindError, Err: err}}
 		}
 		terminal := events[len(events)-1]
+		s.observeRequest(attempt, estimated, terminal)
 		if terminal.Kind != KindError {
 			s.recordActivity(events)
 			return events
@@ -341,6 +372,24 @@ func (s *Session) Turn(ctx context.Context, tools []ToolDef) []Event {
 		}
 		return events
 	}
+}
+
+// observeRequest delivers one work-request observation to the session's
+// request sink (#738). The observation carries the attempt index, the
+// harness's estimated prompt size, and the usage the provider reported on the
+// terminal event when it did — nil is an explicit absence. Delivery is
+// fire-and-forget and isolated: the sink is observability, and a failing
+// sink is dropped, never allowed to change the turn.
+func (s *Session) observeRequest(attempt, estimated int, terminal Event) {
+	deliverRequest(s.requests, RequestObservation{
+		Class:                 RequestWork,
+		Role:                  s.role,
+		Model:                 s.binding,
+		Attempt:               attempt,
+		OK:                    terminal.Kind != KindError,
+		Usage:                 terminal.Usage,
+		EstimatedPromptTokens: estimated,
+	})
 }
 
 // tokensPerChar is the estimate's characters-per-token ratio. Tokenization is
@@ -497,8 +546,9 @@ func (s *Session) Compact(tools []ToolDef) (CompactEvent, bool, error) {
 	s.budget = plan.BudgetAfter
 	event := CompactEvent{Role: s.role, Model: s.binding, Before: plan.Before, After: after, NetSaved: plan.Before - after, DigestedTokens: digestedTokens}
 	if s.compactions != nil {
-		// Observability only: a sink cannot fail a run or a transcript.
-		s.compactions.SessionCompacted(event)
+		// Observability only: a sink cannot fail a run or a transcript, and
+		// a failing sink is isolated at the delivery (#738).
+		deliverCompaction(s.compactions, event)
 	}
 	return event, true, nil
 }

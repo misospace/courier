@@ -1811,11 +1811,11 @@ func TestOptionalRoleDegradedDoesNotGate(t *testing.T) {
 			},
 			"git": map[string]any{"ready": true},
 		}, 0),
-		ModelProbe: func(_ context.Context, model string) error {
+		ModelProbe: func(_ context.Context, model string) ([]Event, error) {
 			if model == "test/coder" {
-				return errors.New("gateway unavailable")
+				return nil, errors.New("gateway unavailable")
 			}
-			return nil
+			return nil, nil
 		},
 		PublicationPresent: true,
 		SnapshotPresent:    true,
@@ -1860,9 +1860,9 @@ func TestSharedModelBindingProbesOnce(t *testing.T) {
 	deps := ProbeDeps{
 		Transport: &Gateway{BaseURL: "http://example.invalid"},
 		Bindings:  bindings,
-		ModelProbe: func(_ context.Context, model string) error {
+		ModelProbe: func(_ context.Context, model string) ([]Event, error) {
 			probed = append(probed, model)
-			return nil
+			return nil, nil
 		},
 	}
 	caps := ProbeCapabilities(context.Background(), deps)
@@ -1921,9 +1921,9 @@ func TestSharedBindingFailureReportsEveryRole(t *testing.T) {
 			"git": map[string]any{"ready": true},
 		}, 0),
 		Mode: "resolve-issue",
-		ModelProbe: func(context.Context, string) error {
+		ModelProbe: func(context.Context, string) ([]Event, error) {
 			probes++
-			return gatewayStatusError(http.StatusTooManyRequests, nil,
+			return nil, gatewayStatusError(http.StatusTooManyRequests, nil,
 				[]byte(`{"error":{"type":"insufficient_quota"}}`), ExhaustionSignals{})
 		},
 		PublicationPresent: true,
