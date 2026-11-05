@@ -1668,6 +1668,32 @@ func TestCredentialEnvRefsMatchRenderedPodSecretRefs(t *testing.T) {
 			config: PodConfig{GitHubCredentialSecret: "courier-github-api", GitHubTokenKey: "api-token"},
 			want:   []CredentialEnvRef{{Name: "GITHUB_TOKEN", Secret: "courier-github-api", Key: "api-token"}},
 		},
+		{
+			name: "rebase assist key only when enabled and configured",
+			config: PodConfig{
+				RebaseModelAssist:     true,
+				ModelGatewayURL:       "http://gateway:4000/v1",
+				ModelGatewayKeySecret: "gateway-key",
+				ModelGatewayKeyName:   "api-key",
+			},
+			want: []CredentialEnvRef{{Name: "COURIER_MODEL_GATEWAY_API_KEY", Secret: "gateway-key", Key: "api-key"}},
+		},
+		{
+			name: "rebase assist key disabled without the capability",
+			config: PodConfig{
+				ModelGatewayURL:       "http://gateway:4000/v1",
+				ModelGatewayKeySecret: "gateway-key",
+			},
+			want: nil,
+		},
+		{
+			name: "rebase assist enabled with empty key secret means unauthenticated",
+			config: PodConfig{
+				RebaseModelAssist: true,
+				ModelGatewayURL:   "http://gateway:4000/v1",
+			},
+			want: nil,
+		},
 		{name: "neither", config: PodConfig{}, want: nil},
 	} {
 		t.Run(test.name, func(t *testing.T) {

@@ -37,16 +37,16 @@ func (f *fakeResolver) Resolve(ctx context.Context, req AssistRequest) (*AssistR
 func executeAssisted(t *testing.T, f fixture, expectedHead string, resolver ModelResolver) Result {
 	t.Helper()
 	result, err := Execute(context.Background(), Options{
-		Repo:          "acme/widgets",
-		Base:          f.base,
-		Branch:        f.branch,
-		ExpectedHead:  expectedHead,
-		Workspace:     f.workspace,
-		RemoteURL:     f.origin,
-		Goal:          "keep the pull request replayable onto its live base",
-		ModelResolver: resolver,
-		AssistTimeout: 30 * time.Second,
-		CheckTimeout:  30 * time.Second,
+		Repo:            "acme/widgets",
+		Base:            f.base,
+		Branch:          f.branch,
+		ExpectedHead:    expectedHead,
+		Workspace:       f.workspace,
+		RemoteURL:       f.origin,
+		Goal:            "keep the pull request replayable onto its live base",
+		ModelResolver:   resolver,
+		LockfileTimeout: 30 * time.Second,
+		CheckTimeout:    30 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
@@ -212,9 +212,9 @@ func TestAssistResolverErrorFailsAttempt(t *testing.T) {
 	}
 }
 
-// Without a configured resolver the engine is byte-for-byte the mechanical
-// one: the two-sided conflict stops as a semantic conflict and no assist
-// report exists at all.
+// Without a configured resolver the closed rules are the entire story: the
+// two-sided conflict stops as a semantic conflict and no assist report
+// exists at all.
 func TestNilResolverLeavesNoAssistReport(t *testing.T) {
 	f := newFixture(t,
 		map[string]string{"code.go": "package main\n\nfunc main() {\n\tx := 3\n\t_ = x\n}\n"},
@@ -462,6 +462,74 @@ func TestAssistSymlinkConflictStopsForHuman(t *testing.T) {
 	}
 }
 
+// A conflicted path whose name carries a NUL byte is refused the same way a
+// symlink is: the operating system rejects the name outright (EINVAL), and
+// git cannot produce such a tree entry, so the path is anomalous rather than
+// infrastructural. resolveFile must return the non-regular stop-for-a-human
+// verdict and write nothing into the workspace.
+func TestResolveFileRefusesNullBytePath(t *testing.T) {
+	directory := t.TempDir()
+	resolved, err := resolveFile(directory, "bad\x00name")
+	var nonRegular *nonRegularConflictError
+	if !errors.As(err, &nonRegular) || nonRegular.path != "bad\x00name" {
+		t.Fatalf("err = %v, want nonRegularConflictError naming the path", err)
+	}
+	if resolved {
+		t.Fatal("resolveFile resolved a path the filesystem refuses")
+	}
+	if !strings.Contains(nonRegular.Error(), "not a name the filesystem accepts") {
+		t.Fatalf("err = %q, want the verdict that names the refused name", nonRegular.Error())
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("directory entries = %v (%v), want nothing written", entries, err)
+	}
+}
+
+// boundedFileContent refuses a NUL-byte path with the same verdict: the
+// prompt can never carry content lifted through a name the OS refuses.
+func TestBoundedFileContentRefusesNullBytePath(t *testing.T) {
+	_, err := boundedFileContent(t.TempDir(), "bad\x00name")
+	var nonRegular *nonRegularConflictError
+	if !errors.As(err, &nonRegular) || nonRegular.path != "bad\x00name" {
+		t.Fatalf("err = %v, want nonRegularConflictError naming the path", err)
+	}
+}
+
+// At the episode level a NUL-byte conflicted path ends as the same semantic
+// conflict a non-regular path gets — the NeedsHuman-classified ending —
+// naming the path, with the model never asked. Git itself can never stage
+// such a tree entry, which is precisely why the path is anomalous, so the
+// round loop's seam is driven directly against a prepared workspace with the
+// conflicted path list Execute would otherwise have received from git.
+func TestNullByteConflictedPathStopsForHuman(t *testing.T) {
+	f := newFixture(t,
+		map[string]string{"code.go": "package main\n\nfunc main() {\n\tx := 3\n\t_ = x\n}\n"},
+		map[string]string{"code.go": "package main\n\nfunc main() {\n\tx := 2\n\t_ = x\n}\n"},
+	)
+	resolver := &fakeResolver{res: &AssistResolution{
+		Files: map[string]string{"bad\x00name": "should never be written"},
+		Model: "litellm/test-model",
+	}}
+	err := resolveConflicts(context.Background(),
+		&git.Workspace{Directory: f.workspace, Base: f.base},
+		Options{ModelResolver: resolver}, f.head,
+		[]string{"code.go", "bad\x00name"}, &AssistReport{})
+	var semantic *semanticError
+	if !errors.As(err, &semantic) {
+		t.Fatalf("err = %v, want a semantic conflict — the NeedsHuman-classified ending", err)
+	}
+	if len(semantic.files) != 1 || semantic.files[0] != "bad\x00name" {
+		t.Fatalf("conflict files = %v, want the anomalous path named", semantic.files)
+	}
+	if !strings.Contains(semantic.reason, "bad\x00name") {
+		t.Fatalf("reason = %q, want the anomalous path named", semantic.reason)
+	}
+	if resolver.calls != 0 {
+		t.Fatalf("resolver calls = %d, want no model turn at all", resolver.calls)
+	}
+}
+
 // The lockfile hint fires on go.sum alone, and the tidy rewrite touches
 // go.mod — a sibling the rejected set never named. Both must be staged, or
 // RebaseContinue fails as an unattributable error; with both staged the
@@ -510,11 +578,14 @@ func TestAssistTidyRestagesRewrittenSibling(t *testing.T) {
 	}
 }
 
-// Each replayed commit that conflicts gets its own single turn: two stops,
-// two answered turns, and each request carries only that round's rejected
-// file. internal/git's RebaseContinue classifies a stop on the next replayed
-// commit exactly like Rebase's, so the round loop sees the second round.
-func TestAssistSecondRoundGetsItsOwnTurn(t *testing.T) {
+// The episode's single model-assisted attempt (#732): the first conflicting
+// round spends it — the valid resolution is written and staged, the replay
+// continues — and the second round that rejects again stops for a human with
+// its own conflicts named and a reason that honestly reports the spent
+// attempt. One attempt per episode, never one per round. internal/git's
+// RebaseContinue classifies a stop on the next replayed commit exactly like
+// Rebase's, so the round loop sees the second round.
+func TestAssistSecondRoundStopsAfterAttemptSpent(t *testing.T) {
 	origin := t.TempDir()
 	runGit(t, origin, "init", "--initial-branch=main")
 	runGit(t, origin, "config", "user.name", "Courier Rebase Test")
@@ -551,21 +622,28 @@ func TestAssistSecondRoundGetsItsOwnTurn(t *testing.T) {
 		{Files: map[string]string{"notes.md": "intro\ntrack := 7\nbody\n"}, Model: "litellm/test-model"},
 	}}
 	result := executeAssisted(t, f, head, resolver)
-	if result.Outcome != OutcomePublished {
+	if result.Outcome != OutcomeSemanticConflict {
 		t.Fatalf("outcome = %q (%s)", result.Outcome, result.Reason)
 	}
-	if resolver.calls != 2 {
-		t.Fatalf("resolver calls = %d, want one turn per conflicting round", resolver.calls)
+	if resolver.calls != 1 {
+		t.Fatalf("resolver calls = %d, want exactly one attempt per episode", resolver.calls)
 	}
-	if result.Assist == nil || !result.Assist.Attempted || result.Assist.Turns != 2 {
-		t.Fatalf("assist report = %#v, want two answered turns", result.Assist)
+	if len(resolver.reqs[0].Conflicts) != 1 || resolver.reqs[0].Conflicts[0].Path != "code.go" ||
+		!strings.Contains(resolver.reqs[0].Conflicts[0].Content, "<<<<<<<") {
+		t.Fatalf("round 1 conflicts = %#v, want the marked code.go conflict", resolver.reqs[0].Conflicts)
 	}
-	for i, want := range []string{"code.go", "notes.md"} {
-		conflicts := resolver.reqs[i].Conflicts
-		if len(conflicts) != 1 || conflicts[0].Path != want ||
-			!strings.Contains(conflicts[0].Content, "<<<<<<<") {
-			t.Fatalf("round %d conflicts = %#v, want the marked %s conflict", i+1, conflicts, want)
-		}
+	if result.Assist == nil || !result.Assist.Attempted || result.Assist.Turns != 1 ||
+		len(result.Assist.FilesResolved) != 1 || result.Assist.FilesResolved[0] != "code.go" {
+		t.Fatalf("assist report = %#v, want the one answered turn that resolved code.go", result.Assist)
+	}
+	if result.Conflict == nil || len(result.Conflict.Files) != 1 || result.Conflict.Files[0] != "notes.md" {
+		t.Fatalf("conflict = %#v, want the second round's notes.md", result.Conflict)
+	}
+	if !strings.Contains(result.Reason, "already spent") {
+		t.Fatalf("reason = %q, want the spent-attempt verdict", result.Reason)
+	}
+	if got := remoteHead(t, f); got != head {
+		t.Fatalf("remote head = %q, want the untouched lease head", got)
 	}
 }
 

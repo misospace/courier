@@ -21,13 +21,10 @@ import (
 
 const (
 	// rebaseAssistMaxResponseBytes bounds the assembled model response. It
-	// is a transport resource bound, not a work limit: a response larger
-	// than this is a broken or hostile turn, and the engine's own content
-	// bound (rebase.maxConflictFileBytes) still governs what may be written.
+	// is a transport resource bound — memory while draining the stream —
+	// not a work cap: the engine's own content bound
+	// (rebase.maxConflictFileBytes) governs what may be written.
 	rebaseAssistMaxResponseBytes = 4 << 20
-	// rebaseAssistMaxOutputTokens is the output ceiling one resolution turn
-	// reserves: a full-file resolution answer for one conflict round.
-	rebaseAssistMaxOutputTokens = 8192
 )
 
 // gatewayResolver implements rebase.ModelResolver over the harness Gateway.
@@ -70,16 +67,16 @@ func newRebaseAssistResolver(cfg config) (rebase.ModelResolver, error) {
 
 // Resolve sends one chat request for the engine's resolution turn and maps
 // the streamed answer into an AssistResolution. One call, one turn, no
-// retry: the engine owns retry policy by re-asking in a later round, and a
-// transport that retried here would spend unbounded model turns outside the
-// engine's accounting.
+// retry and no re-ask: the engine issues at most one model-assisted attempt
+// per episode, so a transport that retried or re-asked here would spend
+// model turns outside the engine's accounting. The request leaves MaxTokens
+// unset — the harness transport's own lane output reservation applies — and
+// the turn is bounded by the caller's context alone: the run's own context
+// (SIGTERM) governs it, with no executor-side timer on model behavior.
 func (g *gatewayResolver) Resolve(ctx context.Context, req rebase.AssistRequest) (*rebase.AssistResolution, error) {
-	assistCtx, cancel := context.WithTimeout(ctx, rebase.DefaultAssistTimeout)
-	defer cancel()
-	events, err := g.gateway.StreamChat(assistCtx, harness.ChatRequest{
-		Model:     g.model,
-		Messages:  []harness.Message{{Role: "user", Content: req.Prompt()}},
-		MaxTokens: rebaseAssistMaxOutputTokens,
+	events, err := g.gateway.StreamChat(ctx, harness.ChatRequest{
+		Model:    g.model,
+		Messages: []harness.Message{{Role: "user", Content: req.Prompt()}},
 	})
 	if err != nil {
 		return nil, err

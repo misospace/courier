@@ -172,6 +172,14 @@ func main() {
 	flag.StringVar(&modelGatewayKeyName, "model-gateway-key-name", "key", "Secure mode: key within the model-gateway key Secret.")
 	flag.StringVar(&modelGatewayCIDR, "model-gateway-cidr", "", "Secure mode: CIDR of the model gateway for control egress policy; empty means no gateway egress slot.")
 	flag.IntVar(&modelGatewayPort, "model-gateway-port", 0, "Secure mode: model gateway port for control egress policy.")
+	var rebaseModelAssist bool
+	var rebaseModelGatewayURL string
+	var rebaseModelGatewayKeySecret string
+	var rebaseModelGatewayKeyName string
+	flag.BoolVar(&rebaseModelAssist, "rebase-model-assist", false, "Enable model-assisted conflict resolution in rebase-run coordinator pods; requires --rebase-model-gateway-url.")
+	flag.StringVar(&rebaseModelGatewayURL, "rebase-model-gateway-url", "", "OpenAI-compatible model gateway API root the rebase assist resolves conflicts through; required when --rebase-model-assist is enabled.")
+	flag.StringVar(&rebaseModelGatewayKeySecret, "rebase-model-gateway-key-secret", "", "Secret containing the model-gateway API key, injected into rebase pods only when --rebase-model-assist is enabled; empty means an unauthenticated gateway.")
+	flag.StringVar(&rebaseModelGatewayKeyName, "rebase-model-gateway-key-name", "key", "Key within the model-gateway API key Secret.")
 	flag.BoolVar(&dispatchEnabled, "dispatch-enabled", false, "Enable Dispatch source discovery.")
 	flag.BoolVar(&dispatchPRFixExclusions, "dispatch-pr-fix-exclusions", false, "Enable Dispatch PR-fix exclusion acknowledgements.")
 	flag.StringVar(&dispatchBaseURL, "dispatch-base-url", "", "Dispatch base URL.")
@@ -348,6 +356,17 @@ func main() {
 	podConfig.GitHubMCPURL = githubMCPURL
 	podConfig.Context7MCPURL = context7MCPURL
 	podConfig.MetricsMCPURL = metricsMCPURL
+	podConfig.RebaseModelAssist = rebaseModelAssist
+	podConfig.ModelGatewayURL = rebaseModelGatewayURL
+	podConfig.ModelGatewayKeySecret = rebaseModelGatewayKeySecret
+	podConfig.ModelGatewayKeyName = rebaseModelGatewayKeyName
+	// Fail fast on a rebase assist enabled without its transport rather than
+	// at the first rebase run: enabled-but-unconfigured must never silently
+	// publish under different rules than the deployment asked for (#732).
+	if rebaseModelAssist && strings.TrimSpace(rebaseModelGatewayURL) == "" {
+		setupLog.Error(fmt.Errorf("--rebase-model-assist is enabled but COURIER_MODEL_GATEWAY_URL is not set"), "unable to configure rebase model assist")
+		os.Exit(1)
+	}
 	launcher := &controller.CoordinatorLauncher{
 		Client:    mgr.GetClient(),
 		APIReader: mgr.GetAPIReader(),

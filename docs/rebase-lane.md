@@ -36,11 +36,16 @@ binary takes an explicit branch before workspace preparation:
    edits, deletions against modifications — stops the attempt for a human with
    the file list. The rules never pick a side for
    code and never merge code text. When the operator explicitly enables
-   model-assisted conflict resolution (below), the engine may hand one round's
-   rejected set to the configured coordinator model for a single validated
-   resolution turn; the closed rules, the validation, the lease, and the
-   bounded checks all still govern what may land, and a disabled (nil)
-   resolver is exactly the mechanical-only behavior.
+   model-assisted conflict resolution (below), the engine may hand the
+   episode's first rejected set to the configured coordinator model for one
+   validated resolution attempt; the closed rules, the validation, the
+   lease, and the bounded checks all still govern what may land. A disabled
+   (nil) resolver is the same closed-rules engine with one deliberate
+   refinement: a conflicted path that is not a regular file — or not a name
+   the filesystem accepts at all — stops the attempt for a human (named,
+   with reason) instead of being read or written through; every such
+   episode still ends parked for a human, and no model-assisted code can
+   run on that path.
 4. **Bounded repository checks** run before publication: rebase fully
    completed, tree clean, branch identity unchanged, base contained, no commit
    lost, plus a bounded `go build ./...` when the repository is a Go module. A
@@ -189,30 +194,39 @@ agent allowlist, the serialized concurrency-one gate, and rebase-only intake):
 
 ### Model-assisted conflict resolution (#732)
 
-Off by default. When `COURIER_REBASE_MODEL_ASSIST` is enabled (one of `1`,
-`true`, `enabled`) and `COURIER_MODEL_GATEWAY_URL` names the run's
-OpenAI-compatible gateway (`COURIER_MODEL_GATEWAY_API_KEY` authenticates it),
-the engine consults the configured coordinator model exactly once per
-conflict round for the files the mechanical rules rejected. The request
-carries repository content only: the bounded PR diff, the base-side diff
-restricted to the conflicted paths, the marked conflict files, and the run
-goal. No credentials ever cross the engine boundary. The answer must be one
-JSON object resolving exactly the rejected files with marker-free full file
-content. The turn reserves an 8192-token output ceiling, which bounds how
-large a single resolvable file can be: a conflicted file whose resolved
-content cannot fit inside one bounded answer cannot be model-resolved, and
-the attempt stops for a human instead. Anything else — a refusal, a foreign
-path, leftover markers,
-oversized content — is treated as a refusal, and the attempt stops for a
-human with the attempted-and-did-not-resolve summary. When the
-conflict set includes `go.mod`/`go.sum` and the `go` tool exists, the
-allowlisted `go mod tidy` runs once inside the workspace after the
-resolution is written, and its outputs are staged again. A tidy failure
-leaves the conflict unresolved. A resolver transport failure is a `failed`
-attempt, never a semantic conflict, so the source's failure policy, not a
-human queue, governs it. Every model-assisted turn is reported on the
-`rebase.model.assist` run event (model, turns, files, token usage),
-for published and unresolved endings alike.
+Off by default. The operator enables it on the coordinator launcher with
+`--rebase-model-assist` plus `--rebase-model-gateway-url` (the
+OpenAI-compatible gateway API root), optionally
+`--rebase-model-gateway-key-secret` (a Secret holding the API key; empty
+means an unauthenticated gateway) and `--rebase-model-gateway-key-name`.
+The pod builder renders the capability into rebase-run coordinator pods as
+exactly three environment variables — `COURIER_REBASE_MODEL_ASSIST=enabled`,
+`COURIER_MODEL_GATEWAY_URL`, and the `COURIER_MODEL_GATEWAY_API_KEY`
+SecretKeyRef — emitted only when the capability is enabled, because their
+absence is the meaningful fail-closed default. The engine consults the
+configured coordinator model exactly once per rebase episode for the first
+rejected set the mechanical rules produce; a later conflict round in the
+same episode has already spent that one attempt, and the attempt stops for
+a human with the new conflicts named. The request carries repository
+content only: the bounded PR diff, the base-side diff restricted to the
+conflicted paths, the marked conflict files, and the run goal. No
+credentials ever cross the engine boundary. The answer must be one JSON
+object resolving exactly the rejected files with marker-free full file
+content. No executor-side token ceiling or model-turn timer governs the
+turn: the lane's own output reservation and the run's own context
+(SIGTERM) bound the model's behavior, while the engine's content bound and
+validation still govern what may be written. Anything else — a refusal, a
+foreign path, leftover markers, oversized content — is treated as a
+refusal, and the attempt stops for a human with the
+attempted-and-did-not-resolve summary. When the conflict set includes
+`go.mod`/`go.sum` and the `go` tool exists, the allowlisted `go mod tidy`
+runs once inside the workspace after the resolution is written, and its
+outputs are staged again. A tidy failure leaves the conflict unresolved. A
+resolver transport failure is a `failed` attempt, never a semantic
+conflict, so the source's failure policy, not a human queue, governs it.
+The episode's model-assisted attempt is reported on the
+`rebase.model.assist` run event (model, turns, files, token usage), for
+published and unresolved endings alike.
 
 The cross-repository capability negotiation that would let Dispatch route
 model-backed rebase work is not settled yet (misospace/dispatch#1540). The
@@ -229,7 +243,7 @@ explicit operator choice until that contract lands.
   recognized toolchain are published after the structural checks alone.
 - Mechanical conflict resolution is deliberately narrower than #1327's full
   wish list (lockfiles and version strings need their tools and are classified
-  semantic here, stopping for a human). The rules can widen only with new
-  proofs, never by picking a likely side for code. Model-assisted resolution,
-  when explicitly enabled, is a bounded escape hatch beside the rules: one
-  validated turn per round, never a widening of the rules themselves.
+   semantic here, stopping for a human). The rules can widen only with new
+   proofs, never by picking a likely side for code. Model-assisted resolution,
+   when explicitly enabled, is a bounded escape hatch beside the rules: one
+   validated attempt per episode, never a widening of the rules themselves.

@@ -31,11 +31,15 @@ func (e *semanticError) Error() string {
 // replay that resolves some hunks and stops midway leaves a half-written
 // branch no better than it started.
 //
-// When opts.ModelResolver is nil the rules are the entire story and the
-// behavior is exactly the mechanical-only engine. When one is configured,
-// a round's rejected set goes to exactly one model-assisted turn (see
-// assistRound) before the round is declared semantic: the fast path, its
-// all-or-nothing property, and the closed rules themselves are untouched.
+// When opts.ModelResolver is nil the rules are the entire story, with one
+// deliberate refinement: a conflicted path that is not a regular file — or
+// not a name the filesystem accepts at all — stops the attempt for a human
+// instead of being read or written through. When one is configured, the
+// episode's first rejected set goes to exactly one model-assisted attempt
+// (see assistRound); a later round in the same episode that rejects again
+// has already spent that single attempt, and the attempt stops for a human
+// with the new conflicts named. The fast path, the all-or-nothing property,
+// and the closed rules themselves are untouched.
 //
 // The rules are deliberately narrow. A hunk resolves mechanically only when
 // the base-side content proves which side moved:
@@ -55,6 +59,10 @@ func resolveConflicts(ctx context.Context, w *git.Workspace, opts Options, origH
 		return errors.New("rebase stopped without reporting conflicted paths")
 	}
 	sort.Strings(paths)
+	// The episode's single model-assisted attempt (#732): spent on the first
+	// round whose rejected set reaches the resolver, and never renewed
+	// within the same Execute.
+	assistSpent := false
 	for round := 0; round < maxRebaseRounds; round++ {
 		var rejected []string
 		for _, path := range paths {
@@ -62,13 +70,13 @@ func resolveConflicts(ctx context.Context, w *git.Workspace, opts Options, origH
 			if err != nil {
 				var nonRegular *nonRegularConflictError
 				if errors.As(err, &nonRegular) {
-					// A non-regular conflicted path can never be classified,
-					// mechanically or otherwise: the attempt stops for a
-					// human with the path named, exactly as a non-mechanical
-					// hunk would.
+					// A conflicted path that can never be classified — not
+					// a regular file, or not a name the filesystem accepts
+					// — stops the attempt for a human with the path named,
+					// exactly as a non-mechanical hunk would.
 					return &semanticError{
 						files:  []string{path},
-						reason: fmt.Sprintf("conflicted path %s is not a regular file; the engine will not read or write through it", path),
+						reason: nonRegular.Error(),
 					}
 				}
 				return fmt.Errorf("classify conflict in %s: %w", path, err)
@@ -89,9 +97,17 @@ func resolveConflicts(ctx context.Context, w *git.Workspace, opts Options, origH
 				}
 			}
 			// The mechanical rules rejected this round's set and a resolver
-			// is configured: one model-assisted turn answers for the whole
-			// set, then the shared continue below runs. A later round may
-			// conflict again and get its own single turn.
+			// is configured. The episode's single model-assisted attempt was
+			// already spent on an earlier round: a new rejected set is a new
+			// conflict the one bounded attempt cannot answer, so the attempt
+			// stops for a human with the new conflicts named honestly.
+			if assistSpent {
+				return &semanticError{
+					files:  rejected,
+					reason: "the episode's single model-assisted attempt was already spent on an earlier conflict round; the new conflicts need a human decision",
+				}
+			}
+			assistSpent = true
 			if err := assistRound(ctx, w, opts, origHead, rejected, assist); err != nil {
 				return err
 			}
@@ -116,15 +132,18 @@ func resolveConflicts(ctx context.Context, w *git.Workspace, opts Options, origH
 // without touching the file when any hunk is non-mechanical, so a rejected
 // file keeps git's markers exactly as the rebase left them for the human
 // summary. A conflicted path that is not a regular file — git leaves the
-// symlink itself in the worktree on a symlink content conflict — is refused
-// as a nonRegularConflictError: reading or writing through the link would
-// reach a path outside the workspace, and a mechanical rule never writes
-// bytes it cannot see the provenance of.
+// symlink itself in the worktree on a symlink content conflict — or not a
+// name the filesystem accepts at all (a NUL byte or an over-long name, which
+// git cannot produce as a tree entry) is refused as a
+// nonRegularConflictError: reading or writing through the link would reach a
+// path outside the workspace, a mechanical rule never writes bytes it cannot
+// see the provenance of, and an unnamable path is anomalous rather than an
+// infrastructure fault to leak.
 func resolveFile(directory, path string) (bool, error) {
 	full := filepath.Join(directory, filepath.FromSlash(path))
 	info, err := os.Lstat(full)
 	if err != nil {
-		return false, err
+		return false, lstatRefusal(path, err)
 	}
 	if !info.Mode().IsRegular() {
 		return false, &nonRegularConflictError{path: path}

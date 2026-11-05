@@ -1790,16 +1790,16 @@ func runRebaseMode(ctx context.Context, report reporter, cfg config) int {
 		return exitFailed
 	}
 	outcome, err := rebase.Execute(ctx, rebase.Options{
-		Repo:          cfg.Repo,
-		Base:          cfg.Base,
-		Branch:        cfg.Branch,
-		ExpectedHead:  cfg.HeadSHA,
-		Workspace:     cfg.Directory,
-		RemoteURL:     cfg.RemoteURL,
-		BaseRemoteURL: cfg.BaseRemoteURL,
-		Goal:          cfg.Goal,
-		ModelResolver: resolver,
-		AssistTimeout: rebase.DefaultAssistTimeout,
+		Repo:            cfg.Repo,
+		Base:            cfg.Base,
+		Branch:          cfg.Branch,
+		ExpectedHead:    cfg.HeadSHA,
+		Workspace:       cfg.Directory,
+		RemoteURL:       cfg.RemoteURL,
+		BaseRemoteURL:   cfg.BaseRemoteURL,
+		Goal:            cfg.Goal,
+		ModelResolver:   resolver,
+		LockfileTimeout: rebase.DefaultLockfileTimeout,
 	})
 	if err != nil {
 		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: exitFailed, Reason: err.Error(), Category: terminalCategoryExecutorCrash})

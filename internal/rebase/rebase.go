@@ -104,13 +104,20 @@ type Options struct {
 	// Goal is the run's goal text, carried into a model-assisted resolution
 	// request as context for why the pull request exists; reason text only.
 	Goal string
-	// ModelResolver, when non-nil, is consulted once per conflict round for
-	// the files the mechanical rules rejected; nil means deterministic-only
-	// resolution — today's behavior, unchanged.
+	// ModelResolver, when non-nil, is consulted at most once per rebase
+	// episode for the files the mechanical rules rejected (the first round
+	// that rejects; a later round that rejects again stops for a human with
+	// its own conflicts). nil means the same closed-rules engine with one
+	// deliberate refinement: a conflicted path that is not a regular file —
+	// or not a name the filesystem accepts at all — stops the attempt for a
+	// human instead of being read or written through. Every such episode
+	// still ends parked for a human, and no model-assisted code can run on
+	// that path.
 	ModelResolver ModelResolver
-	// AssistTimeout bounds the allowlisted lockfile regeneration inside a
-	// model-assisted round; zero uses DefaultAssistTimeout.
-	AssistTimeout time.Duration
+	// LockfileTimeout bounds the allowlisted lockfile regeneration inside a
+	// model-assisted episode; zero uses DefaultLockfileTimeout. It never
+	// bounds a model-assisted turn — the run's own context governs that.
+	LockfileTimeout time.Duration
 	// CheckTimeout bounds each bounded repository check invocation; zero uses
 	// DefaultCheckTimeout.
 	CheckTimeout time.Duration

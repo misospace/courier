@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/misospace/courier/internal/git"
@@ -18,27 +19,32 @@ import (
 // The model-assisted seam extends the mechanical rebase engine with one
 // bounded escape hatch (#732): when the closed mechanical rules reject a
 // conflicted file, a configured coordinator model may be asked — once per
-// conflict round, by the engine, from trusted text only — to produce the
+// rebase episode, by the engine, from trusted text only — to produce the
 // full resolved content of exactly those rejected files. The seam changes
 // who writes the bytes, never what may land: the resolution is validated
 // against the rejected set, the published head is still leased, and the
 // bounded repository checks still run before any push. A nil ModelResolver
-// in Options is exactly the mechanical-only engine this package shipped
-// first: the closed rules alone decide every hunk, and nothing
-// model-assisted can ever run on that path.
+// in Options is the same closed-rules engine with one deliberate
+// refinement: a conflicted path that is not a regular file — or not a name
+// the filesystem accepts at all — stops the attempt for a human (named,
+// with reason) instead of being read or written through. Every such
+// episode still ends parked for a human, and no model-assisted code can
+// ever run on that path.
 
 // ModelResolver is the engine's one seam to a model. It is satisfied by an
 // adapter over the harness gateway (cmd/courier-executor) so the trusted
 // engine never imports a transport. A nil interface value in Options means
-// deterministic-only resolution: today's behavior, byte for byte.
+// deterministic-only resolution: the same closed-rules engine with one
+// deliberate refinement — non-regular or unnamable conflicted paths stop
+// for a human instead of being read or written through.
 type ModelResolver interface {
 	Resolve(ctx context.Context, req AssistRequest) (*AssistResolution, error)
 }
 
-// DefaultAssistTimeout bounds one model-assisted resolution turn — the
-// resolver call and the allowlisted lockfile regeneration alike. A turn
-// that exceeds it fails that turn, never the lease.
-const DefaultAssistTimeout = 10 * time.Minute
+// DefaultLockfileTimeout bounds the allowlisted lockfile regeneration the
+// assist may run. It bounds that tool invocation alone — it never bounds a
+// model-assisted turn, which the run's own context (SIGTERM) governs.
+const DefaultLockfileTimeout = 10 * time.Minute
 
 // DefaultAssistMaxFileBytes bounds one conflicted file's content included
 // in the prompt. It is a prompt bound, not a resolution bound: a file
@@ -132,16 +138,35 @@ func (e *resolverUnavailableError) Error() string {
 
 func (e *resolverUnavailableError) Unwrap() error { return e.err }
 
-// nonRegularConflictError marks a conflicted worktree path that is not a
-// regular file — git leaves the symlink itself in the worktree on a symlink
-// content conflict. Every file read or write below follows symlinks, so a
-// conflicted symlink would lift prompt content from, or land model bytes
-// on, an arbitrary path outside the workspace. The round must stop for a
-// human instead.
+// nonRegularConflictError marks a conflicted worktree path the engine will
+// neither read nor write through: it is not a regular file — git leaves the
+// symlink itself in the worktree on a symlink content conflict — or it is
+// not a name the filesystem accepts at all (a NUL byte or an over-long
+// name, which lstat refuses with EINVAL or ENAMETOOLONG). Git cannot
+// produce such tree entries, so a conflicted path like the latter is
+// anomalous, and the episode stops for a human with the path named instead
+// of leaking an unclassified infrastructure error. Every file read or write
+// below follows symlinks, so a conflicted symlink would lift prompt content
+// from, or land model bytes on, an arbitrary path outside the workspace.
+// Every such episode still ends parked for a human, and no model-assisted
+// code can run on that path.
 type nonRegularConflictError struct{ path string }
 
 func (e *nonRegularConflictError) Error() string {
-	return fmt.Sprintf("conflicted path %s is not a regular file; the engine will not read or write through it", e.path)
+	return fmt.Sprintf("conflicted path %s is not a regular file or not a name the filesystem accepts; the engine will not read or write through it", e.path)
+}
+
+// lstatRefusal classifies one os.Lstat failure on a conflicted path. A name
+// the operating system refuses outright — EINVAL for a NUL byte,
+// ENAMETOOLONG for an over-long component — cannot be a tree entry git
+// produced, so it gets the same non-regular stop-for-a-human verdict instead
+// of an unclassified infrastructure error; every other failure passes
+// through unchanged as the infrastructure error it is.
+func lstatRefusal(path string, err error) error {
+	if errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENAMETOOLONG) {
+		return &nonRegularConflictError{path: path}
+	}
+	return err
 }
 
 // runLockfileTidy is the allowlisted lockfile-regeneration seam. It is a
@@ -185,20 +210,23 @@ func lockfileToolHint(paths []string) string {
 	return ""
 }
 
-// assistRound asks the configured resolver once for this round's rejected
+// assistRound asks the configured resolver once for the episode's rejected
 // set and, on a valid resolution, writes and stages the files and lets the
-// caller continue the replay. The invariant is one coordinator, sequential,
-// no delegation: the engine asks exactly one model exactly one question per
-// round — there is no subagent fan-out on the rebase path, because every
-// extra model turn widens the surface a replay must trust before it may
-// publish.
+// caller continue the replay. It is the rebase episode's single
+// model-assisted attempt (#732): the caller invokes it at most once per
+// Execute, for the first round whose rejected set the mechanical rules
+// rejected. The invariant is one coordinator, sequential, no delegation:
+// the engine asks exactly one model exactly one question per episode —
+// there is no subagent fan-out on the rebase path, because every extra
+// model turn widens the surface a replay must trust before it may publish.
 func assistRound(ctx context.Context, w *git.Workspace, opts Options, origHead string, rejected []string, report *AssistReport) error {
 	req, err := buildAssistRequest(ctx, w, opts, origHead, rejected)
 	if err != nil {
-		// A conflicted path that is not a regular file stops the round for
-		// a human, never through an error classified as infrastructure: the
-		// decision is the same one a non-mechanical hunk gets, and nothing
-		// has been read or written through the link.
+		// A conflicted path the engine will not read through — not a
+		// regular file, or not a name the filesystem accepts — stops the
+		// attempt for a human, never through an error classified as
+		// infrastructure: the decision is the same one a non-mechanical
+		// hunk gets, and nothing has been read or written through the path.
 		var nonRegular *nonRegularConflictError
 		if errors.As(err, &nonRegular) {
 			return &semanticError{
@@ -271,9 +299,9 @@ func assistRound(ctx context.Context, w *git.Workspace, opts Options, origHead s
 	// a failure leaves the conflict unresolved — the engine never
 	// publishes a lockfile it could not regenerate.
 	if hint := lockfileToolHint(rejected); hint == "go mod tidy" {
-		timeout := opts.AssistTimeout
+		timeout := opts.LockfileTimeout
 		if timeout <= 0 {
-			timeout = DefaultAssistTimeout
+			timeout = DefaultLockfileTimeout
 		}
 		if err := runLockfileTidy(ctx, w.Directory, timeout); err != nil {
 			return &semanticError{
@@ -413,14 +441,16 @@ func boundedDiff(ctx context.Context, directory string, args ...string) (string,
 // truncated at the per-file prompt bound with the truncation named, so the
 // model knows it saw a prefix rather than the whole file. The read is
 // bounded at the OS handle — a huge conflicted file never enters memory
-// whole — and a path that is not a regular file is refused, because a read
-// through a symlink would lift prompt content from an arbitrary path
-// outside the workspace.
+// whole — and a path that is not a regular file, or not a name the
+// filesystem accepts at all, is refused as a nonRegularConflictError,
+// because a read through a symlink would lift prompt content from an
+// arbitrary path outside the workspace and a refused name cannot be a tree
+// entry git produced.
 func boundedFileContent(directory, path string) (string, error) {
 	full := filepath.Join(directory, filepath.FromSlash(path))
 	info, err := os.Lstat(full)
 	if err != nil {
-		return "", err
+		return "", lstatRefusal(path, err)
 	}
 	if !info.Mode().IsRegular() {
 		return "", &nonRegularConflictError{path: path}
