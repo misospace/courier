@@ -982,10 +982,13 @@ func forgeTool() ToolDef {
 	}
 }
 
-// coordinatorTools builds the trusted toolset the coordinator session is
+// coordinatorToolsFor builds the trusted toolset the coordinator session is
 // offered: worker shell, delegation, cancellation, and — when the forge seam
-// is wired — broker forge reads. Publication is never a tool.
-func (c *Coordinator) coordinatorTools() []ToolDef {
+// is wired — broker forge reads. Publication is never a tool. The seams are
+// explicit so the model-surface assembly (#730) reads the same builder the
+// sessions declare through — the pre-model startup path and the coordinator
+// cannot drift.
+func coordinatorToolsFor(forge ForgeOps, skills *SkillSet) []ToolDef {
 	tools := []ToolDef{shellTool(), checkTool()}
 	tools = append(tools,
 		ToolDef{
@@ -1016,28 +1019,36 @@ func (c *Coordinator) coordinatorTools() []ToolDef {
 				"required": []string{"id"},
 			},
 		})
-	if c.forge != nil {
+	if forge != nil {
 		tools = append(tools, forgeTool())
 	}
-	if c.skills != nil {
+	if skills != nil {
 		tools = append(tools, skillTool())
 	}
 	return tools
 }
 
-// subagentTools builds the tool declarations a bounded delegate is offered:
-// worker shell only. Forge reads, delegation, and cancellation are
+func (c *Coordinator) coordinatorTools() []ToolDef {
+	return coordinatorToolsFor(c.forge, c.skills)
+}
+
+// subagentToolsFor builds the tool declarations a bounded delegate is
+// offered: worker shell only. Forge reads, delegation, and cancellation are
 // coordinator-only capabilities; a sub-agent's results return to trusted
-// control, and it can never publish.
-func (c *Coordinator) subagentTools() []ToolDef {
+// control, and it can never publish. The skill tool is a delegated role's
+// only skill path (#659): trusted control serves the verified instructions
+// as data, and the sub-agent can no more execute skill content locally than
+// it can shell locally.
+func subagentToolsFor(skills *SkillSet) []ToolDef {
 	tools := []ToolDef{shellTool()}
-	// The skill tool is a delegated role's only skill path (#659): trusted
-	// control serves the verified instructions as data, and the sub-agent
-	// can no more execute skill content locally than it can shell locally.
-	if c.skills != nil {
+	if skills != nil {
 		tools = append(tools, skillTool())
 	}
 	return tools
+}
+
+func (c *Coordinator) subagentTools() []ToolDef {
+	return subagentToolsFor(c.skills)
 }
 
 // runTool routes one tool request through its trusted implementation.

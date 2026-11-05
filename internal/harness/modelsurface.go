@@ -128,12 +128,33 @@ type ModelSurface struct {
 	Encoding []byte
 }
 
+// AssembleModelSurface computes the run's model-surface provenance (#730)
+// from the production assembly the run's sessions are built from — the
+// resolved role→model bindings and the production tool builders exactly as
+// wired (the forge seam and the loaded skill view) — and the run's admitted
+// inputs. The pre-model startup path computes and durably persists it before
+// any capability probe or model execution can issue a model request (#730
+// review); the coordinator's own ModelSurface delegates here with its own
+// wiring, so there is one assembly source and no second surface description
+// to drift. A computation failure fails closed.
+func AssembleModelSurface(bindings Bindings, forge ForgeOps, skills *SkillSet, inputs ModelSurfaceInputs) (*ModelSurface, error) {
+	return assembleModelSurface(bindings, coordinatorToolsFor(forge, skills), subagentToolsFor(skills), inputs)
+}
+
 // ModelSurface computes the run's model-surface provenance (#730) from this
 // coordinator's own assembled surface — the pinned framing sections, the
 // production tool builders exactly as wired for the run — and the run's
-// admitted inputs. The caller computes it after coordinator construction and
-// before any model execution; a computation failure fails closed.
+// admitted inputs. It delegates to AssembleModelSurface, the one assembly
+// source the pre-model startup path persists from. A computation failure
+// fails closed.
 func (c *Coordinator) ModelSurface(inputs ModelSurfaceInputs) (*ModelSurface, error) {
+	return AssembleModelSurface(c.bindings, c.forge, c.skills, inputs)
+}
+
+// assembleModelSurface is the assembly body: the canonical versioned preimage
+// from the given bindings and tool builders — the exact toolsets the sessions
+// declare through — plus the run's admitted inputs.
+func assembleModelSurface(bindings Bindings, coordinatorTools, subagentTools []ToolDef, inputs ModelSurfaceInputs) (*ModelSurface, error) {
 	transport, err := ParseWire(inputs.GatewayTransport)
 	if err != nil {
 		return nil, fmt.Errorf("harness: model-surface digest: %w", err)
@@ -143,10 +164,10 @@ func (c *Coordinator) ModelSurface(inputs ModelSurfaceInputs) (*ModelSurface, er
 		GatewayTransport: transport,
 	}
 
-	// Selected model bindings: the coordinator's own resolved role→model
-	// map, sorted by role so map iteration order cannot reach the encoding.
-	for _, role := range c.bindings.Roles() {
-		surface.Roles = append(surface.Roles, modelSurfaceRole{Role: role, Model: c.bindings.Model(role)})
+	// Selected model bindings: the run's resolved role→model map, sorted by
+	// role so map iteration order cannot reach the encoding.
+	for _, role := range bindings.Roles() {
+		surface.Roles = append(surface.Roles, modelSurfaceRole{Role: role, Model: bindings.Model(role)})
 	}
 
 	// Canonical pinned prompt sections, read from the production constants
@@ -174,8 +195,8 @@ func (c *Coordinator) ModelSurface(inputs ModelSurfaceInputs) (*ModelSurface, er
 		tools []ToolDef
 	}
 	wired := []roleTools{
-		{role: RoleCoordinator, tools: c.coordinatorTools()},
-		{role: modelSurfaceSubagentRole, tools: c.subagentTools()},
+		{role: RoleCoordinator, tools: coordinatorTools},
+		{role: modelSurfaceSubagentRole, tools: subagentTools},
 	}
 	for _, entry := range wired {
 		tools := append([]ToolDef(nil), entry.tools...)

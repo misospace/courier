@@ -1186,7 +1186,8 @@ surfaced as user-visible content.
 model execution carries a canonical, versioned digest of the model-visible
 contract its control incarnation assembled — `status.modelSurface`, computed
 by trusted control from production assembly code and persisted through the
-broker's trusted status path before the first model request. The encoding
+broker's trusted status path before any model request, the capability gate's
+model probes included (#730 review). The encoding
 (`ModelSurfaceSchemaV1`, encoded in `internal/harness`) covers exactly:
 the schema version itself; the effective wire transport; the resolved
 role→model bindings; the canonical identities (name plus sha256) of the
@@ -1225,9 +1226,17 @@ input limits, probe results); and it is not an authorization grant — the
 run's authority lives in the broker policy and the role boundary, not in
 this digest. It is computed by the same trusted binary it describes, so it
 binds the surface only under the trusted-control assumptions of §3; it is
-not a tamper seal against a compromised control pod. Legacy OpenCode runs
-assemble no native surface and record no digest; runs that end before
-model execution (capability-gate or skills-load failures) record none.
+not a tamper seal against a compromised control pod. The digest is computed
+in the pre-model startup phase — after the run's skill view loads, because
+whether the skill tool is wired is a surface fact the tool builders encode,
+and before the capability gate probes anything — from the same production
+assembly entry point the coordinator's own surface reads, so there is one
+assembly source and no second surface description to drift (#730 review). A
+run the gate stops ends with its surface identity already durable, probe
+spend included; a run that fails the phase itself — a skills load, the
+assembly, or the persistence write — records none and issues no model
+request. Legacy OpenCode runs assemble no native surface and record no
+digest.
 
 **Coordinator ownership.** The coordinator owns the run's terminal contract:
 plan, integrate, locally validate, publish, and hand off. Delegation covers
