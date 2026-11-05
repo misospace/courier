@@ -240,8 +240,10 @@ func TestCoordinatorDoesNotTripOnTransientPrerequisiteFailure(t *testing.T) {
 
 // TestCoordinatorUnverifiedTerminationIsNotAPrerequisiteTrip pins the fence
 // class: an unverified termination is not a prerequisite failure in its own
-// right, and the run never ends blocked-external over one. Once the fence is
-// observed, the run ends as an infrastructure failure — the honest recovery
+// right, and the run never ends blocked-external over one. The fence the
+// termination establishes is the final fact, and it is observed at the
+// boundary that establishes it: the run ends as an infrastructure failure on
+// that same boundary, before any further model request — the honest recovery
 // is worker replacement, not another model turn.
 func TestCoordinatorUnverifiedTerminationIsNotAPrerequisiteTrip(t *testing.T) {
 	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
@@ -258,11 +260,13 @@ func TestCoordinatorUnverifiedTerminationIsNotAPrerequisiteTrip(t *testing.T) {
 			toolCallChunk(0, "call-1", toolShell, `{"command":"echo one"}`),
 			finishChunk("tool_calls"),
 		)},
+		// Scripted but never consumed: the fence is observed at the boundary
+		// that established it, so the model never takes a second turn to
+		// rediscover it.
 		gatewayResponse{body: sse(
 			toolCallChunk(0, "call-2", toolShell, `{"command":"echo two"}`),
 			finishChunk("tool_calls"),
 		)},
-		gatewayResponse{body: sse(contentChunk(`{"outcome":"blocked_external","missing":"x"}`), finishChunk("stop"))},
 	)
 	defer cleanup()
 
@@ -285,10 +289,138 @@ func TestCoordinatorUnverifiedTerminationIsNotAPrerequisiteTrip(t *testing.T) {
 	if result.Err == nil || !strings.Contains(result.Err.Error(), prerequisiteFencedReason) {
 		t.Fatalf("err = %v, want the fence reason", result.Err)
 	}
-	// Two requests: the unverified termination alone did not end the run;
-	// the fence observed on the next preparation did.
-	if got := gatewayMock.requestCount(); got != 2 {
-		t.Fatalf("gateway requests = %d, want 2", got)
+	// One request: the fence ends the run at the tool boundary that
+	// established it, before any further model request.
+	if got := gatewayMock.requestCount(); got != 1 {
+		t.Fatalf("gateway requests = %d, want 1", got)
+	}
+}
+
+// TestCoordinatorEndsRunWhenShellDispatchFencesTheWorker pins the fence's
+// reach: a fence established outside workspace preparation — by an ordinary
+// shell dispatch whose termination could not be observed — is the same final
+// fact, and the run ends at that dispatch's own tool boundary, before any
+// further model request.
+func TestCoordinatorEndsRunWhenShellDispatchFencesTheWorker(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	// Preparation is honest: the unpack holds the dispatched tip. The shell
+	// dispatch then fails ambiguously and its reconciliation cannot observe
+	// the termination.
+	worker.snapshotTip = "snap-tip"
+	worker.completeAll = true
+	worker.dispatchPlan = []int{0, 503}
+	worker.scriptUnobservedTermination(1)
+
+	gateway, gatewayMock, cleanup := gatewayFor(
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-1", toolShell, `{"command":"echo one"}`),
+			finishChunk("tool_calls"),
+		)},
+		// Scripted but never consumed: the fence ends the run at its own
+		// boundary.
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-2", toolShell, `{"command":"echo two"}`),
+			finishChunk("tool_calls"),
+		)},
+	)
+	defer cleanup()
+
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Transport: gateway,
+		Bindings:  testBindings(),
+		Worker:    delegator,
+		Snapshot:  snapshotProvider("snap-tip"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := coordinator.Run(context.Background(), testInvocation())
+	if result.Outcome == executor.OutcomeBlockedExternal {
+		t.Fatalf("outcome = %q, a fence is never blocked-external", result.Outcome)
+	}
+	if result.Kind != courierv1alpha1.NativeResultInfrastructureFailed {
+		t.Fatalf("kind = %q, want infrastructure", result.Kind)
+	}
+	if result.Err == nil || !strings.Contains(result.Err.Error(), prerequisiteFencedReason) {
+		t.Fatalf("err = %v, want the fence reason", result.Err)
+	}
+	// One request: the fence ends the run at the tool boundary that
+	// established it.
+	if got := gatewayMock.requestCount(); got != 1 {
+		t.Fatalf("gateway requests = %d, want 1", got)
+	}
+	// Two dispatch requests — the honest unpack and the ambiguous shell —
+	// and no redelivery against the fenced worker.
+	if got := worker.dispatchRequests; got != 2 {
+		t.Fatalf("worker dispatch requests = %d, want 2 (no redelivery)", got)
+	}
+}
+
+// failingCheckpointTransport fails only the durable checkpoint writes, so a
+// test can hold status debt while the run's own trusted status path works.
+type failingCheckpointTransport struct {
+	inner *recordingStatusTransport
+}
+
+func (t *failingCheckpointTransport) PostStatus(ctx context.Context, patch StatusPatch) error {
+	if patch.Checkpoint != nil {
+		return brokerUnavailable()
+	}
+	return t.inner.PostStatus(ctx, patch)
+}
+
+// TestCoordinatorPrerequisiteEndingSettlesDurableStatus pins the ending
+// settlement: a fence ends the run as an infrastructure failure only after
+// the run's durable status obligations are settled, and a completed brief
+// whose durable record never lands makes the ending carry that settlement
+// failure — the relaunch owns the debt, remote-first.
+func TestCoordinatorPrerequisiteEndingSettlesDurableStatus(t *testing.T) {
+	shrinkRetryDelays(t)
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.snapshotTip = "snap-tip"
+	// The dispatch fails ambiguously and the reconciliation cannot observe
+	// the termination: the worker is fenced.
+	worker.dispatchPlan = []int{503}
+	worker.scriptUnobservedTermination(1)
+
+	// A completed brief's durable checkpoint write keeps failing, so the
+	// run carries status debt the ending must settle before it reports.
+	reporter := NewStatusReporter(&failingCheckpointTransport{inner: &recordingStatusTransport{}}, testControlUID, testWorkerUID, 0)
+	checkpoint := &courierv1alpha1.Checkpoint{CompletedBriefs: []courierv1alpha1.Brief{{ID: "b1", Summary: "done", Commit: "abc"}}}
+	if err := reporter.CheckpointPublished(context.Background(), checkpoint, "abc"); err == nil {
+		t.Fatal("CheckpointPublished() error = nil, want the failed write to retain the debt")
+	}
+
+	gateway, gatewayMock, cleanup := gatewayFor(
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-1", toolShell, `{"command":"echo one"}`),
+			finishChunk("tool_calls"),
+		)},
+	)
+	defer cleanup()
+
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Transport: gateway,
+		Bindings:  testBindings(),
+		Worker:    delegator,
+		Snapshot:  snapshotProvider("snap-tip"),
+		Status:    reporter,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := coordinator.Run(context.Background(), testInvocation())
+	if result.Kind != courierv1alpha1.NativeResultInfrastructureFailed {
+		t.Fatalf("kind = %q, want infrastructure", result.Kind)
+	}
+	if result.Err == nil || !strings.Contains(result.Err.Error(), "lacks a durable status record") {
+		t.Fatalf("err = %v, want the settlement failure", result.Err)
+	}
+	// One request: the fence still ends the run at its own boundary.
+	if got := gatewayMock.requestCount(); got != 1 {
+		t.Fatalf("gateway requests = %d, want 1", got)
 	}
 }
 

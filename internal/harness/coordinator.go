@@ -166,12 +166,16 @@ func (c *Coordinator) recordBootstrapBlocker(err error) {
 // termination could not be observed, no further dispatch may run against
 // this worker. First cause wins; fencing never un-fences. The fence is a
 // typed error so the prerequisite classifier can name it as the final fact
-// it is, while its text stays exactly what it always was.
+// it is, while its text stays exactly what it always was. Establishing the
+// fence is itself the observation (#737): the fence is a final fact, so the
+// breaker trips at the boundary that witnessed it — on every dispatch path,
+// not one preparation later.
 func (c *Coordinator) fenceWorker(opID string, cause error) {
 	c.workerFenceMu.Lock()
 	defer c.workerFenceMu.Unlock()
 	if c.workerFenceErr == nil {
 		c.workerFenceErr = &workerFence{reason: fmt.Sprintf("the worker is fenced: termination of operation %s could not be verified (%v); no further workspace operation may run against it", opID, cause)}
+		c.prerequisite.observe(fencedPrerequisite())
 	}
 }
 
@@ -391,7 +395,7 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 			return c.blockedExternalEnding(ctx, turn.blocker)
 		}
 		if turn.infraErr != nil {
-			return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: turn.infraErr}
+			return c.infrastructureEnding(ctx, turn.infraErr)
 		}
 		if turn.harnessErr != nil {
 			return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: fmt.Errorf("harness: step-boundary compaction: %w", turn.harnessErr)}
@@ -417,10 +421,13 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 			// the model said and whatever the operator's soft stop asked
 			// for. The model sees the same condition as a tool error it can
 			// rediscover; the latch is the trusted fact the model cannot
-			// argue with, and it outranks the model's own declaration.
+			// argue with, and it outranks the model's own declaration. This
+			// is the defensive re-check: the tool boundary below normally
+			// consumes the trip first, so a final turn over a tripped latch
+			// means a trip arrived without one.
 			if failure := c.prerequisite.peek(); failure != nil {
 				if failure.kind == courierv1alpha1.NativeResultInfrastructureFailed {
-					return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: failure}
+					return c.infrastructureEnding(ctx, failure)
 				}
 				return c.blockedExternalEnding(ctx, failure)
 			}
@@ -652,6 +659,19 @@ func (c *Coordinator) blockedExternalEnding(ctx context.Context, blocker error) 
 		Outcome: executor.OutcomeBlockedExternal,
 		Reason:  blocker.Error(),
 	}
+}
+
+// infrastructureEnding reports a terminal infrastructure failure: the
+// condition cannot be continued past (a fenced worker), so the honest
+// recovery is operator relaunch. The run's durable status obligations settle
+// first, exactly as a blocked-external ending settles them: a completed
+// brief whose durable record never landed is itself an infrastructure
+// failure, and the relaunch reconciles it remote-first.
+func (c *Coordinator) infrastructureEnding(ctx context.Context, cause error) executor.HarnessResult {
+	if err := c.settleStatus(ctx); err != nil {
+		return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: err}
+	}
+	return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: cause}
 }
 
 // finish applies the declared outcome. Publication is the coordinator's own

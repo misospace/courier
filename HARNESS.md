@@ -1967,7 +1967,10 @@ ending's evidence.
 breaker (§5) adds one classification boundary of its own. A run whose workspace
 preparation has established a terminal condition ends `blocked_external` (a
 refusal, a mismatch, or a repeated preparation-task failure) or as an
-`infrastructure_failed` result (a fenced worker). Both endings carry a fixed,
+`infrastructure_failed` result (a fenced worker). Both endings settle the
+run's durable status obligations before they report: a completed brief whose
+durable record never landed makes either ending an `infrastructure_failed`
+result carrying that settlement failure. Both endings carry a fixed,
 code-owned reason: the model never authors it, and worker output never enters
 it beyond the fixed preparation task's own exit status. A `blocked_external`
 result keeps the source item active and recoverable, exactly like every other

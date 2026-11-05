@@ -2037,7 +2037,9 @@ condition is established. The count is a total across classes and across
 preparation contexts — the coordinator's own commands and the delegated
 briefs prepare the same workspace — so a model that alternates between
 classes or between contexts cannot keep the run alive. A trip never
-un-trips.
+un-trips. A fence is observed by the boundary that establishes it — the
+harness witnesses the fence wherever it fences the worker, so the condition
+never waits for a later preparation to be rediscovered.
 
 A tripped latch ends the run at that turn's tool boundary, before the next
 model request. A refusal, a mismatch, or a repeated task failure ends the run
