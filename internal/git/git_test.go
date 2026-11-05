@@ -2303,3 +2303,56 @@ func TestRemoteBranchHeadKeepsGitVerdictWhenConfigurationRedirectsTheProbe(t *te
 		}
 	})
 }
+
+// TestRebaseContinueClassifiesNextConflictStop pins the continue seam's
+// classification: a continue that advances onto the next replayed commit and
+// stops again on that commit's conflicts is a *RebaseConflictError carrying
+// the unmerged paths — the same verdict Rebase gives a first stop — so the
+// resolver's round loop can classify the new round instead of seeing an
+// unattributable plain error. A continue with no rebase in progress fails
+// closed as a plain error.
+func TestRebaseContinueClassifiesNextConflictStop(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo := t.TempDir()
+	initRepo(t, repo)
+	writeFile(t, filepath.Join(repo, "shared.txt"), "one\ntwo\nthree\n")
+	commit(t, repo, "base")
+	git(t, repo, "branch", "-M", "main")
+	git(t, repo, "checkout", "-b", "pr-branch")
+	writeFile(t, filepath.Join(repo, "shared.txt"), "one\nPR line\nthree\n")
+	commit(t, repo, "pr: edit shared")
+	git(t, repo, "checkout", "main")
+	writeFile(t, filepath.Join(repo, "shared.txt"), "one\nbase line\nthree\n")
+	commit(t, repo, "base: edit shared")
+	git(t, repo, "checkout", "pr-branch")
+
+	w := &Workspace{Directory: repo}
+	if err := w.Rebase(ctx, "main"); err == nil {
+		t.Fatal("Rebase(main): expected the first conflict stop")
+	} else if _, ok := err.(*RebaseConflictError); !ok {
+		t.Fatalf("Rebase(main): %v, want *RebaseConflictError", err)
+	}
+
+	// Resolve nothing: the continue still has the same commit's conflicts,
+	// which it must classify, not swallow.
+	err := w.RebaseContinue(ctx, "main")
+	var conflictErr *RebaseConflictError
+	if !errors.As(err, &conflictErr) {
+		t.Fatalf("RebaseContinue: %v, want *RebaseConflictError", err)
+	}
+	if conflictErr.Upstream != "main" || len(conflictErr.Paths) == 0 {
+		t.Fatalf("RebaseConflictError = %+v, want the upstream and the conflicted paths", conflictErr)
+	}
+	if err := w.RebaseAbort(ctx); err != nil {
+		t.Fatalf("RebaseAbort: %v", err)
+	}
+
+	// No rebase in progress: the continue is a plain error, never a
+	// fabricated conflict verdict.
+	if err := w.RebaseContinue(ctx, "main"); err == nil {
+		t.Fatal("RebaseContinue with no rebase in progress: expected an error")
+	} else if _, ok := err.(*RebaseConflictError); ok {
+		t.Fatalf("RebaseContinue with no rebase in progress: %v, want a plain error", err)
+	}
+}

@@ -595,3 +595,63 @@ func TestRunLockfileTidyProduction(t *testing.T) {
 		}
 	})
 }
+
+// The mechanical path refuses a symlink-conflicted path exactly as the
+// assist path does: no read or write may travel through the link outside the
+// workspace, and the attempt stops for a human with the path named — the
+// outside sentinel is untouched and the remote stays at the lease head.
+func TestMechanicalSymlinkConflictStopsForHuman(t *testing.T) {
+	origin := t.TempDir()
+	runGit(t, origin, "init", "--initial-branch=main")
+	runGit(t, origin, "config", "user.name", "Courier Rebase Test")
+	runGit(t, origin, "config", "user.email", "courier-rebase-test@example.invalid")
+	writeFile(t, filepath.Join(origin, "shared.txt"), "one\ntwo\nthree\n")
+	writeFile(t, filepath.Join(origin, "payload.txt"), "pr payload\n")
+	runGit(t, origin, "add", "--all", "--", ".")
+	runGit(t, origin, "commit", "-m", "base")
+	runGit(t, origin, "checkout", "-b", "pr-branch")
+	if err := os.Symlink("pr-payload.txt", filepath.Join(origin, "link")); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, origin, "add", "--all", "--", ".")
+	runGit(t, origin, "commit", "-m", "pr retarget")
+	runGit(t, origin, "checkout", "main")
+	// The main side retargets the link at a relative path that escapes the
+	// workspace: a read or write through the link would reach outside it.
+	_ = os.Remove(filepath.Join(origin, "link"))
+	if err := os.Symlink(filepath.Join("..", "outside", "escape.txt"), filepath.Join(origin, "link")); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, origin, "add", "--all", "--", ".")
+	runGit(t, origin, "commit", "-m", "main retarget")
+	head := runGit(t, origin, "rev-parse", "pr-branch")
+
+	workspace := filepath.Join(t.TempDir(), "ws")
+	if _, err := git.Prepare(context.Background(), git.PrepareOptions{
+		RemoteURL: origin, Directory: workspace, Base: "main", Branch: "pr-branch", SkipBaseSync: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(filepath.Dir(workspace), "outside")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(outside, "escape.txt")
+	writeFile(t, target, "escape-sentinel\n")
+	f := fixture{origin: origin, workspace: workspace, base: "main", branch: "pr-branch", head: head}
+
+	result := execute(t, f, f.head)
+	if result.Outcome != OutcomeSemanticConflict {
+		t.Fatalf("outcome = %q (%s)", result.Outcome, result.Reason)
+	}
+	if !strings.Contains(result.Reason, "not a regular file") {
+		t.Fatalf("reason = %q, want the non-regular-file verdict", result.Reason)
+	}
+	if got := remoteHead(t, f); got != f.head {
+		t.Fatalf("remote head = %q, want the untouched lease head", got)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil || string(data) != "escape-sentinel\n" {
+		t.Fatalf("outside target = %q (%v), want the sentinel untouched", data, err)
+	}
+}

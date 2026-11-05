@@ -86,14 +86,16 @@ func (g *gatewayResolver) Resolve(ctx context.Context, req rebase.AssistRequest)
 	}
 	var response strings.Builder
 	var usage *harness.Usage
+	overCap := false
 	for _, event := range events {
 		switch event.Kind {
 		case harness.KindDelta:
 			if response.Len()+len(event.Text) > rebaseAssistMaxResponseBytes {
-				return &rebase.AssistResolution{
-					Refusal: fmt.Sprintf("the model response exceeded the %d-byte response bound", rebaseAssistMaxResponseBytes),
-					Model:   g.model,
-				}, nil
+				// The cap stops the assembly, not the drain: the stream's
+				// terminal usage still rides back, so a turn the bound cut
+				// short is reported with the spend it actually cost.
+				overCap = true
+				continue
 			}
 			response.WriteString(event.Text)
 		case harness.KindFinal:
@@ -104,6 +106,17 @@ func (g *gatewayResolver) Resolve(ctx context.Context, req rebase.AssistRequest)
 			// failed attempt, never a semantic one.
 			return nil, event.Err
 		}
+	}
+	if overCap {
+		resolution := &rebase.AssistResolution{
+			Refusal: fmt.Sprintf("the model response exceeded the %d-byte response bound", rebaseAssistMaxResponseBytes),
+			Model:   g.model,
+		}
+		if usage != nil {
+			resolution.InputTokens = usage.InputTokens
+			resolution.OutputTokens = usage.OutputTokens
+		}
+		return resolution, nil
 	}
 	resolution := parseAssistResolution(response.String())
 	resolution.Model = g.model

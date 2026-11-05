@@ -24,7 +24,8 @@ import (
 // against the rejected set, the published head is still leased, and the
 // bounded repository checks still run before any push. A nil ModelResolver
 // in Options is exactly the mechanical-only engine this package shipped
-// first; nothing in the nil path may gain behavior.
+// first: the closed rules alone decide every hunk, and nothing
+// model-assisted can ever run on that path.
 
 // ModelResolver is the engine's one seam to a model. It is satisfied by an
 // adapter over the harness gateway (cmd/courier-executor) so the trusted
@@ -244,10 +245,11 @@ func assistRound(ctx context.Context, w *git.Workspace, opts Options, origHead s
 			return fmt.Errorf("rewrite resolved %s: %w", path, err)
 		}
 		// Defense in depth on the write: the request build already refused
-		// non-regular conflicted paths, and nothing else writes to this
-		// tree, but no write may ever travel through a link out of the
-		// workspace — a link swapped in between the read and this write is
-		// stopped here as the same human decision.
+		// non-regular conflicted paths, and no other code path in the assist
+		// writes to this tree. No write may travel through a link out of the
+		// workspace; the lstat check narrows that window, and a link swapped
+		// in between this check and the write is a residual race contained
+		// by the executor pod's own process boundary, not by this check.
 		if !info.Mode().IsRegular() {
 			return &semanticError{
 				files:  rejected,
@@ -281,7 +283,7 @@ func assistRound(ctx context.Context, w *git.Workspace, opts Options, origHead s
 		}
 		// A tidy rewrite may touch both go.mod and go.sum even when only one
 		// was in the rejected set; an unstaged rewritten sibling would fail
-		// RebaseContinue as an unattributable plain error. Stage both when
+		// the continue as an unattributable plain error. Stage both when
 		// they exist — staging unchanged content is a no-op, so this stays
 		// bounded and idempotent.
 		for _, path := range []string{"go.mod", "go.sum"} {

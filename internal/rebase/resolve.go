@@ -60,6 +60,17 @@ func resolveConflicts(ctx context.Context, w *git.Workspace, opts Options, origH
 		for _, path := range paths {
 			resolved, err := resolveFile(w.Directory, path)
 			if err != nil {
+				var nonRegular *nonRegularConflictError
+				if errors.As(err, &nonRegular) {
+					// A non-regular conflicted path can never be classified,
+					// mechanically or otherwise: the attempt stops for a
+					// human with the path named, exactly as a non-mechanical
+					// hunk would.
+					return &semanticError{
+						files:  []string{path},
+						reason: fmt.Sprintf("conflicted path %s is not a regular file; the engine will not read or write through it", path),
+					}
+				}
 				return fmt.Errorf("classify conflict in %s: %w", path, err)
 			}
 			if !resolved {
@@ -104,12 +115,19 @@ func resolveConflicts(ctx context.Context, w *git.Workspace, opts Options, origH
 // resolveFile rewrites one conflicted file's hunks in place. It returns false
 // without touching the file when any hunk is non-mechanical, so a rejected
 // file keeps git's markers exactly as the rebase left them for the human
-// summary.
+// summary. A conflicted path that is not a regular file — git leaves the
+// symlink itself in the worktree on a symlink content conflict — is refused
+// as a nonRegularConflictError: reading or writing through the link would
+// reach a path outside the workspace, and a mechanical rule never writes
+// bytes it cannot see the provenance of.
 func resolveFile(directory, path string) (bool, error) {
 	full := filepath.Join(directory, filepath.FromSlash(path))
-	info, err := os.Stat(full)
+	info, err := os.Lstat(full)
 	if err != nil {
 		return false, err
+	}
+	if !info.Mode().IsRegular() {
+		return false, &nonRegularConflictError{path: path}
 	}
 	if info.Size() > maxConflictFileBytes {
 		return false, nil
