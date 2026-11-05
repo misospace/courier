@@ -88,7 +88,7 @@ func resolveConflicts(ctx context.Context, w *git.Workspace, opts Options, origH
 		// Every conflict in this round resolved and staged: continue the
 		// replay. The continue itself can stop again on the next replayed
 		// commit, which loops as another round.
-		if err := w.RebaseContinue(ctx); err != nil {
+		if err := w.RebaseContinue(ctx, w.BaseRevisionRef()); err != nil {
 			var conflictErr *git.RebaseConflictError
 			if !errors.As(err, &conflictErr) {
 				return err

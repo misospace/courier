@@ -165,14 +165,53 @@ func TestGatewayResolverStreamError(t *testing.T) {
 	}
 }
 
-// A response holding no JSON object at all is a failed turn, not an empty
-// resolution: the engine must never see a silent no-op answer as data.
-func TestGatewayResolverNoJSON(t *testing.T) {
+// A response holding no JSON object at all is the model failing to answer
+// in the agreed shape — a decision failure, not a down gateway: it maps to
+// a refusal the engine classifies as the model declining, never an error.
+func TestGatewayResolverNoJSONIsRefusal(t *testing.T) {
 	sse := &sseGateway{body: stream("", "I cannot help with that request.")}
 	server := newAssistGateway(t, sse)
 	resolver, _ := newRebaseAssistResolver(testConfig(server.URL))
-	if _, err := resolver.Resolve(context.Background(), assistRequest()); err == nil {
-		t.Fatal("Resolve accepted a prose-only answer")
+	resolution, err := resolver.Resolve(context.Background(), assistRequest())
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if !strings.Contains(resolution.Refusal, "no JSON object") || len(resolution.Files) != 0 {
+		t.Fatalf("resolution = %#v, want the no-JSON refusal and no files", resolution)
+	}
+}
+
+// A complete JSON object that will not decode is the same decision failure:
+// the answer arrived but not in the agreed shape.
+func TestGatewayResolverUndecodableJSONIsRefusal(t *testing.T) {
+	sse := &sseGateway{body: stream("", `{"files":"not a list"}`)}
+	server := newAssistGateway(t, sse)
+	resolver, _ := newRebaseAssistResolver(testConfig(server.URL))
+	resolution, err := resolver.Resolve(context.Background(), assistRequest())
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if !strings.Contains(resolution.Refusal, "undecodable") || len(resolution.Files) != 0 {
+		t.Fatalf("resolution = %#v, want the undecodable refusal and no files", resolution)
+	}
+}
+
+// A response that overruns the assembled-response bound mid-stream is the
+// model failing to answer in the agreed shape too: it maps to the over-bound
+// refusal the engine treats as a decline, never a transport error. The
+// overrun arrives as several deltas, each under the gateway's own per-line
+// bound, so this exercises the adapter's accumulation check.
+func TestGatewayResolverOverCapIsRefusal(t *testing.T) {
+	huge := strings.Repeat("x", 900_000)
+	sse := &sseGateway{body: stream("", huge, huge, huge, huge, huge)}
+	server := newAssistGateway(t, sse)
+	resolver, _ := newRebaseAssistResolver(testConfig(server.URL))
+	resolution, err := resolver.Resolve(context.Background(), assistRequest())
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if !strings.Contains(resolution.Refusal, "exceeded") || len(resolution.Files) != 0 {
+		t.Fatalf("resolution = %#v, want the over-bound refusal and no files", resolution)
 	}
 }
 

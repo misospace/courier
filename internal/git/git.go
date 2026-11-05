@@ -900,10 +900,21 @@ func (w *Workspace) Rebase(ctx context.Context, upstreamRef string) error {
 
 // RebaseContinue resumes an in-progress rebase after the resolver staged its
 // mechanical resolutions. The editor is pinned to true so the continue never
-// opens one.
-func (w *Workspace) RebaseContinue(ctx context.Context) error {
+// opens one. A continue that stops again — the next replayed commit conflicts
+// — is classified exactly like Rebase's stop: *RebaseConflictError with the
+// unmerged paths, so the resolver's round loop can classify the new round
+// instead of seeing an unattributable plain error. Anything else fails
+// closed. upstreamRef names the rebase's upstream for the error record only.
+func (w *Workspace) RebaseContinue(ctx context.Context, upstreamRef string) error {
 	_, err := runWithEnv(ctx, w.Directory, []string{"GIT_EDITOR=true"}, "rebase", "--continue")
-	return err
+	if err == nil {
+		return nil
+	}
+	paths, pathsErr := w.UnmergedPaths(ctx)
+	if pathsErr != nil || len(paths) == 0 {
+		return err
+	}
+	return &RebaseConflictError{Upstream: upstreamRef, Paths: paths}
 }
 
 // RebaseAbort stops an in-progress rebase and restores the branch to its

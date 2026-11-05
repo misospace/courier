@@ -198,7 +198,11 @@ carries repository content only: the bounded PR diff, the base-side diff
 restricted to the conflicted paths, the marked conflict files, and the run
 goal. No credentials ever cross the engine boundary. The answer must be one
 JSON object resolving exactly the rejected files with marker-free full file
-content. Anything else — a refusal, a foreign path, leftover markers,
+content. The turn reserves an 8192-token output ceiling, which bounds how
+large a single resolvable file can be: a conflicted file whose resolved
+content cannot fit inside one bounded answer cannot be model-resolved, and
+the attempt stops for a human instead. Anything else — a refusal, a foreign
+path, leftover markers,
 oversized content — is treated as a refusal, and the attempt stops for a
 human with the attempted-and-did-not-resolve summary. When the
 conflict set includes `go.mod`/`go.sum` and the `go` tool exists, the

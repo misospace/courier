@@ -3,7 +3,9 @@ package rebase
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -103,9 +105,11 @@ type AssistResolution struct {
 
 // AssistReport is the evidence one attempt's model-assisted turns left on
 // the Result: which model served them, how many were asked, which files
-// they resolved, and the token spend. Attempted is the honest boundary —
-// a report with Attempted false names an attempt that never happened, and
-// the engine records the report only when it is true.
+// they resolved, and the token spend. Turns counts the model turns that
+// returned an answer — a refusal is an answer, a transport failure is not.
+// Attempted reports that a model-assisted turn was issued at all, and is
+// the honest boundary: a report with Attempted false names an attempt that
+// never happened, and the engine records the report only when it is true.
 type AssistReport struct {
 	Model         string
 	Turns         int
@@ -127,6 +131,18 @@ func (e *resolverUnavailableError) Error() string {
 
 func (e *resolverUnavailableError) Unwrap() error { return e.err }
 
+// nonRegularConflictError marks a conflicted worktree path that is not a
+// regular file — git leaves the symlink itself in the worktree on a symlink
+// content conflict. Every file read or write below follows symlinks, so a
+// conflicted symlink would lift prompt content from, or land model bytes
+// on, an arbitrary path outside the workspace. The round must stop for a
+// human instead.
+type nonRegularConflictError struct{ path string }
+
+func (e *nonRegularConflictError) Error() string {
+	return fmt.Sprintf("conflicted path %s is not a regular file; the engine will not read or write through it", e.path)
+}
+
 // runLockfileTidy is the allowlisted lockfile-regeneration seam. It is a
 // variable so tests can stub the tool invocation without a Go toolchain
 // or network; the production value runs `go mod tidy` inside the workspace.
@@ -135,11 +151,13 @@ var runLockfileTidy = func(ctx context.Context, directory string, timeout time.D
 	defer cancel()
 	cmd := exec.CommandContext(tidyCtx, "go", "mod", "tidy")
 	cmd.Dir = directory
-	// -mod=readonly forbids the tidy from editing go.mod's requirement
-	// graph beyond what the resolved imports need, and GOWORK=off pins
-	// the module context to the workspace alone — the same environment
-	// the bounded Go build check runs under.
-	cmd.Env = append(os.Environ(), "GOFLAGS=-mod=readonly", "GOWORK=off")
+	// The pins are the sandbox. GOWORK=off pins the module context to the
+	// workspace alone — the same environment the bounded Go build check
+	// runs under. GOTOOLCHAIN=local stops a hostile go.mod from making the
+	// go command download and execute a repo-selected toolchain binary.
+	// GOFLAGS=-mod=readonly governs build commands, not mod commands, and
+	// is kept only for parity with that build check's environment.
+	cmd.Env = append(os.Environ(), "GOFLAGS=-mod=readonly", "GOWORK=off", "GOTOOLCHAIN=local")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -174,16 +192,32 @@ func lockfileToolHint(paths []string) string {
 // extra model turn widens the surface a replay must trust before it may
 // publish.
 func assistRound(ctx context.Context, w *git.Workspace, opts Options, origHead string, rejected []string, report *AssistReport) error {
-	report.Attempted = true
-	report.Turns++
 	req, err := buildAssistRequest(ctx, w, opts, origHead, rejected)
 	if err != nil {
+		// A conflicted path that is not a regular file stops the round for
+		// a human, never through an error classified as infrastructure: the
+		// decision is the same one a non-mechanical hunk gets, and nothing
+		// has been read or written through the link.
+		var nonRegular *nonRegularConflictError
+		if errors.As(err, &nonRegular) {
+			return &semanticError{
+				files:  rejected,
+				reason: assistUnresolvedReason(nonRegular.Error()),
+			}
+		}
 		return fmt.Errorf("assemble the model-assist request: %w", err)
 	}
 	res, err := opts.ModelResolver.Resolve(ctx, req)
 	if err != nil {
+		// The ask was issued even though no answer came back: the attempt
+		// happened, but a turn without an answer is not one of the model's
+		// answered turns.
+		report.Attempted = true
 		return &resolverUnavailableError{err}
 	}
+	// A resolution — including a refusal — is an answered model turn.
+	report.Attempted = true
+	report.Turns++
 	report.Model = res.Model
 	report.InputTokens += res.InputTokens
 	report.OutputTokens += res.OutputTokens
@@ -205,9 +239,20 @@ func assistRound(ctx context.Context, w *git.Workspace, opts Options, origHead s
 	for _, path := range rejected {
 		content := res.Files[path]
 		full := filepath.Join(w.Directory, filepath.FromSlash(path))
-		info, err := os.Stat(full)
+		info, err := os.Lstat(full)
 		if err != nil {
 			return fmt.Errorf("rewrite resolved %s: %w", path, err)
+		}
+		// Defense in depth on the write: the request build already refused
+		// non-regular conflicted paths, and nothing else writes to this
+		// tree, but no write may ever travel through a link out of the
+		// workspace — a link swapped in between the read and this write is
+		// stopped here as the same human decision.
+		if !info.Mode().IsRegular() {
+			return &semanticError{
+				files:  rejected,
+				reason: assistUnresolvedReason(fmt.Sprintf("conflicted path %s is not a regular file; the engine will not write through it", path)),
+			}
 		}
 		if err := os.WriteFile(full, []byte(content), info.Mode().Perm()); err != nil {
 			return fmt.Errorf("rewrite resolved %s: %w", path, err)
@@ -234,12 +279,20 @@ func assistRound(ctx context.Context, w *git.Workspace, opts Options, origHead s
 				reason: assistUnresolvedReason(fmt.Sprintf("the allowlisted %s failed after the resolution was written: %v", hint, err)),
 			}
 		}
-		for _, path := range rejected {
-			switch filepath.ToSlash(path) {
-			case "go.mod", "go.sum":
-				if err := w.Stage(ctx, path); err != nil {
-					return fmt.Errorf("stage regenerated %s: %w", path, err)
+		// A tidy rewrite may touch both go.mod and go.sum even when only one
+		// was in the rejected set; an unstaged rewritten sibling would fail
+		// RebaseContinue as an unattributable plain error. Stage both when
+		// they exist — staging unchanged content is a no-op, so this stays
+		// bounded and idempotent.
+		for _, path := range []string{"go.mod", "go.sum"} {
+			if _, err := os.Stat(filepath.Join(w.Directory, path)); err != nil {
+				if os.IsNotExist(err) {
+					continue
 				}
+				return fmt.Errorf("stage regenerated %s: %w", path, err)
+			}
+			if err := w.Stage(ctx, path); err != nil {
+				return fmt.Errorf("stage regenerated %s: %w", path, err)
 			}
 		}
 	}
@@ -259,15 +312,20 @@ func assistUnresolvedReason(cause string) string {
 // content that provably addresses exactly the rejected files, carries no
 // conflict markers, and stays within the engine's own content bound is
 // written — anything else is treated as a refusal, never as partial input.
+// Completeness is the truncation guard: the write loop reads res.Files by
+// exact path, so a resolution that omits any rejected path would publish
+// that file truncated to zero bytes.
 func invalidResolutionReason(res *AssistResolution, rejected []string) string {
-	if len(res.Files) == 0 {
-		return "the resolution named no files"
-	}
 	allowed := make(map[string]struct{}, len(rejected))
 	for _, path := range rejected {
 		allowed[path] = struct{}{}
 	}
+	named := make(map[string]struct{}, len(res.Files))
 	for path, content := range res.Files {
+		if _, ok := named[path]; ok {
+			continue
+		}
+		named[path] = struct{}{}
 		if _, ok := allowed[path]; !ok {
 			return fmt.Sprintf("the resolution named %q, which is not one of the conflicted files", path)
 		}
@@ -276,6 +334,11 @@ func invalidResolutionReason(res *AssistResolution, rejected []string) string {
 		}
 		if markers := conflictMarkersIn(content); markers != "" {
 			return fmt.Sprintf("the resolution for %q still carries the %s conflict marker", path, markers)
+		}
+	}
+	for _, path := range rejected {
+		if _, ok := named[path]; !ok {
+			return fmt.Sprintf("the resolution is missing %q, one of the conflicted files", path)
 		}
 	}
 	return ""
@@ -346,18 +409,39 @@ func boundedDiff(ctx context.Context, directory string, args ...string) (string,
 
 // boundedFileContent reads one conflicted worktree file for the prompt,
 // truncated at the per-file prompt bound with the truncation named, so the
-// model knows it saw a prefix rather than the whole file.
+// model knows it saw a prefix rather than the whole file. The read is
+// bounded at the OS handle — a huge conflicted file never enters memory
+// whole — and a path that is not a regular file is refused, because a read
+// through a symlink would lift prompt content from an arbitrary path
+// outside the workspace.
 func boundedFileContent(directory, path string) (string, error) {
 	full := filepath.Join(directory, filepath.FromSlash(path))
-	raw, err := os.ReadFile(full)
+	info, err := os.Lstat(full)
 	if err != nil {
 		return "", err
 	}
+	if !info.Mode().IsRegular() {
+		return "", &nonRegularConflictError{path: path}
+	}
+	file, err := os.Open(full)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	// One byte past the bound decides truncation without reading the whole
+	// file; the note names the true size from the lstat of the regular
+	// file, not the bounded read.
+	raw := make([]byte, DefaultAssistMaxFileBytes+1)
+	n, readErr := io.ReadFull(file, raw)
+	if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+		return "", readErr
+	}
+	raw = raw[:n]
 	if len(raw) <= DefaultAssistMaxFileBytes {
 		return string(raw), nil
 	}
 	return string(raw[:DefaultAssistMaxFileBytes]) +
-		fmt.Sprintf("\n[... truncated: the file is %d bytes, the prompt bound is %d ...]", len(raw), DefaultAssistMaxFileBytes), nil
+		fmt.Sprintf("\n[... truncated: the file is %d bytes, the prompt bound is %d ...]", info.Size(), DefaultAssistMaxFileBytes), nil
 }
 
 // boundText truncates s to limit bytes.

@@ -90,7 +90,10 @@ func (g *gatewayResolver) Resolve(ctx context.Context, req rebase.AssistRequest)
 		switch event.Kind {
 		case harness.KindDelta:
 			if response.Len()+len(event.Text) > rebaseAssistMaxResponseBytes {
-				return nil, fmt.Errorf("rebase assist: the model response exceeded %d bytes", rebaseAssistMaxResponseBytes)
+				return &rebase.AssistResolution{
+					Refusal: fmt.Sprintf("the model response exceeded the %d-byte response bound", rebaseAssistMaxResponseBytes),
+					Model:   g.model,
+				}, nil
 			}
 			response.WriteString(event.Text)
 		case harness.KindFinal:
@@ -102,10 +105,7 @@ func (g *gatewayResolver) Resolve(ctx context.Context, req rebase.AssistRequest)
 			return nil, event.Err
 		}
 	}
-	resolution, err := parseAssistResolution(response.String())
-	if err != nil {
-		return nil, err
-	}
+	resolution := parseAssistResolution(response.String())
 	resolution.Model = g.model
 	if usage != nil {
 		resolution.InputTokens = usage.InputTokens
@@ -129,31 +129,33 @@ type assistWire struct {
 // response and maps it to a resolution. Models routinely frame JSON in
 // prose, so the scan tolerates surrounding text: it walks the response once
 // tracking string literals and brace depth, keeps the last complete
-// top-level object, and refuses a response that holds none — a partial or
-// framed answer is data the engine will reject, but no JSON at all is a
-// turn that failed to answer in the agreed shape.
-func parseAssistResolution(response string) (*rebase.AssistResolution, error) {
+// top-level object, and treats a response that holds none — or one that
+// will not decode, or one past the response bound — as the model failing to
+// answer in the agreed shape. That is a decision failure, not a down
+// gateway, so it maps to a refusal the engine classifies as the model
+// declining: a genuine transport error returns from Resolve as an error.
+func parseAssistResolution(response string) *rebase.AssistResolution {
 	if len(response) > rebaseAssistMaxResponseBytes {
-		return nil, fmt.Errorf("rebase assist: the model response exceeded %d bytes", rebaseAssistMaxResponseBytes)
+		return &rebase.AssistResolution{Refusal: fmt.Sprintf("the model response exceeded the %d-byte response bound", rebaseAssistMaxResponseBytes)}
 	}
 	span, ok := lastJSONObject(response)
 	if !ok {
-		return nil, errors.New("rebase assist: the model response contains no JSON object")
+		return &rebase.AssistResolution{Refusal: "the model response contained no JSON object"}
 	}
 	var wire assistWire
 	if err := json.Unmarshal([]byte(response[span.start:span.end]), &wire); err != nil {
-		return nil, fmt.Errorf("rebase assist: the model's JSON answer is undecodable: %w", err)
+		return &rebase.AssistResolution{Refusal: "the model's JSON answer was undecodable"}
 	}
 	if strings.TrimSpace(wire.Refusal) != "" {
 		// An honest decline stands even beside file content: the engine
 		// treats a refusal as the whole answer.
-		return &rebase.AssistResolution{Refusal: wire.Refusal}, nil
+		return &rebase.AssistResolution{Refusal: wire.Refusal}
 	}
 	files := make(map[string]string, len(wire.Files))
 	for _, file := range wire.Files {
 		files[file.Path] = file.Content
 	}
-	return &rebase.AssistResolution{Files: files}, nil
+	return &rebase.AssistResolution{Files: files}
 }
 
 type jsonSpan struct {
