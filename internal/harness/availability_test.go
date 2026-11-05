@@ -225,19 +225,72 @@ func TestConfirmedExhaustionIsNotRetriedInProcess(t *testing.T) {
 	}
 }
 
-func TestTransientRateLimitIsRetriedInProcess(t *testing.T) {
+// TestUnhintedRateLimitIsNotRetriedInProcess pins the #736 burst guard: a
+// plain 429 with no Retry-After hint gets no in-process retries at all, so one
+// provider throttle cannot become four sub-second provider requests.
+func TestUnhintedRateLimitIsNotRetriedInProcess(t *testing.T) {
+	gateway, mocker, cleanup := gatewayFor(gatewayResponse{status: http.StatusTooManyRequests, errBody: `{"error":{"message":"slow down"}}`})
+	defer cleanup()
+	session, _ := NewSession(gateway, testBindings(), RoleCoordinator, nil)
+	start := time.Now()
+	events := session.Turn(context.Background(), nil)
+	if elapsed := time.Since(start); elapsed >= time.Second {
+		t.Fatalf("turn took %v; an unhinted 429 must not burst retries", elapsed)
+	}
+	if last := events[len(events)-1]; last.Kind != KindError {
+		t.Fatalf("terminal event = %+v, want error", last)
+	}
+	if got := mocker.requestCount(); got != 1 {
+		t.Fatalf("gateway requests = %d, want 1 (an unhinted 429 must not burst)", got)
+	}
+}
+
+// TestHintedRateLimitIsRetriedAfterTheHint pins that an authoritative
+// Retry-After hint survives transport classification and controls the retry:
+// a short hint is waited out, not burst-past.
+func TestHintedRateLimitIsRetriedAfterTheHint(t *testing.T) {
 	gateway, mocker, cleanup := gatewayFor(
-		gatewayResponse{status: http.StatusTooManyRequests, errBody: `{"error":{"message":"slow down"}}`},
+		gatewayResponse{status: http.StatusTooManyRequests, header: http.Header{"Retry-After": []string{"1"}}, errBody: `{"error":{"message":"slow down"}}`},
 		gatewayResponse{body: sse(contentChunk("working"), finishChunk("stop"))},
 	)
 	defer cleanup()
 	session, _ := NewSession(gateway, testBindings(), RoleCoordinator, nil)
+	start := time.Now()
 	events := session.Turn(context.Background(), nil)
 	if last := events[len(events)-1]; last.Kind != KindFinal {
 		t.Fatalf("terminal event = %+v, want final", last)
 	}
 	if got := mocker.requestCount(); got != 2 {
-		t.Fatalf("gateway requests = %d, want 2 (transient 429 retried)", got)
+		t.Fatalf("gateway requests = %d, want 2 (a short Retry-After hint is honored and retried)", got)
+	}
+	if elapsed := time.Since(start); elapsed < time.Second {
+		t.Fatalf("turn returned in %v; the retry must wait out the Retry-After hint", elapsed)
+	}
+}
+
+// TestTurnRetryDelayRateLimitPolicy pins the retry decision table at the
+// policy level: transport and 5xx retry on the bounded backoff, an unhinted
+// 429 never retries in-process, a short hint controls the delay, and a hint
+// beyond the in-process bound is left to the source re-offer.
+func TestTurnRetryDelayRateLimitPolicy(t *testing.T) {
+	unhinted := &GatewayError{Status: http.StatusTooManyRequests, Availability: ProviderTransientRateLimit, Retryable: true}
+	if delay, retry := turnRetryDelay(unhinted); retry {
+		t.Fatalf("unhinted 429 = (%v, %v), want no in-process retry", delay, retry)
+	}
+	hinted := &GatewayError{Status: http.StatusTooManyRequests, Availability: ProviderTransientRateLimit, Retryable: true, RetryAfter: 2 * time.Second}
+	if delay, retry := turnRetryDelay(hinted); !retry || delay != 2*time.Second {
+		t.Fatalf("hinted 429 = (%v, %v), want (2s, true)", delay, retry)
+	}
+	longHint := &GatewayError{Status: http.StatusTooManyRequests, Availability: ProviderTransientRateLimit, Retryable: true, RetryAfter: time.Hour}
+	if _, retry := turnRetryDelay(longHint); retry {
+		t.Fatal("a 429 hinted beyond the in-process bound must not be spun on")
+	}
+	unavailable := &GatewayError{Status: http.StatusServiceUnavailable, Availability: ProviderUnavailable, Retryable: true}
+	if delay, retry := turnRetryDelay(unavailable); !retry || delay != retryBackoff {
+		t.Fatalf("5xx = (%v, %v), want (%v, true)", delay, retry, retryBackoff)
+	}
+	if _, retry := turnRetryDelay(&GatewayTransportError{Err: errors.New("reset")}); !retry {
+		t.Fatal("a transport failure must stay retryable")
 	}
 }
 
@@ -309,13 +362,8 @@ func TestCoordinatorEndsBlockedExternalOnAllowanceExhaustion(t *testing.T) {
 	}
 }
 
-func TestCoordinatorEndsBlockedExternalOnPersistentRateLimit(t *testing.T) {
-	shrinkRetryDelays(t)
-	script := make([]gatewayResponse, maxStreamRetries+1)
-	for i := range script {
-		script[i] = gatewayResponse{status: http.StatusTooManyRequests, errBody: `{"error":{"message":"slow down"}}`}
-	}
-	gateway, mocker, cleanup := gatewayFor(script...)
+func TestCoordinatorEndsBlockedExternalOnUnhintedRateLimit(t *testing.T) {
+	gateway, mocker, cleanup := gatewayFor(gatewayResponse{status: http.StatusTooManyRequests, errBody: `{"error":{"message":"slow down"}}`})
 	defer cleanup()
 	coordinator, err := NewCoordinator(CoordinatorConfig{Transport: gateway, Bindings: testBindings()})
 	if err != nil {
@@ -323,13 +371,13 @@ func TestCoordinatorEndsBlockedExternalOnPersistentRateLimit(t *testing.T) {
 	}
 	result := coordinator.Run(context.Background(), testInvocation())
 	if result.Err != nil {
-		t.Fatalf("a persistent rate limit must be recoverable, not an infra error: %v", result.Err)
+		t.Fatalf("an unhinted rate limit must be recoverable, not an infra error: %v", result.Err)
 	}
 	if result.Outcome != executor.OutcomeBlockedExternal {
 		t.Fatalf("outcome = %q, want blocked_external", result.Outcome)
 	}
-	if got := mocker.requestCount(); got != maxStreamRetries+1 {
-		t.Fatalf("gateway requests = %d, want %d retries before deferring", got, maxStreamRetries+1)
+	if got := mocker.requestCount(); got != 1 {
+		t.Fatalf("gateway requests = %d, want 1 (the unhinted 429 defers instead of bursting)", got)
 	}
 }
 

@@ -157,11 +157,12 @@ type ProviderClassification struct {
 }
 
 // Deferred reports whether the failure is a resource-availability condition
-// the run should not fail on: a confirmed exhaustion, a rate limit that
-// persisted through the in-process retries, or a transient failure whose
-// authoritative reset hint is longer than a single incarnation should spin on.
-// A deferred failure is recoverable and belongs to source re-offer, not to a
-// hard run failure or a human decision.
+// the run should not fail on: a confirmed exhaustion, or a transient rate
+// limit — whether unhinted, hinted beyond the in-process bound, or persistent
+// through the retries a short hint allowed — that the source re-offers rather
+// than a burst of in-process retries (#736). A deferred failure is recoverable
+// and belongs to source re-offer, not to a hard run failure or a human
+// decision.
 func (c ProviderClassification) Deferred() bool {
 	switch c.Availability {
 	case ProviderAllowanceExhausted, ProviderTransientRateLimit:

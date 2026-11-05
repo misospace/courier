@@ -1753,17 +1753,22 @@ folded into a known class. The classifier retains only the fixed class and, at
 most, a short allowlisted code; the provider body, message, and any credential
 it might quote are never retained or surfaced.
 
-**Retry policy.** Transport failures, 5xx, request timeouts, and a plain 429
-remain retryable in-process (bounded by the existing stream-retry budget). A
-confirmed exhaustion, an auth rejection, a context-limit rejection, and a
-request rejection are not retried in-process. A retryable failure whose
-authoritative `Retry-After` exceeds the in-process bound (5s) is likewise not
+**Retry policy.** Transport failures, 5xx, and request timeouts remain
+retryable in-process (bounded by the existing stream-retry budget). A rate
+limit (429) is retried in-process only when the provider supplied an
+authoritative `Retry-After` hint within the in-process bound (5s): the hint is
+waited out, not burst-past. An unhinted 429 gets no in-process retries — a
+sub-second multi-request burst is hostile to provider rate-limit recovery —
+and a confirmed exhaustion, an auth rejection, a context-limit rejection, and
+a request rejection are not retried in-process either. A retryable failure
+whose authoritative `Retry-After` exceeds the in-process bound is likewise not
 spun on: the run ends recoverable and the source re-offers it. The harness
 never invents a reset time; an absent or unparseable hint is reported as
 unknown, not guessed.
 
 **Recovery ending.** A **deferred** failure — a confirmed exhaustion, or a
-transient failure with a reset hint longer than the in-process bound — ends the
+transient rate limit (unhinted, hinted beyond the in-process bound, or
+persistent through the retries a short hint allowed) — ends the
 run as `blocked_external`. The operator already maps exit 2 plus the
 `blocked_external` outcome to `PhaseBlockedExternal`, which reports the
 source-neutral `blocked-external` lifecycle result (Dispatch `waiting-external`
