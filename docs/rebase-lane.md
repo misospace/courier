@@ -241,6 +241,13 @@ wire contract stays `rebase-executor:1`, and a deterministic-only run must
 never be reported or described as model execution. This mode stays an
 explicit operator choice until that contract lands.
 
+That contract carries #732's remaining acceptance criteria — the versioned
+capability that distinguishes deterministic-only from model-assisted support,
+safe behavior in both mixed-version release orders, and the exact outgoing
+fallback report with its accepted or refused resolution. This lane delivers
+the Courier-side capability only; #732 stays open until Dispatch settles the
+rest.
+
 ## Limitations of this release
 
 - The secure-mode broker path does not accept rebase runs; the rebase lane
