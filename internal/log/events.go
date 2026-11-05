@@ -62,10 +62,12 @@ const (
 	EventExecutorContinuation = "executor.continuation"
 	// EventModelCall reports one model request the native harness sent
 	// (#738) — a capability-gate completion probe or a session turn attempt,
-	// retries included — carrying the attempt number, the usage the provider
-	// reported when it did (an explicit absence when it did not), and the
-	// harness's estimated prompt size. The event is Verbose so the counts
-	// reach the log store at info level on every run, not only on debug runs.
+	// retries included, plus the request a transport's usage-field seam sent
+	// and the provider rejected before the retry — carrying the attempt
+	// number, the usage the provider reported when it did (an explicit
+	// absence when it did not), and the harness's estimated prompt size. The
+	// event is Verbose so the counts reach the log store at info level on
+	// every run, not only on debug runs.
 	EventModelCall = "model.call"
 	// EventToolCall reports one tool invocation (future harness).
 	EventToolCall = "tool.call"

@@ -432,17 +432,33 @@ func probeModelBindings(ctx context.Context, deps ProbeDeps) []Capability {
 			var events []Event
 			events, err = deps.ModelProbe(ctx, model)
 			probed[model] = err
-			// One probe observation per unique model (#738), attributed to
-			// the first sorted role bound to it: the probe is the model's,
-			// not any one role's, and the roles sharing a model share the
-			// probe. The usage the provider reported rides the probe's
-			// terminal event when it did; the /model/info reads are gateway
-			// metadata, not model requests, and are never recorded. The
-			// delivery is isolated: telemetry is observability only.
+			// One probe observation per provider request the probe's
+			// transport sent (#738), in the order the provider saw them,
+			// attributed to the first sorted role bound to the model: the
+			// probe is the model's, not any one role's, and the roles
+			// sharing a model share the probe. Each rejected pre-retry
+			// request the probe's terminal names on RejectedRequests is
+			// recorded first, as a non-OK request with an explicit usage
+			// absence; the probe's own request carries the usage the
+			// provider reported on the terminal event when it did. The
+			// /model/info reads are gateway metadata, not model requests,
+			// and are never recorded. The delivery is isolated: telemetry
+			// is observability only.
 			if deps.Requests != nil {
 				usage := (*Usage)(nil)
+				rejected := 0
 				if len(events) > 0 {
 					usage = events[len(events)-1].Usage
+					rejected = events[len(events)-1].RejectedRequests
+				}
+				for r := 0; r < rejected; r++ {
+					deliverRequest(deps.Requests, RequestObservation{
+						Class:    RequestProbe,
+						Role:     role,
+						Model:    model,
+						OK:       false,
+						Rejected: true,
+					})
 				}
 				deliverRequest(deps.Requests, RequestObservation{
 					Class: RequestProbe,

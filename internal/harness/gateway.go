@@ -179,9 +179,10 @@ type wireTool struct {
 // exactly as it would have without the telemetry request. The rejected
 // attempt itself is bounded by the same memory: the field is dropped after
 // the first rejection, so only the requests in flight around that first
-// rejection can repeat it, and the session's request accounting stays
-// attempt-scoped — those are the only provider requests the per-run
-// request counts do not name.
+// rejection can repeat it. The rejected request the provider already
+// received is not left unnamed: it rides the turn's terminal event on
+// RejectedRequests, so the run's request observers record every provider
+// request the turn sent and the per-run request counts stay a total.
 func (g *Gateway) StreamChat(ctx context.Context, req ChatRequest) ([]Event, error) {
 	includeUsage := !g.usageUnsupported.Load()
 	resp, sent, err := g.post(ctx, req, includeUsage)
@@ -213,14 +214,23 @@ func (g *Gateway) StreamChat(ctx context.Context, req ChatRequest) ([]Event, err
 				if !sent {
 					return nil, err
 				}
-				return []Event{{Kind: KindError, Err: err}}, nil
+				return []Event{{Kind: KindError, Err: err, RejectedRequests: 1}}, nil
 			}
 			defer resp.Body.Close()
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				body, _ := io.ReadAll(io.LimitReader(resp.Body, maxProviderErrorBody))
-				return []Event{{Kind: KindError, Err: gatewayStatusError(resp.StatusCode, resp.Header, body, g.signals())}}, nil
+				return []Event{{Kind: KindError, Err: gatewayStatusError(resp.StatusCode, resp.Header, body, g.signals()), RejectedRequests: 1}}, nil
 			}
-			return normalizeStream(resp.Body, g.signals())
+			events, err := normalizeStream(resp.Body, g.signals())
+			// The request the provider rejected is a provider request the
+			// run's accounting must name (#738): it rides the turn's
+			// terminal event, whatever the retry's outcome, and the
+			// observers record it as its own non-OK request with an
+			// explicit usage absence.
+			if len(events) > 0 {
+				events[len(events)-1].RejectedRequests = 1
+			}
+			return events, err
 		}
 		return []Event{{Kind: KindError, Err: gatewayStatusError(resp.StatusCode, resp.Header, body, g.signals())}}, nil
 	}
@@ -597,6 +607,18 @@ func decodeUsage(raw json.RawMessage) (*Usage, bool) {
 	}, true
 }
 
+// usageReported reports whether a raw usage object is present: non-empty and
+// not JSON null. Both transports share it as the difference between "the
+// provider sent a usage object telemetry cannot honor" and "the provider
+// sent none" (#738): the former voids the turn's whole report — a report
+// that cannot be honored is no report, and a partial zero-valued one is
+// worse than none — while the latter leaves whatever the provider exactly
+// named standing.
+func usageReported(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null"))
+}
+
 // wholeCount reads one provider-reported count as an exact integer token
 // count. An absent field is a zero the provider did not contradict; a
 // fractional or malformed value is not a report at all.
@@ -702,10 +724,15 @@ func normalizeStream(body io.Reader, signals ExhaustionSignals) ([]Event, error)
 			// below sees nothing in it. A report telemetry cannot read as
 			// exact whole-token counts is an absence, never a turn failure:
 			// the run must proceed exactly as it would have without the
-			// usage request. The gateway reports the turn's usage once, on
-			// a trailing chunk, so a later chunk replaces an earlier one.
+			// usage request. An exact report replaces an earlier one — the
+			// gateway reports the turn's usage once, on a trailing chunk —
+			// and a present report that is not exact voids the report
+			// already assembled (#738): a report that cannot be honored is
+			// no report, on this transport exactly as on the Anthropic one.
 			if decoded, ok := decodeUsage(chunk.Usage); ok {
 				usage = decoded
+			} else if usageReported(chunk.Usage) {
+				usage = nil
 			}
 		}
 		for _, choice := range chunk.Choices {

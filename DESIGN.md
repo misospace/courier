@@ -2217,8 +2217,10 @@ deterministic prompt estimate travels separately, never as usage — plus one
 `model.telemetry` summary next to the terminal handoff tallying requests by
 class and role/model, the reported/missing split, provider-reported token
 sums, the peak prompt size, and the compaction count with before/after
-context sizes. Both events are observability only and carry no credentials
-and no provider response text.
+context sizes. Every provider request the turn's transport sent is
+observed, including the one a `stream_options`-rejected usage-field retry
+forced before it, each with its explicit usage absence. Both events are
+observability only and carry no credentials and no provider response text.
 
 ## Custom resources
 

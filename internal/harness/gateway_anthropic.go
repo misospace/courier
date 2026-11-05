@@ -516,8 +516,14 @@ func normalizeAnthropicStream(body io.Reader, signals ExhaustionSignals) ([]Even
 	// cumulative output count the message_delta events carry (#738).
 	// usageSeen distinguishes "the provider reported usage" from a nil
 	// report: absence is recorded as absence, never a zero.
+	// usageUnusable marks a usage object the provider sent that is not an
+	// exact whole-token count: a report telemetry cannot honor is no
+	// report, so it voids the turn's whole account — the partial counts
+	// already decoded are discarded with it — and no later exact object
+	// resurrects it (#738).
 	var usage *Usage
 	usageSeen := false
+	usageUnusable := false
 
 	terminal := func(err error) ([]Event, error) {
 		event := Event{Kind: KindError, Err: err}
@@ -547,16 +553,27 @@ func normalizeAnthropicStream(body io.Reader, signals ExhaustionSignals) ([]Even
 		case "message_start":
 			// The opening envelope's usage is the only place the stream
 			// names the input and prompt-cache counts (#738); the event
-			// itself carries no other payload. A report that is not an
-			// exact whole-token count is an absence, never a turn failure.
+			// itself carries no other payload. A present usage object that
+			// is not an exact whole-token count is not a report: it voids
+			// the turn's whole account, never a turn failure, and never a
+			// partial one. An exact envelope fills in the input-side counts
+			// without discarding what the turn already recorded exactly —
+			// an output count an earlier delta named stays, so no exact
+			// count the provider reported is ever lost to a zero.
 			if event.Message != nil {
 				if input, cacheRead, cacheWrite, ok := decodeMessageStartUsage(event.Message.Usage); ok {
-					usage = &Usage{
-						InputTokens:      input,
-						CacheReadTokens:  cacheRead,
-						CacheWriteTokens: cacheWrite,
+					if !usageUnusable {
+						if usage == nil {
+							usage = &Usage{}
+						}
+						usage.InputTokens = input
+						usage.CacheReadTokens = cacheRead
+						usage.CacheWriteTokens = cacheWrite
+						usageSeen = true
 					}
-					usageSeen = true
+				} else if usageReported(event.Message.Usage) {
+					usageUnusable = true
+					usage, usageSeen = nil, false
 				}
 			}
 			continue
@@ -640,14 +657,24 @@ func normalizeAnthropicStream(body io.Reader, signals ExhaustionSignals) ([]Even
 			}
 			// The Messages stream's output count arrives here, cumulative
 			// within the message: each value replaces the previous one, so
-			// the last one is the turn's (#738). A count that is not an
-			// exact whole-token count is an absence, never a turn failure.
+			// the last one is the turn's (#738). A present count that is
+			// not an exact whole-token count is not a report: it voids
+			// the turn's whole account, discarding the partial counts
+			// already decoded beside it — a partial zero-valued report is
+			// worse than no report at all — and never fails the turn. An
+			// absent usage object changes nothing: a report assembled
+			// from what the provider exactly named stands.
 			if output, ok := decodeDeltaUsage(event.Usage); ok {
-				if usage == nil {
-					usage = &Usage{}
+				if !usageUnusable {
+					if usage == nil {
+						usage = &Usage{}
+					}
+					usage.OutputTokens = output
+					usageSeen = true
 				}
-				usage.OutputTokens = output
-				usageSeen = true
+			} else if usageReported(event.Usage) {
+				usageUnusable = true
+				usage, usageSeen = nil, false
 			}
 		case "message_stop":
 			sawMessageStop = true

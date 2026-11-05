@@ -340,6 +340,52 @@ func TestProbeRecordsAFailedObservation(t *testing.T) {
 	}
 }
 
+// TestProbeRecordsTheRejectedUsageRequest pins the probe's total request
+// accounting across the usage-field seam (#738): a probe whose transport's
+// first request the provider rejected is recorded as its own non-OK probe
+// request, before the probe's own, with an explicit usage absence — the
+// rejected request the provider received is part of the run's model spend,
+// never an unnamed one.
+func TestProbeRecordsTheRejectedUsageRequest(t *testing.T) {
+	sink := &recordingRequestSink{}
+	bindings, err := BindRoles(map[string]string{"coordinator": "solo/model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deps := ProbeDeps{
+		Transport: &Gateway{},
+		Bindings:  bindings,
+		ModelProbe: func(context.Context, string) ([]Event, error) {
+			return []Event{{Kind: KindFinal, Usage: &Usage{InputTokens: 50, OutputTokens: 5}, RejectedRequests: 1}}, nil
+		},
+		Requests: sink,
+	}
+	_ = probeModelBindings(context.Background(), deps)
+	if len(sink.observations) != 2 {
+		t.Fatalf("probe observations = %d, want 2 (the rejected request and the probe's own)", len(sink.observations))
+	}
+	rejected := sink.observations[0]
+	if rejected.Class != RequestProbe {
+		t.Fatalf("observation 0 class = %s, want probe", rejected.Class)
+	}
+	if rejected.OK {
+		t.Fatal("observation 0 (the rejected request) is OK; it must not be")
+	}
+	if rejected.Usage != nil {
+		t.Fatalf("observation 0 carried usage %v; a request rejected before any stream reports none", rejected.Usage)
+	}
+	own := sink.observations[1]
+	if rejected.Role != own.Role || rejected.Model != own.Model {
+		t.Fatalf("observation 0 attribution = %s/%s, want the probe's own %s/%s", rejected.Role, rejected.Model, own.Role, own.Model)
+	}
+	if own.Class != RequestProbe || !own.OK {
+		t.Fatalf("observation 1 = %+v, want an OK probe", own)
+	}
+	if own.Usage == nil || own.Usage.InputTokens != 50 || own.Usage.OutputTokens != 5 {
+		t.Fatalf("observation 1 usage = %+v, want the probe's terminal report", own.Usage)
+	}
+}
+
 // TestCoordinatorSessionTalliesRequestThroughTelemetry pins the end-to-end
 // wiring: a coordinator built with a telemetry produces a session that reports
 // each request attempt through it, so the run's summary accounts for the work
@@ -468,8 +514,9 @@ func TestModelTelemetryForwardIsolation(t *testing.T) {
 // TestSessionCountsOneAttemptForAFallbackRejectedTurn pins the attempt-scoped
 // accounting seam (#738): a turn whose first request is rejected for the
 // usage field and whose retry without it succeeds is one attempt to the
-// session — the transport-level fallback request is the documented exception
-// the per-run request counts do not name.
+// session — the transport-level fallback does not advance the attempt index.
+// Both provider requests are nonetheless observed, the rejected one first,
+// so the per-run request counts stay a total.
 func TestSessionCountsOneAttemptForAFallbackRejectedTurn(t *testing.T) {
 	shrinkRetryDelays(t)
 	gateway, mocker, cleanup := gatewayFor(
@@ -487,14 +534,125 @@ func TestSessionCountsOneAttemptForAFallbackRejectedTurn(t *testing.T) {
 	if last := events[len(events)-1]; last.Kind != KindFinal {
 		t.Fatalf("terminal event = %+v, want final", last)
 	}
-	// Two provider requests left the pod; the session observed one attempt.
+	// Two provider requests left the pod; the session observed both, under
+	// the one attempt index the fallback retry does not advance.
 	if got := mocker.requestCount(); got != 2 {
 		t.Fatalf("gateway requests = %d, want 2 (the rejected ask and the retry)", got)
 	}
-	if len(sink.observations) != 1 {
-		t.Fatalf("observations = %d, want 1 (the fallback is transport-level and attempt-scoped)", len(sink.observations))
+	if len(sink.observations) != 2 {
+		t.Fatalf("observations = %d, want 2 (one per provider request the turn sent)", len(sink.observations))
 	}
-	if obs := sink.observations[0]; !obs.OK || obs.Usage != nil {
-		t.Fatalf("observation = %+v, want OK with an explicit usage absence", obs)
+	for i, obs := range sink.observations {
+		if obs.Attempt != 0 {
+			t.Fatalf("observation %d attempt = %d, want 0 (the fallback is the transport's, not a new attempt)", i, obs.Attempt)
+		}
+		if obs.Usage != nil {
+			t.Fatalf("observation %d carried usage %v; the seam's requests report none", i, obs.Usage)
+		}
+	}
+	if obs := sink.observations[0]; obs.OK {
+		t.Fatalf("observation 0 (the rejected request) is OK; it must not be: %+v", obs)
+	}
+	if obs := sink.observations[1]; !obs.OK {
+		t.Fatalf("observation 1 (the accepted retry) is not OK: %+v", obs)
+	}
+}
+
+// TestSessionTallyCountsTheSeamRequestButNotAsARetry pins the tally
+// semantics for a turn that hits the usage-field seam mid-retry (#738):
+// every provider request the turn sent is tallied — the in-process retry's
+// transport-rejected first request included — but the rejected request
+// shares its attempt's index without becoming a retry: it is the
+// transport's fallback, not an attempt of its own.
+func TestSessionTallyCountsTheSeamRequestButNotAsARetry(t *testing.T) {
+	shrinkRetryDelays(t)
+	gateway, mocker, cleanup := gatewayFor(
+		gatewayResponse{status: http.StatusServiceUnavailable},
+		gatewayResponse{status: http.StatusBadRequest, errBody: `{"error":{"message":"unrecognized request argument supplied: stream_options","type":"invalid_request_error"}}`},
+		gatewayResponse{body: sse(contentChunk("done"), finishChunk("stop"))},
+	)
+	defer cleanup()
+	recording := &recordingRequestSink{}
+	tally := NewModelTelemetry(recording)
+	session, err := NewSession(gateway, testBindings(), RoleCoordinator, nil, WithRequestSink(tally))
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.Append(Message{Role: "user", Content: "resolve the issue"})
+	events := session.Turn(context.Background(), nil)
+	if last := events[len(events)-1]; last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final", last)
+	}
+	if got := mocker.requestCount(); got != 3 {
+		t.Fatalf("gateway requests = %d, want 3 (failed attempt, rejected usage request, accepted retry)", got)
+	}
+	if len(recording.observations) != 3 {
+		t.Fatalf("observations = %d, want 3 (one per provider request the turn sent)", len(recording.observations))
+	}
+	first, rejected, accepted := recording.observations[0], recording.observations[1], recording.observations[2]
+	if first.Attempt != 0 || first.OK {
+		t.Fatalf("first observation = attempt %d ok %v, want the failed attempt 0", first.Attempt, first.OK)
+	}
+	if rejected.Attempt != 1 || rejected.OK || !rejected.Rejected || rejected.Usage != nil {
+		t.Fatalf("second observation = %+v, want the transport-rejected request: attempt 1, non-OK, explicit absence", rejected)
+	}
+	if accepted.Attempt != 1 || !accepted.OK || accepted.Rejected {
+		t.Fatalf("third observation = attempt %d ok %v rejected %v, want the accepted retry at attempt 1", accepted.Attempt, accepted.OK, accepted.Rejected)
+	}
+	summary := tally.Summary()
+	if summary.TotalRequests != 3 || summary.WorkRequests != 3 {
+		t.Fatalf("summary totals = %d/%d, want 3/3: every provider request is tallied", summary.TotalRequests, summary.WorkRequests)
+	}
+	if summary.Retries != 1 {
+		t.Fatalf("summary retries = %d, want 1: only the accepted attempt is an in-process retry; the transport-rejected request is not", summary.Retries)
+	}
+	if len(summary.ByRoleModel) != 1 || summary.ByRoleModel[0].Retries != 1 {
+		t.Fatalf("cell tallies = %+v, want one cell with one retry", summary.ByRoleModel)
+	}
+}
+
+// TestProbeObservesTheSeamRequestOfARealGateway pins the probe-side
+// accounting end to end (#738): a probe whose gateway rejects the usage
+// request sends two provider requests, and both are observed — the
+// rejected one as a non-OK probe request with an explicit usage absence,
+// then the accepted retry with the usage its stream reported.
+func TestProbeObservesTheSeamRequestOfARealGateway(t *testing.T) {
+	gateway, mocker, cleanup := gatewayFor(
+		gatewayResponse{status: http.StatusBadRequest, errBody: `{"error":{"message":"unrecognized request argument supplied: stream_options","type":"invalid_request_error"}}`},
+		gatewayResponse{body: sse(contentChunk("pong"), finishChunk("stop"), usageChunk(50, 5, 0))},
+	)
+	defer cleanup()
+	sink := &recordingRequestSink{}
+	bindings, err := BindRoles(map[string]string{"coordinator": "solo/model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deps := ProbeDeps{
+		Transport: gateway,
+		Bindings:  bindings,
+		ModelProbe: func(probeCtx context.Context, model string) ([]Event, error) {
+			return gateway.StreamChat(probeCtx, ChatRequest{Model: model, Messages: []Message{{Role: "user", Content: "ping"}}})
+		},
+		Requests: sink,
+	}
+	caps := probeModelBindings(context.Background(), deps)
+	if len(caps) != 1 || caps[0].State != StateHealthy {
+		t.Fatalf("capabilities = %+v, want one healthy binding (the seam must not turn the probe away)", caps)
+	}
+	if got := mocker.requestCount(); got != 2 {
+		t.Fatalf("gateway requests = %d, want 2 (rejected attempt + accepted retry)", got)
+	}
+	if len(sink.observations) != 2 {
+		t.Fatalf("probe observations = %d, want 2 (one per provider request the probe sent)", len(sink.observations))
+	}
+	rejected, accepted := sink.observations[0], sink.observations[1]
+	if rejected.Class != RequestProbe || rejected.OK || !rejected.Rejected || rejected.Usage != nil {
+		t.Fatalf("first probe observation = %+v, want the transport-rejected request: non-OK, explicit absence", rejected)
+	}
+	if accepted.Class != RequestProbe || !accepted.OK || accepted.Rejected {
+		t.Fatalf("second probe observation = %+v, want the accepted retry", accepted)
+	}
+	if accepted.Usage == nil || accepted.Usage.InputTokens != 50 || accepted.Usage.OutputTokens != 5 {
+		t.Fatalf("accepted retry usage = %+v, want the provider's report", accepted.Usage)
 	}
 }

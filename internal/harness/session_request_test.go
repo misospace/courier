@@ -9,13 +9,16 @@ import (
 
 // --- session model-request observations (#738) -----------------------------
 //
-// The session's request sink receives one observation per attempt it sends,
-// retries included, because the gateway terminalizes every failed attempt
+// The session's request sink receives one observation per model request the
+// session's turns send, because the gateway terminalizes every failed attempt
 // (a 5xx, a dropped connection, an in-stream error) as a KindError event and
 // only a request-build failure — the harness's own bug, not a sent request —
-// is left unobserved. These tests pin that the session reports every attempt
-// it made, with the attempt index, the harness's estimated prompt size, and
-// the provider's usage from the terminal when it reported one.
+// is left unobserved. A transport-level fallback is observed too: the one
+// request a usage-field rejection forces before the attempt's own is recorded
+// first, under the attempt's own index. These tests pin that the session
+// reports every request it made, with the attempt index, the harness's
+// estimated prompt size, and the provider's usage from the terminal when it
+// reported one.
 
 // recordingRequestSink captures the request observations a session delivers.
 type recordingRequestSink struct {
@@ -92,6 +95,63 @@ func TestSessionRequestSinkRecordsEveryAttempt(t *testing.T) {
 	}
 	if sink.observations[0].EstimatedPromptTokens != sink.observations[2].EstimatedPromptTokens {
 		t.Fatalf("estimate changed between attempts: %d vs %d", sink.observations[0].EstimatedPromptTokens, sink.observations[2].EstimatedPromptTokens)
+	}
+}
+
+// TestSessionRequestSinkRecordsTheRejectedUsageRequest pins the total
+// request accounting across the usage-field seam (#738): the request the
+// provider rejected is part of the run's model spend, so the session records
+// it — first, in the order the provider saw it, as a non-OK request with an
+// explicit usage absence and the attempt's shared estimate, under the
+// attempt's own index, because the fallback retry is the transport's, not a
+// new session attempt.
+func TestSessionRequestSinkRecordsTheRejectedUsageRequest(t *testing.T) {
+	gateway, mocker, cleanup := gatewayFor(
+		gatewayResponse{status: http.StatusBadRequest, errBody: `{"error":{"message":"unrecognized request argument supplied: stream_options","type":"invalid_request_error"}}`},
+		gatewayResponse{body: sse(contentChunk("done"), finishChunk("stop"))},
+	)
+	defer cleanup()
+	sink := &recordingRequestSink{}
+	session, err := NewSession(gateway, testBindings(), RoleCoordinator, nil, WithRequestSink(sink))
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.Append(Message{Role: "user", Content: "resolve the issue"})
+	events := session.Turn(context.Background(), nil)
+	if last := events[len(events)-1]; last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final", last)
+	}
+	if got := mocker.requestCount(); got != 2 {
+		t.Fatalf("gateway requests = %d, want 2 (the rejected ask and the retry)", got)
+	}
+	if len(sink.observations) != 2 {
+		t.Fatalf("observations = %d, want 2 (one per provider request the turn sent)", len(sink.observations))
+	}
+	for i, obs := range sink.observations {
+		if obs.Class != RequestWork {
+			t.Fatalf("observation %d class = %s, want work", i, obs.Class)
+		}
+		if obs.Role != RoleCoordinator || obs.Model != "test/coordinator" {
+			t.Fatalf("observation %d attribution = %s/%s, want the session's role/binding", i, obs.Role, obs.Model)
+		}
+		if obs.Attempt != 0 {
+			t.Fatalf("observation %d attempt = %d, want 0 (the fallback retry is the transport's, not a new attempt)", i, obs.Attempt)
+		}
+		if obs.EstimatedPromptTokens == 0 {
+			t.Fatalf("observation %d estimate = 0, want the transcript's shared nonzero estimate", i)
+		}
+		if obs.Usage != nil {
+			t.Fatalf("observation %d carried usage %v; the seam's requests report none", i, obs.Usage)
+		}
+	}
+	if obs := sink.observations[0]; obs.OK {
+		t.Fatalf("observation 0 (the rejected request) is OK; it must not be: %+v", obs)
+	}
+	if obs := sink.observations[1]; !obs.OK {
+		t.Fatalf("observation 1 (the accepted retry) is not OK: %+v", obs)
+	}
+	if sink.observations[0].EstimatedPromptTokens != sink.observations[1].EstimatedPromptTokens {
+		t.Fatalf("estimate changed across the seam: %d vs %d", sink.observations[0].EstimatedPromptTokens, sink.observations[1].EstimatedPromptTokens)
 	}
 }
 

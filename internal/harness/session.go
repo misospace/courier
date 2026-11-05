@@ -233,9 +233,11 @@ type Session struct {
 
 	budget      ContextBudget
 	compactions CompactionSink
-	// requests receives one observation per model request the session
-	// sends (#738): every attempt, with the usage the provider reported on
-	// the terminal event when it did. Nil sends no observations.
+	// requests receives one observation per model request the session's
+	// turns send (#738): every attempt, and the request its transport
+	// rejected and retried without the usage field, with the usage the
+	// provider reported on the terminal event when it did. Nil sends no
+	// observations.
 	requests ModelRequestSink
 
 	// pinned is the number of leading messages compaction must never digest:
@@ -322,10 +324,12 @@ func (s *Session) Settle(text string) {
 // retries are active, not alive). The returned events always end with a
 // terminal event (final, tool requests, or error).
 //
-// Every attempt the session sends — the first and each in-process retry — is
-// observed as one work request by the session's request sink (#738): the
-// sink is observability only, and a failed observation never changes the
-// turn's outcome.
+// Every provider request an attempt of the session sends is observed as a
+// work request by the session's request sink (#738) — the attempt's own
+// request, and the request its transport rejected and retried without the
+// usage field, named on the turn's terminal — so the run's request counts
+// stay a total: the sink is observability only, and a failed observation
+// never changes the turn's outcome.
 func (s *Session) Turn(ctx context.Context, tools []ToolDef) []Event {
 	// The harness's deterministic estimate of the request's prompt size:
 	// the transcript plus the tool declarations, the same account the
@@ -374,13 +378,30 @@ func (s *Session) Turn(ctx context.Context, tools []ToolDef) []Event {
 	}
 }
 
-// observeRequest delivers one work-request observation to the session's
-// request sink (#738). The observation carries the attempt index, the
-// harness's estimated prompt size, and the usage the provider reported on the
-// terminal event when it did — nil is an explicit absence. Delivery is
-// fire-and-forget and isolated: the sink is observability, and a failing
-// sink is dropped, never allowed to change the turn.
+// observeRequest delivers one work-request observation per provider request
+// the attempt's transport sent (#738), in the order the provider saw them:
+// first each rejected pre-retry request the terminal event names on
+// RejectedRequests — the OpenAI-compatible seam's usage-field retry — as a
+// non-OK request with an explicit usage absence and the attempt's shared
+// prompt-size estimate, under the attempt's own index, because the fallback
+// is the transport's, not a new session attempt; then the attempt's own
+// request, carrying the attempt index, the harness's estimated prompt size,
+// and the usage the provider reported on the terminal event when it did —
+// nil is an explicit absence. Delivery is fire-and-forget and isolated: the
+// sink is observability, and a failing sink is dropped, never allowed to
+// change the turn.
 func (s *Session) observeRequest(attempt, estimated int, terminal Event) {
+	for rejected := 0; rejected < terminal.RejectedRequests; rejected++ {
+		deliverRequest(s.requests, RequestObservation{
+			Class:                 RequestWork,
+			Role:                  s.role,
+			Model:                 s.binding,
+			Attempt:               attempt,
+			OK:                    false,
+			EstimatedPromptTokens: estimated,
+			Rejected:              true,
+		})
+	}
 	deliverRequest(s.requests, RequestObservation{
 		Class:                 RequestWork,
 		Role:                  s.role,

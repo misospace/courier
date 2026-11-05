@@ -1479,13 +1479,14 @@ telemetry instead of inferring it from gateway failover alerts. It is a log
 event, never status, and never lets a model assert liveness or completion.
 
 **Model-consumption telemetry (#738).** The native harness observes every
-model request it sends and reports the run's consumption shape as run
-telemetry. Each request — a capability-gate probe or a session turn attempt,
-retries included — emits one `model.call` event carrying the request class
-(probe or work), the role and its bound model, the attempt number, the
-outcome, and the usage the provider reported on that request's stream when it
-reported one. The transports parse usage from the provider's own report: the
-OpenAI-compatible transport asks for it with
+provider request its turns send and reports the run's consumption shape as
+run telemetry. Each provider request — a capability-gate probe or a session
+turn attempt, in-process retries included, and the one request a usage-field
+rejection forces before the attempt's own — emits one `model.call` event
+carrying the request class (probe or work), the role and its bound model,
+the attempt number, the outcome, and the usage the provider reported on that
+request's stream when it reported one. The transports parse usage from the
+provider's own report: the OpenAI-compatible transport asks for it with
 `stream_options.include_usage`, and the Anthropic transport reads the
 `message_start` and `message_delta` usage objects. A gateway that rejects
 the request because of that field is not turned away by it: the OpenAI
@@ -1493,8 +1494,12 @@ transport recognizes the rejection from the bounded error prefix naming the
 field, retries the turn once without the field, and omits the field from
 every later request on that transport — the usage is then an explicit
 absence, and the turn's outcome is exactly what it would have been without
-the usage request. A usage report that is not an exact whole-token count is
-treated as no report, never a turn failure. A request the provider did
+the usage request. The rejected request itself is observed as its own
+non-OK `model.call` — it reached the provider, so the run's request counts
+stay a total — with an explicit usage absence, in the order the provider
+saw it. A usage report that is not an exact whole-token count is treated as
+no report for the turn's whole account — never a partial zero-valued one,
+and never a turn failure. A request the provider did
 not count is recorded as an explicit absence (`usage_reported: false`, no
 token fields), never a zero; the harness's own deterministic prompt estimate
 is reported beside it as an estimate and never as provider-reported usage.

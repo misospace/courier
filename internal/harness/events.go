@@ -109,6 +109,15 @@ type Event struct {
 	// an explicit absence: the provider said nothing, and the run's
 	// telemetry records that absence rather than inventing a zero.
 	Usage *Usage
+	// RejectedRequests names the provider requests this call's transport
+	// sent that the returned events do not describe (#738): the
+	// OpenAI-compatible transport's usage-field seam sends one request the
+	// provider rejects before any stream, then retries without the field,
+	// and this count rides the retry's terminal event for the rejected
+	// one. It was sent, so the run's request accounting counts it:
+	// observers record each as its own non-OK request with an explicit
+	// usage absence. Zero names none.
+	RejectedRequests int
 }
 
 // ErrStreamTruncated reports a stream that ended without a terminal event.

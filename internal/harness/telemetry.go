@@ -41,6 +41,12 @@ type RequestObservation struct {
 	OK                    bool
 	Usage                 *Usage
 	EstimatedPromptTokens int
+	// Rejected marks a request the provider refused before any stream — the
+	// OpenAI-compatible usage-field seam's rejected first request (#738). It
+	// shares its attempt's index and attribution because that is the turn it
+	// belongs to, but it is the transport's fallback, not an in-process
+	// retry: the tallies count it as a request and never as a retry.
+	Rejected bool
 }
 
 // ModelRequestSink receives one observation per model request the native
@@ -174,10 +180,14 @@ type ModelTelemetrySummary struct {
 	// ProbeRequests is the capability gate's completion probes, one per
 	// unique bound model.
 	ProbeRequests int
-	// WorkRequests is the session turn attempts, retries included.
+	// WorkRequests is the session work requests, turn attempts and their
+	// in-process retries included — plus the transport-rejected request a
+	// usage-field seam turn sent (#738), which is a provider request the
+	// run sent even though it was not an attempt of its own.
 	WorkRequests int
 	// Retries is the work requests that were in-process retries of a
-	// failed attempt.
+	// failed attempt. The transport-rejected request a seam turn sent
+	// shares its attempt's index but is not counted here (#738).
 	Retries int
 	// ByRoleModel splits the tallies per role and bound model, sorted by
 	// role then model.
@@ -277,7 +287,11 @@ func (t *ModelTelemetry) tallyRequest(observation RequestObservation) {
 		t.probes++
 	case RequestWork:
 		t.work++
-		if observation.Attempt > 0 {
+		// The transport-rejected request a seam turn sent shares its
+		// attempt's index but is the transport's fallback, not an in-process
+		// retry of a failed attempt (#738): it counts as a request, never as
+		// a retry.
+		if observation.Attempt > 0 && !observation.Rejected {
 			t.retries++
 			cell.retries++
 		}
