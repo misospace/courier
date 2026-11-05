@@ -1231,7 +1231,9 @@ could not verify is never blocked-external. The reason never carries model
 prose, and it never carries worker output beyond the fixed preparation task's
 own exit status. The model never decides whether a prerequisite is terminal: a
 tripped latch overrides the model's own outcome declaration, and a delegated
-brief aborts without a further turn.
+brief aborts without a further turn — the brief's guard checks the latch before
+its first request, and the delegated session's own tool boundary stops the
+remaining tool calls of a turn whose call tripped the latch.
 
 **Spawn brief schema and authenticated worker protocol.** Each delegation is a
 typed brief carrying a stable `briefID` (unique within the run), objective,

@@ -2052,7 +2052,9 @@ task's own exit status.
 
 The model never decides whether a prerequisite is terminal. A tripped latch
 overrides the model's own outcome declaration, and a delegated brief aborts
-without a further turn once the latch has tripped.
+without a further turn once the latch has tripped: the brief's guard checks the
+latch before its first request, and the delegated session's own tool boundary
+stops the remaining tool calls of a turn whose call tripped the latch.
 
 ## Commit cadence
 

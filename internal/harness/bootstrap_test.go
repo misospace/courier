@@ -528,8 +528,9 @@ func TestCoordinatorSkipsBootstrapWithoutAnApprovedContract(t *testing.T) {
 }
 
 // TestRunBriefAbortsOnRecordedBootstrapBlocker pins the brief-level guard:
-// a blocker recorded before the brief ran aborts it after its first turn,
-// without further model requests and without integration.
+// a blocker recorded before the brief ran aborts it before any model
+// request — the workspace the brief would work in failed to prepare, so a
+// spent turn would only rediscover the failure (#414, #737).
 func TestRunBriefAbortsOnRecordedBootstrapBlocker(t *testing.T) {
 	gateway, gatewayMock, cleanup := gatewayFor(
 		gatewayResponse{body: sse(contentChunk("about to work"), finishChunk("stop"))},
@@ -547,8 +548,8 @@ func TestRunBriefAbortsOnRecordedBootstrapBlocker(t *testing.T) {
 	if summary != "workspace bootstrap failed; the brief is aborted" {
 		t.Fatalf("summary = %q, want the fixed abort text", summary)
 	}
-	if got := gatewayMock.requestCount(); got != 1 {
-		t.Fatalf("gateway requests = %d, want 1 (the aborted turn only)", got)
+	if got := gatewayMock.requestCount(); got != 0 {
+		t.Fatalf("gateway requests = %d, want 0 (the blocker aborts the brief at entry)", got)
 	}
 }
 

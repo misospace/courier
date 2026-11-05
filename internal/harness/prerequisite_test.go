@@ -477,6 +477,235 @@ func TestCoordinatorStopsModelTurnsWhenADelegationHitsThePrerequisite(t *testing
 	}
 }
 
+// TestCoordinatorDelegatedBriefStopsAtItsOwnToolBoundary pins the delegated
+// path's fence reach (#737): a fence established by the brief's own shell
+// dispatch trips the latch at the tool boundary that witnessed it, the brief
+// aborts without a second model request, and the coordinator's own loop ends
+// the run at the delegate call as an infrastructure failure. (That no
+// dispatch follows the fence is enforced by the fence gate itself; the
+// boundary-level stop is pinned by
+// TestDelegatedToolBoundaryStopsRemainingCallsOnTrippedLatch.)
+func TestCoordinatorDelegatedBriefStopsAtItsOwnToolBoundary(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	// The brief's unpack is honest; its first shell dispatch then fails
+	// ambiguously and its reconciliation cannot observe the termination.
+	worker.snapshotTip = "snap-tip"
+	worker.completeAll = true
+	worker.dispatchPlan = []int{0, 503}
+	worker.scriptUnobservedTermination(1)
+
+	gateway, gatewayMock, cleanup := gatewayFor(
+		// Coordinator: delegate.
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-1", toolDelegate, `{"id":"b1","role":"coder","objective":"Do the work","successCheck":"tests pass"}`),
+			finishChunk("tool_calls"),
+		)},
+		// The brief's first turn asks for two shell commands; the first
+		// fences the worker, and the second must never run.
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-2", toolShell, `{"command":"echo one"}`),
+			toolCallChunk(1, "call-3", toolShell, `{"command":"echo two"}`),
+			finishChunk("tool_calls"),
+		)},
+		// Scripted but never consumed: the latch has already ended the run.
+		gatewayResponse{body: sse(contentChunk(`{"outcome":"changes"}`), finishChunk("stop"))},
+	)
+	defer cleanup()
+
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Transport: gateway,
+		Bindings:  testBindings(),
+		Worker:    delegator,
+		Snapshot:  snapshotProvider("snap-tip"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := coordinator.Run(context.Background(), testInvocation())
+	if result.Outcome == executor.OutcomeBlockedExternal {
+		t.Fatalf("outcome = %q, a fence is never blocked-external", result.Outcome)
+	}
+	if result.Kind != courierv1alpha1.NativeResultInfrastructureFailed {
+		t.Fatalf("kind = %q, want infrastructure", result.Kind)
+	}
+	if result.Err == nil || !strings.Contains(result.Err.Error(), prerequisiteFencedReason) {
+		t.Fatalf("err = %v, want the fence reason", result.Err)
+	}
+	// Two requests: the coordinator's delegate turn and the brief's one
+	// turn. The brief never takes a second turn over a tripped latch.
+	if got := gatewayMock.requestCount(); got != 2 {
+		t.Fatalf("gateway requests = %d, want 2", got)
+	}
+	// The brief's unpack and its first shell: the count pins that the run
+	// ended at the delegate call without redelivery (the second call, where
+	// it runs at all, is refused by the fence gate before any request).
+	if got := worker.dispatchRequests; got != 2 {
+		t.Fatalf("worker dispatch requests = %d, want 2", got)
+	}
+}
+
+// TestDelegatedToolBoundaryStopsRemainingCallsOnTrippedLatch pins the
+// delegated pump's own tool boundary (#737): a delegated turn that requests
+// several tool calls stops at the call that trips the latch, so no later
+// call in the same turn runs and the transcript holds only the earned
+// result. The boundary peeks, never takes — the trip stays unconsumed for
+// the coordinator's own loop.
+func TestDelegatedToolBoundaryStopsRemainingCallsOnTrippedLatch(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	// The brief's first shell dispatch fails ambiguously and its
+	// reconciliation cannot observe the termination.
+	worker.snapshotTip = "snap-tip"
+	worker.completeAll = true
+	worker.dispatchPlan = []int{0, 503}
+	worker.scriptUnobservedTermination(1)
+
+	gateway, gatewayMock, cleanup := gatewayFor(
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-a", toolShell, `{"command":"echo one"}`),
+			toolCallChunk(1, "call-b", toolShell, `{"command":"echo two"}`),
+			finishChunk("tool_calls"),
+		)},
+	)
+	defer cleanup()
+
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Transport: gateway,
+		Bindings:  testBindings(),
+		Worker:    delegator,
+		Snapshot:  snapshotProvider("snap-tip"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := coordinator.newSession("coder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	turn := coordinator.pump(context.Background(), session, "b1", coordinator.subagentTools())
+	if coordinator.prerequisite.peek() == nil {
+		t.Fatal("the latch must be tripped by the boundary that witnessed the fence")
+	}
+	if len(turn.toolResults) != 1 {
+		t.Fatalf("tool results = %d, want 1: the turn stops at the call that tripped the latch", len(turn.toolResults))
+	}
+	if got := turn.toolResults[0].Result.ToolCallID; got != "call-a" {
+		t.Fatalf("tool result call = %q, want the call that tripped the latch", got)
+	}
+	toolMessages := 0
+	for _, message := range session.Messages {
+		if message.Role == "tool" {
+			toolMessages++
+		}
+	}
+	if toolMessages != 1 {
+		t.Fatalf("transcript tool messages = %d, want 1: the abandoned call earns no result", toolMessages)
+	}
+	if got := gatewayMock.requestCount(); got != 1 {
+		t.Fatalf("gateway requests = %d, want 1", got)
+	}
+	// The brief's unpack and its first shell; the abandoned call never
+	// dispatched.
+	if got := worker.dispatchRequests; got != 2 {
+		t.Fatalf("worker dispatch requests = %d, want 2", got)
+	}
+}
+
+// TestDelegatedBriefEntryGuardNeverBuysATurnOverTrippedLatch pins the
+// delegated brief's entry guard (#737): a brief entered over a latch the
+// incarnation has already tripped aborts before its first model request.
+func TestDelegatedBriefEntryGuardNeverBuysATurnOverTrippedLatch(t *testing.T) {
+	gateway, gatewayMock, cleanup := gatewayFor(
+		// Scripted but never consumed: the entry guard aborts the brief
+		// before any model request.
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-1", toolShell, `{"command":"echo one"}`),
+			finishChunk("tool_calls"),
+		)},
+	)
+	defer cleanup()
+
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Transport: gateway,
+		Bindings:  testBindings(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator.prerequisite.observe(refusedPrerequisite())
+	summary, completed, unavailable := coordinator.runBrief(context.Background(), Brief{ID: "b1", Role: "coder", Objective: "Do the work", SuccessCheck: "tests pass"})
+	if completed {
+		t.Fatal("completed = true, want the aborted brief")
+	}
+	if unavailable != nil {
+		t.Fatalf("unavailable = %v, want nil", unavailable)
+	}
+	if summary != "workspace prerequisite failed; the brief is aborted" {
+		t.Fatalf("summary = %q, want the fixed abort summary", summary)
+	}
+	if got := gatewayMock.requestCount(); got != 0 {
+		t.Fatalf("gateway requests = %d, want 0: a tripped latch never buys a turn", got)
+	}
+}
+
+// TestDelegatedToolBoundaryRunsEveryCallWhenTheLatchHolds pins the boundary's
+// negative case: a delegated turn whose calls never trip the latch runs every
+// call it asked for, so the stop is a trip response, never a standing
+// truncation of delegated turns.
+func TestDelegatedToolBoundaryRunsEveryCallWhenTheLatchHolds(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	// Honest preparation and honest shell tasks: nothing trips.
+	worker.snapshotTip = "snap-tip"
+	worker.completeAll = true
+
+	gateway, gatewayMock, cleanup := gatewayFor(
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-a", toolShell, `{"command":"echo one"}`),
+			toolCallChunk(1, "call-b", toolShell, `{"command":"echo two"}`),
+			finishChunk("tool_calls"),
+		)},
+	)
+	defer cleanup()
+
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Transport: gateway,
+		Bindings:  testBindings(),
+		Worker:    delegator,
+		Snapshot:  snapshotProvider("snap-tip"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := coordinator.newSession("coder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	turn := coordinator.pump(context.Background(), session, "b1", coordinator.subagentTools())
+	if coordinator.prerequisite.peek() != nil {
+		t.Fatal("an honest turn must not trip the latch")
+	}
+	if len(turn.toolResults) != 2 {
+		t.Fatalf("tool results = %d, want 2: every requested call runs while the latch holds", len(turn.toolResults))
+	}
+	toolMessages := 0
+	for _, message := range session.Messages {
+		if message.Role == "tool" {
+			toolMessages++
+		}
+	}
+	if toolMessages != 2 {
+		t.Fatalf("transcript tool messages = %d, want 2", toolMessages)
+	}
+	if got := worker.dispatchRequests; got != 3 {
+		t.Fatalf("worker dispatch requests = %d, want 3 (unpack plus both shells)", got)
+	}
+	if got := gatewayMock.requestCount(); got != 1 {
+		t.Fatalf("gateway requests = %d, want 1", got)
+	}
+}
+
 // TestClassifyPrerequisite pins the classifier: only the failures trusted
 // control can vouch for are classified, and each class carries its own
 // terminal kind.

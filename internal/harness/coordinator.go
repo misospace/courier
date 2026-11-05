@@ -622,6 +622,19 @@ func (c *Coordinator) pump(ctx context.Context, session *Session, briefID string
 				}
 				return turnResult{blocker: failure, toolResults: toolResults}
 			}
+		} else if c.prerequisite.peek() != nil {
+			// The delegated session's own tool boundary enforces the latch
+			// too (#737): once the trip is observed, no further call in this
+			// turn runs, so nothing the latch has already ended the brief's
+			// right to ask for reaches the worker. peek, never take — only
+			// the coordinator's own loop consumes the trip and ends the run.
+			// The boundary is a post-check: the turn's first call always
+			// executes, and the brief's entry guard one level up owns the
+			// already-tripped case. The transcript may hold fewer tool
+			// results than the assistant message requested, which is safe
+			// because the aborting brief discards this session; the earned
+			// events are still returned, not dropped.
+			return turnResult{toolResults: toolResults}
 		}
 	}
 	return turnResult{toolResults: toolResults}
@@ -1331,20 +1344,16 @@ func (c *Coordinator) runBrief(ctx context.Context, brief Brief) (summary string
 	// a delegate that loses its decisions mid-brief must not re-derive them.
 	session.Settle(settledStateBlock(brief))
 	for {
-		turn := c.pump(ctx, session, brief.ID, c.subagentTools())
-		// A bootstrap environment blocker recorded before this brief ran
-		// (#414) aborts it without further model requests: the workspace
-		// it would work in failed to prepare, and the run ends
-		// blocked-external at the coordinator's own turn boundary.
-		if c.hasBootstrapBlocker() {
-			return "workspace bootstrap failed; the brief is aborted", false, nil
+		// Trusted control's own conditions gate the brief at every model
+		// boundary (#737): before the request, so a latch already tripped
+		// when the brief starts never buys a turn, and after it, so a trip
+		// during the turn's own tool calls aborts without a further one.
+		if abort := c.delegatedTripAbort(); abort != "" {
+			return abort, false, nil
 		}
-		// A workspace-prerequisite failure trips the latch for the whole
-		// incarnation (#737): the workspace this brief would work in cannot
-		// be prepared, so the brief aborts without a further model request
-		// and the coordinator's own loop ends the run.
-		if c.prerequisite.peek() != nil {
-			return "workspace prerequisite failed; the brief is aborted", false, nil
+		turn := c.pump(ctx, session, brief.ID, c.subagentTools())
+		if abort := c.delegatedTripAbort(); abort != "" {
+			return abort, false, nil
 		}
 		if turn.harnessErr != nil {
 			// Compaction could not fit the protected tail (#243). The
@@ -1370,6 +1379,23 @@ func (c *Coordinator) runBrief(ctx context.Context, brief Brief) (summary string
 			return "sub-agent ended without a result", false, nil
 		}
 	}
+}
+
+// delegatedTripAbort names the trusted-control condition that aborts a
+// delegated brief without a further model request: a bootstrap environment
+// blocker recorded while this brief's workspace was prepared (#414), or a
+// workspace-prerequisite failure the latch has tripped on for the whole
+// incarnation (#737). The workspace the brief would work in cannot serve it,
+// so the fixed abort summary is the brief's whole result and the
+// coordinator's own loop ends the run. Empty when the brief may continue.
+func (c *Coordinator) delegatedTripAbort() string {
+	if c.hasBootstrapBlocker() {
+		return "workspace bootstrap failed; the brief is aborted"
+	}
+	if c.prerequisite.peek() != nil {
+		return "workspace prerequisite failed; the brief is aborted"
+	}
+	return ""
 }
 
 func briefText(brief Brief) string {
