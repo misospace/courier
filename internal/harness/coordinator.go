@@ -115,6 +115,12 @@ type Coordinator struct {
 	workerFenceErr error
 	workerFenceMu  sync.Mutex
 
+	// prerequisite is the incarnation's circuit breaker for workspace
+	// prerequisites (#737): once trusted control knows the workspace cannot
+	// be prepared for this incarnation, the model never takes another turn
+	// to rediscover the same condition.
+	prerequisite prerequisiteLatch
+
 	// bootstrapEnv holds the latest applied development-bootstrap
 	// environment delta (#414): the filtered capture of the approved
 	// contract's activated environment, merged over the worker's own
@@ -158,13 +164,27 @@ func (c *Coordinator) recordBootstrapBlocker(err error) {
 
 // fenceWorker records the worker fence (#414 review): once an operation's
 // termination could not be observed, no further dispatch may run against
-// this worker. First cause wins; fencing never un-fences.
+// this worker. First cause wins; fencing never un-fences. The fence is a
+// typed error so the prerequisite classifier can name it as the final fact
+// it is, while its text stays exactly what it always was. Establishing the
+// fence is itself the observation (#737): the fence is a final fact, so the
+// breaker trips at the boundary that witnessed it — on every dispatch path,
+// not one preparation later.
 func (c *Coordinator) fenceWorker(opID string, cause error) {
 	c.workerFenceMu.Lock()
 	defer c.workerFenceMu.Unlock()
 	if c.workerFenceErr == nil {
-		c.workerFenceErr = fmt.Errorf("the worker is fenced: termination of operation %s could not be verified (%v); no further workspace operation may run against it", opID, cause)
+		c.workerFenceErr = &workerFence{reason: fmt.Sprintf("the worker is fenced: termination of operation %s could not be verified (%v); no further workspace operation may run against it", opID, cause)}
+		c.prerequisite.observe(fencedPrerequisite())
 	}
+}
+
+// observePrerequisite records one workspace-preparation failure against the
+// incarnation's circuit breaker (#737). Only the failures trusted control
+// classifies as stable count; a transient failure, an unclassified error, and
+// the #414 bootstrap blocker change nothing.
+func (c *Coordinator) observePrerequisite(err error) {
+	c.prerequisite.observe(classifyPrerequisite(err))
 }
 
 // workerFenced returns the sticky worker fence error, if set.
@@ -372,7 +392,10 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 		}
 		turn := c.pump(ctx, session, "", c.coordinatorTools())
 		if turn.blocker != nil {
-			return executor.HarnessResult{Kind: courierv1alpha1.NativeResultBlockedExternal, Outcome: executor.OutcomeBlockedExternal, Reason: turn.blocker.Error()}
+			return c.blockedExternalEnding(ctx, turn.blocker)
+		}
+		if turn.infraErr != nil {
+			return c.infrastructureEnding(ctx, turn.infraErr)
 		}
 		if turn.harnessErr != nil {
 			return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: fmt.Errorf("harness: step-boundary compaction: %w", turn.harnessErr)}
@@ -393,6 +416,21 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 			return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: fmt.Errorf("harness: model stream failed: %w", turn.streamErr)}
 		}
 		if turn.final {
+			// The model never decides whether a workspace prerequisite is
+			// terminal (#737): a tripped latch ends the run here, whatever
+			// the model said and whatever the operator's soft stop asked
+			// for. The model sees the same condition as a tool error it can
+			// rediscover; the latch is the trusted fact the model cannot
+			// argue with, and it outranks the model's own declaration. This
+			// is the defensive re-check: the tool boundary below normally
+			// consumes the trip first, so a final turn over a tripped latch
+			// means a trip arrived without one.
+			if failure := c.prerequisite.peek(); failure != nil {
+				if failure.kind == courierv1alpha1.NativeResultInfrastructureFailed {
+					return c.infrastructureEnding(ctx, failure)
+				}
+				return c.blockedExternalEnding(ctx, failure)
+			}
 			if c.control.Stopped() {
 				// The run loop exits only with the latch set and every
 				// brief terminal: in-flight work always reaches its
@@ -472,6 +510,12 @@ type turnResult struct {
 	// blocked-external at this turn boundary, before any further model
 	// request.
 	blocker error
+	// infraErr carries a workspace-prerequisite failure whose class means
+	// the run cannot continue at all (#737): the worker is fenced, so no
+	// further workspace operation may run against it. The run ends as an
+	// infrastructure failure for the operator to relaunch — the honest
+	// recovery is worker replacement, not another model turn.
+	infraErr error
 }
 
 // newSession opens one role-bound session carrying that role's resolved
@@ -566,9 +610,81 @@ func (c *Coordinator) pump(ctx context.Context, session *Session, briefID string
 			if blocker := c.takeBootstrapBlocker(); blocker != nil {
 				return turnResult{blocker: blocker, toolResults: toolResults}
 			}
+			// A workspace-prerequisite failure that trusted control has
+			// classified as stable ends the run here (#737): the model gets
+			// no second turn to rediscover a condition the workspace itself
+			// cannot satisfy. The ending is scoped to the coordinator's own
+			// loop — a sub-agent pump never consumes it, so the trip can
+			// only abort the session that owns the run.
+			if failure := c.prerequisite.take(); failure != nil {
+				if failure.kind == courierv1alpha1.NativeResultInfrastructureFailed {
+					return turnResult{infraErr: failure, toolResults: toolResults}
+				}
+				return turnResult{blocker: failure, toolResults: toolResults}
+			}
+		} else if c.prerequisite.peek() != nil {
+			// The delegated session's own tool boundary enforces the latch
+			// too (#737): once the trip is observed, no further call in this
+			// turn runs, so nothing the latch has already ended the brief's
+			// right to ask for reaches the worker. peek, never take — only
+			// the coordinator's own loop consumes the trip and ends the run.
+			// The boundary is a post-check: the turn's first call always
+			// executes, and the brief's entry guard one level up owns the
+			// already-tripped case. The transcript may hold fewer tool
+			// results than the assistant message requested, which is safe
+			// because the aborting brief discards this session; the earned
+			// events are still returned, not dropped.
+			return turnResult{toolResults: toolResults}
 		}
 	}
 	return turnResult{toolResults: toolResults}
+}
+
+// settleStatus closes the run's durable status obligations before an ending
+// is reported. It flushes retained operation clears opportunistically — a
+// failure there never changes the ending, because the operator supersedes
+// this incarnation's entries regardless — and then reconciles the debt a
+// completed brief leaves behind when its durable record never landed. A
+// completed unit whose durable status record never landed can never be
+// turned into a successful ending by a model declaration. The broker
+// revalidates the recorded OID against the live work ref on the retry, so the
+// recovery half re-checks the world; a persistent failure is an infrastructure
+// failure for the operator to relaunch, which resumes remote-first (§7).
+func (c *Coordinator) settleStatus(ctx context.Context) error {
+	_ = c.status.Flush(ctx)
+	if err := c.status.ReconcileDebt(ctx); err != nil {
+		return fmt.Errorf("harness: a completed brief lacks a durable status record: %w", err)
+	}
+	return nil
+}
+
+// blockedExternalEnding reports a terminal environment blocker: the run ends
+// recoverably blocked-external with the blocker's fixed reason. The run's
+// durable status obligations are settled first, so a brief whose durable
+// record never landed is an infrastructure failure rather than a clean
+// blocked-external ending.
+func (c *Coordinator) blockedExternalEnding(ctx context.Context, blocker error) executor.HarnessResult {
+	if err := c.settleStatus(ctx); err != nil {
+		return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: err}
+	}
+	return executor.HarnessResult{
+		Kind:    courierv1alpha1.NativeResultBlockedExternal,
+		Outcome: executor.OutcomeBlockedExternal,
+		Reason:  blocker.Error(),
+	}
+}
+
+// infrastructureEnding reports a terminal infrastructure failure: the
+// condition cannot be continued past (a fenced worker), so the honest
+// recovery is operator relaunch. The run's durable status obligations settle
+// first, exactly as a blocked-external ending settles them: a completed
+// brief whose durable record never landed is itself an infrastructure
+// failure, and the relaunch reconciles it remote-first.
+func (c *Coordinator) infrastructureEnding(ctx context.Context, cause error) executor.HarnessResult {
+	if err := c.settleStatus(ctx); err != nil {
+		return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: err}
+	}
+	return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: cause}
 }
 
 // finish applies the declared outcome. Publication is the coordinator's own
@@ -578,20 +694,10 @@ func (c *Coordinator) pump(ctx context.Context, session *Session, briefID string
 // the operator to relaunch, and a declared-changes-with-no-work ending is a
 // workload failure.
 func (c *Coordinator) finish(ctx context.Context, inv executor.Invocation, outcome executor.DeclaredOutcome, summary string, noChange *courierv1alpha1.NoChangeClose) executor.HarnessResult {
-	// The run is ending: opportunistically flush retained operation clears so
-	// a cleanly ended run does not leave suppression evidence behind. A
-	// failure never changes the declared outcome — the operator supersedes
-	// this incarnation's entries regardless.
-	_ = c.status.Flush(ctx)
-	// A completed unit whose durable status record never landed can never be
-	// turned into a successful ending by a model declaration: the debt is
-	// reconciled here, in trusted control, before any declared outcome is
-	// honored (§7). The broker revalidates the recorded OID against the live
-	// work ref on the retry, so the recovery half re-checks the world; a
-	// persistent failure is an infrastructure failure for the operator to
-	// relaunch, which resumes remote-first.
-	if err := c.status.ReconcileDebt(ctx); err != nil {
-		return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: fmt.Errorf("harness: a completed brief lacks a durable status record: %w", err)}
+	// The run is ending: the durable status obligations are settled here, in
+	// trusted control, before any declared outcome is honored (§7).
+	if err := c.settleStatus(ctx); err != nil {
+		return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: err}
 	}
 	switch outcome {
 	case executor.OutcomeChanges:
@@ -1238,13 +1344,16 @@ func (c *Coordinator) runBrief(ctx context.Context, brief Brief) (summary string
 	// a delegate that loses its decisions mid-brief must not re-derive them.
 	session.Settle(settledStateBlock(brief))
 	for {
+		// Trusted control's own conditions gate the brief at every model
+		// boundary (#737): before the request, so a latch already tripped
+		// when the brief starts never buys a turn, and after it, so a trip
+		// during the turn's own tool calls aborts without a further one.
+		if abort := c.delegatedTripAbort(); abort != "" {
+			return abort, false, nil
+		}
 		turn := c.pump(ctx, session, brief.ID, c.subagentTools())
-		// A bootstrap environment blocker recorded before this brief ran
-		// (#414) aborts it without further model requests: the workspace
-		// it would work in failed to prepare, and the run ends
-		// blocked-external at the coordinator's own turn boundary.
-		if c.hasBootstrapBlocker() {
-			return "workspace bootstrap failed; the brief is aborted", false, nil
+		if abort := c.delegatedTripAbort(); abort != "" {
+			return abort, false, nil
 		}
 		if turn.harnessErr != nil {
 			// Compaction could not fit the protected tail (#243). The
@@ -1270,6 +1379,23 @@ func (c *Coordinator) runBrief(ctx context.Context, brief Brief) (summary string
 			return "sub-agent ended without a result", false, nil
 		}
 	}
+}
+
+// delegatedTripAbort names the trusted-control condition that aborts a
+// delegated brief without a further model request: a bootstrap environment
+// blocker recorded while this brief's workspace was prepared (#414), or a
+// workspace-prerequisite failure the latch has tripped on for the whole
+// incarnation (#737). The workspace the brief would work in cannot serve it,
+// so the fixed abort summary is the brief's whole result and the
+// coordinator's own loop ends the run. Empty when the brief may continue.
+func (c *Coordinator) delegatedTripAbort() string {
+	if c.hasBootstrapBlocker() {
+		return "workspace bootstrap failed; the brief is aborted"
+	}
+	if c.prerequisite.peek() != nil {
+		return "workspace prerequisite failed; the brief is aborted"
+	}
+	return ""
 }
 
 func briefText(brief Brief) string {
@@ -1339,6 +1465,23 @@ func (c *Coordinator) runForge(ctx context.Context, call ToolCall, result ToolRe
 // verified termination lands even though the caller's context is gone.
 const reconcileGrace = 30 * time.Second
 
+// statusPersistFailure reports that an operation's status entry could not be
+// persisted, so the operation was never dispatched. It is not a workspace
+// condition: the run's trusted status path is what failed, and the harness
+// classifies such a failure as an infrastructure failure elsewhere. It is
+// typed so the prerequisite classifier (#737) never counts it as a refusal
+// of the workspace preparation.
+type statusPersistFailure struct {
+	opID string
+	err  error
+}
+
+func (e *statusPersistFailure) Error() string {
+	return fmt.Sprintf("operation %s was not dispatched because its status entry could not be persisted: %v", e.opID, e.err)
+}
+
+func (e *statusPersistFailure) Unwrap() error { return e.err }
+
 // dispatchAndAwait dispatches one operation and polls it to termination. The
 // operation's active-operation entry is persisted through the trusted status
 // path before the task is sent (§6: persist before dispatch), and cleared
@@ -1358,7 +1501,7 @@ func (c *Coordinator) dispatchAndAwait(ctx context.Context, opID, briefID string
 		return protocol.Result{}, err
 	}
 	if err := c.status.BeginOperation(ctx, opID, briefID); err != nil {
-		return protocol.Result{}, fmt.Errorf("operation %s was not dispatched because its status entry could not be persisted: %w", opID, err)
+		return protocol.Result{}, &statusPersistFailure{opID: opID, err: err}
 	}
 	if _, err := c.worker.Dispatch(ctx, opID, briefID, task); err != nil {
 		if definiteWorkerRejection(err) {
@@ -1641,9 +1784,18 @@ func (c *Coordinator) currentSnapshotGen() uint64 {
 // depends on render/materialize ordering across callers.
 func (c *Coordinator) renderSnapshot(ctx context.Context) (Snapshot, error) {
 	if c.snapshot == nil {
-		return Snapshot{}, errors.New("no snapshot provider is configured in this build")
+		err := errors.New("no snapshot provider is configured in this build")
+		c.observePrerequisite(err)
+		return Snapshot{}, err
 	}
-	return c.snapshot(ctx)
+	snap, err := c.snapshot(ctx)
+	if err != nil {
+		// Every preparation path renders the snapshot, so the render
+		// failure is the one observation point that covers them all (#737).
+		c.observePrerequisite(err)
+		return Snapshot{}, err
+	}
+	return snap, nil
 }
 
 // materializeSnapshot uploads the rendered snapshot bundle to the worker and
@@ -1662,9 +1814,12 @@ func (c *Coordinator) materializeSnapshot(ctx context.Context, briefID string, s
 	c.snapshotMu.Lock()
 	defer c.snapshotMu.Unlock()
 	if c.worker == nil {
-		return errors.New("no worker is configured in this build")
+		err := errors.New("no worker is configured in this build")
+		c.observePrerequisite(err)
+		return err
 	}
 	if err := c.worker.client.UploadSnapshot(ctx, snap.Data); err != nil {
+		c.observePrerequisite(err)
 		return err
 	}
 	// The unpack is trusted control's own fixed script: it materializes the
@@ -1674,17 +1829,26 @@ func (c *Coordinator) materializeSnapshot(ctx context.Context, briefID string, s
 	task := protocol.Task{Command: []string{"sh", "-c", workerUnpackScript()}}
 	result, err := c.dispatchAndAwait(ctx, newOpID("snapshot", briefID), briefID, task)
 	if err != nil {
+		c.observePrerequisite(err)
 		return err
 	}
 	if result.ExitCode != 0 {
-		return errors.New("workspace snapshot unpack failed")
+		// The fixed preparation task ran and failed: one failure may still
+		// be transient, so it is observed as the task-failed class and the
+		// latch decides whether it has become a condition (#737).
+		failure := failedPrerequisiteTask(result.ExitCode)
+		c.observePrerequisite(failure)
+		return failure
 	}
 	// The unpack echoes the tip it materialized. On the honest path it must
 	// equal the dispatched tip; a mismatch means the workspace does not hold
 	// the snapshot control dispatched, and nothing may be dispatched
-	// against it.
+	// against it. A mismatch is a final fact, never a transient: the latch
+	// trips on this one observation (#737).
 	if strings.TrimSpace(result.StdoutTail) != snap.Tip {
-		return errors.New("worker workspace does not match the dispatched snapshot tip")
+		failure := mismatchedPrerequisite()
+		c.observePrerequisite(failure)
+		return failure
 	}
 	// The workspace is materialized at the dispatched tip: if the approved
 	// development-bootstrap contract applies (#414), it runs now, after
@@ -1695,11 +1859,14 @@ func (c *Coordinator) materializeSnapshot(ctx context.Context, briefID string, s
 		if err := c.bootstrapWorkspace(ctx, briefID, snap.BaseTip); err != nil {
 			// The blocker, if this was one, is recorded before the error
 			// returns: the run ends blocked-external at the next turn
-			// boundary, whatever consumed this preparation.
+			// boundary, whatever consumed this preparation. The #414
+			// mechanism owns that class, so the prerequisite breaker never
+			// observes it.
 			var blocker *bootstrapBlocker
 			if errors.As(err, &blocker) {
 				c.recordBootstrapBlocker(blocker)
 			}
+			c.observePrerequisite(err)
 			return err
 		}
 	case devenv.StateAbsent, devenv.StateModified:
@@ -2055,14 +2222,22 @@ func sanitizeExcerpt(value string) string {
 // Anything else — transport failure, 5xx, unknown — is ambiguous and must be
 // reconciled rather than redelivered.
 func definiteWorkerRejection(err error) bool {
-	transportErr, ok := err.(*protocol.TransportError)
-	if !ok {
+	var transportErr *protocol.TransportError
+	if !errors.As(err, &transportErr) {
 		return false
 	}
-	switch transportErr.StatusCode {
+	return definiteWorkerRejectionStatus(transportErr.StatusCode)
+}
+
+// definiteWorkerRejectionStatus reports whether one worker response status is
+// a definite refusal. The rule is the same wherever the status is read: a
+// request timeout and a rate limit are ambiguous, and every other 4xx is the
+// worker refusing outright.
+func definiteWorkerRejectionStatus(status int) bool {
+	switch status {
 	case http.StatusRequestTimeout, http.StatusTooManyRequests:
 		return false
 	default:
-		return transportErr.StatusCode >= 400 && transportErr.StatusCode < 500
+		return status >= 400 && status < 500
 	}
 }
