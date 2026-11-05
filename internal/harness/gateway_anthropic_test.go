@@ -1021,3 +1021,34 @@ func TestAnthropicStreamOptionalCacheCountsDefaultToZero(t *testing.T) {
 		t.Fatalf("terminal usage = %+v, want the report with the omitted cache subsets at zero", last.Usage)
 	}
 }
+
+// TestAnthropicStreamUnreadableCacheCountVoidsTheReport pins the optional
+// count's exactness rule (#738): a present-but-fractional prompt-cache count
+// voids the opening envelope's report exactly as a fractional input_tokens
+// does — optional in presence, not in exactness — and the turn still
+// succeeds: telemetry must never fail a stream the provider counted.
+func TestAnthropicStreamUnreadableCacheCountVoidsTheReport(t *testing.T) {
+	transport, _, cleanup := anthropicFor(t, anthropicSSE(
+		anthropicPayload(t, map[string]any{
+			"type":    "message_start",
+			"message": map[string]any{"id": "msg_1", "usage": map[string]any{"input_tokens": 250, "cache_read_input_tokens": 12.5}},
+		}),
+		anthropicPayload(t, map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}}),
+		anthropicPayload(t, map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "done"}}),
+		anthropicPayload(t, map[string]any{"type": "content_block_stop", "index": 0}),
+		anthropicPayload(t, map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn"}, "usage": map[string]any{"output_tokens": 30}}),
+		anthropicPayload(t, map[string]any{"type": "message_stop"}),
+	))
+	defer cleanup()
+	events, err := transport.StreamChat(context.Background(), ChatRequest{Model: "MiniMax-M3.1-Flash", Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := events[len(events)-1]
+	if last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final (an unreadable cache count must not fail the turn)", last)
+	}
+	if last.Usage != nil {
+		t.Fatalf("terminal usage = %+v, want nil: a present non-exact cache count is not an exact report", last.Usage)
+	}
+}

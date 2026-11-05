@@ -447,6 +447,59 @@ func TestGatewayStreamOptionalCacheSubsetDefaultsToZero(t *testing.T) {
 	}
 }
 
+// TestGatewayStreamExactUsageChunkAfterUnusableOneWins pins the OpenAI
+// ordering rule beside the void: a usage chunk is a self-contained report of
+// both mandatory totals, so an exact chunk after an unusable one replaces it
+// instead of resurrecting a voided partial — the provider stated both totals
+// exactly, and nothing the later report omits is invented.
+func TestGatewayStreamExactUsageChunkAfterUnusableOneWins(t *testing.T) {
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(
+		contentChunk("answer"),
+		finishChunk("stop"),
+		`{"usage":{"prompt_tokens":120.5,"completion_tokens":30}}`,
+		usageChunk(120, 30, 80),
+	)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m", Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := events[len(events)-1]
+	if last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final", last)
+	}
+	if last.Usage == nil {
+		t.Fatal("the final terminal carries no usage, but the provider's last chunk reported both mandatory totals exactly")
+	}
+	if last.Usage.InputTokens != 120 || last.Usage.OutputTokens != 30 || last.Usage.CacheReadTokens != 80 {
+		t.Fatalf("terminal usage = %+v, want the later exact report", last.Usage)
+	}
+}
+
+// TestGatewayStreamUnreadableCacheSubsetVoidsTheReport pins the optional
+// subset's exactness rule (#738): a present-but-fractional cached_tokens
+// voids the whole report exactly as a fractional mandatory total does —
+// optional in presence, not in exactness — and the turn still succeeds.
+func TestGatewayStreamUnreadableCacheSubsetVoidsTheReport(t *testing.T) {
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(
+		contentChunk("answer"),
+		finishChunk("stop"),
+		`{"usage":{"prompt_tokens":120,"completion_tokens":30,"prompt_tokens_details":{"cached_tokens":80.5}}}`,
+	)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m", Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := events[len(events)-1]
+	if last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final (an unreadable cache subset must not fail the turn)", last)
+	}
+	if last.Usage != nil {
+		t.Fatalf("terminal usage = %+v, want nil: a present non-exact cache subset is not an exact report", last.Usage)
+	}
+}
+
 // TestGatewayStreamRetriesWithoutUsageWhenRetryTransportFails pins that the
 // rejected request is accounted even when the retry dies at the transport
 // layer: the provider received both requests — the rejected usage-field
