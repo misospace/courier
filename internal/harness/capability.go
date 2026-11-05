@@ -399,6 +399,13 @@ func probeForge(ctx context.Context, deps ProbeDeps) []Capability {
 // probeModelBindings probes every bound role. The coordinator binding is
 // required; other roles are optional and their unavailability is named so a
 // degraded run is a visible decision, not a silent drop.
+//
+// One completion probe per effective binding: within one probe round every
+// role shares the transport, endpoint, and credentials the deployment
+// configured, so the bound model identifier is the whole binding identity,
+// and roles sharing one model spend one provider request, not one per role
+// (#735). The shared verdict — retryability, availability classification,
+// and redacted reason — is reported on every role's entry.
 func probeModelBindings(ctx context.Context, deps ProbeDeps) []Capability {
 	caps := make([]Capability, 0, len(deps.Bindings.Roles()))
 	if deps.Transport == nil || deps.ModelProbe == nil {
@@ -408,8 +415,15 @@ func probeModelBindings(ctx context.Context, deps ProbeDeps) []Capability {
 		}
 		return caps
 	}
+	probed := make(map[string]error, len(deps.Bindings.Roles()))
 	for _, role := range deps.Bindings.Roles() {
-		if err := deps.ModelProbe(ctx, deps.Bindings.Model(role)); err != nil {
+		model := deps.Bindings.Model(role)
+		err, done := probed[model]
+		if !done {
+			err = deps.ModelProbe(ctx, model)
+			probed[model] = err
+		}
+		if err != nil {
 			capability := unavailable("model-binding:"+role, role == RoleCoordinator, err.Error())
 			capability.Retryable = isProbeRetryable(err)
 			if classification, ok := providerClassificationOf(err); ok {

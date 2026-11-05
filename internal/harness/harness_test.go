@@ -1843,6 +1843,118 @@ func findCapability(caps []Capability, name string) (Capability, bool) {
 	return Capability{}, false
 }
 
+// TestSharedModelBindingProbesOnce pins the #735 deduplication contract:
+// roles bound to one model spend one provider completion probe per probe
+// round, every role's capability entry is still emitted with its own
+// required/optional state, and a distinct binding still probes on its own.
+func TestSharedModelBindingProbesOnce(t *testing.T) {
+	bindings, err := BindRoles(map[string]string{
+		"coordinator": "test/shared",
+		"reviewer":    "test/shared",
+		"coder":       "test/distinct",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var probed []string
+	deps := ProbeDeps{
+		Transport: &Gateway{BaseURL: "http://example.invalid"},
+		Bindings:  bindings,
+		ModelProbe: func(_ context.Context, model string) error {
+			probed = append(probed, model)
+			return nil
+		},
+	}
+	caps := ProbeCapabilities(context.Background(), deps)
+	shared, distinct := 0, 0
+	for _, model := range probed {
+		switch model {
+		case "test/shared":
+			shared++
+		case "test/distinct":
+			distinct++
+		}
+	}
+	if shared != 1 || distinct != 1 {
+		t.Fatalf("provider completion probes = %v, want exactly one per distinct binding", probed)
+	}
+	coordinator, ok := findCapability(caps, "model-binding:coordinator")
+	if !ok || coordinator.State != StateHealthy || !coordinator.Required {
+		t.Fatalf("coordinator capability = %+v, want healthy and required", coordinator)
+	}
+	reviewer, ok := findCapability(caps, "model-binding:reviewer")
+	if !ok || reviewer.State != StateHealthy || reviewer.Required {
+		t.Fatalf("reviewer capability = %+v, want healthy and optional", reviewer)
+	}
+	coder, ok := findCapability(caps, "model-binding:coder")
+	if !ok || coder.State != StateHealthy || coder.Required {
+		t.Fatalf("coder capability = %+v, want healthy and optional", coder)
+	}
+}
+
+// TestSharedBindingFailureReportsEveryRole pins the #735 failure contract:
+// one shared binding's single probe failure is reflected consistently on
+// every role using it — the same retryability, availability classification,
+// and redacted reason — while the coordinator entry still gates the run as
+// a recoverable exhaustion and the optional role still names the
+// degradation.
+func TestSharedBindingFailureReportsEveryRole(t *testing.T) {
+	bindings, err := BindRoles(map[string]string{
+		"coordinator": "test/shared",
+		"reviewer":    "test/shared",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	probes := 0
+	deps := ProbeDeps{
+		Transport: &Gateway{BaseURL: "http://example.invalid"},
+		Bindings:  bindings,
+		Broker: capabilityBroker(map[string]any{
+			"provider": map[string]any{"name": "acme-forge"},
+			"operations": []map[string]any{
+				{"name": "read-work-item", "available": true},
+				{"name": "create-pull-request", "available": true},
+				{"name": "update-pull-request", "available": true},
+				{"name": "comment", "available": true},
+			},
+			"git": map[string]any{"ready": true},
+		}, 0),
+		Mode: "resolve-issue",
+		ModelProbe: func(context.Context, string) error {
+			probes++
+			return gatewayStatusError(http.StatusTooManyRequests, nil,
+				[]byte(`{"error":{"type":"insufficient_quota"}}`), ExhaustionSignals{})
+		},
+		PublicationPresent: true,
+		SnapshotPresent:    true,
+	}
+	caps := ProbeCapabilities(context.Background(), deps)
+	if probes != 1 {
+		t.Fatalf("provider completion probes = %d, want 1 for one shared binding", probes)
+	}
+	coordinator, ok := findCapability(caps, "model-binding:coordinator")
+	if !ok || coordinator.State != StateUnavailable || !coordinator.Required {
+		t.Fatalf("coordinator capability = %+v, want unavailable and required", coordinator)
+	}
+	reviewer, ok := findCapability(caps, "model-binding:reviewer")
+	if !ok || reviewer.State != StateUnavailable || reviewer.Required {
+		t.Fatalf("reviewer capability = %+v, want unavailable and optional", reviewer)
+	}
+	if reviewer.Detail != coordinator.Detail || reviewer.Retryable != coordinator.Retryable {
+		t.Fatalf("shared-binding roles disagree: coordinator %+v, reviewer %+v", coordinator, reviewer)
+	}
+	if coordinator.Availability != ProviderAllowanceExhausted || reviewer.Availability != ProviderAllowanceExhausted {
+		t.Fatalf("shared-binding availability = coordinator %q, reviewer %q, want allowance-exhausted on both",
+			coordinator.Availability, reviewer.Availability)
+	}
+	_, gateErr := Gate(caps)
+	var ge *GateError
+	if !errors.As(gateErr, &ge) || !ge.Exhausted() {
+		t.Fatalf("gate error = %v, want a recoverable exhausted gate", gateErr)
+	}
+}
+
 // --- coordinator: subagents route through the worker and cannot publish ----
 
 func TestSubagentShellRoutesThroughWorkerAndOnlyControlPublishes(t *testing.T) {
