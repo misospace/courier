@@ -383,8 +383,16 @@ func retried[T any](ctx context.Context, call func(context.Context) (T, error)) 
 }
 
 // classify maps a broker failure to the publication error taxonomy. A
-// definite denial is a blocked world; only transport-class failure that
-// persisted past the bounded rounds is an infrastructure failure.
+// definite denial is a fact the broker stated — a non-retryable status error
+// inside the same 4xx denial range the prerequisite classifier applies — so
+// it is a blocked world; only transport-class failure that persisted past
+// the bounded rounds is an infrastructure failure. A non-retryable broker
+// error that states no denial is a local construction or decoding failure
+// the broker never answered (#743): every publication call site treats it
+// as the infrastructure path — the relaunch recovery the prerequisite
+// classifier's local-failure class establishes — never as a denial, so no
+// run reason says "the broker denied" for a failure the broker never
+// stated.
 func (e *PublicationEngine) classify(err error, what string) error {
 	if err == nil {
 		return nil
@@ -394,7 +402,7 @@ func (e *PublicationEngine) classify(err error, what string) error {
 		return blocked
 	}
 	var callErr *BrokerCallError
-	if errors.As(err, &callErr) && !callErr.Retryable {
+	if errors.As(err, &callErr) && !callErr.Retryable && definiteWorkerRejectionStatus(callErr.StatusCode) {
 		return &PublicationBlockedError{Reason: fmt.Sprintf("the broker denied %s (%s)", what, callErr.Category), Err: err}
 	}
 	return &TransientPublicationError{Err: err}

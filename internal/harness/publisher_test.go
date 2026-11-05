@@ -682,7 +682,9 @@ func TestPublicationBaseAdvanceResync(t *testing.T) {
 }
 
 // A broker that keeps refusing is classified: a definite denial is blocked,
-// transport failure is transient after the bounded retries.
+// transport failure is transient after the bounded retries, and a local
+// construction or decoding failure — one the broker never answered — is
+// never a denial either (#743).
 func TestPublicationDenialClassification(t *testing.T) {
 	shrinkRetryDelays(t)
 	t.Run("definite denial", func(t *testing.T) {
@@ -697,6 +699,29 @@ func TestPublicationDenialClassification(t *testing.T) {
 			t.Fatalf("error = %v, want PublicationBlockedError", err)
 		}
 	})
+	t.Run("local failure is never a denial", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "operation denied", http.StatusUnprocessableEntity)
+		}))
+		defer server.Close()
+		engine, err := NewPublicationEngine(&BrokerClient{
+			BaseURL:     server.URL,
+			TokenSource: NewStaticBrokerTokenSource([]byte("x")),
+			CA:          []byte("not a pem block"),
+		}, NewIntegrator(filepath.Join(t.TempDir(), "integration"), nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = engine.Publish(context.Background())
+		var blocked *PublicationBlockedError
+		if errors.As(err, &blocked) {
+			t.Fatalf("error = %v, a local construction failure the broker never answered is not a denial", err)
+		}
+		var transient *TransientPublicationError
+		if !errors.As(err, &transient) {
+			t.Fatalf("error = %v, want TransientPublicationError", err)
+		}
+	})
 	t.Run("transport exhaustion", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			http.Error(w, "unavailable", http.StatusServiceUnavailable)
@@ -709,6 +734,27 @@ func TestPublicationDenialClassification(t *testing.T) {
 			t.Fatalf("error = %v, want TransientPublicationError", err)
 		}
 	})
+}
+
+// classify's denial predicate is the prerequisite classifier's: a
+// non-retryable status inside the definite-denial range is the broker's own
+// refusal, while a non-retryable status outside that range is a local
+// failure the trusted world never refused (#743).
+func TestPublicationClassifyDenialRange(t *testing.T) {
+	engine, err := NewPublicationEngine(&BrokerClient{BaseURL: "http://localhost"}, NewIntegrator(filepath.Join(t.TempDir(), "integration"), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked := engine.classify(&BrokerCallError{StatusCode: http.StatusForbidden, Category: "denied the operation"}, "the seed snapshot read")
+	var denial *PublicationBlockedError
+	if !errors.As(blocked, &denial) || denial.Reason != "the broker denied the seed snapshot read (denied the operation)" {
+		t.Fatalf("classify(403) = %v, want the broker-denied block", blocked)
+	}
+	outOfRange := engine.classify(&BrokerCallError{StatusCode: http.StatusFound, Category: "denied the operation"}, "the seed snapshot read")
+	var transient *TransientPublicationError
+	if !errors.As(outOfRange, &transient) {
+		t.Fatalf("classify(302) = %v, want TransientPublicationError: a status outside the denial range is not a refusal", outOfRange)
+	}
 }
 
 // seedTipEngine seeds a tree locally and points the engine at the given
