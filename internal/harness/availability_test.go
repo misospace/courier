@@ -54,8 +54,8 @@ func TestClassifyProviderError(t *testing.T) {
 			body:          `{"error":{"message":"slow down"}}`,
 			want:          ProviderTransientRateLimit,
 			wantRetryable: true,
-			// A rate limit that persists through the in-process retries is
-			// still a recoverable availability condition, not a hard failure.
+			// A rate limit the in-process policy does not retry is still a
+			// recoverable availability condition, not a hard failure.
 			wantDeferred: true,
 		},
 		{
