@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.21](https://github.com/misospace/courier/compare/v0.1.20...v0.1.21) (2026-11-06)
+
+
+### Features
+
+* **cache:** serve approved Go dependencies to secure workers ([#136](https://github.com/misospace/courier/issues/136)) ([#759](https://github.com/misospace/courier/issues/759)) ([56a5ab3](https://github.com/misospace/courier/commit/56a5ab39f414d2ed3b5e606302ca6abbfabe24bc))
+* **chart:** ship the model-gateway egress NetworkPolicy ([#763](https://github.com/misospace/courier/issues/763)) ([#765](https://github.com/misospace/courier/issues/765)) ([d79d174](https://github.com/misospace/courier/commit/d79d174bd8f133ff0fb0a81465a3aec955131d95))
+
+
+### Bug Fixes
+
+* **controller:** converge existing run NetworkPolicies to the rendered spec ([#758](https://github.com/misospace/courier/issues/758)) ([8ed27a1](https://github.com/misospace/courier/commit/8ed27a1799df16f828948d9d4ad72d3a9ba6ec7a))
+* **harness:** pin the task as the user turn in session assembly ([#764](https://github.com/misospace/courier/issues/764)) ([2288431](https://github.com/misospace/courier/commit/22884313705305e8f4b04ebad72319a1acee66d5))
+* **harness:** promote the task turn on the OpenAI-compatible first request ([#762](https://github.com/misospace/courier/issues/762)) ([6bf9881](https://github.com/misospace/courier/commit/6bf9881e2c50c017da81d6e25cd4823530d64371))
+
 ## [0.1.20](https://github.com/misospace/courier/compare/v0.1.19...v0.1.20) (2026-11-06)
 
 
