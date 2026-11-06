@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // ModelTransport is the harness's model boundary (HARNESS.md §5, #716): one
@@ -60,6 +61,33 @@ func ParseWire(declared string) (string, error) {
 		return "", fmt.Errorf("harness: unknown model transport %q (want %q or %q)", declared, WireOpenAI, WireAnthropic)
 	}
 }
+
+// modelStallBound is the first-byte stall bound every harness model turn's
+// transport carries (#754): a gateway that accepts the connection and then
+// never produces a response header fails the turn as a transport error
+// instead of holding the run — and any concurrency slot the turn occupies —
+// until the pod is terminated. It bounds the wait for the response header
+// only, never model generation: once headers arrive, a healthy streaming turn
+// may run as long as the model works. It is a transport resource bound, not a
+// work or model-behavior limit, exactly like the stream's own byte and event
+// bounds.
+const modelStallBound = 2 * time.Minute
+
+// stallGuardedTransport renders the transport behind a harness-owned model
+// client: the default transport plus the first-byte stall bound (#754). Tests
+// build their own with a short bound.
+func stallGuardedTransport(bound time.Duration) *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = bound
+	return transport
+}
+
+// ownedModelClient is the HTTP client both wire transports use when the
+// deployment supplied none. http.DefaultClient carries no timeouts at all, so
+// before #754 a stalled gateway held every model turn on the bare run
+// context. It is shared because it is immutable; a supplied client belongs to
+// whoever supplied it and is never wrapped or modified.
+var ownedModelClient = &http.Client{Transport: stallGuardedTransport(modelStallBound)}
 
 // NewModelTransport constructs the transport one lane declared. The endpoint
 // and key are deployment configuration shared by every transport — the same

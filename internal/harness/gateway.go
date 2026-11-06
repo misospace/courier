@@ -29,7 +29,11 @@ type Gateway struct {
 	// APIKey is the bearer token sent with every request. Empty means the
 	// gateway accepts unauthenticated callers.
 	APIKey string
-	HTTP   *http.Client
+	// HTTP is the caller-supplied HTTP client. Nil means the transport uses
+	// the harness-owned default, whose first-byte stall bound (#754) fails a
+	// gateway that never produces a response header as a transport error; a
+	// supplied client belongs to whoever supplied it and is never modified.
+	HTTP *http.Client
 	// ExhaustionSignals names the structured provider signals that mean a
 	// model allowance is spent rather than a transient rate limit (#320). An
 	// empty value falls back to the provider-neutral defaults; deployments
@@ -49,7 +53,10 @@ func (g *Gateway) client() *http.Client {
 	if g.HTTP != nil {
 		return g.HTTP
 	}
-	return http.DefaultClient
+	// The harness-owned default carries the first-byte stall bound (#754):
+	// http.DefaultClient has no timeouts at all, so a gateway that accepted
+	// the connection and stalled would hold the turn on the bare run context.
+	return ownedModelClient
 }
 
 // signals returns the configured exhaustion signals, falling back to the
@@ -349,7 +356,7 @@ func (g *Gateway) ModelInputLimit(ctx context.Context, model string) (int, error
 // universal protocol requirement, and a missing limit is never invented).
 func modelInfoInputLimit(ctx context.Context, client *http.Client, baseURL, apiKey, model string, signals ExhaustionSignals) (int, error) {
 	if client == nil {
-		client = http.DefaultClient
+		client = ownedModelClient
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSuffix(baseURL, "/")+"/model/info", nil)
 	if err != nil {
