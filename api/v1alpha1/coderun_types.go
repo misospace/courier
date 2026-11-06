@@ -964,6 +964,54 @@ type PublicationPolicy struct {
 	AcceptanceCriteriaDigest string `json:"acceptanceCriteriaDigest,omitempty"`
 }
 
+// ModelSurfaceSchemaV1 is the schema version of the canonical model-surface
+// provenance encoding (#730). The version pins the exact definition of what
+// contributes to the digest: the encoder lives in internal/harness, which
+// derives every input identity from production assembly code and the run's
+// admitted operator-authored identities. A change to the encoding — an added,
+// removed, or redefined input — bumps the version, so a recorded digest is
+// always reproducible under the schema version it names. Keep this constant
+// in sync with the encoder; the kubebuilder validation on
+// ModelSurfaceProvenance.SchemaVersion admits it and every later version.
+const ModelSurfaceSchemaV1 = 1
+
+// ModelSurfaceProvenance is the per-run, per-incarnation identity of the
+// model-visible contract one native control incarnation assembled (#730):
+// a canonical, versioned digest over the trusted identities that determine
+// what the model sees — the harness model-surface schema version, the
+// canonical pinned prompt-section identities, the declared tool schema
+// identities per role, the selected role→model bindings and wire transport,
+// the pinned skill name+digest pairs, and the persisted context-policy and
+// pinned acceptance-criteria identities. It is computed and persisted by
+// trusted control through the broker's trusted status path before any model
+// execution, and never carries prompt bodies, skill instruction bodies,
+// secret material, model output, workspace contents, or source text already
+// covered by an existing trusted digest or pin.
+//
+// What it proves, and what it does not, is documented in HARNESS.md §5.
+type ModelSurfaceProvenance struct {
+	// SchemaVersion is the canonical encoding version that produced Digest.
+	// +kubebuilder:validation:Minimum=1
+	SchemaVersion int `json:"schemaVersion"`
+	// Digest is the sha256 over the canonical versioned encoding of the
+	// run's model-surface identities. Equivalent model-visible contracts
+	// produce the same digest regardless of map or order nondeterminism; a
+	// material change to any covered identity changes it.
+	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
+	Digest string `json:"digest"`
+	// CoordinatorPodUID is the control incarnation that computed and
+	// persisted this record. It is the fence: the broker refuses a record
+	// attributing itself to any other incarnation, one incarnation's
+	// recorded digest is final for that incarnation, and a replacement
+	// incarnation records its own.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	CoordinatorPodUID string `json:"coordinatorPodUID"`
+	// At is when trusted control persisted the digest, before model
+	// execution.
+	At metav1.Time `json:"at"`
+}
+
 // CoderRunStatus is the observed state of a CoderRun.
 type CoderRunStatus struct {
 	// SourceReceipt is sensitive source-issued claim fencing data.
@@ -1158,6 +1206,18 @@ type CoderRunStatus struct {
 	// kubelet termination handoff as before.
 	// +optional
 	NativeResult *NativeResult `json:"nativeResult,omitempty"`
+
+	// ModelSurface is the per-incarnation provenance digest of the
+	// model-visible contract the native harness assembled (#730), computed
+	// and persisted by trusted control through the run's broker status path
+	// before any model execution. One incarnation's recorded digest is
+	// final for that incarnation; a replacement incarnation records its
+	// own. Absent for legacy executors and for runs that failed before the
+	// digest could be computed (a skills-load failure precedes it); the
+	// capability gate runs after persistence, so a gate-stopped run keeps
+	// its digest.
+	// +optional
+	ModelSurface *ModelSurfaceProvenance `json:"modelSurface,omitempty"`
 
 	// CIPark is the durable park-and-resume record while the run waits on
 	// CI in Verifying. Nil means the run is not parked (#475).

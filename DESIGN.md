@@ -1214,6 +1214,23 @@ world wins on conflict.
 - **Workspace: ephemeral `emptyDir`,** rebuilt from git on every start. Nothing
   durable lives on disk, so there is no workspace PVC to sprawl.
 
+**Model-surface provenance (`status.modelSurface`).** Every native run that
+reaches model execution persists one canonical, versioned digest of the
+model-visible contract its control incarnation assembled — schema version,
+digest, incarnation fence, and time — through the broker's trusted status
+path. The persist-before-use contract is dispatch evidence's: the digest is
+computed from the production assembly — the same tool builders and role
+bindings the sessions declare through, one assembly source, no second
+surface description — and durably persisted in the pre-model startup phase,
+after the run's skill view loads and before the capability gate probes
+anything (#730 review), so no model request, the gate's model probes
+included, exists without the durable surface identity that explains it, and
+a run whose provenance never landed issues zero model requests. The record
+is set-once per incarnation: an identical rewrite is idempotent, a different
+digest is refused, and a replacement incarnation records its own. What the
+digest covers, proves, and does not prove is detailed in
+[HARNESS.md](./HARNESS.md) §5.
+
 A mechanical-CI repair resume is the same discipline in its smallest form. What
 survives is the durable checkpoint — the plan and the completed briefs — plus
 the bounded failed-check evidence the operator recorded, and the git and forge

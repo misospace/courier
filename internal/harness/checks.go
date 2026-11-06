@@ -236,7 +236,7 @@ func (r *checkRegistry) dropOrder(key string) {
 func (c *Coordinator) runCheck(ctx context.Context, call ToolCall, briefID string, result ToolResult) ToolResult {
 	if c.worker == nil {
 		result.IsError = true
-		result.Content = "no worker is configured in this build"
+		result.Content = noticeNoWorker
 		return result
 	}
 	if briefID == "" {
@@ -248,7 +248,7 @@ func (c *Coordinator) runCheck(ctx context.Context, call ToolCall, briefID strin
 	}
 	if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil || strings.TrimSpace(args.Command) == "" {
 		result.IsError = true
-		result.Content = "check arguments must carry a command string"
+		result.Content = noticeCheckArgs
 		return result
 	}
 	if strings.ContainsRune(args.Command, '\x00') {
@@ -256,7 +256,7 @@ func (c *Coordinator) runCheck(ctx context.Context, call ToolCall, briefID strin
 		// argument would reach sh truncated at the NUL, so the program
 		// executed would not be the one this identity records.
 		result.IsError = true
-		result.Content = "a check command must not contain a NUL byte"
+		result.Content = noticeCheckNUL
 		return result
 	}
 	// Rendering the snapshot is non-destructive: it re-renders the bundle
@@ -349,7 +349,7 @@ func (c *Coordinator) runCheck(ctx context.Context, call ToolCall, briefID strin
 				// a fixed error here rather than dispatching a second
 				// operation.
 				result.IsError = true
-				result.Content = "the tracked check failed to launch; no receipt was recorded"
+				result.Content = noticeCheckLaunchFailed
 				return result
 			}
 			// The same generation guard applies to a served wait: the

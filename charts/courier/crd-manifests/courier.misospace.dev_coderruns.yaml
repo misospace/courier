@@ -642,6 +642,53 @@ spec:
                   non-secret value limited to 128 Unicode code points.
                 maxLength: 128
                 type: string
+              modelSurface:
+                description: |-
+                  ModelSurface is the per-incarnation provenance digest of the
+                  model-visible contract the native harness assembled (#730), computed
+                  and persisted by trusted control through the run's broker status path
+                  before any model execution. One incarnation's recorded digest is
+                  final for that incarnation; a replacement incarnation records its
+                  own. Absent for legacy executors and for runs that failed before the
+                  digest could be computed (a skills-load failure precedes it); the
+                  capability gate runs after persistence, so a gate-stopped run keeps
+                  its digest.
+                properties:
+                  at:
+                    description: |-
+                      At is when trusted control persisted the digest, before model
+                      execution.
+                    format: date-time
+                    type: string
+                  coordinatorPodUID:
+                    description: |-
+                      CoordinatorPodUID is the control incarnation that computed and
+                      persisted this record. It is the fence: the broker refuses a record
+                      attributing itself to any other incarnation, one incarnation's
+                      recorded digest is final for that incarnation, and a replacement
+                      incarnation records its own.
+                    maxLength: 128
+                    minLength: 1
+                    type: string
+                  digest:
+                    description: |-
+                      Digest is the sha256 over the canonical versioned encoding of the
+                      run's model-surface identities. Equivalent model-visible contracts
+                      produce the same digest regardless of map or order nondeterminism; a
+                      material change to any covered identity changes it.
+                    pattern: ^sha256:[0-9a-f]{64}$
+                    type: string
+                  schemaVersion:
+                    description: SchemaVersion is the canonical encoding version that
+                      produced Digest.
+                    minimum: 1
+                    type: integer
+                required:
+                - at
+                - coordinatorPodUID
+                - digest
+                - schemaVersion
+                type: object
               nativeResult:
                 description: |-
                   NativeResult is the trusted native coordinator's structured terminal

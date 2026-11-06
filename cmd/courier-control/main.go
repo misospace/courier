@@ -57,14 +57,18 @@ type termination struct {
 	Category string `json:"category,omitempty"`
 }
 
-// Probe retry rounds and delay are bounded infrastructure retries covering a
+// Probe retry rounds are bounded infrastructure retries covering a
 // dependency that is still starting (the broker pod is created before
 // control). They are not run-duration limits: persistent failure after the
 // rounds declares NeedsHuman with the capability table.
 const (
 	probeRetryRounds = 5
-	probeRetryDelay  = 10 * time.Second
 )
+
+// probeRetryDelay is the wait between capability-gate re-probe rounds. It is
+// a var so the startup-order regressions can shrink it (#730 review): they
+// drive the gate through every round.
+var probeRetryDelay = 10 * time.Second
 
 // maxTerminationReasonBytes bounds the termination reason. The kubelet caps
 // termination message files, and an oversized payload would truncate the
@@ -171,13 +175,6 @@ func runArgs(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 
-	// Startup capability health (§5): every semantic capability the harness
-	// depends on is probed and named. Required and unavailable fails closed
-	// before any model work starts; optional capabilities proceed degraded.
-	// Transient probe failures (a broker pod still starting, one gateway
-	// hiccup) are re-probed for bounded rounds before declaring, so a
-	// slow-to-start dependency does not park the run with a human.
-	//
 	// The run's model telemetry (#738): one shared emitter serves both the
 	// per-request model.call lines and the terminal model.telemetry summary,
 	// and the tally tallies every request observation and applied compaction
@@ -192,103 +189,50 @@ func runArgs(args []string) error {
 		stderr:     os.Stderr,
 		invocation: invocation,
 	})
-	deps := harness.ProbeDeps{
-		Transport:          gateway,
-		Bindings:           bindings,
-		Broker:             identity.brokerProber(),
-		Mode:               string(invocation.Mode),
-		PublicationPresent: true, // the publisher is wired below (#125)
-		SnapshotPresent:    true, // the snapshot provider is wired below (#125)
-		Context:            policy,
-		// The probe records each declared role's resolution input — declared
-		// policy plus the gateway-verified limit — and those inputs feed
-		// CoordinatorConfig.ContextBudgets verbatim (#636), so the sessions
-		// the coordinator opens execute under exactly the limits this gate
-		// verified; there is no second gateway read that could disagree with
-		// the one that decided capability health. The retry loop overwrites
-		// per role, so after the gate passes the map holds the passing
-		// round's inputs for every declared role.
-		OnContextBudget: func(role string, input harness.ContextBudgetInput) {
-			budgetInputs[role] = input
-		},
-		ProbeWorker: func(probeCtx context.Context) harness.Capability {
-			return identity.probeWorker(probeCtx)
-		},
-		ModelProbe: func(probeCtx context.Context, model string) ([]harness.Event, error) {
-			return probeModel(probeCtx, gateway, model)
-		},
-		// The gate's model spend rides the run's model telemetry: one probe
-		// observation per unique bound model (#738).
-		Requests: modelTally,
-	}
-	var caps []harness.Capability
-	for attempt := 0; ; attempt++ {
-		probeCtx, cancelProbe := context.WithTimeout(ctx, probeTimeout)
-		caps = harness.ProbeCapabilities(probeCtx, deps)
-		cancelProbe()
-		_, err := harness.Gate(caps)
-		if err == nil {
-			break
-		}
-		reason, retryable := classifyGateFailure(err)
-		if !retryable || attempt >= probeRetryRounds {
-			// A confirmed provider allowance exhaustion is a recoverable
-			// resource-availability condition, not a human decision: declare
-			// a blocked-external ending so the source re-offers the work once
-			// capacity returns (#320).
-			if exhaustedGate(err) {
-				emitModelTelemetry(modelEvents, invocation, modelTally.Summary())
-				return declareBlockedExternal(reason, caps, reporter, identity)
-			}
-			emitModelTelemetry(modelEvents, invocation, modelTally.Summary())
-			return declareNeedsHuman(reason, caps, reporter, identity)
-		}
-		fmt.Printf("transient capability failure, re-probing: %s\n", reason)
-		select {
-		case <-ctx.Done():
-			emitModelTelemetry(modelEvents, invocation, modelTally.Summary())
-			return declareNeedsHuman(reason, caps, reporter, identity)
-		case <-time.After(probeRetryDelay):
-		}
-	}
-	fmt.Printf("capability health: %s\n", mustJSON(caps))
 
-	// The trusted integration tree and publication engine (#125): the tree
-	// lives in the control pod's private workspace, is seeded from the
-	// broker's live observation, and owns the one-commit-per-brief cadence.
-	// The scope is the operator-resolved path policy; absent an operator
-	// resolution the whole repository is in scope — there are no default
-	// path filters.
-	integrator := harness.NewIntegrator(
-		filepath.Join(topology.ControlWorkspacePath, "integration"), nil)
-	engine, err := harness.NewPublicationEngine(identity.brokerClient(), integrator)
+	// The trusted non-model startup phase (#730 review): the publication
+	// engine, the run's skill view, and the model-surface provenance digest —
+	// computed from the production assembly and durably persisted through the
+	// broker's trusted status path — all before the capability gate can issue
+	// its first model request. The digest needs the skill view first: whether
+	// the skill tool is wired is a surface fact the tool builders encode. A
+	// run whose provenance never landed issues zero model requests — the
+	// gate's capability probes included.
+	work, gateFail, err := prepareModelWork(modelWorkDeps{
+		ctx:          ctx,
+		identity:     identity,
+		reporter:     reporter,
+		bindings:     bindings,
+		invocation:   invocation,
+		policy:       policy,
+		gateway:      gateway,
+		emitter:      modelEvents,
+		tally:        modelTally,
+		budgetInputs: budgetInputs,
+		probeTimeout: probeTimeout,
+	})
 	if err != nil {
-		// The gate already passed, so the tally holds the run's probe
-		// requests: the summary is emitted before the failure returns, on
-		// the same best-effort terms as every other exit (#738).
-		emitModelTelemetry(modelEvents, invocation, modelTally.Summary())
-		return fmt.Errorf("courier-control: publication engine: %w", err)
-	}
-
-	// Skill loading (#659): a pinned run resolves and verifies its pinned
-	// skill identities against the deployment-mounted bundle config before
-	// any model work starts. Missing, drifted, or oversized content is a
-	// clear pre-model failure — never an omitted skill — and the loaded
-	// identities are the only skill view every harness role sees for this
-	// incarnation. A load failure declares NeedsHuman with the skills
-	// capability; a seed failure for repository-local discovery is
-	// infrastructure the relaunch owns.
-	skillSet, err := loadRunSkills(ctx, invocation, engine)
-	if err != nil {
-		// The gate already passed, so the tally holds the run's probe
-		// requests: the summary is emitted before the declare, on the same
-		// best-effort terms as every other exit (#738).
-		emitModelTelemetry(modelEvents, invocation, modelTally.Summary())
+		// A skill-load failure is operator-authored run configuration that
+		// never reached the gate (#659): it declares NeedsHuman with the
+		// skills capability. No model request has been issued.
 		var skillsErr *skillLoadError
 		if errors.As(err, &skillsErr) {
-			return declareNeedsHuman(skillsErr.reason(), append(caps, skillsErr.capability()), reporter, identity)
+			emitModelTelemetry(modelEvents, invocation, modelTally.Summary(), "")
+			return declareNeedsHuman(skillsErr.reason(), []harness.Capability{skillsErr.capability()}, reporter, identity)
 		}
-		return fmt.Errorf("courier-control: skills: %w", err)
+		emitModelTelemetry(modelEvents, invocation, modelTally.Summary(), "")
+		return err
+	}
+	if gateFail != nil {
+		// The digest is already durable here: every later telemetry line
+		// carries the surface identity that explains the gate's probe spend
+		// (#730 review).
+		if gateFail.exhausted {
+			emitModelTelemetry(modelEvents, invocation, modelTally.Summary(), work.surface.Digest)
+			return declareBlockedExternal(gateFail.reason, gateFail.caps, reporter, identity)
+		}
+		emitModelTelemetry(modelEvents, invocation, modelTally.Summary(), work.surface.Digest)
+		return declareNeedsHuman(gateFail.reason, gateFail.caps, reporter, identity)
 	}
 
 	// The coordinator loop. It is interrupted by pod termination (context),
@@ -309,8 +253,8 @@ func runArgs(args []string) error {
 		Transport: gateway,
 		Bindings:  bindings,
 		Worker:    identity.delegator(),
-		Snapshot:  engine.PrepareSnapshot,
-		Publisher: engine,
+		Snapshot:  work.engine.PrepareSnapshot,
+		Publisher: work.engine,
 		Activity:  reporter,
 		Status:    reporter,
 		// The budget inputs the gate verified (#636), resolved once here by
@@ -322,9 +266,9 @@ func runArgs(args []string) error {
 		// incarnation, and is acknowledged durably through the same
 		// trusted status path before the stop latch flips.
 		Control:             harness.NewControlWatcher(identity.brokerStatusClient(), reporter),
-		WorkRefBeyondAnchor: engine.WorkRefBeyondAnchor,
+		WorkRefBeyondAnchor: work.engine.WorkRefBeyondAnchor,
 		CapacityWorkspaceSafety: func(ctx context.Context) (executor.WorkspaceSafetyEvidence, error) {
-			evidence, err := engine.CapacityWorkspaceSafety(ctx)
+			evidence, err := work.engine.CapacityWorkspaceSafety(ctx)
 			// The integration checkout uses a private branch; the broker's pinned
 			// publication destination is the run branch from trusted invocation.
 			evidence.Branch = invocation.Branch
@@ -345,18 +289,205 @@ func runArgs(args []string) error {
 			stderr:     os.Stderr,
 			invocation: invocation,
 		},
-		Skills: skillSet,
+		Skills: work.skills,
 	})
 	if err != nil {
 		// A coordinator that failed construction already made its gate's
-		// probe requests: the summary is emitted before the failure returns,
-		// on the same best-effort terms as every other exit (#738).
-		emitModelTelemetry(modelEvents, invocation, modelTally.Summary())
+		// probe requests, and the surface identity that explains them is
+		// durable (#730 review): the summary is emitted before the failure
+		// returns, on the same best-effort terms as every other exit (#738).
+		emitModelTelemetry(modelEvents, invocation, modelTally.Summary(), work.surface.Digest)
 		return fmt.Errorf("courier-control: %w", err)
 	}
+
 	result := coordinator.Run(ctx, invocation)
-	emitModelTelemetry(modelEvents, invocation, modelTally.Summary())
+	emitModelTelemetry(modelEvents, invocation, modelTally.Summary(), work.surface.Digest)
 	return declare(result, invocation.Mode, reporter, identity)
+}
+
+// modelWorkDeps carries what the pre-model startup phase needs: the run's
+// trusted identity and status reporter, the resolved bindings and invocation
+// the digest assembles from, and the model boundary the capability gate
+// probes through.
+type modelWorkDeps struct {
+	ctx          context.Context
+	identity     *controlIdentity
+	reporter     *harness.StatusReporter
+	bindings     harness.Bindings
+	invocation   executor.Invocation
+	policy       harness.ContextPolicy
+	gateway      harness.ModelTransport
+	emitter      *courierlog.Emitter
+	tally        *harness.ModelTelemetry
+	budgetInputs map[string]harness.ContextBudgetInput
+	probeTimeout time.Duration
+}
+
+// modelWork is the prepared pre-model state the coordinator loop consumes:
+// the final capability table, the run's loaded skill view, the publication
+// engine, and the persisted model-surface provenance.
+type modelWork struct {
+	caps    []harness.Capability
+	skills  *harness.SkillSet
+	engine  *harness.PublicationEngine
+	surface *harness.ModelSurface
+}
+
+// gateFailure is a capability gate that will not pass: the reason it stopped,
+// the final capability table, and whether the failure is a confirmed
+// provider allowance exhaustion — a blocked-external ending the source
+// re-offers once capacity returns (#320). The caller owns the declare,
+// because the declare path exits the process.
+type gateFailure struct {
+	reason    string
+	caps      []harness.Capability
+	exhausted bool
+}
+
+// prepareModelWork runs the trusted non-model startup phase and the
+// capability gate in the order the model-surface contract requires (#730
+// review): the publication engine, the run's skill view, and the
+// model-surface provenance digest — computed from the production assembly,
+// the same tool builders and bindings the coordinator's sessions declare
+// through, and durably persisted through the broker's trusted status path —
+// all before any capability probe can issue a model request. A run whose
+// provenance never landed fails closed with zero model requests issued, the
+// gate's probes included. Engine, skill-load, assembly, and persistence
+// failures return as errors; a gate that will not pass returns as the
+// *gateFailure the caller declares, alongside the prepared work — the digest
+// is already durable by then, so every later telemetry line carries it.
+func prepareModelWork(deps modelWorkDeps) (*modelWork, *gateFailure, error) {
+	// The trusted integration tree and publication engine (#125): the tree
+	// lives in the control pod's private workspace, is seeded from the
+	// broker's live observation, and owns the one-commit-per-brief cadence.
+	// The scope is the operator-resolved path policy; absent an operator
+	// resolution the whole repository is in scope — there are no default
+	// path filters.
+	integrator := harness.NewIntegrator(
+		filepath.Join(topology.ControlWorkspacePath, "integration"), nil)
+	engine, err := harness.NewPublicationEngine(deps.identity.brokerClient(), integrator)
+	if err != nil {
+		// No model request has been issued: the provenance phase and the
+		// gate have not run (#730 review). The summary is emitted before the
+		// failure returns, on the same best-effort terms as every other exit
+		// (#738).
+		emitModelTelemetry(deps.emitter, deps.invocation, deps.tally.Summary(), "")
+		return nil, nil, fmt.Errorf("courier-control: publication engine: %w", err)
+	}
+
+	// Skill loading (#659): a pinned run resolves and verifies its pinned
+	// skill identities against the deployment-mounted bundle config before
+	// any model work starts. Missing, drifted, or oversized content is a
+	// clear pre-model failure — never an omitted skill — and the loaded
+	// identities are the only skill view every harness role sees for this
+	// incarnation. A seed failure for repository-local discovery is
+	// infrastructure the relaunch owns. The view loads before the surface
+	// assembly: whether the skill tool is wired is a surface fact the tool
+	// builders encode (#730 review).
+	skillSet, err := loadRunSkills(deps.ctx, deps.invocation, engine)
+	if err != nil {
+		// No model request has been issued. The caller declares the
+		// skills-capability NeedsHuman, because the declare path exits the
+		// process.
+		emitModelTelemetry(deps.emitter, deps.invocation, deps.tally.Summary(), "")
+		return nil, nil, fmt.Errorf("courier-control: skills: %w", err)
+	}
+
+	// The run's model-surface provenance digest (#730): computed from the
+	// production assembly and persisted through the broker's trusted status
+	// path before any capability probe can issue a model request (#730
+	// review). The persist-before-execution contract is the same one
+	// dispatch evidence rides: a run whose provenance never landed durably
+	// does not run a model — and its probe spend never exists without the
+	// durable surface identity that explains it. A computation or
+	// persistence failure is an infrastructure failure the relaunch owns,
+	// bounded by the crashloop backstop. The run path wires no forge seam,
+	// so the assembly sees the same nil seam the coordinator will.
+	surface, err := harness.AssembleModelSurface(deps.bindings, nil, skillSet, harness.ModelSurfaceInputs{
+		GatewayTransport: deps.invocation.GatewayTransport,
+		LaneFraming:      deps.invocation.Framing,
+		ContextPolicy:    deps.invocation.Context,
+		SkillsJSON:       deps.invocation.Skills,
+		CriteriaJSON:     deps.invocation.Criteria,
+	})
+	if err != nil {
+		emitModelTelemetry(deps.emitter, deps.invocation, deps.tally.Summary(), "")
+		return nil, nil, fmt.Errorf("courier-control: model-surface provenance: %w", err)
+	}
+	emitRunSurface(deps.emitter, deps.invocation, surface)
+	if err := deps.reporter.ModelSurface(deps.ctx, surface.SchemaVersion, surface.Digest); err != nil {
+		emitModelTelemetry(deps.emitter, deps.invocation, deps.tally.Summary(), "")
+		return nil, nil, fmt.Errorf("courier-control: persist model-surface provenance: %w", err)
+	}
+
+	// Startup capability health (§5): every semantic capability the harness
+	// depends on is probed and named. Required and unavailable fails closed
+	// before any model work starts; optional capabilities proceed degraded.
+	// Transient probe failures (a broker pod still starting, one gateway
+	// hiccup) are re-probed for bounded rounds before declaring, so a
+	// slow-to-start dependency does not park the run with a human. The gate
+	// runs after the digest is durable: its model probes are model requests
+	// the surface identity must already explain (#730 review).
+	gate := harness.ProbeDeps{
+		Transport:          deps.gateway,
+		Bindings:           deps.bindings,
+		Broker:             deps.identity.brokerProber(),
+		Mode:               string(deps.invocation.Mode),
+		PublicationPresent: true, // the publisher is wired above (#125)
+		SnapshotPresent:    true, // the snapshot provider is wired above (#125)
+		Context:            deps.policy,
+		// The probe records each declared role's resolution input — declared
+		// policy plus the gateway-verified limit — and those inputs feed
+		// CoordinatorConfig.ContextBudgets verbatim (#636), so the sessions
+		// the coordinator opens execute under exactly the limits this gate
+		// verified; there is no second gateway read that could disagree with
+		// the one that decided capability health. The retry loop overwrites
+		// per role, so after the gate passes the map holds the passing
+		// round's inputs for every declared role.
+		OnContextBudget: func(role string, input harness.ContextBudgetInput) {
+			deps.budgetInputs[role] = input
+		},
+		ProbeWorker: func(probeCtx context.Context) harness.Capability {
+			return deps.identity.probeWorker(probeCtx)
+		},
+		ModelProbe: func(probeCtx context.Context, model string) ([]harness.Event, error) {
+			return probeModel(probeCtx, deps.gateway, model)
+		},
+		// The gate's model spend rides the run's model telemetry: one probe
+		// observation per unique bound model (#738).
+		Requests: deps.tally,
+	}
+	var caps []harness.Capability
+	for attempt := 0; ; attempt++ {
+		probeCtx, cancelProbe := context.WithTimeout(deps.ctx, deps.probeTimeout)
+		caps = harness.ProbeCapabilities(probeCtx, gate)
+		cancelProbe()
+		_, err := harness.Gate(caps)
+		if err == nil {
+			break
+		}
+		reason, retryable := classifyGateFailure(err)
+		if !retryable || attempt >= probeRetryRounds {
+			// A confirmed provider allowance exhaustion is a recoverable
+			// resource-availability condition, not a human decision: a
+			// blocked-external ending so the source re-offers the work once
+			// capacity returns (#320). The caller declares it.
+			work := &modelWork{caps: caps, skills: skillSet, engine: engine, surface: surface}
+			if exhaustedGate(err) {
+				return work, &gateFailure{reason: reason, caps: caps, exhausted: true}, nil
+			}
+			return work, &gateFailure{reason: reason, caps: caps}, nil
+		}
+		fmt.Printf("transient capability failure, re-probing: %s\n", reason)
+		select {
+		case <-deps.ctx.Done():
+			return &modelWork{caps: caps, skills: skillSet, engine: engine, surface: surface},
+				&gateFailure{reason: reason, caps: caps}, nil
+		case <-time.After(probeRetryDelay):
+		}
+	}
+	fmt.Printf("capability health: %s\n", mustJSON(caps))
+	return &modelWork{caps: caps, skills: skillSet, engine: engine, surface: surface}, nil, nil
 }
 
 // classifyGateFailure decides, for a harness.Gate failure, the reason the
@@ -387,10 +518,13 @@ func exhaustedGate(err error) bool {
 // peaks, and the compaction account. The provider's token fields appear only
 // when some provider reported usage — a run with no reported usage carries
 // the counts that are always known, never zero token sums that could read as
-// a free run. The event is Verbose so the summary reaches the log store at
+// a free run. modelSurface, when non-empty, is the run's model-surface
+// provenance digest (#730): the digest string only, so the run's model spend
+// and the model-visible contract that produced it correlate in one line. The
+// event is Verbose so the summary reaches the log store at
 // info level on every finished run, like run.summary. Emission is
 // best-effort: a dropped event is noted on stderr and the run continues.
-func emitModelTelemetry(emitter *courierlog.Emitter, invocation executor.Invocation, summary harness.ModelTelemetrySummary) {
+func emitModelTelemetry(emitter *courierlog.Emitter, invocation executor.Invocation, summary harness.ModelTelemetrySummary, modelSurface string) {
 	cells := make([]map[string]any, 0, len(summary.ByRoleModel))
 	for _, cell := range summary.ByRoleModel {
 		cells = append(cells, map[string]any{
@@ -416,6 +550,9 @@ func emitModelTelemetry(emitter *courierlog.Emitter, invocation executor.Invocat
 		"last_compaction_before":      summary.LastCompactionBefore,
 		"last_compaction_after":       summary.LastCompactionAfter,
 	}
+	if modelSurface != "" {
+		detail["model_surface"] = modelSurface
+	}
 	if summary.UsageReported > 0 {
 		detail["input_tokens"] = summary.InputTokens
 		detail["output_tokens"] = summary.OutputTokens
@@ -436,6 +573,37 @@ func emitModelTelemetry(emitter *courierlog.Emitter, invocation executor.Invocat
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "courier-control: dropped %s event: %v\n", courierlog.EventModelTelemetry, err)
+	}
+}
+
+// emitRunSurface records the run's model-surface provenance (#730) on the
+// structured event log: one run.surface line carrying the schema version,
+// the digest, and the canonical encoding that produced the digest — the
+// input identities, carried as names and digests only. Prompt bodies, skill
+// instruction bodies, model output, workspace contents, and secret material
+// are never part of the encoding, so emitting it whole exposes nothing the
+// digest does not already name. The event is Verbose so the identities reach
+// the log store at info level on every finished run that computed them, like
+// run.summary. Emission is best-effort: a dropped event is noted on stderr
+// and the run continues.
+func emitRunSurface(emitter *courierlog.Emitter, invocation executor.Invocation, surface *harness.ModelSurface) {
+	err := emitter.Emit(courierlog.Event{
+		Type:  courierlog.EventRunSurface,
+		RunID: invocation.RunName,
+		Repo:  invocation.Repo,
+		Ref:   invocation.Ref,
+		Mode:  string(invocation.Mode),
+		// No status: like model.telemetry, the provenance is observability,
+		// never a liveness or completion claim about the run.
+		Detail: map[string]any{
+			"schema_version": surface.SchemaVersion,
+			"digest":         surface.Digest,
+			"encoding":       json.RawMessage(surface.Encoding),
+		},
+		Verbose: true,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "courier-control: dropped %s event: %v\n", courierlog.EventRunSurface, err)
 	}
 }
 

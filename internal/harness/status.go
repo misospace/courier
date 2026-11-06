@@ -60,6 +60,13 @@ type StatusPatch struct {
 	// incarnation.
 	// +optional
 	ControlRequestAck *courierv1alpha1.ControlRequestAck `json:"controlRequestAck,omitempty"`
+
+	// ModelSurface persists the run's model-surface provenance digest (#730)
+	// before any model execution. The broker fences it to the authenticated
+	// control incarnation: one incarnation's recorded digest is final for
+	// that incarnation, and a replacement incarnation records its own.
+	// +optional
+	ModelSurface *courierv1alpha1.ModelSurfaceProvenance `json:"modelSurface,omitempty"`
 }
 
 // OperationAddition carries the operation ID (the set's key) and its entry.
@@ -299,6 +306,30 @@ func (r *StatusReporter) TerminalResult(ctx context.Context, result courierv1alp
 		return nil
 	}
 	return r.retried(ctx, StatusPatch{TerminalResult: &result, NoChange: noChange})
+}
+
+// ModelSurface persists the run's model-surface provenance digest (#730)
+// through the broker's trusted status path, before any model execution. The
+// record is fenced to this exact incarnation: the reporter stamps the
+// authenticated control UID and its own clock, exactly as a heartbeat does.
+// The write must be acknowledged before the first model request, on the same
+// persist-before-use contract as BeginOperation: a run without its persisted
+// provenance does not run a model. A persistent failure is returned to the
+// caller, which fails closed on the infrastructure path — recovery is the
+// relaunch bounded by the crashloop backstop, never a model-visible choice.
+func (r *StatusReporter) ModelSurface(ctx context.Context, schemaVersion int, digest string) error {
+	if r == nil || r.transport == nil {
+		return nil
+	}
+	if digest == "" || r.controlUID == "" {
+		return errors.New("harness: model-surface provenance is malformed")
+	}
+	return r.retried(ctx, StatusPatch{ModelSurface: &courierv1alpha1.ModelSurfaceProvenance{
+		SchemaVersion:     schemaVersion,
+		Digest:            digest,
+		CoordinatorPodUID: r.controlUID,
+		At:                metav1.NewTime(r.now()),
+	}})
 }
 
 // ReconcileDebt retries a retained checkpoint write. The broker's

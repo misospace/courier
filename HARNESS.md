@@ -1182,6 +1182,73 @@ re-rendered verbatim on the next request, because reasoning survives only
 its own protocol — never flattened into assistant text, dropped, or
 surfaced as user-visible content.
 
+**Model-surface provenance digest (#730).** Every native run that reaches
+model execution carries a canonical, versioned digest of the model-visible
+contract its control incarnation assembled — `status.modelSurface`, computed
+by trusted control from production assembly code and persisted through the
+broker's trusted status path before any model request, the capability gate's
+model probes included (#730 review). The encoding
+(`ModelSurfaceSchemaV1`, encoded in `internal/harness`) covers exactly:
+the schema version itself; the effective wire transport; the resolved
+role→model bindings; the canonical identities (name plus sha256) of the
+pinned prompt sections — the coordinator and sub-agent framings, the
+soft-stop control turn, the outcome clarification, and the lane's declared
+framing when present; the per-role declared tool-schema identities, read
+from the same production builders the sessions declare, so a wiring change
+(skills, forge) lands in the digest; the fixed-notice identities — the exact
+text (or fmt template) of every refusal, denial, argument rejection,
+compaction-header line, and skill-result scaffolding line trusted control's
+own tool paths can put in front of the model, read from the same constants
+the tool paths emit, so an edit to any fixed notice lands in the digest
+(#730 review); the pinned skill name+digest pairs;
+the lane's declared context policy (canonical JSON of the declarations —
+never the gateway-verified effective budgets); and the pinned
+acceptance-criteria set digest. Equivalent contracts produce the same
+digest regardless of map or order nondeterminism; a material change to any
+covered identity changes it. A run whose digest write does not land does
+not run a model (the persist-before-execution contract dispatch evidence
+rides); one incarnation's recorded digest is final for that incarnation,
+and a replacement incarnation records its own. The digest and its full
+input-identity encoding ride structured run telemetry (`run.surface`, and
+the digest on `model.telemetry`) — identities only, never prompt bodies,
+skill instruction bodies, model output, workspace contents, goal text, or
+secret material.
+
+What the digest **proves**: the exact trusted identity set of the
+model-facing contract one control incarnation assembled — two runs with the
+same digest received the same prompt-section identities, tool schemas,
+model bindings, transport, pinned skills, context declarations, and
+criterion pin under the same encoding version, so postmortems can compare
+runs and correlate behavior differences with contract differences.
+
+What it **does not prove**: nothing about the goal text, the workspace
+contents, or repository-local skill bodies (deliberately excluded — the
+goal is source-owned task data and those are workspace state); nothing
+about model behavior or output; nothing about the gateway endpoint, key,
+or the provider behind it; nothing about the worker-side environment the
+model's commands run in; nothing about runtime-resolved values (verified
+input limits, probe results); nothing about the dynamic parts of a
+templated notice (brief IDs, role names, the visible-skill list), the
+validation errors that quote model-provided arguments, or the subsystem
+error text one of the coordinator's own composed prefixes wraps — the
+trusted-authored prefix is pinned, the tail is data, and its trusted
+identity rides the covered identities above; and it is not an
+authorization grant — the
+run's authority lives in the broker policy and the role boundary, not in
+this digest. It is computed by the same trusted binary it describes, so it
+binds the surface only under the trusted-control assumptions of §3; it is
+not a tamper seal against a compromised control pod. The digest is computed
+in the pre-model startup phase — after the run's skill view loads, because
+whether the skill tool is wired is a surface fact the tool builders encode,
+and before the capability gate probes anything — from the same production
+assembly entry point the coordinator's own surface reads, so there is one
+assembly source and no second surface description to drift (#730 review). A
+run the gate stops ends with its surface identity already durable, probe
+spend included; a run that fails the phase itself — a skills load, the
+assembly, or the persistence write — records none and issues no model
+request. Legacy OpenCode runs assemble no native surface and record no
+digest.
+
 **Coordinator ownership.** The coordinator owns the run's terminal contract:
 plan, integrate, locally validate, publish, and hand off. Delegation covers
 bounded work only — implementation, research, review — never the terminal

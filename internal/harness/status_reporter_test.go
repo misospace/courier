@@ -881,3 +881,40 @@ func TestAvailabilityEndingClassifiesRecoverableKinds(t *testing.T) {
 		t.Fatal("an ordinary failure classified as an availability ending")
 	}
 }
+
+// TestStatusReporterModelSurfacePersistsBeforeModelExecution proves the
+// model-surface provenance digest (#730) rides the same identity-fenced
+// status path: the reporter stamps the authenticated control UID and its own
+// clock, retries through transient availability, and refuses a malformed
+// digest rather than writing one.
+func TestStatusReporterModelSurfacePersistsBeforeModelExecution(t *testing.T) {
+	shrinkRetryDelays(t)
+	transport := &recordingStatusTransport{errs: []error{brokerUnavailable()}}
+	reporter := testReporter(transport)
+	digest := "sha256:" + strings.Repeat("7", 64)
+	if err := reporter.ModelSurface(context.Background(), courierv1alpha1.ModelSurfaceSchemaV1, digest); err != nil {
+		t.Fatalf("ModelSurface after one transient failure: %v", err)
+	}
+	sent := transport.sent()
+	if len(sent) != 2 {
+		t.Fatalf("writes = %d, want the failed attempt plus the retry", len(sent))
+	}
+	last := sent[len(sent)-1]
+	if last.ModelSurface == nil || last.ModelSurface.Digest != digest ||
+		last.ModelSurface.SchemaVersion != courierv1alpha1.ModelSurfaceSchemaV1 ||
+		last.ModelSurface.CoordinatorPodUID != testControlUID || last.ModelSurface.At.IsZero() {
+		t.Fatalf("persisted record = %#v, want the fenced digest record", last.ModelSurface)
+	}
+	if last.Heartbeat != nil || last.Checkpoint != nil || last.TerminalResult != nil {
+		t.Fatalf("model-surface patch carried unrelated fields: %#v", last)
+	}
+
+	// A malformed digest is refused at the reporter, not persisted.
+	empty := &recordingStatusTransport{}
+	if err := testReporter(empty).ModelSurface(context.Background(), courierv1alpha1.ModelSurfaceSchemaV1, ""); err == nil {
+		t.Fatal("an empty digest was accepted")
+	}
+	if got := empty.sent(); len(got) != 0 {
+		t.Fatalf("malformed digest produced %d writes, want none", len(got))
+	}
+}

@@ -178,7 +178,7 @@ func (c *Coordinator) fenceWorker(opID string, cause error) {
 	c.workerFenceMu.Lock()
 	defer c.workerFenceMu.Unlock()
 	if c.workerFenceErr == nil {
-		c.workerFenceErr = &workerFence{reason: fmt.Sprintf("the worker is fenced: termination of operation %s could not be verified (%v); no further workspace operation may run against it", opID, cause)}
+		c.workerFenceErr = &workerFence{reason: fmt.Sprintf(noticeWorkerFencedFmt, opID, cause)}
 		c.prerequisite.observe(fencedPrerequisite())
 	}
 }
@@ -982,10 +982,13 @@ func forgeTool() ToolDef {
 	}
 }
 
-// coordinatorTools builds the trusted toolset the coordinator session is
+// coordinatorToolsFor builds the trusted toolset the coordinator session is
 // offered: worker shell, delegation, cancellation, and — when the forge seam
-// is wired — broker forge reads. Publication is never a tool.
-func (c *Coordinator) coordinatorTools() []ToolDef {
+// is wired — broker forge reads. Publication is never a tool. The seams are
+// explicit so the model-surface assembly (#730) reads the same builder the
+// sessions declare through — the pre-model startup path and the coordinator
+// cannot drift.
+func coordinatorToolsFor(forge ForgeOps, skills *SkillSet) []ToolDef {
 	tools := []ToolDef{shellTool(), checkTool()}
 	tools = append(tools,
 		ToolDef{
@@ -1016,28 +1019,36 @@ func (c *Coordinator) coordinatorTools() []ToolDef {
 				"required": []string{"id"},
 			},
 		})
-	if c.forge != nil {
+	if forge != nil {
 		tools = append(tools, forgeTool())
 	}
-	if c.skills != nil {
+	if skills != nil {
 		tools = append(tools, skillTool())
 	}
 	return tools
 }
 
-// subagentTools builds the tool declarations a bounded delegate is offered:
-// worker shell only. Forge reads, delegation, and cancellation are
+func (c *Coordinator) coordinatorTools() []ToolDef {
+	return coordinatorToolsFor(c.forge, c.skills)
+}
+
+// subagentToolsFor builds the tool declarations a bounded delegate is
+// offered: worker shell only. Forge reads, delegation, and cancellation are
 // coordinator-only capabilities; a sub-agent's results return to trusted
-// control, and it can never publish.
-func (c *Coordinator) subagentTools() []ToolDef {
+// control, and it can never publish. The skill tool is a delegated role's
+// only skill path (#659): trusted control serves the verified instructions
+// as data, and the sub-agent can no more execute skill content locally than
+// it can shell locally.
+func subagentToolsFor(skills *SkillSet) []ToolDef {
 	tools := []ToolDef{shellTool()}
-	// The skill tool is a delegated role's only skill path (#659): trusted
-	// control serves the verified instructions as data, and the sub-agent
-	// can no more execute skill content locally than it can shell locally.
-	if c.skills != nil {
+	if skills != nil {
 		tools = append(tools, skillTool())
 	}
 	return tools
+}
+
+func (c *Coordinator) subagentTools() []ToolDef {
+	return subagentToolsFor(c.skills)
 }
 
 // runTool routes one tool request through its trusted implementation.
@@ -1056,28 +1067,28 @@ func (c *Coordinator) runTool(ctx context.Context, call ToolCall, briefID string
 	case toolCheck:
 		if subagent {
 			result.IsError = true
-			result.Content = "tracked checks are not available to sub-agents"
+			result.Content = noticeSubagentChecks
 			return result
 		}
 		return c.runCheck(ctx, call, briefID, result)
 	case toolDelegate:
 		if subagent {
 			result.IsError = true
-			result.Content = "delegation is not available to sub-agents"
+			result.Content = noticeSubagentDelegate
 			return result
 		}
 		return c.runDelegate(ctx, call, result)
 	case toolCancelBrief:
 		if subagent {
 			result.IsError = true
-			result.Content = "cancellation is not available to sub-agents"
+			result.Content = noticeSubagentCancel
 			return result
 		}
 		return c.runCancelBrief(ctx, call, result)
 	case toolForge:
 		if subagent {
 			result.IsError = true
-			result.Content = "forge operations are not available to sub-agents"
+			result.Content = noticeSubagentForge
 			return result
 		}
 		return c.runForge(ctx, call, result)
@@ -1087,7 +1098,7 @@ func (c *Coordinator) runTool(ctx context.Context, call ToolCall, briefID string
 		return c.runSkill(call, result)
 	default:
 		result.IsError = true
-		result.Content = fmt.Sprintf("unknown tool %q", call.Name)
+		result.Content = fmt.Sprintf(noticeUnknownToolFmt, call.Name)
 		return result
 	}
 }
@@ -1102,7 +1113,7 @@ func (c *Coordinator) runTool(ctx context.Context, call ToolCall, briefID string
 func (c *Coordinator) runShell(ctx context.Context, call ToolCall, briefID string, result ToolResult) ToolResult {
 	if c.worker == nil {
 		result.IsError = true
-		result.Content = "no worker is configured in this build"
+		result.Content = noticeNoWorker
 		return result
 	}
 	if briefID == "" {
@@ -1110,7 +1121,7 @@ func (c *Coordinator) runShell(ctx context.Context, call ToolCall, briefID strin
 	}
 	if briefID != "control" && c.briefs.Cancelled(briefID) {
 		result.IsError = true
-		result.Content = fmt.Sprintf("brief %s is cancelled", briefID)
+		result.Content = fmt.Sprintf(noticeBriefCancelledFmt, briefID)
 		return result
 	}
 	var args struct {
@@ -1119,7 +1130,7 @@ func (c *Coordinator) runShell(ctx context.Context, call ToolCall, briefID strin
 	}
 	if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil || strings.TrimSpace(args.Command) == "" {
 		result.IsError = true
-		result.Content = "shell arguments must carry a command string"
+		result.Content = noticeShellArgs
 		return result
 	}
 	var err error
@@ -1131,7 +1142,7 @@ func (c *Coordinator) runShell(ctx context.Context, call ToolCall, briefID strin
 	}
 	if err != nil {
 		result.IsError = true
-		result.Content = "workspace snapshot is unavailable"
+		result.Content = noticeSnapshotUnavailable
 		return result
 	}
 	// Only model-influenced tasks carry the applied bootstrap environment
@@ -1183,7 +1194,7 @@ func (c *Coordinator) runDelegate(ctx context.Context, call ToolCall, result Too
 	// the model can validate, commit, and publish what it has.
 	if c.control.Stopped() {
 		result.IsError = true
-		result.Content = "a soft stop is in effect: this incarnation dispatches no new briefs; let in-flight work stand, run final validation, and declare your outcome"
+		result.Content = noticeSoftStop
 		return result
 	}
 	var args struct {
@@ -1197,7 +1208,7 @@ func (c *Coordinator) runDelegate(ctx context.Context, call ToolCall, result Too
 	}
 	if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
 		result.IsError = true
-		result.Content = "delegate arguments must be a JSON object"
+		result.Content = noticeDelegateArgs
 		return result
 	}
 	brief := Brief{
@@ -1219,7 +1230,7 @@ func (c *Coordinator) runDelegate(ctx context.Context, call ToolCall, result Too
 	}
 	if c.bindings.Model(brief.Role) == "" {
 		result.IsError = true
-		result.Content = fmt.Sprintf("no model is bound to role %q", brief.Role)
+		result.Content = fmt.Sprintf(noticeRoleUnboundFmt, brief.Role)
 		return result
 	}
 	registered, err := c.briefs.Register(brief)
@@ -1241,7 +1252,7 @@ func (c *Coordinator) runDelegate(ctx context.Context, call ToolCall, result Too
 	dispatchedTip, err := c.prepareSnapshot(ctx, brief.ID)
 	if err != nil {
 		result.IsError = true
-		result.Content = "workspace snapshot could not be prepared: " + safeToolError(err)
+		result.Content = noticeSnapshotPreparePrefix + safeToolError(err)
 		return result
 	}
 	summary, completed, unavailable := c.runBrief(ctx, registered)
@@ -1255,7 +1266,7 @@ func (c *Coordinator) runDelegate(ctx context.Context, call ToolCall, result Too
 		// redacted, never the provider body.
 		c.recordDeferredAvailability(unavailable)
 		result.IsError = true
-		result.Content = "the delegated model binding is temporarily unavailable; the run ends recoverably and this brief's incomplete work is not integrated"
+		result.Content = noticeBindingUnavailable
 		return result
 	}
 	if !completed {
@@ -1299,7 +1310,7 @@ func (c *Coordinator) runDelegate(ctx context.Context, call ToolCall, result Too
 		checkpoint := &courierv1alpha1.Checkpoint{CompletedBriefs: c.briefs.CompletedBriefs()}
 		if err := c.status.CheckpointPublished(ctx, checkpoint, lastCommit); err != nil {
 			result.IsError = true
-			result.Content = "completed brief could not be recorded durably: " + safeToolError(err)
+			result.Content = noticeBriefRecordPrefix + safeToolError(err)
 			return result
 		}
 	}
@@ -1394,7 +1405,7 @@ func (c *Coordinator) runBrief(ctx context.Context, brief Brief) (summary string
 			// transcript is unchanged, so this is a brief failure like any
 			// other — tool-visible, bounded, never a silent truncation —
 			// and the coordinator re-delegates under a fresh brief ID.
-			return "sub-agent context could not be compacted: " + safeToolError(turn.harnessErr), false, nil
+			return noticeSubagentCompactPrefix + safeToolError(turn.harnessErr), false, nil
 		}
 		if turn.streamErr != nil {
 			if classification, ok := providerClassificationOf(turn.streamErr); ok && classification.Deferred() {
@@ -1404,13 +1415,13 @@ func (c *Coordinator) runBrief(ctx context.Context, brief Brief) (summary string
 			// tool-visible data for the coordinator, which owns the
 			// brief's fate; the coordinator's own next turn surfaces a
 			// gateway outage as the §8 infrastructure failure.
-			return "sub-agent stream failed: " + safeToolError(turn.streamErr), false, nil
+			return noticeSubagentStreamPrefix + safeToolError(turn.streamErr), false, nil
 		}
 		if turn.final {
 			return turn.text, true, nil
 		}
 		if turn.toolResults == nil {
-			return "sub-agent ended without a result", false, nil
+			return noticeSubagentNoResult, false, nil
 		}
 	}
 }
@@ -1424,10 +1435,10 @@ func (c *Coordinator) runBrief(ctx context.Context, brief Brief) (summary string
 // coordinator's own loop ends the run. Empty when the brief may continue.
 func (c *Coordinator) delegatedTripAbort() string {
 	if c.hasBootstrapBlocker() {
-		return "workspace bootstrap failed; the brief is aborted"
+		return noticeBriefBootstrapAbort
 	}
 	if c.prerequisite.peek() != nil {
-		return "workspace prerequisite failed; the brief is aborted"
+		return noticeBriefPrerequisiteAbort
 	}
 	return ""
 }
@@ -1450,7 +1461,7 @@ func (c *Coordinator) runCancelBrief(ctx context.Context, call ToolCall, result 
 	}
 	if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil || strings.TrimSpace(args.ID) == "" {
 		result.IsError = true
-		result.Content = "cancel_brief arguments must carry the brief ID"
+		result.Content = noticeCancelArgs
 		return result
 	}
 	if _, err := c.briefs.Cancel(args.ID); err != nil {
@@ -1458,14 +1469,14 @@ func (c *Coordinator) runCancelBrief(ctx context.Context, call ToolCall, result 
 		result.Content = safeToolError(err)
 		return result
 	}
-	result.Content = "brief " + args.ID + " is cancelled; new work under this ID is rejected"
+	result.Content = fmt.Sprintf(noticeBriefCancelledDoneFmt, args.ID)
 	return result
 }
 
 func (c *Coordinator) runForge(ctx context.Context, call ToolCall, result ToolResult) ToolResult {
 	if c.forge == nil {
 		result.IsError = true
-		result.Content = "forge operations are unavailable in this build"
+		result.Content = noticeForgeSeamless
 		return result
 	}
 	var args struct {
@@ -1474,7 +1485,7 @@ func (c *Coordinator) runForge(ctx context.Context, call ToolCall, result ToolRe
 	}
 	if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
 		result.IsError = true
-		result.Content = "forge arguments must be a JSON object"
+		result.Content = noticeForgeArgs
 		return result
 	}
 	content, err := c.forge.Call(ctx, args.Operation, string(args.Arguments))
@@ -1863,7 +1874,7 @@ func (c *Coordinator) materializeSnapshot(ctx context.Context, briefID string, s
 	c.snapshotMu.Lock()
 	defer c.snapshotMu.Unlock()
 	if c.worker == nil {
-		err := errors.New("no worker is configured in this build")
+		err := errors.New(noticeNoWorker)
 		c.observePrerequisite(err)
 		return err
 	}

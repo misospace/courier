@@ -141,6 +141,16 @@ const (
 	// names a binding, never an invocation. It is Verbose so the evidence
 	// reaches the log store on every run that ran the assist.
 	EventRebaseModelAssist = "rebase.model.assist"
+	// EventRunSurface reports the run's model-surface provenance (#730):
+	// the schema version, the digest, and the canonical encoding that
+	// produced it — the input identities (role bindings, section and tool
+	// identities, pinned skill pairs, context and criteria identities),
+	// carried as names and digests only. Prompt bodies, skill instruction
+	// bodies, model output, workspace contents, and secret material are
+	// never part of the encoding. The event is Verbose so the identities
+	// reach the log store at info level on every finished run that computed
+	// them, like run.summary.
+	EventRunSurface = "run.surface"
 )
 
 // Status values for the status field.

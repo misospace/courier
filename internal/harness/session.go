@@ -664,7 +664,7 @@ const maxDigestLines = 20
 // describe the same bytes.
 func compactDigest(count int, settled string, digested []Message) Message {
 	var b strings.Builder
-	fmt.Fprintf(&b, "[compacted: %d earlier messages were summarized to save context; their tool results and file contents are no longer available]", count)
+	fmt.Fprintf(&b, noticeCompactedFmt, count)
 	if settled != "" {
 		b.WriteString("\n" + settled)
 	}
@@ -678,7 +678,7 @@ func compactDigest(count int, settled string, digested []Message) Message {
 		b.WriteString("\n- " + digestLine(message))
 	}
 	if elided > 0 {
-		fmt.Fprintf(&b, "\n- ... and %d more messages", elided)
+		fmt.Fprintf(&b, noticeCompactedMoreFmt, elided)
 	}
 	return Message{Role: "system", Content: b.String()}
 }
