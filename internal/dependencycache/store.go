@@ -5,7 +5,10 @@
 // cache on demand, never redirects, and never proxies — a miss is answered
 // locally with an actionable approval diagnostic. Approval is exactly
 // population: a module version is served only when its complete .info/.mod/
-// .zip artifact set is present in the administrator-controlled store root.
+// .zip artifact set is present in the administrator-controlled store root as
+// ordinary files — every lookup is resolved beneath the store root and
+// through no symlink, so a mis-populated store can never redirect a request
+// to a file the administrator did not place there.
 //
 // The store layout is the Go module cache's wire layout, so administrators
 // populate it with the ordinary toolchain from a trusted machine:
@@ -24,6 +27,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -105,9 +109,17 @@ func (e *NotApprovedError) Error() string {
 // each holding an @v directory of per-version artifacts:
 //
 //	<root>/<escaped-module-path>/@v/<escaped-version>.{info,mod,zip}
+//
+// Every lookup is resolved through a root-confined handle (os.Root) and an
+// element walk that refuses symlinks, so no request can reach a file outside
+// the root no matter what a mis-populated store contains.
 type Store struct {
 	root   string
 	limits Limits
+	// rooted confines path resolution beneath the root directory: even a
+	// populated symlink can never direct a lookup outside the store, and the
+	// guarantee holds without a check-then-open race.
+	rooted *os.Root
 }
 
 // NewStore validates that root is an existing directory and returns the
@@ -126,18 +138,63 @@ func NewStoreWithLimits(root string, limits Limits) (*Store, error) {
 	if !info.IsDir() {
 		return nil, fmt.Errorf("dependency-cache: store root %q is not a directory", root)
 	}
-	return &Store{root: root, limits: limits}, nil
+	rooted, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, fmt.Errorf("dependency-cache: open store root: %w", err)
+	}
+	return &Store{root: root, limits: limits, rooted: rooted}, nil
 }
 
 // Root returns the store's root directory.
 func (s *Store) Root() string { return s.root }
 
+// errStoreSymlink marks a store path element that is a symlink. The store
+// layout is populated by the ordinary toolchain, which produces only ordinary
+// files and directories, so a symlink anywhere on an artifact path is a
+// population error — and refusing it (rather than following it) is what keeps
+// an approved-looking path from resolving to content the administrator never
+// placed there.
+var errStoreSymlink = errors.New("symlink in store population")
+
+// statArtifact Lstats one root-relative store path ("<escaped-module>/@v/<file>")
+// element by element without following symlinks: a symlink at any element is
+// refused with errStoreSymlink, and every element but the last must be a real
+// directory. os.Root already guarantees the lookup cannot escape the store
+// root even through a symlink; the element walk additionally enforces the
+// population contract that every path element is an ordinary directory or
+// file, so a populated symlink can never redirect an artifact read — out of
+// the root, or to another location inside it.
+func (s *Store) statArtifact(relPath string) (fs.FileInfo, error) {
+	parts := strings.Split(relPath, "/")
+	prefix := ""
+	var info fs.FileInfo
+	for i, part := range parts {
+		if i > 0 {
+			prefix += "/"
+		}
+		prefix += part
+		next, err := s.rooted.Lstat(prefix)
+		if err != nil {
+			return nil, err
+		}
+		if next.Mode()&fs.ModeSymlink != 0 {
+			return nil, fmt.Errorf("%w at %q", errStoreSymlink, prefix)
+		}
+		if i < len(parts)-1 && !next.IsDir() {
+			return nil, fmt.Errorf("dependency-cache: store path element %q is not a directory", prefix)
+		}
+		info = next
+	}
+	return info, nil
+}
+
 // Open resolves and opens one artifact of a module version. The request is
 // validated twice — as a module path and version (which bounds every
 // character and rejects traversal, absolute paths, and non-canonical
-// escapes) and again as a canonical on-disk path confined to the store root —
-// so a hostile request can only ever reach a file the administrator
-// populated, never a path outside the store.
+// escapes) and again as a root-confined, symlink-free on-disk path — so a
+// hostile request can only ever reach a file the administrator populated,
+// never a path outside the store and never a store path that redirects
+// through a symlink.
 func (s *Store) Open(modulePath, version, ext string) (*os.File, int64, error) {
 	if !validExt(ext) {
 		return nil, 0, fmt.Errorf("dependency-cache: unsupported artifact type %q", ext)
@@ -153,14 +210,19 @@ func (s *Store) Open(modulePath, version, ext string) (*os.File, int64, error) {
 			Detail: fmt.Sprintf("invalid version: %v", err)}
 	}
 
-	dir := filepath.Join(s.root, escapedModule, "@v")
+	dirRel := escapedModule + "/@v"
 	missing := make([]string, 0, len(ArtifactExts))
 	for _, artifactExt := range ArtifactExts {
-		if _, err := os.Stat(filepath.Join(dir, escapedVersion+artifactExt)); err != nil {
-			if !errors.Is(err, fs.ErrNotExist) {
+		artifactRel := dirRel + "/" + escapedVersion + artifactExt
+		if _, err := s.statArtifact(artifactRel); err != nil {
+			switch {
+			case errors.Is(err, fs.ErrNotExist):
+				missing = append(missing, artifactExt)
+			case errors.Is(err, errStoreSymlink):
+				return nil, 0, symlinkPopulationError(modulePath, version, artifactRel)
+			default:
 				return nil, 0, fmt.Errorf("dependency-cache: inspect %s@%s: %w", modulePath, version, err)
 			}
-			missing = append(missing, artifactExt)
 		}
 	}
 	if len(missing) > 0 {
@@ -168,26 +230,55 @@ func (s *Store) Open(modulePath, version, ext string) (*os.File, int64, error) {
 			Detail: "incomplete artifact set, missing " + strings.Join(missing, ", ")}
 	}
 
-	name := filepath.Join(dir, escapedVersion+ext)
-	info, err := os.Stat(name)
-	if err != nil {
+	name := dirRel + "/" + escapedVersion + ext
+	if _, err := s.statArtifact(name); err != nil {
 		// The complete set existed a moment ago; treat any loss as a miss
 		// rather than serving a partial read of a re-population.
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			return nil, 0, &NotApprovedError{ModulePath: modulePath, Version: version,
+				Detail: "artifact disappeared during the request; the store must not be re-populated while serving"}
+		case errors.Is(err, errStoreSymlink):
+			return nil, 0, symlinkPopulationError(modulePath, version, name)
+		default:
+			return nil, 0, fmt.Errorf("dependency-cache: open %s@%s: %w", modulePath, version, err)
+		}
+	}
+	file, err := s.rooted.Open(name)
+	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, 0, &NotApprovedError{ModulePath: modulePath, Version: version,
 				Detail: "artifact disappeared during the request; the store must not be re-populated while serving"}
 		}
 		return nil, 0, fmt.Errorf("dependency-cache: open %s@%s: %w", modulePath, version, err)
 	}
-	if bound := s.limits.maxFor(ext); info.Size() > bound {
+	// Size the served bytes from the open handle: what we report is exactly
+	// what the descriptor reads, and the artifact must still be an ordinary
+	// file within its bound. A race can only ever swap in-root content — the
+	// root-confined Open cannot follow anything out.
+	openInfo, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, 0, fmt.Errorf("dependency-cache: open %s@%s: %w", modulePath, version, err)
+	}
+	if !openInfo.Mode().IsRegular() {
+		_ = file.Close()
+		return nil, 0, symlinkPopulationError(modulePath, version, dirRel)
+	}
+	if bound := s.limits.maxFor(ext); openInfo.Size() > bound {
+		_ = file.Close()
 		return nil, 0, &NotApprovedError{ModulePath: modulePath, Version: version,
 			Detail: fmt.Sprintf("%s artifact exceeds the server's %d byte bound; fix the population", ext, bound)}
 	}
-	file, err := os.Open(name)
-	if err != nil {
-		return nil, 0, fmt.Errorf("dependency-cache: open %s@%s: %w", modulePath, version, err)
-	}
-	return file, info.Size(), nil
+	return file, openInfo.Size(), nil
+}
+
+// symlinkPopulationError is the approval refusal for a store path that
+// carries a symlink (the artifact-path element walk refuses it before any
+// read). It names the offending store location in deployment-admin terms.
+func symlinkPopulationError(modulePath, version, dirRel string) *NotApprovedError {
+	return &NotApprovedError{ModulePath: modulePath, Version: version,
+		Detail: fmt.Sprintf("store population at %q holds a symlink; the store must contain only ordinary files and directories; fix the population", dirRel)}
 }
 
 // VersionInfo is one approved version of a module: its canonical (unescaped)
@@ -198,21 +289,37 @@ type VersionInfo struct {
 }
 
 // Versions lists the approved versions of a module in semver order. A version
-// appears only when its complete artifact set is populated, so the list is
-// exactly the approval set version resolution may choose from.
+// appears only when its complete artifact set is populated as ordinary files,
+// so the list is exactly the approval set version resolution may choose from.
 func (s *Store) Versions(modulePath string) ([]VersionInfo, error) {
 	escapedModule, err := module.EscapePath(modulePath)
 	if err != nil {
 		return nil, &NotApprovedError{ModulePath: modulePath,
 			Detail: fmt.Sprintf("invalid module path: %v", err)}
 	}
-	dir := filepath.Join(s.root, escapedModule, "@v")
-	entries, err := os.ReadDir(dir)
+	dirRel := escapedModule + "/@v"
+	dirInfo, err := s.statArtifact(dirRel)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
 			return nil, &NotApprovedError{ModulePath: modulePath,
 				Detail: "module is not populated in this deployment's dependency cache"}
+		case errors.Is(err, errStoreSymlink):
+			return nil, symlinkPopulationError(modulePath, "", dirRel)
 		}
+		return nil, fmt.Errorf("dependency-cache: list %s: %w", modulePath, err)
+	}
+	if !dirInfo.IsDir() {
+		return nil, &NotApprovedError{ModulePath: modulePath,
+			Detail: fmt.Sprintf("store population at %q is not a directory; fix the population", dirRel)}
+	}
+	dir, err := s.rooted.Open(dirRel)
+	if err != nil {
+		return nil, fmt.Errorf("dependency-cache: list %s: %w", modulePath, err)
+	}
+	defer dir.Close()
+	entries, err := dir.ReadDir(-1)
+	if err != nil {
 		return nil, fmt.Errorf("dependency-cache: list %s: %w", modulePath, err)
 	}
 
@@ -231,14 +338,15 @@ func (s *Store) Versions(modulePath string) ([]VersionInfo, error) {
 		if err != nil || !semver.IsValid(version) || seen[version] {
 			continue
 		}
-		// A version is approved only when its complete artifact set exists.
+		// A version is approved only when its complete artifact set exists as
+		// ordinary store files (the stat walk refuses symlinks).
 		escapedVersion, err := module.EscapeVersion(version)
 		if err != nil {
 			continue
 		}
 		complete := true
 		for _, artifactExt := range ArtifactExts {
-			if _, err := os.Stat(filepath.Join(dir, escapedVersion+artifactExt)); err != nil {
+			if _, err := s.statArtifact(dirRel + "/" + escapedVersion + artifactExt); err != nil {
 				complete = false
 				break
 			}
@@ -269,8 +377,8 @@ func (s *Store) populationTime(escapedModule, version string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	data, err := os.ReadFile(filepath.Join(s.root, escapedModule, "@v", escapedVersion+ExtInfo))
-	if err != nil {
+	data, ok := s.readInfoBounded(escapedModule, escapedVersion)
+	if !ok {
 		return "", false
 	}
 	var payload struct {
@@ -285,22 +393,91 @@ func (s *Store) populationTime(escapedModule, version string) (string, bool) {
 	return *payload.Time, true
 }
 
-// Latest resolves the module's newest approved non-pseudo version, the
-// semantic of the proxy protocol's @latest endpoint. Modules with only
-// pseudo-versions report no latest, and the go command falls back to the
-// version list.
+// readInfoBounded reads one populated .info through the same confined,
+// symlink-refusing artifact path the serving path uses, under the
+// MaxInfoBytes bound: the stat gate refuses an oversized .info before any
+// read, and the read itself is capped so a size race cannot allocate beyond
+// the bound either. Listing and @latest metadata therefore never allocate on
+// a mis-populated store; the artifact-serving path is what reports the bound
+// violation to the worker.
+func (s *Store) readInfoBounded(escapedModule, escapedVersion string) ([]byte, bool) {
+	name := escapedModule + "/@v/" + escapedVersion + ExtInfo
+	info, err := s.statArtifact(name)
+	if err != nil || info.Size() > s.limits.MaxInfoBytes {
+		return nil, false
+	}
+	file, err := s.rooted.Open(name)
+	if err != nil {
+		return nil, false
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, s.limits.MaxInfoBytes+1))
+	if err != nil || int64(len(data)) > s.limits.MaxInfoBytes {
+		return nil, false
+	}
+	return data, true
+}
+
+// Latest resolves the module's newest approved version, the semantic of the
+// proxy protocol's @latest endpoint, following the go command's own
+// preference: the highest release, then the highest prerelease, then the
+// chronologically newest pseudo-version. Serving a pseudo-version is
+// required for tagless modules — the go command filters pseudo-versions out
+// of @v/list and resolves module@latest through this endpoint.
 func (s *Store) Latest(modulePath string) (VersionInfo, error) {
 	versions, err := s.Versions(modulePath)
 	if err != nil {
 		return VersionInfo{}, err
+	}
+	// Versions is semver-ascending, so the last match of each pass is the
+	// highest of its kind.
+	for i := len(versions) - 1; i >= 0; i-- {
+		if !module.IsPseudoVersion(versions[i].Version) && semver.Prerelease(versions[i].Version) == "" {
+			return versions[i], nil
+		}
 	}
 	for i := len(versions) - 1; i >= 0; i-- {
 		if !module.IsPseudoVersion(versions[i].Version) {
 			return versions[i], nil
 		}
 	}
-	return VersionInfo{}, &NotApprovedError{ModulePath: modulePath,
-		Detail: "no non-pseudo version is populated; resolution must use an explicit version"}
+	// Pseudo-only: pick by chronology, the way the go command's list fallback
+	// does — the populated .info time first, then the time embedded in the
+	// pseudo-version itself. Ties keep the semver-earlier version, matching
+	// the go command's strict-before comparison.
+	best := VersionInfo{}
+	var bestTime time.Time
+	for _, version := range versions {
+		if !module.IsPseudoVersion(version.Version) {
+			continue
+		}
+		when, ok := pseudoVersionTime(version)
+		if !ok {
+			continue
+		}
+		if best.Version == "" || bestTime.Before(when) {
+			best, bestTime = version, when
+		}
+	}
+	if best.Version == "" {
+		// Unreachable for valid pseudo-versions, which always embed a time.
+		return VersionInfo{}, &NotApprovedError{ModulePath: modulePath,
+			Detail: "no resolvable version is populated"}
+	}
+	return best, nil
+}
+
+// pseudoVersionTime derives a pseudo-version's chronology the way the go
+// command's list fallback does: the populated .info time first, then the
+// timestamp embedded in the pseudo-version string.
+func pseudoVersionTime(version VersionInfo) (time.Time, bool) {
+	if version.Time != "" {
+		if t, err := time.Parse(time.RFC3339, version.Time); err == nil {
+			return t, true
+		}
+	}
+	when, err := module.PseudoVersionTime(version.Version)
+	return when, err == nil
 }
 
 // LatestJSON renders the RevInfo JSON shape the go command parses from an

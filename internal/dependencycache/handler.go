@@ -161,6 +161,33 @@ func (h *Handler) serve(w *responseRecorder, r *http.Request) {
 		http.Error(w, "invalid request path", http.StatusBadRequest)
 		return
 	}
+
+	// The GOPROXY protocol mounts @latest at the module root
+	// ("$base/$module/@latest") — unlike the version list and the artifacts,
+	// it carries no "@v" element.
+	if rest, ok := strings.CutPrefix(escaped, "/"); ok && strings.HasSuffix(rest, "/@latest") {
+		escapedModule := strings.TrimSuffix(rest, "/@latest")
+		if escapedModule == "" {
+			http.Error(w, "invalid request path: expected <module>/@latest", http.StatusBadRequest)
+			return
+		}
+		modulePath, err := module.UnescapePath(escapedModule)
+		if err != nil || canonicalEscape(modulePath, module.EscapePath) != escapedModule {
+			http.Error(w, "invalid module path: "+moduleErrText(modulePath, err), http.StatusBadRequest)
+			return
+		}
+		latest, err := h.store.Latest(modulePath)
+		if err != nil {
+			h.reportMiss(w, modulePath, "", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(latest.LatestJSON()))
+		return
+	}
+
 	idx := strings.LastIndex(escaped, "/@v/")
 	if idx <= 0 {
 		// No separator at all, or an empty module part ("/@v/…").
@@ -206,16 +233,6 @@ func (h *Handler) serve(w *responseRecorder, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(body.String()))
-	case tail == "latest":
-		latest, err := h.store.Latest(modulePath)
-		if err != nil {
-			h.reportMiss(w, modulePath, "", err)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(latest.LatestJSON()))
 	default:
 		ext, escapedVersion, ok := splitArtifact(tail)
 		if !ok {

@@ -53,7 +53,7 @@ func TestHandlerServesApprovedArtifacts(t *testing.T) {
 		{"/example.com/hello/@v/v1.0.0.mod", "text/plain; charset=utf-8"},
 		{"/example.com/hello/@v/v1.0.0.zip", "application/zip"},
 		{"/example.com/hello/@v/list", "text/plain; charset=utf-8"},
-		{"/example.com/hello/@v/latest", "application/json"},
+		{"/example.com/hello/@latest", "application/json"},
 	} {
 		recorder := handlerRequest(t, handler, http.MethodGet, tc.target, "10.0.0.1:1234", nil)
 		if recorder.Code != http.StatusOK {
@@ -72,7 +72,7 @@ func TestHandlerServesApprovedArtifacts(t *testing.T) {
 			t.Fatalf("list output missing %q: %q", want, recorder.Body.String())
 		}
 	}
-	latest := handlerRequest(t, handler, http.MethodGet, "/example.com/hello/@v/latest", "10.0.0.1:1234", nil)
+	latest := handlerRequest(t, handler, http.MethodGet, "/example.com/hello/@latest", "10.0.0.1:1234", nil)
 	if !strings.Contains(latest.Body.String(), `"Version":"v1.1.0"`) {
 		t.Fatalf("@latest picked the wrong version: %q", latest.Body.String())
 	}
@@ -92,7 +92,7 @@ func TestHandlerMissIsActionableApprovalDiagnostic(t *testing.T) {
 		"/example.com/absent/@v/v1.0.0.info",
 		"/example.com/hello/@v/v9.9.9.info",
 		"/example.com/absent/@v/list",
-		"/example.com/absent/@v/latest",
+		"/example.com/absent/@latest",
 	} {
 		recorder := handlerRequest(t, handler, http.MethodGet, target, "10.0.0.1:1234", nil)
 		if recorder.Code != http.StatusNotFound {
@@ -310,7 +310,14 @@ func TestHandlerBrokenStoreStaysGeneric(t *testing.T) {
 	// A store whose root has vanished produces storage errors: the response
 	// must stay generic while the log carries the detail.
 	var logged []string
-	store := &Store{root: "/nonexistent-store-root", limits: DefaultLimits()}
+	root := t.TempDir()
+	store, err := NewStore(root)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatalf("remove store root: %v", err)
+	}
 	handler := NewHandler(store, Options{Log: func(format string, args ...any) {
 		logged = append(logged, fmt.Sprintf(format, args...))
 	}, LogRequests: true})
@@ -319,7 +326,7 @@ func TestHandlerBrokenStoreStaysGeneric(t *testing.T) {
 		// The module directory is absent: still a refusal, not a leak.
 		t.Fatalf("absent module on a broken store: status %d", recorder.Code)
 	}
-	if strings.Contains(recorder.Body.String(), "/nonexistent-store-root") {
+	if strings.Contains(recorder.Body.String(), root) {
 		t.Fatalf("response leaks store paths: %q", recorder.Body.String())
 	}
 	_ = logged

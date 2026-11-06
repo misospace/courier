@@ -1,8 +1,11 @@
 package dependencycache
 
 import (
+	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -135,6 +138,299 @@ func TestStoreLatestPrefersNonPseudoVersions(t *testing.T) {
 	if !strings.Contains(latest.LatestJSON(), `"Version":"v0.9.0"`) ||
 		!strings.Contains(latest.LatestJSON(), `"Time":"2026-01-02T03:04:05Z"`) {
 		t.Fatalf("@latest JSON shape unexpected: %s", latest.LatestJSON())
+	}
+}
+
+func TestStoreLatestFollowsGoPreferenceOrder(t *testing.T) {
+	// The go command resolves module@latest by preferring the highest
+	// release, then the highest prerelease, then the chronologically newest
+	// pseudo-version. The pseudo step is mandatory: the client filters
+	// pseudo-versions out of @v/list, so @latest is its only resolution path
+	// for tagless modules.
+	populatePseudo := func(root, version, when string) {
+		writeArtifact(t, root, "example.com/tagless", version, ExtInfo, fmt.Sprintf(`{"Version":%q,"Time":%q}`, version, when))
+		writeArtifact(t, root, "example.com/tagless", version, ExtMod, "module example.com/tagless\n\ngo 1.21\n")
+		writeArtifact(t, root, "example.com/tagless", version, ExtZip, "zip-bytes")
+	}
+
+	t.Run("highest release beats prerelease and pseudo", func(t *testing.T) {
+		store, _ := newTestStore(t, DefaultLimits(), func(root string) {
+			approveAll(t, root, "example.com/mixed", "v0.0.0-20250101000000-aaaaaaaaaaaa")
+			approveAll(t, root, "example.com/mixed", "v0.9.0-rc.1")
+			approveAll(t, root, "example.com/mixed", "v1.0.0")
+			approveAll(t, root, "example.com/mixed", "v1.2.0")
+		})
+		latest, err := store.Latest("example.com/mixed")
+		if err != nil {
+			t.Fatalf("Latest: %v", err)
+		}
+		if latest.Version != "v1.2.0" {
+			t.Fatalf("want the highest release v1.2.0, got %q", latest.Version)
+		}
+	})
+
+	t.Run("highest prerelease when no release is populated", func(t *testing.T) {
+		store, _ := newTestStore(t, DefaultLimits(), func(root string) {
+			approveAll(t, root, "example.com/mixed", "v0.0.0-20250101000000-aaaaaaaaaaaa")
+			approveAll(t, root, "example.com/mixed", "v0.8.0-rc.1")
+			approveAll(t, root, "example.com/mixed", "v0.9.0-rc.2")
+		})
+		latest, err := store.Latest("example.com/mixed")
+		if err != nil {
+			t.Fatalf("Latest: %v", err)
+		}
+		if latest.Version != "v0.9.0-rc.2" {
+			t.Fatalf("want the highest prerelease v0.9.0-rc.2, got %q", latest.Version)
+		}
+	})
+
+	t.Run("newest pseudo-version by .info time", func(t *testing.T) {
+		store, _ := newTestStore(t, DefaultLimits(), func(root string) {
+			// The populated .info time decides, not the timestamp embedded in
+			// the pseudo-version: the older pseudo carries the later .info
+			// time and must win.
+			populatePseudo(root, "v0.0.0-20250101000000-aaaaaaaaaaaa", "2027-01-01T00:00:00Z")
+			populatePseudo(root, "v0.0.0-20260101000000-bbbbbbbbbbbb", "2026-03-01T00:00:00Z")
+		})
+		latest, err := store.Latest("example.com/tagless")
+		if err != nil {
+			t.Fatalf("Latest: %v", err)
+		}
+		if latest.Version != "v0.0.0-20250101000000-aaaaaaaaaaaa" {
+			t.Fatalf("want the newest .info-time pseudo-version, got %q", latest.Version)
+		}
+	})
+
+	t.Run("pseudo-version without a parseable .info time falls back to the embedded time", func(t *testing.T) {
+		store, _ := newTestStore(t, DefaultLimits(), func(root string) {
+			populatePseudo(root, "v0.0.0-20250101000000-aaaaaaaaaaaa", "")
+			populatePseudo(root, "v0.0.0-20260101000000-bbbbbbbbbbbb", "")
+		})
+		latest, err := store.Latest("example.com/tagless")
+		if err != nil {
+			t.Fatalf("Latest: %v", err)
+		}
+		if latest.Version != "v0.0.0-20260101000000-bbbbbbbbbbbb" {
+			t.Fatalf("want the newest embedded-time pseudo-version, got %q", latest.Version)
+		}
+	})
+}
+
+func TestStoreRefusesSymlinkedStorePaths(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires privileges on windows")
+	}
+	// A populated symlink under an approved-looking module/version must never
+	// serve a file the administrator did not place in the store — inside the
+	// root or outside it. The element walk refuses the symlink before any
+	// read, so no test here may observe outside content. The outside
+	// directory holds a complete artifact set so that any following of the
+	// links would succeed rather than fail into a look-alike error.
+	secretDir := t.TempDir()
+	secretInfo := filepath.Join(secretDir, "v1.0.0.info")
+	secretMod := filepath.Join(secretDir, "v1.0.0.mod")
+	secretZip := filepath.Join(secretDir, "v1.0.0.zip")
+	for _, artifact := range []struct{ path, body string }{
+		{secretInfo, `{"Version":"v1.0.0","Time":"2020-01-01T00:00:00Z"}`},
+		{secretMod, "module example.com/linked\n"},
+		{secretZip, "outside-zip-bytes"},
+	} {
+		if err := os.WriteFile(artifact.path, []byte(artifact.body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("module directory symlink escapes the store", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(root, "example.com"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(secretDir, filepath.Join(root, "example.com", "linked")); err != nil {
+			t.Fatal(err)
+		}
+		store, err := NewStore(root)
+		if err != nil {
+			t.Fatalf("NewStore: %v", err)
+		}
+
+		var notApproved *NotApprovedError
+		if _, _, err := store.Open("example.com/linked", "v1.0.0", ExtInfo); !asNotApproved(err, &notApproved) {
+			t.Fatalf("Open through a module-dir symlink: want NotApprovedError, got %v", err)
+		} else if !strings.Contains(notApproved.Detail, "symlink") {
+			t.Fatalf("diagnostic must name the symlink, got %q", notApproved.Detail)
+		}
+		if _, err := store.Versions("example.com/linked"); !asNotApproved(err, &notApproved) {
+			t.Fatalf("Versions through a module-dir symlink: want NotApprovedError, got %v", err)
+		} else if !strings.Contains(notApproved.Detail, "symlink") {
+			t.Fatalf("diagnostic must name the symlink, got %q", notApproved.Detail)
+		}
+	})
+
+	t.Run("@v directory symlink escapes the store", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(root, "example.com", "real"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(secretDir, filepath.Join(root, "example.com", "real", "@v")); err != nil {
+			t.Fatal(err)
+		}
+		store, err := NewStore(root)
+		if err != nil {
+			t.Fatalf("NewStore: %v", err)
+		}
+
+		var notApproved *NotApprovedError
+		if _, _, err := store.Open("example.com/real", "v1.0.0", ExtInfo); !asNotApproved(err, &notApproved) {
+			t.Fatalf("Open through an @v symlink: want NotApprovedError, got %v", err)
+		}
+		if _, err := store.Versions("example.com/real"); !asNotApproved(err, &notApproved) {
+			t.Fatalf("Versions through an @v symlink: want NotApprovedError, got %v", err)
+		}
+	})
+
+	t.Run("artifact symlink escapes the store", func(t *testing.T) {
+		root := t.TempDir()
+		approveAll(t, root, "example.com/real", "v1.0.0")
+		if err := os.Remove(filepath.Join(root, "example.com", "real", "@v", "v1.0.0.zip")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(secretZip, filepath.Join(root, "example.com", "real", "@v", "v1.0.0.zip")); err != nil {
+			t.Fatal(err)
+		}
+		store, err := NewStore(root)
+		if err != nil {
+			t.Fatalf("NewStore: %v", err)
+		}
+
+		var notApproved *NotApprovedError
+		if _, _, err := store.Open("example.com/real", "v1.0.0", ExtZip); !asNotApproved(err, &notApproved) {
+			t.Fatalf("Open of a symlinked artifact: want NotApprovedError, got %v", err)
+		} else if !strings.Contains(notApproved.Detail, "v1.0.0.zip") {
+			t.Fatalf("diagnostic must name the offending artifact, got %q", notApproved.Detail)
+		}
+		// The whole version is tainted, not just the linked artifact: a set
+		// holding a symlink is not an approved artifact set.
+		if _, _, err := store.Open("example.com/real", "v1.0.0", ExtInfo); !asNotApproved(err, &notApproved) {
+			t.Fatalf("Open of an artifact whose set holds a symlink: want NotApprovedError, got %v", err)
+		}
+		// Listing must not approve a version whose set holds a symlink.
+		versions, err := store.Versions("example.com/real")
+		if err != nil {
+			t.Fatalf("Versions: %v", err)
+		}
+		if len(versions) != 0 {
+			t.Fatalf("a symlinked artifact must not be listed as approved, got %+v", versions)
+		}
+	})
+
+	t.Run("in-root symlink is refused too", func(t *testing.T) {
+		root := t.TempDir()
+		approveAll(t, root, "example.com/real", "v1.0.0")
+		if err := os.Remove(filepath.Join(root, "example.com", "real", "@v", "v1.0.0.info")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(root, "example.com", "real", "@v", "v1.0.0.mod"),
+			filepath.Join(root, "example.com", "real", "@v", "v1.0.0.info")); err != nil {
+			t.Fatal(err)
+		}
+		store, err := NewStore(root)
+		if err != nil {
+			t.Fatalf("NewStore: %v", err)
+		}
+
+		var notApproved *NotApprovedError
+		if _, _, err := store.Open("example.com/real", "v1.0.0", ExtInfo); !asNotApproved(err, &notApproved) {
+			t.Fatalf("Open of an in-root symlinked artifact: want NotApprovedError, got %v", err)
+		} else if !strings.Contains(notApproved.Detail, "symlink") {
+			t.Fatalf("diagnostic must name the symlink, got %q", notApproved.Detail)
+		}
+	})
+
+	t.Run("handler refuses with the approval diagnostic", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(root, "example.com"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(secretDir, filepath.Join(root, "example.com", "linked")); err != nil {
+			t.Fatal(err)
+		}
+		store, err := NewStore(root)
+		if err != nil {
+			t.Fatalf("NewStore: %v", err)
+		}
+		handler := NewHandler(store, Options{LogRequests: true})
+		recorder := handlerRequest(t, handler, http.MethodGet, "/example.com/linked/@v/v1.0.0.info", "10.0.0.1:1", nil)
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("symlink escape must refuse with 404, got %d", recorder.Code)
+		}
+		if !strings.Contains(recorder.Body.String(), "symlink") {
+			t.Fatalf("404 body must tell the administrator about the symlink: %q", recorder.Body.String())
+		}
+		if strings.Contains(recorder.Body.String(), secretDir) {
+			t.Fatalf("response leaks outside-store paths: %q", recorder.Body.String())
+		}
+	})
+}
+
+func TestStoreListRefusesOversizedInfoWithoutUnboundedRead(t *testing.T) {
+	// Listing and @latest read .info metadata through the bounded, confined
+	// artifact path: a populated oversized .info is refused without ever
+	// allocating for its full size, even though the (otherwise complete)
+	// version stays listed and the serving path reports the bound violation.
+	limits := DefaultLimits()
+	limits.MaxInfoBytes = 512
+	store, _ := newTestStore(t, limits, func(root string) {
+		writeArtifact(t, root, "example.com/bloated", "v1.0.0", ExtInfo,
+			`{"Version":"v1.0.0","Time":"2026-01-02T03:04:05Z"}`+strings.Repeat(" ", 8<<20))
+		writeArtifact(t, root, "example.com/bloated", "v1.0.0", ExtMod, "module example.com/bloated\n\ngo 1.21\n")
+		writeArtifact(t, root, "example.com/bloated", "v1.0.0", ExtZip, "zip-bytes")
+	})
+
+	assertBounded := func(t *testing.T, read func()) {
+		t.Helper()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		read()
+		runtime.ReadMemStats(&after)
+		if grew := after.TotalAlloc - before.TotalAlloc; grew > 1<<20 {
+			t.Fatalf("metadata read allocated %d bytes despite the %d byte bound; the read is not bounded", grew, limits.MaxInfoBytes)
+		}
+	}
+
+	var versions []VersionInfo
+	var err error
+	assertBounded(t, func() {
+		versions, err = store.Versions("example.com/bloated")
+	})
+	if err != nil {
+		t.Fatalf("Versions: %v", err)
+	}
+	if len(versions) != 1 || versions[0].Version != "v1.0.0" {
+		t.Fatalf("an oversized .info must not hide the otherwise-complete version, got %+v", versions)
+	}
+	if versions[0].Time != "" {
+		t.Fatalf("oversized .info metadata must be refused, got time %q", versions[0].Time)
+	}
+
+	var latest VersionInfo
+	assertBounded(t, func() {
+		latest, err = store.Latest("example.com/bloated")
+	})
+	if err != nil {
+		t.Fatalf("Latest: %v", err)
+	}
+	if latest.Version != "v1.0.0" || latest.Time != "" {
+		t.Fatalf("@latest must resolve without the refused metadata, got %+v", latest)
+	}
+
+	// The artifact-serving path reports the bound violation to the worker.
+	_, _, err = store.Open("example.com/bloated", "v1.0.0", ExtInfo)
+	var notApproved *NotApprovedError
+	if !asNotApproved(err, &notApproved) {
+		t.Fatalf("Open of an oversized .info: want NotApprovedError, got %v", err)
+	}
+	if !strings.Contains(notApproved.Detail, "bound") {
+		t.Fatalf("diagnostic must name the bound, got %q", notApproved.Detail)
 	}
 }
 
