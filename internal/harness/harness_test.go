@@ -3456,9 +3456,12 @@ func TestSuppliedHTTPClientKeepsOwnership(t *testing.T) {
 // and the OpenAI-compatible wire renderer sent it verbatim — providers that
 // require at least one user query refused every first turn with
 // "No user query found in messages", so no role-bound turn ever terminalized
-// and no earned heartbeat could ever land. Mirror #724's promotion: the final
-// pinned system message becomes the user turn verbatim, nothing invented.
-func TestOpenAIAllSystemTranscriptPromotesFinalSystemToUserTurn(t *testing.T) {
+// and no earned heartbeat could ever land. Mirror #724's promotion: the first
+// pinned system message — the goal, the task itself — becomes the user turn
+// verbatim, nothing invented; the framing and the skills index after it stay
+// system, the same rule the Anthropic renderer applies (the skill-canary
+// requires the composed index to reach the model as a system message).
+func TestOpenAIAllSystemTranscriptPromotesTheGoalToUserTurn(t *testing.T) {
 	gateway, mock, close := gatewayFor(gatewayResponse{body: sse(contentChunk("ok"), finishChunk("stop"))})
 	defer close()
 	transcript := []Message{
@@ -3484,14 +3487,14 @@ func TestOpenAIAllSystemTranscriptPromotesFinalSystemToUserTurn(t *testing.T) {
 	if len(wire.Messages) != 3 {
 		t.Fatalf("messages = %d entries; want all three pinned messages rendered", len(wire.Messages))
 	}
-	if wire.Messages[0].Role != "system" || wire.Messages[0].Content != "goal: land the fix" {
-		t.Fatalf("first message = %+v; want the goal left in place as system", wire.Messages[0])
+	if wire.Messages[0].Role != "user" || wire.Messages[0].Content != "goal: land the fix" {
+		t.Fatalf("first message = %+v; want the goal promoted to the user turn verbatim", wire.Messages[0])
 	}
 	if wire.Messages[1].Role != "system" || wire.Messages[1].Content != "harness framing: bounded steps" {
 		t.Fatalf("second message = %+v; want the framing left in place as system", wire.Messages[1])
 	}
-	if wire.Messages[2].Role != "user" || wire.Messages[2].Content != "skills index: shell, git" {
-		t.Fatalf("last message = %+v; want the final pinned system message promoted to the user turn verbatim", wire.Messages[2])
+	if wire.Messages[2].Role != "system" || wire.Messages[2].Content != "skills index: shell, git" {
+		t.Fatalf("last message = %+v; want the skills index left in place as system", wire.Messages[2])
 	}
 }
 

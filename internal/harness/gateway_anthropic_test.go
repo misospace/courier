@@ -537,9 +537,11 @@ func TestAnthropicLeadingSystemMessagesAllPreserved(t *testing.T) {
 // which rendered zero wire messages and marshaled "messages": null — a shape
 // litellm's /v1/messages normalizer 500s on every first turn. The all-system
 // transcript must produce a non-null messages array of exactly one user turn
-// carrying the final pinned system message verbatim, with everything before
-// it joined in the top-level system field.
-func TestAnthropicAllSystemTranscriptPromotesFinalSystemToUserTurn(t *testing.T) {
+// carrying the first pinned system message verbatim — the goal, the task
+// itself — with the framing and the skills index joined in the top-level
+// system field (#731: the composed skill index must reach the model as
+// system framing, never as the task turn).
+func TestAnthropicAllSystemTranscriptPromotesTheGoalToUserTurn(t *testing.T) {
 	var bodies [][]byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		payload, _ := readAllLimited(r.Body, maxStreamContentBytes)
@@ -578,8 +580,8 @@ func TestAnthropicAllSystemTranscriptPromotesFinalSystemToUserTurn(t *testing.T)
 	if err := json.Unmarshal(bodies[0], &wire); err != nil {
 		t.Fatal(err)
 	}
-	if want := "goal: land the fix\n\nharness framing: bounded steps"; wire.System != want {
-		t.Fatalf("system = %q; want the first two pinned messages joined by the separator", wire.System)
+	if want := "harness framing: bounded steps\n\nskills index: shell, git"; wire.System != want {
+		t.Fatalf("system = %q; want the framing and the skills index joined by the separator", wire.System)
 	}
 	if len(wire.Messages) != 1 {
 		t.Fatalf("messages = %d entries; want exactly one user turn", len(wire.Messages))
@@ -595,8 +597,8 @@ func TestAnthropicAllSystemTranscriptPromotesFinalSystemToUserTurn(t *testing.T)
 	if err := json.Unmarshal(blockJSON, &block); err != nil {
 		t.Fatal(err)
 	}
-	if block["type"] != "text" || block["text"] != "skills index: shell, git" {
-		t.Fatalf("promoted turn block = %s; want the final pinned system message verbatim", blockJSON)
+	if block["type"] != "text" || block["text"] != "goal: land the fix" {
+		t.Fatalf("promoted turn block = %s; want the goal pinned message verbatim", blockJSON)
 	}
 }
 
