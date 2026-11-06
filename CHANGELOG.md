@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.1.20](https://github.com/misospace/courier/compare/v0.1.19...v0.1.20) (2026-11-06)
+
+
+### Features
+
+* **deps:** update module github.com/prometheus/prometheus (v0.315.1 → v0.316.0) ([#747](https://github.com/misospace/courier/issues/747)) ([5bd5c0e](https://github.com/misospace/courier/commit/5bd5c0e41f6e1b40f99bb5544c2243820347af3a))
+* **harness:** expose per-run model request, token, and context-consumption telemetry ([#742](https://github.com/misospace/courier/issues/742)) ([ea610fd](https://github.com/misospace/courier/commit/ea610fd350605ffa9d2af6db2091f7556bad0833))
+* **harness:** persist a per-run model-surface provenance digest ([#753](https://github.com/misospace/courier/issues/753)) ([1dd89bb](https://github.com/misospace/courier/commit/1dd89bb2743f271e5af123febe057b098cd0fc23))
+* **rebase:** resolve conflicts with the configured model ([#750](https://github.com/misospace/courier/issues/750)) ([bbeed10](https://github.com/misospace/courier/commit/bbeed10654d8f5f2b4723833417c73740ce06ed6))
+
+
+### Bug Fixes
+
+* **deps:** update dependency astro (7.4.5 → 7.4.6) ([#746](https://github.com/misospace/courier/issues/746)) ([e293472](https://github.com/misospace/courier/commit/e29347220a2e157e80d8246126db0f0dc64664ee))
+* **deps:** update dependency astro (7.4.6 → 7.4.7) ([#751](https://github.com/misospace/courier/issues/751)) ([81df614](https://github.com/misospace/courier/commit/81df6149f1be958759dd49409a61b6f852c39844))
+* **dispatch:** close already-satisfied issue work ([#727](https://github.com/misospace/courier/issues/727)) ([5431dbc](https://github.com/misospace/courier/commit/5431dbc79a692308ec10881d765f786c54dc3978))
+* **harness:** bound stalled model turns at the gateway transport ([#754](https://github.com/misospace/courier/issues/754)) ([#756](https://github.com/misospace/courier/issues/756)) ([3230340](https://github.com/misospace/courier/commit/323034092c367345fa3654f306c05ab31f9fd248))
+* **harness:** circuit-break repeated model turns on definite status-path refusals ([#752](https://github.com/misospace/courier/issues/752)) ([4e7fa53](https://github.com/misospace/courier/commit/4e7fa53a209591ba1a7fe36b1a33baa00ed7b46a))
+* **harness:** circuit-break repeated model turns on prerequisite failure ([#740](https://github.com/misospace/courier/issues/740)) ([f766170](https://github.com/misospace/courier/commit/f76617019fd323a1f5cd29455e63eee7a83553ac))
+* **harness:** classify local broker failures as infrastructure, not broker denials ([#748](https://github.com/misospace/courier/issues/748)) ([d43167a](https://github.com/misospace/courier/commit/d43167a828351e6bb3a9e30014d574d63cc7e0ed))
+* **harness:** probe each unique model binding once per capability round ([#739](https://github.com/misospace/courier/issues/739)) ([42c3e47](https://github.com/misospace/courier/commit/42c3e478ede9d77885a3794ed8143c888c91f178))
+* **harness:** stop burst-retrying unhinted provider 429s ([#749](https://github.com/misospace/courier/issues/749)) ([ca47756](https://github.com/misospace/courier/commit/ca4775634e4d1f05015dff3d2692b9ddac4866b1))
+
+
+### Refactors
+
+* **topology:** one canonical dnsSafeTag for skill volume and node probe tags ([#733](https://github.com/misospace/courier/issues/733)) ([e666d73](https://github.com/misospace/courier/commit/e666d737e47db57531a0d02e9be9383605827152))
+
 ## [0.1.19](https://github.com/misospace/courier/compare/v0.1.18...v0.1.19) (2026-11-04)
 
 
