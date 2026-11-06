@@ -212,12 +212,14 @@ func anthropicWireRequest(req ChatRequest) ([]byte, error) {
 	// harness framing, optional lane framing, skills index, all
 	// Role "system" — renders zero wire messages, but the Messages API
 	// requires at least one message and the model must be handed the task
-	// as a turn (#724). The final pinned system message is promoted to the
-	// user turn verbatim, nothing invented, and everything before it stays
-	// in the top-level system field.
+	// as a turn (#724). The first pinned system message is promoted to the
+	// user turn verbatim, nothing invented, and the framing and the skills
+	// index after it stay in the top-level system field — they are framing
+	// the model reads as system state, never the task (#731), the same rule
+	// the OpenAI-compatible renderer applies.
 	if len(systemParts) > 0 && len(wire.Messages) == 0 {
-		promoted := systemParts[len(systemParts)-1]
-		systemParts = systemParts[:len(systemParts)-1]
+		promoted := systemParts[0]
+		systemParts = systemParts[1:]
 		wire.Messages = append(wire.Messages, anthropicWireMessage{
 			Role:    "user",
 			Content: []json.RawMessage{anthropicTextBlock(promoted)},
