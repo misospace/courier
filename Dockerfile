@@ -30,7 +30,8 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 	go build -o courier-executor ./cmd/courier-executor && \
 	go build -o courier-control ./cmd/courier-control && \
 	go build -o courier-worker ./cmd/courier-worker && \
-	go build -o courier-broker ./cmd/courier-broker
+	go build -o courier-broker ./cmd/courier-broker && \
+	go build -o courier-dependency-cache ./cmd/courier-dependency-cache
 
 FROM builder AS binaries-builder
 
@@ -163,12 +164,14 @@ COPY --from=binaries /workspace/courier-broker /usr/local/bin/courier-broker
 
 USER 65532:65532
 
-# Manager image: distroless, manager binary only. Kept last so a bare
-# `docker build .` produces the operator image; build paths still pass
-# --target explicitly.
+# Manager image: distroless, the manager binary plus the read-only
+# dependency cache server (courier-dependency-cache) — the deployment-level
+# trusted infrastructure binaries. Kept last so a bare `docker build .`
+# produces the operator image; build paths still pass --target explicitly.
 FROM gcr.io/distroless/static:nonroot@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329 AS manager
 WORKDIR /
 COPY --from=binaries /workspace/manager .
+COPY --from=binaries /workspace/courier-dependency-cache /usr/local/bin/courier-dependency-cache
 USER 65532:65532
 
 ENTRYPOINT ["/manager"]

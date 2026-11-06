@@ -192,6 +192,7 @@ jobs:
         run: |
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/manager cmd/main.go
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/courier-executor ./cmd/courier-executor
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/courier-dependency-cache ./cmd/courier-dependency-cache
 
       - name: Save Go build cache
         if: steps.go-cache.outputs.cache-hit != 'true'

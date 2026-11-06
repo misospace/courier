@@ -1821,3 +1821,92 @@ func TestChartRejectsOwnershipBoundaryThatStrandsRuns(t *testing.T) {
 		t.Fatalf("expected an invalid owned namespace to fail, err = %v:\n%s", err, out)
 	}
 }
+
+func TestChartRendersDependencyCache(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
+		t.Fatalf("configure chart repository: %v", err)
+	}
+	runHelm(t, chartDir, "dependency", "build")
+
+	secureBase := []string{
+		"--set", "secure.enabled=true",
+		"--set", "secure.runNamespace=courier-runs",
+		"--set", "secure.providers[0].name=github",
+		"--set", "secure.providers[0].type=github",
+		"--set", "secure.providers[0].endpoint=https://api.github.com/",
+		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
+	}
+
+	// Disabled by default: no cache resources and no cache operator flag.
+	disabled := runHelm(t, chartDir, append(append([]string{"template", "courier", "."}, secureBase...),
+		"--set", "secure.dependencyCache.enabled=false")...)
+	for _, unwanted := range []string{
+		"kind: PersistentVolumeClaim",
+		"dependency-cache",
+	} {
+		if strings.Contains(disabled, unwanted) {
+			t.Fatalf("dependency-cache-disabled secure chart output unexpectedly contains %q", unwanted)
+		}
+	}
+
+	enabled := runHelm(t, chartDir,
+		append(append([]string{"template", "courier", "."}, secureBase...),
+			"--set", "secure.dependencyCache.enabled=true")...)
+	for _, want := range []string{
+		"name: courier-dependency-cache",
+		"kind: PersistentVolumeClaim",
+		"kind: Service",
+		"kind: Deployment",
+		"kind: NetworkPolicy",
+		"/usr/local/bin/courier-dependency-cache",
+		"--root=/var/lib/courier/dependency-cache",
+		"--dependency-cache-service=default/courier-dependency-cache",
+		"automountServiceAccountToken: false",
+		"readOnly: true",
+		"courier.misospace.dev/component: worker",
+	} {
+		if !strings.Contains(enabled, want) {
+			t.Fatalf("dependency-cache-enabled chart output is missing %q", want)
+		}
+	}
+	// The store volume mounts read-only in the serving pod, and the cache
+	// policy denies egress (no egress rules rendered).
+	if !strings.Contains(enabled, "mountPath: /var/lib/courier/dependency-cache") {
+		t.Fatalf("cache Deployment does not mount the store:\n%s", enabled)
+	}
+	cachePolicy := strings.Split(enabled, "kind: NetworkPolicy")[1]
+	if strings.Contains(cachePolicy, "egress:") {
+		t.Fatalf("cache NetworkPolicy must deny all egress:\n%s", cachePolicy)
+	}
+	if !strings.Contains(cachePolicy, "kubernetes.io/metadata.name: courier-runs") {
+		t.Fatalf("cache NetworkPolicy must admit only the run namespace:\n%s", cachePolicy)
+	}
+
+	// An external dependencyCacheService alongside the rendered one is
+	// rejected: two silent sources of approved modules is not a
+	// configuration, it is an accident.
+	out, err := runHelmOutput(t, chartDir,
+		append(append([]string{"template", "courier", "."}, secureBase...),
+			"--set", "secure.dependencyCache.enabled=true",
+			"--set", "secure.dependencyCacheService=cache-system/go-cache")...)
+	if err == nil || !strings.Contains(out, "mutually exclusive") {
+		t.Fatalf("expected enabled cache plus external dependencyCacheService to fail, err = %v:\n%s", err, out)
+	}
+
+	// A dependencyCachePort that contradicts the rendered Service port would
+	// pin workers to a GOPROXY address the cache never serves.
+	out, err = runHelmOutput(t, chartDir,
+		append(append([]string{"template", "courier", "."}, secureBase...),
+			"--set", "secure.dependencyCache.enabled=true",
+			"--set", "secure.dependencyCachePort=9999")...)
+	if err == nil || !strings.Contains(out, "contradicts the rendered dependency cache port") {
+		t.Fatalf("expected contradicting cache port to fail, err = %v:\n%s", err, out)
+	}
+}
