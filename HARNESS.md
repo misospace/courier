@@ -254,6 +254,16 @@ selected topology, not a configurable shared-broker fallback.
   ingress instead of as a reply. The admission covers the run's untrusted
   worker, so the worker's own deny-egress is what keeps the worker from
   reaching control. No pod outside the run can reach control.
+  The deployment may also hold one namespace-scoped policy in the run
+  namespace, owned by the chart: it grants the control/coordinator pods
+  egress to the model gateway's pods only — no worker path, no other
+  destination — and it is a union with, never a replacement for, the per-run
+  policy, because the egress rules of several policies selecting the same
+  pod are unioned. A run namespace belongs to one release, so two releases
+  sharing one run namespace render two policies whose egress grants union;
+  and in a secure release every coordinator-labelled pod in the run namespace
+  is a secure control pod that a per-run policy also selects, so this policy
+  only adds a path to that pod's egress.
   NetworkPolicy is defense in depth, not the primary boundary: secure mode
   requires enforced policy and refuses clusters that cannot enforce it. Launch
   no workload exposure before policy is applied and live deny probes pass.

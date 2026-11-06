@@ -9,9 +9,12 @@ import (
 	"strings"
 	"testing"
 
+	courier "github.com/misospace/courier/api/v1alpha1"
 	bootstrap "github.com/misospace/courier/internal/bootstrap"
 	"github.com/misospace/courier/internal/skills"
 	"github.com/misospace/courier/internal/source/cron"
+	"github.com/misospace/courier/internal/topology"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 )
 
@@ -805,6 +808,388 @@ func TestChartRendersSecureTopologyConfiguration(t *testing.T) {
 		if strings.Contains(disabled, unwanted) {
 			t.Fatalf("secure-disabled chart output unexpectedly contains %q", unwanted)
 		}
+	}
+}
+
+// secureRenderArgs returns the helm template arguments that render a secure
+// release, extended with the caller's own --set arguments.
+func secureRenderArgs(extra ...string) []string {
+	args := []string{"template", "courier", ".",
+		"--set", "secure.enabled=true",
+		"--set", "secure.runNamespace=courier-runs",
+		"--set", "secure.providers[0].name=github",
+		"--set", "secure.providers[0].type=github",
+		"--set", "secure.providers[0].endpoint=https://api.github.com/",
+		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
+	}
+	return append(args, extra...)
+}
+
+// modelGatewayPolicyArgs returns the --set arguments that configure the
+// model-gateway egress NetworkPolicy's destination.
+func modelGatewayPolicyArgs() []string {
+	return []string{
+		"--set", "secure.modelGateway.networkPolicy.namespace=courier-native",
+		"--set", "secure.modelGateway.networkPolicy.podSelector.app=courier-native-model-gateway",
+		"--set", "secure.modelGateway.networkPolicy.port=4000",
+	}
+}
+
+// renderedNetworkPolicy is the subset of a rendered NetworkPolicy the
+// model-gateway policy tests assert on.
+type renderedNetworkPolicy struct {
+	APIVersion string `json:"apiVersion"`
+	Kind       string `json:"kind"`
+	Metadata   struct {
+		Name      string            `json:"name"`
+		Namespace string            `json:"namespace"`
+		Labels    map[string]string `json:"labels"`
+	} `json:"metadata"`
+	Spec struct {
+		PodSelector struct {
+			MatchLabels map[string]string `json:"matchLabels"`
+		} `json:"podSelector"`
+		PolicyTypes []string `json:"policyTypes"`
+		Egress      []struct {
+			To []struct {
+				NamespaceSelector *struct {
+					MatchLabels map[string]string `json:"matchLabels"`
+				} `json:"namespaceSelector"`
+				PodSelector *struct {
+					MatchLabels map[string]string `json:"matchLabels"`
+				} `json:"podSelector"`
+			} `json:"to"`
+			Ports []struct {
+				Protocol string `json:"protocol"`
+				Port     int    `json:"port"`
+			} `json:"ports"`
+		} `json:"egress"`
+	} `json:"spec"`
+}
+
+// parseRenderedNetworkPolicy parses a rendered NetworkPolicy document. It
+// also returns the document's generic form, so a test can assert on the
+// presence or absence of a key and not only on its parsed value.
+func parseRenderedNetworkPolicy(t *testing.T, doc string) (renderedNetworkPolicy, map[string]any) {
+	t.Helper()
+	var policy renderedNetworkPolicy
+	if err := yaml.Unmarshal([]byte(doc), &policy); err != nil {
+		t.Fatalf("parse rendered NetworkPolicy: %v\n%s", err, doc)
+	}
+	var generic map[string]any
+	if err := yaml.Unmarshal([]byte(doc), &generic); err != nil {
+		t.Fatalf("parse rendered NetworkPolicy: %v\n%s", err, doc)
+	}
+	return policy, generic
+}
+
+// selectorSelects reports whether a pod carrying the given labels is selected
+// by the given label selector.
+func selectorSelects(selector, labels map[string]string) bool {
+	for key, value := range selector {
+		if labels[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+// writeNetworkPolicySelectorValues writes a values file that configures the
+// model-gateway NetworkPolicy's pod selector. It exists for the selector
+// cases --set cannot express, such as a key or a value with a space.
+func writeNetworkPolicySelectorValues(t *testing.T, chartDir, name, selector string) {
+	t.Helper()
+	values := `secure:
+  enabled: true
+  runNamespace: courier-runs
+  providers:
+    - name: github
+      type: github
+      endpoint: https://api.github.com/
+      serves:
+        - misospace/*
+      credentials:
+        forge-api:
+          secretName: forge-creds
+          key: token
+  modelGateway:
+    networkPolicy:
+      namespace: courier-native
+      podSelector:
+` + selector + `      port: 4000
+`
+	if err := os.WriteFile(filepath.Join(chartDir, name), []byte(values), 0o600); err != nil {
+		t.Fatalf("write %s: %v", name, err)
+	}
+}
+
+// TestChartRendersModelGatewayNetworkPolicy covers #763: the chart owns the
+// deployment-level model-gateway egress policy, renders it into the run
+// namespace, and shapes it exactly like the policy that replaces the
+// deployment's hand-authored copy. The shape, the drift guard, and the
+// unconfigured render share one chart copy and one dependency build.
+func TestChartRendersModelGatewayNetworkPolicy(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
+		t.Fatalf("configure chart repository: %v", err)
+	}
+	runHelm(t, chartDir, "dependency", "build")
+
+	// The chart hardcodes the operator's coordinator label keys; the guard
+	// below checks that they stay the ones the operator stamps.
+	wantSource := map[string]string{
+		"courier.misospace.dev/component": "coordinator",
+		"app.kubernetes.io/component":     "coordinator",
+	}
+
+	out := runHelm(t, chartDir, secureRenderArgs(modelGatewayPolicyArgs()...)...)
+	doc := findDocument(t, out, "kind: NetworkPolicy", "name: courier-model-gateway-egress")
+	policy, generic := parseRenderedNetworkPolicy(t, doc)
+
+	t.Run("policy shape", func(t *testing.T) {
+		if policy.APIVersion != "networking.k8s.io/v1" || policy.Kind != "NetworkPolicy" {
+			t.Fatalf("rendered policy is %s/%s, want networking.k8s.io/v1/NetworkPolicy", policy.APIVersion, policy.Kind)
+		}
+		if policy.Metadata.Name != "courier-model-gateway-egress" {
+			t.Fatalf("rendered policy name = %q", policy.Metadata.Name)
+		}
+		// The policy lives in the run namespace, where the operator creates
+		// the run's control pods, and not in the release namespace.
+		if policy.Metadata.Namespace != "courier-runs" {
+			t.Fatalf("rendered policy namespace = %q, want the run namespace", policy.Metadata.Namespace)
+		}
+		if policy.Metadata.Labels["app.kubernetes.io/managed-by"] != "courier" {
+			t.Fatalf("rendered policy labels = %v", policy.Metadata.Labels)
+		}
+		if !reflect.DeepEqual(policy.Spec.PolicyTypes, []string{"Egress"}) {
+			t.Fatalf("rendered policy types = %v, want [Egress]", policy.Spec.PolicyTypes)
+		}
+		spec, _ := generic["spec"].(map[string]any)
+		if _, ok := spec["ingress"]; ok {
+			t.Fatal("the rendered policy must not carry an ingress rule: it grants egress only")
+		}
+		if !reflect.DeepEqual(policy.Spec.PodSelector.MatchLabels, wantSource) {
+			t.Fatalf("rendered source selector = %v, want %v", policy.Spec.PodSelector.MatchLabels, wantSource)
+		}
+		if len(policy.Spec.Egress) != 1 {
+			t.Fatalf("rendered policy carries %d egress rules, want 1", len(policy.Spec.Egress))
+		}
+		rule := policy.Spec.Egress[0]
+		if len(rule.To) != 1 {
+			t.Fatalf("rendered egress rule carries %d peers, want 1", len(rule.To))
+		}
+		peer := rule.To[0]
+		if peer.NamespaceSelector == nil || peer.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] != "courier-native" {
+			t.Fatalf("rendered egress peer namespace selector = %+v", peer.NamespaceSelector)
+		}
+		wantPeer := map[string]string{"app": "courier-native-model-gateway"}
+		if peer.PodSelector == nil || !reflect.DeepEqual(peer.PodSelector.MatchLabels, wantPeer) {
+			t.Fatalf("rendered egress peer pod selector = %+v, want %v", peer.PodSelector, wantPeer)
+		}
+		if len(rule.Ports) != 1 {
+			t.Fatalf("rendered egress rule carries %d ports, want 1", len(rule.Ports))
+		}
+		if rule.Ports[0].Protocol != "TCP" || rule.Ports[0].Port != 4000 {
+			t.Fatalf("rendered egress port = %+v, want TCP/4000", rule.Ports[0])
+		}
+	})
+
+	t.Run("source selector drift guard", func(t *testing.T) {
+		source := policy.Spec.PodSelector.MatchLabels
+
+		// The rendered selector must carry exactly the chart's hardcoded
+		// coordinator keys: a dropped or an added key is the drift this
+		// guard exists for.
+		if !reflect.DeepEqual(source, wantSource) {
+			t.Fatalf("rendered source selector = %v, want exactly %v", source, wantSource)
+		}
+		if len(source) == 0 {
+			t.Fatal("the rendered source selector is empty: it would select every pod in the run namespace")
+		}
+
+		// Every label the chart selects on must be stamped on a coordinator
+		// pod with the same value.
+		coordinator := topology.Labels("drift-check", topology.ComponentCoordinator)
+		for key, value := range source {
+			stamped, ok := coordinator[key]
+			if !ok {
+				t.Fatalf("the chart's source selector carries %q, which the operator never stamps on a coordinator pod", key)
+			}
+			if stamped != value {
+				t.Fatalf("the chart's source selector carries %s=%q, the operator stamps %q", key, value, stamped)
+			}
+		}
+
+		// The selector must never match a worker or a broker pod.
+		for _, component := range []string{topology.ComponentWorker, topology.ComponentBroker} {
+			if selectorSelects(source, topology.Labels("drift-check", component)) {
+				t.Fatalf("the chart's source selector selects %s pods", component)
+			}
+		}
+
+		// Nor a probe pod: a probe carries the component label of the
+		// workload whose policy it exercises.
+		run := &courier.CoderRun{ObjectMeta: metav1.ObjectMeta{Name: "drift-check", Namespace: "courier-runs"}}
+		if selectorSelects(source, topology.ProbePod(run, "node-a", "busybox:1.38", "").Labels) {
+			t.Fatal("the chart's source selector selects the worker's probe pod")
+		}
+		if selectorSelects(source, topology.BrokerProbePod(run, "node-a", "busybox:1.38", "").Labels) {
+			t.Fatal("the chart's source selector selects the broker's probe pod")
+		}
+
+		// The per-run label cannot be encoded in a static chart template: its
+		// value is per run, so a selector carrying it would select nothing.
+		if _, ok := source[topology.LabelRun]; ok {
+			t.Fatalf("the chart's source selector must not carry the per-run label %q", topology.LabelRun)
+		}
+	})
+
+	t.Run("numeric pod selector value renders as a string", func(t *testing.T) {
+		rendered := runHelm(t, chartDir, secureRenderArgs(append(modelGatewayPolicyArgs(),
+			"--set", "secure.modelGateway.networkPolicy.podSelector.portnum=4000")...)...)
+		document := findDocument(t, rendered, "kind: NetworkPolicy", "name: courier-model-gateway-egress")
+		if !strings.Contains(document, `portnum: "4000"`) {
+			t.Fatalf("a numeric pod selector value must render as a quoted string:\n%s", document)
+		}
+	})
+
+	t.Run("no policy without the block", func(t *testing.T) {
+		secure := runHelm(t, chartDir, secureRenderArgs()...)
+		if strings.Contains(secure, "kind: NetworkPolicy") {
+			t.Fatal("a secure render without the networkPolicy block must render no NetworkPolicy")
+		}
+		legacy := runHelm(t, chartDir, "template", "courier", ".")
+		if strings.Contains(legacy, "kind: NetworkPolicy") {
+			t.Fatal("a legacy render must render no NetworkPolicy")
+		}
+	})
+}
+
+// TestChartRejectsPartialModelGatewayNetworkPolicy covers the render-time
+// guard: a half-configured block fails the render naming the missing field,
+// so the misconfiguration surfaces at helm template/upgrade time instead of
+// as a blackholed model path at run time.
+func TestChartRejectsPartialModelGatewayNetworkPolicy(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
+		t.Fatalf("configure chart repository: %v", err)
+	}
+	runHelm(t, chartDir, "dependency", "build")
+
+	cases := []struct {
+		name  string
+		extra []string
+		want  string
+	}{
+		{
+			name:  "namespace only",
+			extra: []string{"--set", "secure.modelGateway.networkPolicy.namespace=courier-native"},
+			want:  "secure.modelGateway.networkPolicy.podSelector is required when the block is configured",
+		},
+		{
+			name:  "pod selector only",
+			extra: []string{"--set", "secure.modelGateway.networkPolicy.podSelector.app=gateway"},
+			want:  "secure.modelGateway.networkPolicy.namespace is required when the block is configured",
+		},
+		{
+			name:  "port only",
+			extra: []string{"--set", "secure.modelGateway.networkPolicy.port=4000"},
+			want:  "secure.modelGateway.networkPolicy.namespace is required when the block is configured",
+		},
+		{
+			name: "namespace is not a DNS-1123 label",
+			extra: []string{
+				"--set", "secure.modelGateway.networkPolicy.namespace=Bad_Namespace",
+				"--set", "secure.modelGateway.networkPolicy.podSelector.app=gateway",
+				"--set", "secure.modelGateway.networkPolicy.port=4000",
+			},
+			want: `secure.modelGateway.networkPolicy.namespace "Bad_Namespace" must be a valid DNS-1123 label (lowercase alphanumeric or '-', at most 63 characters, starting and ending with an alphanumeric)`,
+		},
+		{
+			name: "port is not a number",
+			extra: []string{
+				"--set", "secure.modelGateway.networkPolicy.namespace=courier-native",
+				"--set", "secure.modelGateway.networkPolicy.podSelector.app=gateway",
+				"--set", "secure.modelGateway.networkPolicy.port=true",
+			},
+			want: "secure.modelGateway.networkPolicy.port must be a number",
+		},
+		{
+			name: "port is out of range",
+			extra: []string{
+				"--set", "secure.modelGateway.networkPolicy.namespace=courier-native",
+				"--set", "secure.modelGateway.networkPolicy.podSelector.app=gateway",
+				"--set", "secure.modelGateway.networkPolicy.port=70000",
+			},
+			want: "secure.modelGateway.networkPolicy.port must be between 1 and 65535",
+		},
+		{
+			name: "run namespace is not a DNS-1123 label",
+			extra: []string{
+				"--set", "secure.runNamespace=Bad_Namespace",
+				"--set", "secure.modelGateway.networkPolicy.namespace=courier-native",
+				"--set", "secure.modelGateway.networkPolicy.podSelector.app=gateway",
+				"--set", "secure.modelGateway.networkPolicy.port=4000",
+			},
+			want: `secure.runNamespace "Bad_Namespace" must be a valid DNS-1123 label (lowercase alphanumeric or '-', at most 63 characters, starting and ending with an alphanumeric)`,
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			out, err := runHelmOutput(t, chartDir, secureRenderArgs(testCase.extra...)...)
+			if err == nil {
+				t.Fatalf("expected helm template to fail, but it succeeded:\n%s", out)
+			}
+			if !strings.Contains(out, testCase.want) {
+				t.Fatalf("helm template failed without the expected message %q:\n%s", testCase.want, out)
+			}
+		})
+	}
+
+	// The selector cases --set cannot express: a key or a value carrying a
+	// space, and an empty key.
+	selectorCases := []struct {
+		name     string
+		selector string
+		want     string
+	}{
+		{
+			name:     "empty key",
+			selector: "        \"\": gateway\n",
+			want:     `secure.modelGateway.networkPolicy.podSelector key "" is not a valid label key`,
+		},
+		{
+			name:     "key with whitespace",
+			selector: "        \"a b\": gateway\n",
+			want:     `secure.modelGateway.networkPolicy.podSelector key "a b" is not a valid label key`,
+		},
+		{
+			name:     "value with whitespace",
+			selector: "        app: \"a b\"\n",
+			want:     `secure.modelGateway.networkPolicy.podSelector value "a b" for key "app" is not a valid label value`,
+		},
+	}
+	for _, testCase := range selectorCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			writeNetworkPolicySelectorValues(t, chartDir, "values-netpol.yaml", testCase.selector)
+			out, err := runHelmOutput(t, chartDir, "template", "courier", ".", "--values", "values-netpol.yaml")
+			if err == nil {
+				t.Fatalf("expected helm template to fail, but it succeeded:\n%s", out)
+			}
+			if !strings.Contains(out, testCase.want) {
+				t.Fatalf("helm template failed without the expected message %q:\n%s", testCase.want, out)
+			}
+		})
 	}
 }
 
