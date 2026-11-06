@@ -1817,6 +1817,11 @@ boundary (#716). LiteLLM's OpenAI translation is not semantics-preserving for
 provider-native reasoning, so a model whose thinking survives only its own
 protocol is served by its own transport, with thinking blocks carried as
 opaque provider continuation data and never flattened into assistant text.
+The harness-owned default client behind both transports carries a first-byte
+stall bound (#754): a gateway that accepts the connection and never produces a
+response header fails the turn as a transport error instead of holding the run
+until termination — a transport resource bound that never caps model
+generation, and one a deployment-supplied client replaces wholesale.
 
 **Unknowns and remaining scope.** The legacy OpenCode executor delegates model
 calls to an external binary and has no structured provider signal, so it is not

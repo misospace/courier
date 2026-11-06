@@ -74,8 +74,12 @@ func newRebaseAssistResolver(cfg config) (rebase.ModelResolver, error) {
 // gateway request the harness Gateway builds sends no max_tokens field at
 // all, and the turn runs on the caller's context alone — the run's own
 // context (SIGTERM) governs it, exactly as every harness session model turn
-// does. What the executor binds is what may be written, not what the model
-// may say: the engine's content bound and validation still govern that.
+// does. The only bound below that context is the gateway transport's shared
+// first-byte stall guard (#754): a gateway that never produces a response
+// header fails the turn as a transport error instead of holding the rebase
+// lane's serialized slot. What the executor binds is what may be written,
+// not what the model may say: the engine's content bound and validation
+// still govern that.
 func (g *gatewayResolver) Resolve(ctx context.Context, req rebase.AssistRequest) (*rebase.AssistResolution, error) {
 	events, err := g.gateway.StreamChat(ctx, harness.ChatRequest{
 		Model:    g.model,

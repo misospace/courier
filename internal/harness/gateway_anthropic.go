@@ -61,7 +61,9 @@ func (a *AnthropicTransport) client() *http.Client {
 	if a.HTTP != nil {
 		return a.HTTP
 	}
-	return http.DefaultClient
+	// The harness-owned default carries the first-byte stall bound (#754),
+	// exactly as the OpenAI-compatible transport's does.
+	return ownedModelClient
 }
 
 func (a *AnthropicTransport) signals() ExhaustionSignals {
