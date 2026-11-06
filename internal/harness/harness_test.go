@@ -3558,3 +3558,132 @@ func TestOpenAIAllEmptySystemTranscriptPromotesNothing(t *testing.T) {
 		t.Fatalf("messages = %+v; want the empty system message rendered unchanged, nothing promoted", wire.Messages)
 	}
 }
+
+// decodeFirstRequest decodes the messages array of one captured request body.
+func decodeFirstRequest(t *testing.T, raw string) []struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+} {
+	t.Helper()
+	var wire struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(raw), &wire); err != nil {
+		t.Fatalf("decode request: %v", err)
+	}
+	return wire.Messages
+}
+
+// The real coordinator assembly path (#764 review): Run pins the trusted
+// framing — harness framing, lane framing, skills index — as system role and
+// the goal last as the user task turn, and the first model request the
+// coordinator sends carries exactly that shape. Hand-built transcripts assert
+// the renderer; this asserts the assembly.
+func TestCoordinatorRunPinsFramingSystemAndGoalUser(t *testing.T) {
+	skillSet := surfaceSkillSet(t)
+	gateway, mock, cleanup := gatewayFor(
+		gatewayResponse{body: sse(contentChunk(`{"outcome":"blocked_external","missing":"x"}`), finishChunk("stop"))},
+	)
+	defer cleanup()
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Transport: gateway,
+		Bindings:  testBindings(),
+		Skills:    skillSet,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inv := testInvocation()
+	inv.Framing = "lane framing: production native canary"
+	result := coordinator.Run(context.Background(), inv)
+	if result.Outcome != executor.OutcomeBlockedExternal {
+		t.Fatalf("outcome = %q (%v)", result.Outcome, result.Err)
+	}
+	if mock.requestCount() < 1 {
+		t.Fatal("the coordinator sent no model request")
+	}
+	messages := decodeFirstRequest(t, mock.calls[0].rawBody)
+	wantRoles := []string{"system", "system", "system", "user"}
+	wantContent := []string{harnessFraming, inv.Framing, skillSet.Section(), inv.Goal}
+	if len(messages) != len(wantRoles) {
+		t.Fatalf("first request carries %d messages; want the pinned shape in full: %+v", len(messages), messages)
+	}
+	for i := range wantRoles {
+		if messages[i].Role != wantRoles[i] {
+			t.Fatalf("pinned message %d role = %q; want %q", i, messages[i].Role, wantRoles[i])
+		}
+		if messages[i].Content != wantContent[i] {
+			t.Fatalf("pinned message %d content = %q; want the production section verbatim", i, messages[i].Content)
+		}
+	}
+	if got := strings.Count(mock.calls[0].rawBody, inv.Goal); got != 1 {
+		t.Fatalf("the goal appears %d times in the first request; want exactly once", got)
+	}
+}
+
+// The real delegate assembly path (#764 review): the coordinator requests a
+// delegation, the brief's own session is seeded through runBrief, and the
+// delegate session's first model request carries the sub-agent framing and
+// the skills index as system role with the brief itself as the user task
+// turn, exactly once.
+func TestDelegateSessionPinsFramingSystemAndBriefUser(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.completeAll = true
+	worker.snapshotTip = "snap-tip"
+	skillSet := surfaceSkillSet(t)
+	gateway, mock, cleanup := gatewayFor(
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-1", toolDelegate, `{"id":"b1","role":"coder","objective":"Do the work","successCheck":"tests pass"}`),
+			finishChunk("tool_calls"),
+		)},
+		gatewayResponse{body: sse(contentChunk("brief done"), finishChunk("stop"))},
+		gatewayResponse{body: sse(contentChunk(`{"outcome":"blocked_external","missing":"x"}`), finishChunk("stop"))},
+	)
+	defer cleanup()
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Transport: gateway,
+		Bindings:  testBindings(),
+		Worker:    delegator,
+		Snapshot:  snapshotProvider("snap-tip"),
+		Skills:    skillSet,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := coordinator.Run(context.Background(), testInvocation())
+	if result.Outcome != executor.OutcomeBlockedExternal {
+		t.Fatalf("outcome = %q (%v)", result.Outcome, result.Err)
+	}
+	if mock.requestCount() != 3 {
+		t.Fatalf("captured %d requests; want coordinator, delegate, coordinator", mock.requestCount())
+	}
+	// The coordinator's own first request carries the goal as the user turn.
+	coordinatorMessages := decodeFirstRequest(t, mock.calls[0].rawBody)
+	if len(coordinatorMessages) < 2 || coordinatorMessages[len(coordinatorMessages)-1].Role != "user" || coordinatorMessages[len(coordinatorMessages)-1].Content != "Resolve the issue." {
+		t.Fatalf("coordinator first request = %+v; want the goal as the final user turn", coordinatorMessages)
+	}
+	// The brief session's first request: sub-agent framing and skills index
+	// as system, the brief as the user task turn.
+	brief := Brief{ID: "b1", Role: "coder", Objective: "Do the work", SuccessCheck: "tests pass"}
+	delegateMessages := decodeFirstRequest(t, mock.calls[1].rawBody)
+	wantRoles := []string{"system", "system", "user"}
+	wantContent := []string{subagentFraming, skillSet.Section(), briefText(brief)}
+	if len(delegateMessages) != len(wantRoles) {
+		t.Fatalf("delegate first request carries %d messages; want the pinned shape in full: %+v", len(delegateMessages), delegateMessages)
+	}
+	for i := range wantRoles {
+		if delegateMessages[i].Role != wantRoles[i] {
+			t.Fatalf("delegate pinned message %d role = %q; want %q", i, delegateMessages[i].Role, wantRoles[i])
+		}
+		if delegateMessages[i].Content != wantContent[i] {
+			t.Fatalf("delegate pinned message %d content = %q; want the production section verbatim", i, delegateMessages[i].Content)
+		}
+	}
+	if got := strings.Count(mock.calls[1].rawBody, "Do the work"); got != 1 {
+		t.Fatalf("the brief objective appears %d times in the delegate's first request; want exactly once", got)
+	}
+}
