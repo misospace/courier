@@ -296,6 +296,36 @@ func TestModelSurfaceCarriesEveryFixedNotice(t *testing.T) {
 	}
 }
 
+// TestModelSurfacePinsRawLaneFraming pins the framing preimage (#730
+// review): Run pins the raw framing text the invocation carries — the trim
+// decides only whether a framing exists — so a whitespace-only framing
+// change alters the model-visible prompt and must alter the digest, while a
+// whitespace-only framing is no framing at all.
+func TestModelSurfacePinsRawLaneFraming(t *testing.T) {
+	plain, err := modelsurfaceCoordinator(t, nil).ModelSurface(ModelSurfaceInputs{GatewayTransport: "openai", LaneFraming: "LANE FRAMING"})
+	if err != nil {
+		t.Fatalf("compute plain: %v", err)
+	}
+	padded, err := modelsurfaceCoordinator(t, nil).ModelSurface(ModelSurfaceInputs{GatewayTransport: "openai", LaneFraming: "LANE FRAMING  \n"})
+	if err != nil {
+		t.Fatalf("compute padded: %v", err)
+	}
+	if padded.Digest == plain.Digest {
+		t.Fatal("a whitespace-only framing change did not change the digest")
+	}
+	absent, err := modelsurfaceCoordinator(t, nil).ModelSurface(ModelSurfaceInputs{GatewayTransport: "openai"})
+	if err != nil {
+		t.Fatalf("compute absent: %v", err)
+	}
+	blank, err := modelsurfaceCoordinator(t, nil).ModelSurface(ModelSurfaceInputs{GatewayTransport: "openai", LaneFraming: "   \n\t"})
+	if err != nil {
+		t.Fatalf("compute blank: %v", err)
+	}
+	if blank.Digest != absent.Digest {
+		t.Fatal("a whitespace-only framing must not appear in the digest: Run would pin nothing")
+	}
+}
+
 func TestModelSurfaceReflectsWiring(t *testing.T) {
 	// A skills-wired run declares the skill tool to both roles; a skillless
 	// run does not. The wiring difference is a material contract change and

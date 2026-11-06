@@ -649,9 +649,10 @@ spec:
                   and persisted by trusted control through the run's broker status path
                   before any model execution. One incarnation's recorded digest is
                   final for that incarnation; a replacement incarnation records its
-                  own. Absent for legacy executors and for runs that ended before the
-                  digest could be computed (a capability-gate or skills-load failure
-                  precedes model execution and records no digest).
+                  own. Absent for legacy executors and for runs that failed before the
+                  digest could be computed (a skills-load failure precedes it); the
+                  capability gate runs after persistence, so a gate-stopped run keeps
+                  its digest.
                 properties:
                   at:
                     description: |-

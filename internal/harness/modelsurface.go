@@ -196,8 +196,13 @@ func assembleModelSurface(bindings Bindings, coordinatorTools, subagentTools []T
 		{Name: "control.turn", Digest: textDigest(controlTurnText)},
 		{Name: "outcome.clarification", Digest: textDigest(outcomeClarification)},
 	}
-	if framing := strings.TrimSpace(inputs.LaneFraming); framing != "" {
-		sections = append(sections, modelSurfaceSection{Name: "lane.framing", Digest: textDigest(framing)})
+	// The lane's framing pins verbatim when it exists: Run pins the raw
+	// text the invocation carries, so the digest hashes the exact bytes and
+	// the trim decides only whether a framing exists at all — a
+	// whitespace-only framing change is a prompt change and moves the
+	// digest (#730 review).
+	if strings.TrimSpace(inputs.LaneFraming) != "" {
+		sections = append(sections, modelSurfaceSection{Name: "lane.framing", Digest: textDigest(inputs.LaneFraming)})
 	}
 	sort.Slice(sections, func(i, j int) bool { return sections[i].Name < sections[j].Name })
 	surface.Sections = sections
