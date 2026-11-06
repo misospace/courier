@@ -3451,3 +3451,103 @@ func TestSuppliedHTTPClientKeepsOwnership(t *testing.T) {
 		t.Fatalf("CloseIdleConnections closed %d connections on a supplied client, want 0: the supplier owns the pool", got)
 	}
 }
+
+// Regression for #731: the pinned coordinator transcript is all system role,
+// and the OpenAI-compatible wire renderer sent it verbatim — providers that
+// require at least one user query refused every first turn with
+// "No user query found in messages", so no role-bound turn ever terminalized
+// and no earned heartbeat could ever land. Mirror #724's promotion: the final
+// pinned system message becomes the user turn verbatim, nothing invented.
+func TestOpenAIAllSystemTranscriptPromotesFinalSystemToUserTurn(t *testing.T) {
+	gateway, mock, close := gatewayFor(gatewayResponse{body: sse(contentChunk("ok"), finishChunk("stop"))})
+	defer close()
+	transcript := []Message{
+		{Role: "system", Content: "goal: land the fix"},
+		{Role: "system", Content: "harness framing: bounded steps"},
+		{Role: "system", Content: "skills index: shell, git"},
+	}
+	if _, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "qwen3.8-27b", Messages: transcript}); err != nil {
+		t.Fatal(err)
+	}
+	if mock.requestCount() != 1 {
+		t.Fatalf("captured %d requests", mock.requestCount())
+	}
+	var wire struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(mock.calls[0].rawBody), &wire); err != nil {
+		t.Fatal(err)
+	}
+	if len(wire.Messages) != 3 {
+		t.Fatalf("messages = %d entries; want all three pinned messages rendered", len(wire.Messages))
+	}
+	if wire.Messages[0].Role != "system" || wire.Messages[0].Content != "goal: land the fix" {
+		t.Fatalf("first message = %+v; want the goal left in place as system", wire.Messages[0])
+	}
+	if wire.Messages[1].Role != "system" || wire.Messages[1].Content != "harness framing: bounded steps" {
+		t.Fatalf("second message = %+v; want the framing left in place as system", wire.Messages[1])
+	}
+	if wire.Messages[2].Role != "user" || wire.Messages[2].Content != "skills index: shell, git" {
+		t.Fatalf("last message = %+v; want the final pinned system message promoted to the user turn verbatim", wire.Messages[2])
+	}
+}
+
+// The single-pinned-message edge of #731: with one system message and nothing
+// else, the whole pinned message becomes the user turn.
+func TestOpenAISingleSystemMessageBecomesTheUserTurn(t *testing.T) {
+	gateway, mock, close := gatewayFor(gatewayResponse{body: sse(contentChunk("ok"), finishChunk("stop"))})
+	defer close()
+	if _, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "qwen3.8-27b", Messages: []Message{
+		{Role: "system", Content: "goal: land the fix"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(mock.calls[0].rawBody), &wire); err != nil {
+		t.Fatal(err)
+	}
+	if len(wire.Messages) != 1 || wire.Messages[0].Role != "user" || wire.Messages[0].Content != "goal: land the fix" {
+		t.Fatalf("messages = %+v; want the single pinned message promoted to the user turn verbatim", wire.Messages)
+	}
+}
+
+// A transcript that already carries a non-system message — every later turn,
+// and any session seeded with a user turn — renders verbatim: the promotion
+// is the all-system first turn's shape fix, never a mid-run rewrite.
+func TestOpenAITranscriptWithNonSystemMessageRendersVerbatim(t *testing.T) {
+	gateway, mock, close := gatewayFor(gatewayResponse{body: sse(contentChunk("ok"), finishChunk("stop"))})
+	defer close()
+	transcript := []Message{
+		{Role: "system", Content: "goal: land the fix"},
+		{Role: "assistant", Content: "working"},
+		{Role: "tool", Content: "done", ToolCallID: "call-1"},
+	}
+	if _, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "qwen3.8-27b", Messages: transcript}); err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(mock.calls[0].rawBody), &wire); err != nil {
+		t.Fatal(err)
+	}
+	if len(wire.Messages) != 3 {
+		t.Fatalf("messages = %d entries; want the transcript verbatim", len(wire.Messages))
+	}
+	for i, want := range []string{"system", "assistant", "tool"} {
+		if wire.Messages[i].Role != want {
+			t.Fatalf("message %d role = %q; want %q (verbatim transcript)", i, wire.Messages[i].Role, want)
+		}
+	}
+}

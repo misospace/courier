@@ -108,9 +108,21 @@ type wireAssistantToolCall struct {
 	} `json:"function"`
 }
 
+// toWireMessages renders the normalized transcript into the OpenAI-compatible
+// messages array. An all-system transcript — the pinned first turn: the goal
+// plus harness framing, optional lane framing, the skills index, all Role
+// "system" — is refused by OpenAI-compatible providers that require at least
+// one user query (#731): the final pinned system message is promoted to the
+// user turn verbatim, nothing invented, exactly as the Anthropic wire renderer
+// promotes it for the Messages API (#724). Any non-system message — every
+// later turn carries assistant or tool messages — renders verbatim.
 func toWireMessages(messages []Message) []wireMessage {
 	out := make([]wireMessage, 0, len(messages))
+	allSystem := true
 	for _, message := range messages {
+		if message.Role != "system" {
+			allSystem = false
+		}
 		wire := wireMessage{Role: message.Role, Content: message.Content, ToolCallID: message.ToolCallID}
 		for _, call := range message.ToolCalls {
 			entry := wireAssistantToolCall{ID: call.ID, Type: "function"}
@@ -119,6 +131,19 @@ func toWireMessages(messages []Message) []wireMessage {
 			wire.ToolCalls = append(wire.ToolCalls, entry)
 		}
 		out = append(out, wire)
+	}
+	// Mirror #724's promotion rule: the last pinned system message carries the
+	// task, so it becomes the user turn. An empty final message can never
+	// carry the task, so the walk-back skips it, exactly as the Anthropic
+	// renderer's system-parts join does.
+	if allSystem && len(out) > 0 {
+		promoted := len(out) - 1
+		for promoted >= 0 && out[promoted].Content == "" {
+			promoted--
+		}
+		if promoted >= 0 {
+			out[promoted].Role = "user"
+		}
 	}
 	return out
 }
