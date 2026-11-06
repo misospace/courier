@@ -455,6 +455,61 @@ The OpenCode shim resumes a run's session only inside the running pod; it does
 not survive pod/model restarts with conversational state. Git commits and the
 remote branch are its durable floor until the custom harness replaces it.
 
+## Model-gateway egress policy
+
+In secure mode the operator renders a per-run NetworkPolicy for every run's
+pods. The deployment's model gateway belongs to no run, so a secure install
+needs a policy in the run namespace that lets the control pods reach it
+whenever the operator's ipBlock slot (`secure.modelGateway.cidr` and
+`secure.modelGateway.port`) does not cover the real path. That covers a
+gateway in another namespace and a gateway in the same namespace reached
+through a Service ClusterIP. The chart renders that policy from
+`secure.modelGateway.networkPolicy`:
+
+```yaml
+# charts/courier values
+secure:
+  modelGateway:
+    networkPolicy:
+      namespace: courier-native
+      podSelector:
+        app: courier-native-model-gateway
+      port: 4000
+```
+
+`namespace` is the namespace holding the gateway's pods, `podSelector` selects
+those pods, and `port` is the gateway pod's target port — NetworkPolicy ports
+match the post-DNAT destination port, so it is the pod's port.
+`secure.modelGateway.port` is the operator's ipBlock pin and
+`secure.modelGateway.networkPolicy.port` is this policy's port; both are
+post-DNAT gateway ports, and the port in `secure.modelGateway.url` need not
+equal either.
+
+The policy's source selector is not configurable: the chart hardcodes the
+operator's coordinator label keys (`courier.misospace.dev/component` and
+`app.kubernetes.io/component` = `coordinator`). A chart test asserts the
+rendered selector's key set is exactly those keys, that each key is stamped
+on a coordinator pod with the same value, and that the selector matches no
+worker, broker, or probe pod.
+
+Leave the block unset and the chart renders no policy; set only part of it
+and the render fails naming the missing field. Once the block is set, the
+deployment's hand-authored copy of the same policy can be deleted — but only
+after verifying that it grants no path beyond the model gateway.
+
+A run namespace belongs to one release: two releases sharing one run
+namespace render two policies whose egress grants union. In a secure release
+every coordinator-labelled pod in the run namespace is a secure control pod
+that a per-run policy also selects, so this policy only adds a path to that
+pod's egress. The policy lives in the run namespace, so that namespace must
+exist before the release installs. Helm applies the policy to that namespace
+and fails the install when the namespace is missing.
+
+The Cilium-specific companion policy for the broker's API-server path (#680)
+stays deployment-specific: `CiliumNetworkPolicy` is a CNI-vendor CRD, so a
+CNI-agnostic chart must not render it — it would fail to apply on non-Cilium
+clusters.
+
 ## Skill bundles
 
 Skill bundles are directories of operator-authored skill content — a

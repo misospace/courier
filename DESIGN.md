@@ -3765,6 +3765,19 @@ only informs.
   capability health) are implemented behind secure mode, while artifact
   integration and publication (#125), authenticated status semantics (#126),
   and real-cluster e2e acceptance remain outstanding.
+- **The chart owns the deployment-level model-gateway egress policy.** In the
+  run namespace the chart renders one NetworkPolicy that grants the
+  control/coordinator pods egress to the model gateway's pods and to nothing
+  else. Its source selector is not configurable: the chart hardcodes the
+  operator's coordinator label keys, and a chart test asserts the rendered
+  selector's key set is exactly those keys, that each key is stamped on a
+  coordinator pod with the same value, and that the selector matches no
+  worker, broker, or probe pod; its destination (namespace, pod selector,
+  port) comes from values. The policy is unioned with the per-run policy,
+  never a replacement for it, and grants no worker path. The Cilium
+  companion policy for the broker's API-server path (#680) stays
+  deployment-specific, because `CiliumNetworkPolicy` is a CNI-vendor CRD a
+  CNI-agnostic chart must not render.
 - Merge remains a human gate. Neither the target broker nor autonomous roles may
   merge, mutate the queue, or access destinations outside the resolved policy.
   The target coordinator may request permitted publication, but cannot bypass

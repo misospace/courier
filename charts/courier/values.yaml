@@ -210,6 +210,33 @@ secure:
     keySecretKey: "key"
     cidr: ""
     port: 0
+    # -- Model-gateway egress NetworkPolicy, rendered into
+    #    secure.runNamespace (#763): it grants the run namespace's
+    #    control/coordinator pods egress to the model gateway's pods and to
+    #    nothing else. The source selector is not configurable: the chart
+    #    hardcodes the operator's coordinator label keys
+    #    (courier.misospace.dev/component and app.kubernetes.io/component =
+    #    coordinator). A chart test asserts the rendered selector's key set
+    #    is exactly those keys, that each key is stamped on a coordinator pod
+    #    with the same value, and that the selector matches no worker,
+    #    broker, or probe pod. The destination is configured: namespace is
+    #    the namespace holding the gateway's pods, podSelector selects those
+    #    pods, and port is the gateway pod's target port (NetworkPolicy
+    #    ports match the post-DNAT destination port, so this is the pod's
+    #    port). secure.modelGateway.port is the operator's ipBlock pin and
+    #    secure.modelGateway.networkPolicy.port is this policy's port; both
+    #    are post-DNAT gateway ports, and the port in
+    #    secure.modelGateway.url need not equal either. All three unset
+    #    renders no policy; a half-configured block fails the render naming
+    #    the missing field. Configure it for secure installs whose gateway
+    #    path the operator's ipBlock slot does not cover; the deployment's
+    #    hand-authored copy of the same policy can be deleted once this
+    #    block is set and that copy is verified to grant no path beyond the
+    #    model gateway.
+    networkPolicy:
+      namespace: ""
+      podSelector: {}
+      port: 0
 
 # -- Optional Prometheus Operator ServiceMonitor for the controller's
 # metrics endpoint (port 8080). When enabled, renders a `<release>-metrics`
