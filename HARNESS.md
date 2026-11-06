@@ -1201,12 +1201,15 @@ contract its control incarnation assembled — `status.modelSurface`, computed
 by trusted control from production assembly code and persisted through the
 broker's trusted status path before any model request, the capability gate's
 model probes included (#730 review). The encoding
-(`ModelSurfaceSchemaV1`, encoded in `internal/harness`) covers exactly:
+(`ModelSurfaceSchemaV2`, encoded in `internal/harness`) covers exactly:
 the schema version itself; the effective wire transport; the resolved
 role→model bindings; the canonical identities (name plus sha256) of the
 pinned prompt sections — the coordinator and sub-agent framings, the
 soft-stop control turn, the outcome clarification, and the lane's declared
-framing when present; the per-role declared tool-schema identities, read
+framing when present — each with the transcript role it pins under, plus the
+task turn's placement (the role the goal, or a delegate's brief, pins as —
+the task text itself is source-owned and never hashed, but which channel
+carries it is part of the contract); the per-role declared tool-schema identities, read
 from the same production builders the sessions declare, so a wiring change
 (skills, forge) lands in the digest; the fixed-notice identities — the exact
 text (or fmt template) of every refusal, denial, argument rejection,
@@ -1282,7 +1285,8 @@ the failed configured mechanical checks and their bounded output, and the
 durable checkpoint — the plan and the completed briefs — plus the instruction
 to reproduce the failure from that evidence, fix it, re-run the relevant local
 validation, and push to the same run branch rather than open a second pull
-request. The goal is the coordinator's system message, so the contract travels
+request. The goal is the coordinator's user task turn — the message the model
+answers, pinned after the trusted system framing — so the contract travels
 in the goal the run already renders (`COURIER_GOAL`): no second channel and no
 new environment variable. The contract is bounded — per-item and in total, with
 every cut marked — and a run with no repair context renders the goal it

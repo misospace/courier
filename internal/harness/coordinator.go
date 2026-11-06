@@ -389,17 +389,23 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 	if err != nil {
 		return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: err}
 	}
-	session.Pin(Message{Role: "system", Content: strings.TrimSpace(inv.Goal) + "\n\n" + harnessFraming})
+	// The pinned transcript's role split is the production transcript
+	// contract (#762 regression): trusted framing pins as system — harness
+	// framing first, then the lane's, then the skills index (#659), each
+	// bounded the way the loader bounds it so the index can never grow with
+	// the deployment registry mid-incarnation — and the goal pins last as
+	// the user task turn, the message the model answers. Every provider
+	// both transports reach refuses an all-system first turn, and the wire
+	// renderers render roles verbatim: no renderer may re-role trusted
+	// framing to satisfy a provider.
+	session.Pin(Message{Role: "system", Content: harnessFraming})
 	if strings.TrimSpace(inv.Framing) != "" {
 		session.Pin(Message{Role: "system", Content: inv.Framing})
 	}
-	// The run's pinned skills (#659) ride the same pinned boundary as the
-	// framing: composed once from the loader's verified view, bounded by
-	// the loader's and the set's own limits, so the index can never grow
-	// with the deployment registry mid-incarnation.
 	if c.skills != nil {
 		session.Pin(Message{Role: "system", Content: c.skills.Section()})
 	}
+	session.Pin(Message{Role: "user", Content: strings.TrimSpace(inv.Goal)})
 
 	clarifications := 0
 	for {
@@ -1378,13 +1384,18 @@ func (c *Coordinator) runBrief(ctx context.Context, brief Brief) (summary string
 	if err != nil {
 		return safeToolError(err), false, nil
 	}
-	session.Pin(Message{Role: "system", Content: briefText(brief) + "\n\n" + subagentFraming})
+	// The delegate's pinned transcript mirrors the coordinator's role split
+	// (#762 regression): the sub-agent framing pins as system, the skills
+	// index with it (#659), and the brief itself is the user task turn the
+	// model answers.
+	session.Pin(Message{Role: "system", Content: subagentFraming})
 	// Delegated roles load the same pinned skills through the same trusted
 	// tool (#659): the index is identical to the coordinator's, so a brief
 	// that needs a skill does not depend on the coordinator's transcript.
 	if c.skills != nil {
 		session.Pin(Message{Role: "system", Content: c.skills.Section()})
 	}
+	session.Pin(Message{Role: "user", Content: briefText(brief)})
 	// The brief's settled state is re-injected verbatim into every digest:
 	// a delegate that loses its decisions mid-brief must not re-derive them.
 	session.Settle(settledStateBlock(brief))

@@ -975,6 +975,14 @@ type PublicationPolicy struct {
 // ModelSurfaceProvenance.SchemaVersion admits it and every later version.
 const ModelSurfaceSchemaV1 = 1
 
+// ModelSurfaceSchemaV2 adds prompt-section placement to the V1 inputs: every
+// section carries the transcript role it pins under, and the task turn's
+// placement is recorded explicitly (#762 regression). Moving a section
+// between system and user placement — or the task between them — changes the
+// model-visible contract without changing any section text, so the placement
+// is part of the digest.
+const ModelSurfaceSchemaV2 = 2
+
 // ModelSurfaceProvenance is the per-run, per-incarnation identity of the
 // model-visible contract one native control incarnation assembled (#730):
 // a canonical, versioned digest over the trusted identities that determine
