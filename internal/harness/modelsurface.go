@@ -39,6 +39,11 @@ import (
 // role gets the same framing and toolset — so one label covers them all.
 const modelSurfaceSubagentRole = "subagent"
 
+// modelSurfaceTaskTurnRole is the transcript role the pinned task message
+// carries in production session assembly (#762 regression): the coordinator's
+// goal and a delegate's brief pin as the user turn, after the system framing.
+const modelSurfaceTaskTurnRole = "user"
+
 // modelSurface is the canonical versioned preimage. Every text-bearing input
 // contributes as name plus sha256 identity — never as text — so the encoding
 // is bounded and safe to emit in telemetry. Field order is the wire contract;
@@ -60,6 +65,13 @@ type modelSurface struct {
 	// dynamic parts of a templated notice are data the encoding already
 	// carries elsewhere.
 	Notices []modelSurfaceNotice `json:"notices"`
+	// TaskTurn is the transcript role the pinned task message carries — the
+	// goal on the coordinator session, the brief on a delegate session. The
+	// task text itself is source-owned and never hashed, but its placement
+	// is part of the model-visible contract (#762 regression): a session
+	// that pinned the task as system role instead would hand the model the
+	// same words through a different channel, and the digest must move.
+	TaskTurn string `json:"taskTurn"`
 	// ContextPolicy is the canonical JSON of the lane's declared context
 	// policy as admitted; omitted when the lane declares none. Declarations
 	// only: the gateway-verified effective budgets are resolved values and
@@ -78,9 +90,15 @@ type modelSurfaceRole struct {
 	Model string `json:"model"`
 }
 
-// modelSurfaceSection is one canonical pinned prompt section's identity.
+// modelSurfaceSection is one canonical pinned prompt section's identity: the
+// transcript role the section pins under and the digest over its exact text.
+// The role is part of the identity (#762 regression): moving a section
+// between system and user placement changes what the model is told through
+// which channel, so it must change the digest even when the text is
+// identical.
 type modelSurfaceSection struct {
 	Name   string `json:"name"`
+	Role   string `json:"role"`
 	Digest string `json:"digest"`
 }
 
@@ -112,8 +130,8 @@ type ModelSurfaceInputs struct {
 	// transport fails closed exactly as production does.
 	GatewayTransport string
 	// LaneFraming is the lane's additional pinned framing text, when the
-	// lane declares one; it is pinned into the coordinator session between
-	// the goal and the harness framing.
+	// lane declares one; it is pinned into the coordinator session as system
+	// framing, after the harness framing and before the user task turn.
 	LaneFraming string
 	// ContextPolicy is the lane's declared context policy as admitted; nil
 	// when the lane declares none.
@@ -175,8 +193,11 @@ func assembleModelSurface(bindings Bindings, coordinatorTools, subagentTools []T
 		return nil, fmt.Errorf("harness: model-surface digest: %w", err)
 	}
 	surface := modelSurface{
-		SchemaVersion:    courierv1alpha1.ModelSurfaceSchemaV1,
+		SchemaVersion:    courierv1alpha1.ModelSurfaceSchemaV2,
 		GatewayTransport: transport,
+		// The production role split (#762 regression): the task turn is the
+		// user message; every framing section pins system.
+		TaskTurn: modelSurfaceTaskTurnRole,
 	}
 
 	// Selected model bindings: the run's resolved role→model map, sorted by
@@ -186,15 +207,17 @@ func assembleModelSurface(bindings Bindings, coordinatorTools, subagentTools []T
 	}
 
 	// Canonical pinned prompt sections, read from the production constants
-	// the Run path pins. The goal text and the skills section are
-	// deliberately absent: the goal is source-owned task data, and the
-	// skills section embeds workspace-derived descriptions — the pinned
-	// skill pairs below are the trusted skill identity.
+	// the Run path pins, each carrying the transcript role it pins under.
+	// The goal text and the skills section are deliberately absent: the goal
+	// is source-owned task data, and the skills section embeds
+	// workspace-derived descriptions — the pinned skill pairs below are the
+	// trusted skill identity. The task turn's placement is the TaskTurn
+	// field, not a section.
 	sections := []modelSurfaceSection{
-		{Name: "coordinator.framing", Digest: textDigest(harnessFraming)},
-		{Name: "subagent.framing", Digest: textDigest(subagentFraming)},
-		{Name: "control.turn", Digest: textDigest(controlTurnText)},
-		{Name: "outcome.clarification", Digest: textDigest(outcomeClarification)},
+		{Name: "coordinator.framing", Role: "system", Digest: textDigest(harnessFraming)},
+		{Name: "subagent.framing", Role: "system", Digest: textDigest(subagentFraming)},
+		{Name: "control.turn", Role: "system", Digest: textDigest(controlTurnText)},
+		{Name: "outcome.clarification", Role: "user", Digest: textDigest(outcomeClarification)},
 	}
 	// The lane's framing pins verbatim when it exists: Run pins the raw
 	// text the invocation carries, so the digest hashes the exact bytes and
@@ -202,7 +225,7 @@ func assembleModelSurface(bindings Bindings, coordinatorTools, subagentTools []T
 	// whitespace-only framing change is a prompt change and moves the
 	// digest (#730 review).
 	if strings.TrimSpace(inputs.LaneFraming) != "" {
-		sections = append(sections, modelSurfaceSection{Name: "lane.framing", Digest: textDigest(inputs.LaneFraming)})
+		sections = append(sections, modelSurfaceSection{Name: "lane.framing", Role: "system", Digest: textDigest(inputs.LaneFraming)})
 	}
 	sort.Slice(sections, func(i, j int) bool { return sections[i].Name < sections[j].Name })
 	surface.Sections = sections

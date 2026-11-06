@@ -3452,22 +3452,19 @@ func TestSuppliedHTTPClientKeepsOwnership(t *testing.T) {
 	}
 }
 
-// Regression for #731: the pinned coordinator transcript is all system role,
-// and the OpenAI-compatible wire renderer sent it verbatim — providers that
-// require at least one user query refused every first turn with
-// "No user query found in messages", so no role-bound turn ever terminalized
-// and no earned heartbeat could ever land. Mirror #724's promotion: the first
-// pinned system message — the goal, the task itself — becomes the user turn
-// verbatim, nothing invented; the framing and the skills index after it stay
-// system, the same rule the Anthropic renderer applies (the skill-canary
-// requires the composed index to reach the model as a system message).
-func TestOpenAIAllSystemTranscriptPromotesTheGoalToUserTurn(t *testing.T) {
+// The production pinned shape renders verbatim on the OpenAI-compatible
+// wire (#762 regression): trusted framing — the harness framing, the lane's,
+// the skills index — stays system role, and the goal pins last as the user
+// task turn. The renderer re-roles nothing; the transcript's own role split
+// is what satisfies providers that require a user query.
+func TestOpenAIRendersTheProductionPinnedShapeVerbatim(t *testing.T) {
 	gateway, mock, close := gatewayFor(gatewayResponse{body: sse(contentChunk("ok"), finishChunk("stop"))})
 	defer close()
 	transcript := []Message{
-		{Role: "system", Content: "goal: land the fix"},
-		{Role: "system", Content: "harness framing: bounded steps"},
+		{Role: "system", Content: harnessFraming},
+		{Role: "system", Content: "lane framing: production native canary"},
 		{Role: "system", Content: "skills index: shell, git"},
+		{Role: "user", Content: "goal: land the fix"},
 	}
 	if _, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "qwen3.8-27b", Messages: transcript}); err != nil {
 		t.Fatal(err)
@@ -3484,41 +3481,20 @@ func TestOpenAIAllSystemTranscriptPromotesTheGoalToUserTurn(t *testing.T) {
 	if err := json.Unmarshal([]byte(mock.calls[0].rawBody), &wire); err != nil {
 		t.Fatal(err)
 	}
-	if len(wire.Messages) != 3 {
-		t.Fatalf("messages = %d entries; want all three pinned messages rendered", len(wire.Messages))
+	if len(wire.Messages) != 4 {
+		t.Fatalf("messages = %d entries; want the pinned shape rendered in full", len(wire.Messages))
 	}
-	if wire.Messages[0].Role != "user" || wire.Messages[0].Content != "goal: land the fix" {
-		t.Fatalf("first message = %+v; want the goal promoted to the user turn verbatim", wire.Messages[0])
+	wantRoles := []string{"system", "system", "system", "user"}
+	for i, want := range wantRoles {
+		if wire.Messages[i].Role != want {
+			t.Fatalf("message %d role = %q; want %q", i, wire.Messages[i].Role, want)
+		}
 	}
-	if wire.Messages[1].Role != "system" || wire.Messages[1].Content != "harness framing: bounded steps" {
-		t.Fatalf("second message = %+v; want the framing left in place as system", wire.Messages[1])
+	if wire.Messages[3].Content != "goal: land the fix" {
+		t.Fatalf("task turn = %q; want the goal verbatim as the user turn", wire.Messages[3].Content)
 	}
-	if wire.Messages[2].Role != "system" || wire.Messages[2].Content != "skills index: shell, git" {
-		t.Fatalf("last message = %+v; want the skills index left in place as system", wire.Messages[2])
-	}
-}
-
-// The single-pinned-message edge of #731: with one system message and nothing
-// else, the whole pinned message becomes the user turn.
-func TestOpenAISingleSystemMessageBecomesTheUserTurn(t *testing.T) {
-	gateway, mock, close := gatewayFor(gatewayResponse{body: sse(contentChunk("ok"), finishChunk("stop"))})
-	defer close()
-	if _, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "qwen3.8-27b", Messages: []Message{
-		{Role: "system", Content: "goal: land the fix"},
-	}}); err != nil {
-		t.Fatal(err)
-	}
-	var wire struct {
-		Messages []struct {
-			Role    string `json:"role"`
-			Content string `json:"content"`
-		} `json:"messages"`
-	}
-	if err := json.Unmarshal([]byte(mock.calls[0].rawBody), &wire); err != nil {
-		t.Fatal(err)
-	}
-	if len(wire.Messages) != 1 || wire.Messages[0].Role != "user" || wire.Messages[0].Content != "goal: land the fix" {
-		t.Fatalf("messages = %+v; want the single pinned message promoted to the user turn verbatim", wire.Messages)
+	if wire.Messages[0].Content != harnessFraming {
+		t.Fatalf("framing message = %q; want the harness framing verbatim as system", wire.Messages[0].Content)
 	}
 }
 
@@ -3580,5 +3556,134 @@ func TestOpenAIAllEmptySystemTranscriptPromotesNothing(t *testing.T) {
 	}
 	if len(wire.Messages) != 1 || wire.Messages[0].Role != "system" {
 		t.Fatalf("messages = %+v; want the empty system message rendered unchanged, nothing promoted", wire.Messages)
+	}
+}
+
+// decodeFirstRequest decodes the messages array of one captured request body.
+func decodeFirstRequest(t *testing.T, raw string) []struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+} {
+	t.Helper()
+	var wire struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(raw), &wire); err != nil {
+		t.Fatalf("decode request: %v", err)
+	}
+	return wire.Messages
+}
+
+// The real coordinator assembly path (#764 review): Run pins the trusted
+// framing — harness framing, lane framing, skills index — as system role and
+// the goal last as the user task turn, and the first model request the
+// coordinator sends carries exactly that shape. Hand-built transcripts assert
+// the renderer; this asserts the assembly.
+func TestCoordinatorRunPinsFramingSystemAndGoalUser(t *testing.T) {
+	skillSet := surfaceSkillSet(t)
+	gateway, mock, cleanup := gatewayFor(
+		gatewayResponse{body: sse(contentChunk(`{"outcome":"blocked_external","missing":"x"}`), finishChunk("stop"))},
+	)
+	defer cleanup()
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Transport: gateway,
+		Bindings:  testBindings(),
+		Skills:    skillSet,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inv := testInvocation()
+	inv.Framing = "lane framing: production native canary"
+	result := coordinator.Run(context.Background(), inv)
+	if result.Outcome != executor.OutcomeBlockedExternal {
+		t.Fatalf("outcome = %q (%v)", result.Outcome, result.Err)
+	}
+	if mock.requestCount() < 1 {
+		t.Fatal("the coordinator sent no model request")
+	}
+	messages := decodeFirstRequest(t, mock.calls[0].rawBody)
+	wantRoles := []string{"system", "system", "system", "user"}
+	wantContent := []string{harnessFraming, inv.Framing, skillSet.Section(), inv.Goal}
+	if len(messages) != len(wantRoles) {
+		t.Fatalf("first request carries %d messages; want the pinned shape in full: %+v", len(messages), messages)
+	}
+	for i := range wantRoles {
+		if messages[i].Role != wantRoles[i] {
+			t.Fatalf("pinned message %d role = %q; want %q", i, messages[i].Role, wantRoles[i])
+		}
+		if messages[i].Content != wantContent[i] {
+			t.Fatalf("pinned message %d content = %q; want the production section verbatim", i, messages[i].Content)
+		}
+	}
+	if got := strings.Count(mock.calls[0].rawBody, inv.Goal); got != 1 {
+		t.Fatalf("the goal appears %d times in the first request; want exactly once", got)
+	}
+}
+
+// The real delegate assembly path (#764 review): the coordinator requests a
+// delegation, the brief's own session is seeded through runBrief, and the
+// delegate session's first model request carries the sub-agent framing and
+// the skills index as system role with the brief itself as the user task
+// turn, exactly once.
+func TestDelegateSessionPinsFramingSystemAndBriefUser(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.completeAll = true
+	worker.snapshotTip = "snap-tip"
+	skillSet := surfaceSkillSet(t)
+	gateway, mock, cleanup := gatewayFor(
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-1", toolDelegate, `{"id":"b1","role":"coder","objective":"Do the work","successCheck":"tests pass"}`),
+			finishChunk("tool_calls"),
+		)},
+		gatewayResponse{body: sse(contentChunk("brief done"), finishChunk("stop"))},
+		gatewayResponse{body: sse(contentChunk(`{"outcome":"blocked_external","missing":"x"}`), finishChunk("stop"))},
+	)
+	defer cleanup()
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Transport: gateway,
+		Bindings:  testBindings(),
+		Worker:    delegator,
+		Snapshot:  snapshotProvider("snap-tip"),
+		Skills:    skillSet,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := coordinator.Run(context.Background(), testInvocation())
+	if result.Outcome != executor.OutcomeBlockedExternal {
+		t.Fatalf("outcome = %q (%v)", result.Outcome, result.Err)
+	}
+	if mock.requestCount() != 3 {
+		t.Fatalf("captured %d requests; want coordinator, delegate, coordinator", mock.requestCount())
+	}
+	// The coordinator's own first request carries the goal as the user turn.
+	coordinatorMessages := decodeFirstRequest(t, mock.calls[0].rawBody)
+	if len(coordinatorMessages) < 2 || coordinatorMessages[len(coordinatorMessages)-1].Role != "user" || coordinatorMessages[len(coordinatorMessages)-1].Content != "Resolve the issue." {
+		t.Fatalf("coordinator first request = %+v; want the goal as the final user turn", coordinatorMessages)
+	}
+	// The brief session's first request: sub-agent framing and skills index
+	// as system, the brief as the user task turn.
+	brief := Brief{ID: "b1", Role: "coder", Objective: "Do the work", SuccessCheck: "tests pass"}
+	delegateMessages := decodeFirstRequest(t, mock.calls[1].rawBody)
+	wantRoles := []string{"system", "system", "user"}
+	wantContent := []string{subagentFraming, skillSet.Section(), briefText(brief)}
+	if len(delegateMessages) != len(wantRoles) {
+		t.Fatalf("delegate first request carries %d messages; want the pinned shape in full: %+v", len(delegateMessages), delegateMessages)
+	}
+	for i := range wantRoles {
+		if delegateMessages[i].Role != wantRoles[i] {
+			t.Fatalf("delegate pinned message %d role = %q; want %q", i, delegateMessages[i].Role, wantRoles[i])
+		}
+		if delegateMessages[i].Content != wantContent[i] {
+			t.Fatalf("delegate pinned message %d content = %q; want the production section verbatim", i, delegateMessages[i].Content)
+		}
+	}
+	if got := strings.Count(mock.calls[1].rawBody, "Do the work"); got != 1 {
+		t.Fatalf("the brief objective appears %d times in the delegate's first request; want exactly once", got)
 	}
 }

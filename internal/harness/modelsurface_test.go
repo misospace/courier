@@ -83,14 +83,48 @@ func TestModelSurfaceIsStable(t *testing.T) {
 	if string(first.Encoding) != string(second.Encoding) {
 		t.Fatalf("canonical encoding is not stable:\n%s\n%s", first.Encoding, second.Encoding)
 	}
-	if first.SchemaVersion != courierv1alpha1.ModelSurfaceSchemaV1 {
-		t.Fatalf("schema version = %d, want %d", first.SchemaVersion, courierv1alpha1.ModelSurfaceSchemaV1)
+	if first.SchemaVersion != courierv1alpha1.ModelSurfaceSchemaV2 {
+		t.Fatalf("schema version = %d, want %d", first.SchemaVersion, courierv1alpha1.ModelSurfaceSchemaV2)
 	}
 	// The digest is the sha256 of the canonical encoding, verifiable
 	// independently of the implementation.
 	sum := sha256.Sum256(first.Encoding)
 	if want := "sha256:" + hex.EncodeToString(sum[:]); first.Digest != want {
 		t.Fatalf("digest = %s, want %s (sha256 of the canonical encoding)", first.Digest, want)
+	}
+}
+
+// TestModelSurfaceEncodesPlacement pins the placement inputs of the V2
+// encoding: every section records the transcript role it pins under, and the
+// task turn's placement is explicit (#762 regression). An encoder that stops
+// carrying placement — or a production shape that moves a section between
+// roles — fails here instead of silently keeping a placement-blind digest.
+func TestModelSurfaceEncodesPlacement(t *testing.T) {
+	surface, err := modelsurfaceCoordinator(t, nil).ModelSurface(ModelSurfaceInputs{GatewayTransport: "openai"})
+	if err != nil {
+		t.Fatalf("compute: %v", err)
+	}
+	var decoded modelSurface
+	if err := json.Unmarshal(surface.Encoding, &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if decoded.TaskTurn != modelSurfaceTaskTurnRole {
+		t.Fatalf("task turn placement = %q; want %q", decoded.TaskTurn, modelSurfaceTaskTurnRole)
+	}
+	roles := make(map[string]string, len(decoded.Sections))
+	for _, section := range decoded.Sections {
+		roles[section.Name] = section.Role
+	}
+	want := map[string]string{
+		"coordinator.framing":   "system",
+		"subagent.framing":      "system",
+		"control.turn":          "system",
+		"outcome.clarification": "user",
+	}
+	for name, role := range want {
+		if roles[name] != role {
+			t.Fatalf("section %q placement = %q; want %q", name, roles[name], role)
+		}
 	}
 }
 
@@ -199,6 +233,30 @@ func TestModelSurfaceMaterialChanges(t *testing.T) {
 	}
 	if "sha256:"+hex.EncodeToString(textDigestBytes(mutated)) == base.Digest {
 		t.Fatal("a changed fixed-notice identity did not change the digest")
+	}
+
+	// A changed section placement — the transcript role a section pins
+	// under — must change the digest too (#762 regression): the same words
+	// through a different channel are a different model-visible contract.
+	decoded.Sections[0].Role = "user"
+	mutated, err = json.Marshal(decoded)
+	if err != nil {
+		t.Fatalf("re-encode: %v", err)
+	}
+	if "sha256:"+hex.EncodeToString(textDigestBytes(mutated)) == base.Digest {
+		t.Fatal("a changed section placement did not change the digest")
+	}
+
+	// A changed task-turn placement must change the digest: the task text
+	// itself is never hashed (source-owned data), so the placement field is
+	// the only record of which channel carried it.
+	decoded.TaskTurn = "system"
+	mutated, err = json.Marshal(decoded)
+	if err != nil {
+		t.Fatalf("re-encode: %v", err)
+	}
+	if "sha256:"+hex.EncodeToString(textDigestBytes(mutated)) == base.Digest {
+		t.Fatal("a changed task-turn placement did not change the digest")
 	}
 
 	// Representative material changes through the production inputs, each
