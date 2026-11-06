@@ -14,16 +14,16 @@ import (
 // ErrDuplicateBrief reports a dispatch of a briefID that already exists in
 // the run. Brief IDs identify work units: two executions of one ID would
 // double-apply work, so the second is always rejected.
-var ErrDuplicateBrief = errors.New("harness: brief ID already exists in this run")
+var ErrDuplicateBrief = errors.New(noticeBriefDuplicate)
 
 // ErrBriefCancelled reports dispatch or retry of a brief whose work unit was
 // cancelled. A tombstone is final for the work unit: new work needs a new
 // brief ID.
-var ErrBriefCancelled = errors.New("harness: brief is cancelled and cannot run again")
+var ErrBriefCancelled = errors.New(noticeBriefCancelledLedger)
 
 // ErrBriefUnknown reports an operation against a brief ID control never
 // registered.
-var ErrBriefUnknown = errors.New("harness: unknown brief ID")
+var ErrBriefUnknown = errors.New(noticeBriefUnknown)
 
 // Brief is one typed delegation unit (HARNESS.md §5). It carries a stable
 // briefID unique within the run, the objective, settled decisions with exact
@@ -64,23 +64,23 @@ type BriefResult struct {
 // worker protocol carries operation IDs derived from it.
 func (b Brief) Validate() error {
 	if strings.TrimSpace(b.ID) == "" {
-		return errors.New("harness: brief requires an ID")
+		return errors.New(noticeBriefRequiresID)
 	}
 	if !isBriefID(b.ID) {
-		return errors.New("harness: brief ID must be letters, digits, dots, dashes, or underscores")
+		return errors.New(noticeBriefIDAlphabet)
 	}
 	if strings.TrimSpace(b.Role) == "" {
-		return errors.New("harness: brief requires a role")
+		return errors.New(noticeBriefRequiresRole)
 	}
 	if strings.TrimSpace(b.Objective) == "" {
-		return errors.New("harness: brief requires an objective")
+		return errors.New(noticeBriefRequiresObjective)
 	}
 	if strings.TrimSpace(b.SuccessCheck) == "" {
-		return errors.New("harness: brief requires an observable success check")
+		return errors.New(noticeBriefRequiresCheck)
 	}
 	for _, decision := range b.Decisions {
 		if strings.TrimSpace(decision.Summary) == "" || strings.TrimSpace(decision.Value) == "" {
-			return errors.New("harness: brief decisions must carry a summary and an exact value")
+			return errors.New(noticeBriefDecisionShape)
 		}
 	}
 	return nil

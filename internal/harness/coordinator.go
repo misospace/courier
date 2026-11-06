@@ -1067,28 +1067,28 @@ func (c *Coordinator) runTool(ctx context.Context, call ToolCall, briefID string
 	case toolCheck:
 		if subagent {
 			result.IsError = true
-			result.Content = "tracked checks are not available to sub-agents"
+			result.Content = noticeSubagentChecks
 			return result
 		}
 		return c.runCheck(ctx, call, briefID, result)
 	case toolDelegate:
 		if subagent {
 			result.IsError = true
-			result.Content = "delegation is not available to sub-agents"
+			result.Content = noticeSubagentDelegate
 			return result
 		}
 		return c.runDelegate(ctx, call, result)
 	case toolCancelBrief:
 		if subagent {
 			result.IsError = true
-			result.Content = "cancellation is not available to sub-agents"
+			result.Content = noticeSubagentCancel
 			return result
 		}
 		return c.runCancelBrief(ctx, call, result)
 	case toolForge:
 		if subagent {
 			result.IsError = true
-			result.Content = "forge operations are not available to sub-agents"
+			result.Content = noticeSubagentForge
 			return result
 		}
 		return c.runForge(ctx, call, result)
@@ -1098,7 +1098,7 @@ func (c *Coordinator) runTool(ctx context.Context, call ToolCall, briefID string
 		return c.runSkill(call, result)
 	default:
 		result.IsError = true
-		result.Content = fmt.Sprintf("unknown tool %q", call.Name)
+		result.Content = fmt.Sprintf(noticeUnknownToolFmt, call.Name)
 		return result
 	}
 }
@@ -1113,7 +1113,7 @@ func (c *Coordinator) runTool(ctx context.Context, call ToolCall, briefID string
 func (c *Coordinator) runShell(ctx context.Context, call ToolCall, briefID string, result ToolResult) ToolResult {
 	if c.worker == nil {
 		result.IsError = true
-		result.Content = "no worker is configured in this build"
+		result.Content = noticeNoWorker
 		return result
 	}
 	if briefID == "" {
@@ -1121,7 +1121,7 @@ func (c *Coordinator) runShell(ctx context.Context, call ToolCall, briefID strin
 	}
 	if briefID != "control" && c.briefs.Cancelled(briefID) {
 		result.IsError = true
-		result.Content = fmt.Sprintf("brief %s is cancelled", briefID)
+		result.Content = fmt.Sprintf(noticeBriefCancelledFmt, briefID)
 		return result
 	}
 	var args struct {
@@ -1130,7 +1130,7 @@ func (c *Coordinator) runShell(ctx context.Context, call ToolCall, briefID strin
 	}
 	if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil || strings.TrimSpace(args.Command) == "" {
 		result.IsError = true
-		result.Content = "shell arguments must carry a command string"
+		result.Content = noticeShellArgs
 		return result
 	}
 	var err error
@@ -1142,7 +1142,7 @@ func (c *Coordinator) runShell(ctx context.Context, call ToolCall, briefID strin
 	}
 	if err != nil {
 		result.IsError = true
-		result.Content = "workspace snapshot is unavailable"
+		result.Content = noticeSnapshotUnavailable
 		return result
 	}
 	// Only model-influenced tasks carry the applied bootstrap environment
@@ -1194,7 +1194,7 @@ func (c *Coordinator) runDelegate(ctx context.Context, call ToolCall, result Too
 	// the model can validate, commit, and publish what it has.
 	if c.control.Stopped() {
 		result.IsError = true
-		result.Content = "a soft stop is in effect: this incarnation dispatches no new briefs; let in-flight work stand, run final validation, and declare your outcome"
+		result.Content = noticeSoftStop
 		return result
 	}
 	var args struct {
@@ -1208,7 +1208,7 @@ func (c *Coordinator) runDelegate(ctx context.Context, call ToolCall, result Too
 	}
 	if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
 		result.IsError = true
-		result.Content = "delegate arguments must be a JSON object"
+		result.Content = noticeDelegateArgs
 		return result
 	}
 	brief := Brief{
@@ -1230,7 +1230,7 @@ func (c *Coordinator) runDelegate(ctx context.Context, call ToolCall, result Too
 	}
 	if c.bindings.Model(brief.Role) == "" {
 		result.IsError = true
-		result.Content = fmt.Sprintf("no model is bound to role %q", brief.Role)
+		result.Content = fmt.Sprintf(noticeRoleUnboundFmt, brief.Role)
 		return result
 	}
 	registered, err := c.briefs.Register(brief)
@@ -1266,7 +1266,7 @@ func (c *Coordinator) runDelegate(ctx context.Context, call ToolCall, result Too
 		// redacted, never the provider body.
 		c.recordDeferredAvailability(unavailable)
 		result.IsError = true
-		result.Content = "the delegated model binding is temporarily unavailable; the run ends recoverably and this brief's incomplete work is not integrated"
+		result.Content = noticeBindingUnavailable
 		return result
 	}
 	if !completed {
@@ -1461,7 +1461,7 @@ func (c *Coordinator) runCancelBrief(ctx context.Context, call ToolCall, result 
 	}
 	if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil || strings.TrimSpace(args.ID) == "" {
 		result.IsError = true
-		result.Content = "cancel_brief arguments must carry the brief ID"
+		result.Content = noticeCancelArgs
 		return result
 	}
 	if _, err := c.briefs.Cancel(args.ID); err != nil {
@@ -1469,14 +1469,14 @@ func (c *Coordinator) runCancelBrief(ctx context.Context, call ToolCall, result 
 		result.Content = safeToolError(err)
 		return result
 	}
-	result.Content = "brief " + args.ID + " is cancelled; new work under this ID is rejected"
+	result.Content = fmt.Sprintf(noticeBriefCancelledDoneFmt, args.ID)
 	return result
 }
 
 func (c *Coordinator) runForge(ctx context.Context, call ToolCall, result ToolResult) ToolResult {
 	if c.forge == nil {
 		result.IsError = true
-		result.Content = "forge operations are unavailable in this build"
+		result.Content = noticeForgeSeamless
 		return result
 	}
 	var args struct {
@@ -1485,7 +1485,7 @@ func (c *Coordinator) runForge(ctx context.Context, call ToolCall, result ToolRe
 	}
 	if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
 		result.IsError = true
-		result.Content = "forge arguments must be a JSON object"
+		result.Content = noticeForgeArgs
 		return result
 	}
 	content, err := c.forge.Call(ctx, args.Operation, string(args.Arguments))
@@ -1874,7 +1874,7 @@ func (c *Coordinator) materializeSnapshot(ctx context.Context, briefID string, s
 	c.snapshotMu.Lock()
 	defer c.snapshotMu.Unlock()
 	if c.worker == nil {
-		err := errors.New("no worker is configured in this build")
+		err := errors.New(noticeNoWorker)
 		c.observePrerequisite(err)
 		return err
 	}

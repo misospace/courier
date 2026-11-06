@@ -1195,7 +1195,12 @@ pinned prompt sections — the coordinator and sub-agent framings, the
 soft-stop control turn, the outcome clarification, and the lane's declared
 framing when present; the per-role declared tool-schema identities, read
 from the same production builders the sessions declare, so a wiring change
-(skills, forge) lands in the digest; the pinned skill name+digest pairs;
+(skills, forge) lands in the digest; the fixed-notice identities — the exact
+text (or fmt template) of every refusal, denial, argument rejection,
+compaction-header line, and skill-result scaffolding line trusted control's
+own tool paths can put in front of the model, read from the same constants
+the tool paths emit, so an edit to any fixed notice lands in the digest
+(#730 review); the pinned skill name+digest pairs;
 the lane's declared context policy (canonical JSON of the declarations —
 never the gateway-verified effective budgets); and the pinned
 acceptance-criteria set digest. Equivalent contracts produce the same
@@ -1222,7 +1227,11 @@ goal is source-owned task data and those are workspace state); nothing
 about model behavior or output; nothing about the gateway endpoint, key,
 or the provider behind it; nothing about the worker-side environment the
 model's commands run in; nothing about runtime-resolved values (verified
-input limits, probe results); and it is not an authorization grant — the
+input limits, probe results); nothing about the dynamic parts of a
+templated notice (brief IDs, role names, the visible-skill list) or the
+validation errors that quote model-provided arguments — those are data, and
+their trusted identity rides the covered identities above; and it is not an
+authorization grant — the
 run's authority lives in the broker policy and the role boundary, not in
 this digest. It is computed by the same trusted binary it describes, so it
 binds the surface only under the trusted-control assumptions of §3; it is

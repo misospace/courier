@@ -53,6 +53,13 @@ type modelSurface struct {
 	Sections         []modelSurfaceSection      `json:"sections"`
 	Tools            []modelSurfaceTool         `json:"tools"`
 	Skills           []courierv1alpha1.SkillPin `json:"skills"`
+	// Notices is the fixed-notice table: the exact text (or fmt template) of
+	// every refusal, denial, argument rejection, compaction-header line, and
+	// skill-result scaffolding line trusted control's own tool paths can put
+	// in front of the model (#730 review). Names and digests only; the
+	// dynamic parts of a templated notice are data the encoding already
+	// carries elsewhere.
+	Notices []modelSurfaceNotice `json:"notices"`
 	// ContextPolicy is the canonical JSON of the lane's declared context
 	// policy as admitted; omitted when the lane declares none. Declarations
 	// only: the gateway-verified effective budgets are resolved values and
@@ -82,6 +89,14 @@ type modelSurfaceSection struct {
 // declaration (name, description, canonical parameter schema).
 type modelSurfaceTool struct {
 	Role   string `json:"role"`
+	Name   string `json:"name"`
+	Digest string `json:"digest"`
+}
+
+// modelSurfaceNotice is one fixed notice's identity: the stable name of the
+// notice and the digest over its exact fixed text or fmt template — the same
+// constants the emitting tool paths use verbatim.
+type modelSurfaceNotice struct {
 	Name   string `json:"name"`
 	Digest string `json:"digest"`
 }
@@ -209,6 +224,22 @@ func assembleModelSurface(bindings Bindings, coordinatorTools, subagentTools []T
 			})
 		}
 	}
+
+	// Fixed notices: the exact text (or fmt template) of every refusal,
+	// denial, argument rejection, compaction-header line, and skill-result
+	// scaffolding line trusted control's own tool paths can put in front of
+	// the model (#730 review). The table holds the same constants the tool
+	// paths emit verbatim, so an edit to any fixed notice changes the
+	// digest; the dynamic parts of a templated notice are data the encoding
+	// already carries elsewhere.
+	surface.Notices = make([]modelSurfaceNotice, 0, len(fixedNoticeTable))
+	for _, notice := range fixedNoticeTable {
+		surface.Notices = append(surface.Notices, modelSurfaceNotice{
+			Name:   notice.name,
+			Digest: textDigest(notice.text),
+		})
+	}
+	sort.Slice(surface.Notices, func(i, j int) bool { return surface.Notices[i].Name < surface.Notices[j].Name })
 
 	// Pinned skill name+digest pairs, from the run's persisted envelope.
 	if strings.TrimSpace(inputs.SkillsJSON) != "" {

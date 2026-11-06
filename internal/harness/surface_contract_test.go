@@ -342,6 +342,100 @@ func TestModelVisibleSurfaceContract(t *testing.T) {
 		surfaceSubagentSurface(t, nil),
 	}
 
+	// The digest drift guard (#730 review): every fixed notice the tool
+	// paths emit — harvested above by driving the production paths — must
+	// be pinned in the model-surface digest, either by its exact constant
+	// digest or, for a templated notice, by its slug with the template
+	// rendered against the same fixture the harvest used. A new literal in
+	// a tool path that never entered the fixed-notice table fails here.
+	t.Run("every fixed notice is pinned in the model-surface digest", func(t *testing.T) {
+		surface, err := AssembleModelSurface(testBindings(), nil, nil, ModelSurfaceInputs{GatewayTransport: "openai"})
+		if err != nil {
+			t.Fatalf("assemble: %v", err)
+		}
+		var decoded modelSurface
+		if err := json.Unmarshal(surface.Encoding, &decoded); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		digests := make(map[string]struct{}, len(decoded.Notices)+len(decoded.Sections))
+		names := make(map[string]struct{}, len(decoded.Notices))
+		for _, notice := range decoded.Notices {
+			digests[notice.Digest] = struct{}{}
+			names[notice.Name] = struct{}{}
+		}
+		// The control turn and the outcome clarification are pinned as
+		// Sections, not notices.
+		for _, section := range decoded.Sections {
+			digests[section.Digest] = struct{}{}
+		}
+		// The templated notices render against the same fixtures the
+		// harvest used; the digest pins the template, not the rendering.
+		templated := map[string]string{
+			"shell.brief-cancelled": fmt.Sprintf(noticeBriefCancelledFmt, "tombstoned"),
+			"tool.unknown":          fmt.Sprintf(noticeUnknownToolFmt, "surface-mystery"),
+		}
+		for _, roleSurface := range surfaces {
+			for _, section := range roleSurface.sections {
+				// The pinned framing and skills sections are the digest's
+				// Sections list, not the notice table; only the tool paths'
+				// own fixed output is guarded here.
+				if !strings.HasPrefix(section.owner, "notice:") && !strings.HasPrefix(section.owner, "skill result:") {
+					continue
+				}
+				if _, pinned := digests[textDigest(section.text)]; pinned {
+					continue
+				}
+				// The templated notices render against the same fixtures the
+				// harvest used; the digest pins the template, not the
+				// rendering. The compaction harvest is a composite — header
+				// template plus dynamic digest lines — so a prefix match,
+				// and a ledger sentinel wrapped with a dynamic ID renders
+				// as prefix plus the ID.
+				prefixPinned := []struct{ slug, prefix string }{
+					{"compaction.header", fmt.Sprintf(noticeCompactedFmt, 2)},
+					{"brief.unknown", noticeBriefUnknown},
+					{"brief.duplicate", noticeBriefDuplicate},
+					{"brief.cancelled-ledger", noticeBriefCancelledLedger},
+				}
+				matched := false
+				for slug, rendered := range templated {
+					if section.text != rendered {
+						continue
+					}
+					if _, hasSlug := names[slug]; !hasSlug {
+						t.Fatalf("notice %q renders the harvested text but its slug is not pinned: %q", slug, section.owner)
+					}
+					matched = true
+					break
+				}
+				for _, pinned := range prefixPinned {
+					if !strings.HasPrefix(section.text, pinned.prefix) {
+						continue
+					}
+					if _, hasSlug := names[pinned.slug]; !hasSlug {
+						t.Fatalf("notice %q renders the harvested text but its slug is not pinned: %q", pinned.slug, section.owner)
+					}
+					matched = true
+					break
+				}
+				if matched {
+					continue
+				}
+				if strings.HasPrefix(section.owner, "skill result:") {
+					// The skill-result bodies are data whose identity rides
+					// the pinned skill pairs; the scaffolding around them —
+					// the repository banner or the asset listing — must be
+					// pinned.
+					if !strings.Contains(section.text, noticeSkillRepoBanner) && !strings.Contains(section.text, noticeSkillAssetsFmt) && !strings.Contains(section.text, fmt.Sprintf(noticeSkillRepoFilesFmt, "surface-fixture-repo")) {
+						t.Fatalf("harvested skill result %q carries no pinned scaffolding", section.owner)
+					}
+					continue
+				}
+				t.Fatalf("harvested fixed notice %q is not pinned in the model-surface digest: %q", section.owner, section.text)
+			}
+		}
+	})
+
 	t.Run("tool references exist for the instructed role", func(t *testing.T) {
 		// Failure mode 1 (and the text half of 4): every tool a role's
 		// model-visible text instructs it to use must be declared to that

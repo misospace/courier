@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"sort"
 	"strings"
 	"testing"
 
@@ -188,6 +189,18 @@ func TestModelSurfaceMaterialChanges(t *testing.T) {
 		t.Fatal("a changed section identity did not change the digest")
 	}
 
+	// A changed notice digest — the preimage's representation of an edit to
+	// a fixed refusal, denial, compaction-header line, or skill-result
+	// scaffolding — must change the digest too (#730 review).
+	decoded.Notices[0].Digest = "sha256:" + strings.Repeat("e", 64)
+	mutated, err = json.Marshal(decoded)
+	if err != nil {
+		t.Fatalf("re-encode: %v", err)
+	}
+	if "sha256:"+hex.EncodeToString(textDigestBytes(mutated)) == base.Digest {
+		t.Fatal("a changed fixed-notice identity did not change the digest")
+	}
+
 	// Representative material changes through the production inputs, each
 	// of which must move the digest. A nil skillSet builds a skillless
 	// coordinator — the wiring difference is itself a material change.
@@ -238,6 +251,48 @@ func TestModelSurfaceMaterialChanges(t *testing.T) {
 				t.Fatalf("%s did not change the digest", variation.name)
 			}
 		})
+	}
+}
+
+// TestModelSurfaceCarriesEveryFixedNotice pins the fixed-notice coverage the
+// #730 review required: the canonical encoding carries the production
+// fixed-notice table — name plus digest over the exact text or fmt template
+// the tool paths emit — so a material change to any fixed refusal, denial,
+// argument rejection, compaction-header line, or skill-result scaffolding
+// changes the digest. The encoding sorts by name and the table's names are
+// unique, so the encoding is byte-deterministic for the same table.
+func TestModelSurfaceCarriesEveryFixedNotice(t *testing.T) {
+	surface, err := modelsurfaceCoordinator(t, nil).ModelSurface(ModelSurfaceInputs{GatewayTransport: "openai"})
+	if err != nil {
+		t.Fatalf("compute: %v", err)
+	}
+	var decoded modelSurface
+	if err := json.Unmarshal(surface.Encoding, &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(decoded.Notices) != len(fixedNoticeTable) {
+		t.Fatalf("encoding carries %d notices, want the table's %d", len(decoded.Notices), len(fixedNoticeTable))
+	}
+	byDigest := make(map[string]string, len(decoded.Notices))
+	for _, notice := range decoded.Notices {
+		if _, dup := byDigest[notice.Digest]; dup {
+			t.Fatalf("encoding carries duplicate notice digest %s", notice.Digest)
+		}
+		byDigest[notice.Digest] = notice.Name
+	}
+	expected := make([]string, 0, len(fixedNoticeTable))
+	for _, notice := range fixedNoticeTable {
+		expected = append(expected, notice.name)
+		digest := textDigest(notice.text)
+		if byDigest[digest] != notice.name {
+			t.Fatalf("notice %q: the encoding does not carry its exact digest %s (the digest belongs to %q)", notice.name, digest, byDigest[digest])
+		}
+	}
+	sort.Strings(expected)
+	for i, name := range expected {
+		if got := decoded.Notices[i].Name; got != name {
+			t.Fatalf("encoding notices[%d].name = %q, want the sorted %q", i, got, name)
+		}
 	}
 }
 
