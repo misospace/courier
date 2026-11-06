@@ -109,24 +109,16 @@ type wireAssistantToolCall struct {
 }
 
 // toWireMessages renders the normalized transcript into the OpenAI-compatible
-// messages array. An all-system transcript — the pinned first turn: the goal
-// plus harness framing, optional lane framing, the skills index, all Role
-// "system" — is refused by OpenAI-compatible providers that require at least
-// one user query (#731): the first pinned system message is promoted to the
-// user turn verbatim, nothing invented, exactly as the Anthropic wire renderer
-// promotes it for the Messages API (#724). The first pinned message carries
-// the goal — the task itself — so it is the one that becomes the turn; the
-// framing and the skills index after it stay system role, because they are
-// framing the model reads as system state, never the task. Any non-system
-// message — every later turn carries assistant or tool messages — renders
-// verbatim.
+// messages array, verbatim. The all-system first turn that once required a
+// wire-level role promotion cannot occur: production session assembly pins
+// the task (the goal, a delegate's brief) as the user turn and keeps trusted
+// framing system role (#762 regression), so the renderer never re-roles a
+// message — a transcript that arrives all-system is a broken transcript, and
+// the provider's refusal of it is the fail-closed answer, not something to
+// paper over.
 func toWireMessages(messages []Message) []wireMessage {
 	out := make([]wireMessage, 0, len(messages))
-	allSystem := true
 	for _, message := range messages {
-		if message.Role != "system" {
-			allSystem = false
-		}
 		wire := wireMessage{Role: message.Role, Content: message.Content, ToolCallID: message.ToolCallID}
 		for _, call := range message.ToolCalls {
 			entry := wireAssistantToolCall{ID: call.ID, Type: "function"}
@@ -135,19 +127,6 @@ func toWireMessages(messages []Message) []wireMessage {
 			wire.ToolCalls = append(wire.ToolCalls, entry)
 		}
 		out = append(out, wire)
-	}
-	// Mirror #724's promotion rule: the first pinned message carries the
-	// goal, so it becomes the user turn. An empty first message can never
-	// carry the task, so the walk-forward skips it, exactly as the Anthropic
-	// renderer's system-parts join does.
-	if allSystem && len(out) > 0 {
-		promoted := 0
-		for promoted < len(out) && out[promoted].Content == "" {
-			promoted++
-		}
-		if promoted < len(out) {
-			out[promoted].Role = "user"
-		}
 	}
 	return out
 }

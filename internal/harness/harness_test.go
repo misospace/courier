@@ -3452,22 +3452,19 @@ func TestSuppliedHTTPClientKeepsOwnership(t *testing.T) {
 	}
 }
 
-// Regression for #731: the pinned coordinator transcript is all system role,
-// and the OpenAI-compatible wire renderer sent it verbatim — providers that
-// require at least one user query refused every first turn with
-// "No user query found in messages", so no role-bound turn ever terminalized
-// and no earned heartbeat could ever land. Mirror #724's promotion: the first
-// pinned system message — the goal, the task itself — becomes the user turn
-// verbatim, nothing invented; the framing and the skills index after it stay
-// system, the same rule the Anthropic renderer applies (the skill-canary
-// requires the composed index to reach the model as a system message).
-func TestOpenAIAllSystemTranscriptPromotesTheGoalToUserTurn(t *testing.T) {
+// The production pinned shape renders verbatim on the OpenAI-compatible
+// wire (#762 regression): trusted framing — the harness framing, the lane's,
+// the skills index — stays system role, and the goal pins last as the user
+// task turn. The renderer re-roles nothing; the transcript's own role split
+// is what satisfies providers that require a user query.
+func TestOpenAIRendersTheProductionPinnedShapeVerbatim(t *testing.T) {
 	gateway, mock, close := gatewayFor(gatewayResponse{body: sse(contentChunk("ok"), finishChunk("stop"))})
 	defer close()
 	transcript := []Message{
-		{Role: "system", Content: "goal: land the fix"},
-		{Role: "system", Content: "harness framing: bounded steps"},
+		{Role: "system", Content: harnessFraming},
+		{Role: "system", Content: "lane framing: production native canary"},
 		{Role: "system", Content: "skills index: shell, git"},
+		{Role: "user", Content: "goal: land the fix"},
 	}
 	if _, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "qwen3.8-27b", Messages: transcript}); err != nil {
 		t.Fatal(err)
@@ -3484,41 +3481,20 @@ func TestOpenAIAllSystemTranscriptPromotesTheGoalToUserTurn(t *testing.T) {
 	if err := json.Unmarshal([]byte(mock.calls[0].rawBody), &wire); err != nil {
 		t.Fatal(err)
 	}
-	if len(wire.Messages) != 3 {
-		t.Fatalf("messages = %d entries; want all three pinned messages rendered", len(wire.Messages))
+	if len(wire.Messages) != 4 {
+		t.Fatalf("messages = %d entries; want the pinned shape rendered in full", len(wire.Messages))
 	}
-	if wire.Messages[0].Role != "user" || wire.Messages[0].Content != "goal: land the fix" {
-		t.Fatalf("first message = %+v; want the goal promoted to the user turn verbatim", wire.Messages[0])
+	wantRoles := []string{"system", "system", "system", "user"}
+	for i, want := range wantRoles {
+		if wire.Messages[i].Role != want {
+			t.Fatalf("message %d role = %q; want %q", i, wire.Messages[i].Role, want)
+		}
 	}
-	if wire.Messages[1].Role != "system" || wire.Messages[1].Content != "harness framing: bounded steps" {
-		t.Fatalf("second message = %+v; want the framing left in place as system", wire.Messages[1])
+	if wire.Messages[3].Content != "goal: land the fix" {
+		t.Fatalf("task turn = %q; want the goal verbatim as the user turn", wire.Messages[3].Content)
 	}
-	if wire.Messages[2].Role != "system" || wire.Messages[2].Content != "skills index: shell, git" {
-		t.Fatalf("last message = %+v; want the skills index left in place as system", wire.Messages[2])
-	}
-}
-
-// The single-pinned-message edge of #731: with one system message and nothing
-// else, the whole pinned message becomes the user turn.
-func TestOpenAISingleSystemMessageBecomesTheUserTurn(t *testing.T) {
-	gateway, mock, close := gatewayFor(gatewayResponse{body: sse(contentChunk("ok"), finishChunk("stop"))})
-	defer close()
-	if _, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "qwen3.8-27b", Messages: []Message{
-		{Role: "system", Content: "goal: land the fix"},
-	}}); err != nil {
-		t.Fatal(err)
-	}
-	var wire struct {
-		Messages []struct {
-			Role    string `json:"role"`
-			Content string `json:"content"`
-		} `json:"messages"`
-	}
-	if err := json.Unmarshal([]byte(mock.calls[0].rawBody), &wire); err != nil {
-		t.Fatal(err)
-	}
-	if len(wire.Messages) != 1 || wire.Messages[0].Role != "user" || wire.Messages[0].Content != "goal: land the fix" {
-		t.Fatalf("messages = %+v; want the single pinned message promoted to the user turn verbatim", wire.Messages)
+	if wire.Messages[0].Content != harnessFraming {
+		t.Fatalf("framing message = %q; want the harness framing verbatim as system", wire.Messages[0].Content)
 	}
 }
 

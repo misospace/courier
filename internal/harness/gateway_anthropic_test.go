@@ -533,15 +533,12 @@ func TestAnthropicLeadingSystemMessagesAllPreserved(t *testing.T) {
 	}
 }
 
-// Regression for #724: the pinned coordinator transcript is all system role,
-// which rendered zero wire messages and marshaled "messages": null — a shape
-// litellm's /v1/messages normalizer 500s on every first turn. The all-system
-// transcript must produce a non-null messages array of exactly one user turn
-// carrying the first pinned system message verbatim — the goal, the task
-// itself — with the framing and the skills index joined in the top-level
-// system field (#731: the composed skill index must reach the model as
-// system framing, never as the task turn).
-func TestAnthropicAllSystemTranscriptPromotesTheGoalToUserTurn(t *testing.T) {
+// The production pinned shape renders into the Messages API request
+// (#762 regression): the leading system framing — harness framing, lane
+// framing, skills index — joins in the top-level system field, and the goal
+// pins last as the user task turn the model answers. The renderer re-roles
+// nothing; the transcript's own role split is what satisfies the API.
+func TestAnthropicRendersTheProductionPinnedShape(t *testing.T) {
 	var bodies [][]byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		payload, _ := readAllLimited(r.Body, maxStreamContentBytes)
@@ -557,9 +554,10 @@ func TestAnthropicAllSystemTranscriptPromotesTheGoalToUserTurn(t *testing.T) {
 	defer server.Close()
 	transport := &AnthropicTransport{BaseURL: server.URL}
 	transcript := []Message{
-		{Role: "system", Content: "goal: land the fix"},
-		{Role: "system", Content: "harness framing: bounded steps"},
+		{Role: "system", Content: harnessFraming},
+		{Role: "system", Content: "lane framing: production native canary"},
 		{Role: "system", Content: "skills index: shell, git"},
+		{Role: "user", Content: "goal: land the fix"},
 	}
 	if _, err := transport.StreamChat(context.Background(), ChatRequest{Model: "MiniMax-M3.1-Flash", Messages: transcript}); err != nil {
 		t.Fatal(err)
@@ -580,17 +578,14 @@ func TestAnthropicAllSystemTranscriptPromotesTheGoalToUserTurn(t *testing.T) {
 	if err := json.Unmarshal(bodies[0], &wire); err != nil {
 		t.Fatal(err)
 	}
-	if want := "harness framing: bounded steps\n\nskills index: shell, git"; wire.System != want {
-		t.Fatalf("system = %q; want the framing and the skills index joined by the separator", wire.System)
-	}
 	if len(wire.Messages) != 1 {
-		t.Fatalf("messages = %d entries; want exactly one user turn", len(wire.Messages))
+		t.Fatalf("messages = %d entries; want exactly the user task turn", len(wire.Messages))
 	}
 	if wire.Messages[0].Role != "user" {
-		t.Fatalf("promoted turn role = %q; want user", wire.Messages[0].Role)
+		t.Fatalf("task turn role = %q; want user", wire.Messages[0].Role)
 	}
 	if len(wire.Messages[0].Content) != 1 {
-		t.Fatalf("promoted turn carries %d blocks; want one text block", len(wire.Messages[0].Content))
+		t.Fatalf("task turn carries %d blocks; want one text block", len(wire.Messages[0].Content))
 	}
 	blockJSON, _ := json.Marshal(wire.Messages[0].Content[0])
 	var block map[string]any
@@ -598,14 +593,22 @@ func TestAnthropicAllSystemTranscriptPromotesTheGoalToUserTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	if block["type"] != "text" || block["text"] != "goal: land the fix" {
-		t.Fatalf("promoted turn block = %s; want the goal pinned message verbatim", blockJSON)
+		t.Fatalf("task turn block = %s; want the goal verbatim", blockJSON)
+	}
+	if !strings.Contains(wire.System, "lane framing: production native canary") || !strings.Contains(wire.System, "skills index: shell, git") || !strings.Contains(wire.System, harnessFraming) {
+		t.Fatalf("system = %q; want the harness framing, the lane framing, and the skills index joined in the system field", wire.System)
+	}
+	if strings.Contains(wire.System, "goal: land the fix") {
+		t.Fatalf("system = %q; the task text must never ride the system field", wire.System)
 	}
 }
 
-// The single-pinned-message edge of #724: with one system message and
-// nothing else, there is nothing left for the system field — the whole
-// pinned message becomes the user turn and the system field is omitted.
-func TestAnthropicSingleSystemMessageBecomesTheUserTurn(t *testing.T) {
+// Regression for #724/#725: a transcript that renders zero wire messages
+// must marshal the array as [] — a nil slice marshals "messages": null,
+// which litellm's /v1/messages normalizer 500s on. Production assembly
+// never builds an all-system transcript — the task pins as the user turn —
+// but the non-null guarantee holds for any transcript the renderer receives.
+func TestAnthropicAllSystemTranscriptRendersNonNullMessages(t *testing.T) {
 	var bodies [][]byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		payload, _ := readAllLimited(r.Body, maxStreamContentBytes)
@@ -625,25 +628,23 @@ func TestAnthropicSingleSystemMessageBecomesTheUserTurn(t *testing.T) {
 	}}); err != nil {
 		t.Fatal(err)
 	}
+	if strings.Contains(string(bodies[0]), `"messages":null`) {
+		t.Fatalf("wire marshaled a null messages array: %s", bodies[0])
+	}
 	var wire struct {
-		System   *string `json:"system"`
+		System   string `json:"system"`
 		Messages []struct {
-			Role    string           `json:"role"`
-			Content []map[string]any `json:"content"`
+			Role string `json:"role"`
 		} `json:"messages"`
 	}
 	if err := json.Unmarshal(bodies[0], &wire); err != nil {
 		t.Fatal(err)
 	}
-	if wire.System != nil {
-		t.Fatalf("system = %q; want the field omitted for a single pinned message", *wire.System)
+	if wire.System != "goal: land the fix" {
+		t.Fatalf("system = %q; want the pinned message in the system field", wire.System)
 	}
-	if len(wire.Messages) != 1 || wire.Messages[0].Role != "user" {
-		t.Fatalf("messages = %+v; want exactly one user turn", wire.Messages)
-	}
-	blockJSON, _ := json.Marshal(wire.Messages[0].Content[0])
-	if !strings.Contains(string(blockJSON), "goal: land the fix") {
-		t.Fatalf("promoted turn block = %s; want the pinned message verbatim", blockJSON)
+	if len(wire.Messages) != 0 {
+		t.Fatalf("messages = %+v; want an empty array, nothing promoted", wire.Messages)
 	}
 }
 

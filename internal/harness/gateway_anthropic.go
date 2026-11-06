@@ -134,10 +134,10 @@ func anthropicWireRequest(req ChatRequest) ([]byte, error) {
 		Model:     req.Model,
 		MaxTokens: req.MaxTokens,
 		Stream:    true,
-		// The Messages API requires a non-null messages array (#724): an
-		// all-system transcript renders no wire messages, and a nil slice
-		// marshals "messages": null, which litellm's /v1/messages
-		// normalizer 500s on every first turn. Initialize non-nil so the
+		// The Messages API requires a non-null messages array (#724): a
+		// transcript that renders no wire messages would marshal
+		// "messages": null with a nil slice, which litellm's
+		// /v1/messages normalizer 500s on. Initialize non-nil so the
 		// field can never marshal as null.
 		Messages: []anthropicWireMessage{},
 	}
@@ -148,17 +148,18 @@ func anthropicWireRequest(req ChatRequest) ([]byte, error) {
 	leadingSystem := true
 	for _, message := range req.Messages {
 		// Every consecutive leading system message — a production session
-		// pins several: the goal plus harness framing, optional lane framing,
-		// the skills index (#716 review) — belongs in the top-level system
-		// field, in order, joined by the stable separator. None of them may
-		// be dropped or duplicated into messages. The first non-system
-		// message ends the collection: any later system message is
-		// mid-transcript framing (the compaction digest), which the Messages
-		// API has no role for and which renders as a user text block.
+		// pins several: the harness framing, optional lane framing, the
+		// skills index (#716 review) — belongs in the top-level system
+		// field, in order, joined by the stable separator. None of them
+		// may be dropped or duplicated into messages. The first
+		// non-system message ends the collection: the production session's
+		// pinned user task turn (#762 regression) ends it first, and any
+		// later system message is mid-transcript framing (the compaction
+		// digest), which the Messages API has no role for and which
+		// renders as a user text block.
 		if message.Role == "system" && leadingSystem {
 			// An empty pinned message contributes nothing to the system
-			// field — the pre-#724 join behavior — and can never carry the
-			// task turn, so it never becomes the promoted message either.
+			// field — the pre-#724 join behavior.
 			if message.Content != "" {
 				systemParts = append(systemParts, message.Content)
 			}
@@ -207,23 +208,6 @@ func anthropicWireRequest(req ChatRequest) ([]byte, error) {
 				Content: []json.RawMessage{anthropicTextBlock(message.Content)},
 			})
 		}
-	}
-	// An all-system transcript — the pinned coordinator session: goal plus
-	// harness framing, optional lane framing, skills index, all
-	// Role "system" — renders zero wire messages, but the Messages API
-	// requires at least one message and the model must be handed the task
-	// as a turn (#724). The first pinned system message is promoted to the
-	// user turn verbatim, nothing invented, and the framing and the skills
-	// index after it stay in the top-level system field — they are framing
-	// the model reads as system state, never the task (#731), the same rule
-	// the OpenAI-compatible renderer applies.
-	if len(systemParts) > 0 && len(wire.Messages) == 0 {
-		promoted := systemParts[0]
-		systemParts = systemParts[1:]
-		wire.Messages = append(wire.Messages, anthropicWireMessage{
-			Role:    "user",
-			Content: []json.RawMessage{anthropicTextBlock(promoted)},
-		})
 	}
 	if len(systemParts) > 0 {
 		wire.System = strings.Join(systemParts, anthropicSystemSeparator)
