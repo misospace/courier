@@ -68,6 +68,7 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/courier-control ./cmd/courier-control
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/courier-worker ./cmd/courier-worker
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/courier-broker ./cmd/courier-broker
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/courier-dependency-cache ./cmd/courier-dependency-cache
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4.4.1

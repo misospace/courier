@@ -268,6 +268,20 @@
 {{- if not $hasCachePort }}{{- $args = append $args (printf "--dependency-cache-port=%d" (int $secure.dependencyCachePort)) }}{{- end }}
 {{- end }}
 {{- end }}
+{{- if $secure.dependencyCache.enabled }}
+{{- /* The chart owns the dependency cache Service when it renders one (#136):
+  an external dependencyCacheService would point the operator at a second,
+  silent source of approved modules, so the two are mutually exclusive. The
+  port flag must agree with the rendered Service's port or the operator pins
+  a worker GOPROXY address the cache never serves. */}}
+{{- if or $secure.dependencyCacheService $hasCacheService }}
+{{- fail "secure.dependencyCache.enabled and secure.dependencyCacheService are mutually exclusive: the chart renders its own dependency cache Service; clear one of them" }}
+{{- end }}
+{{- if and $secure.dependencyCachePort (ne (int $secure.dependencyCachePort) (int $secure.dependencyCache.port)) }}
+{{- fail (printf "secure.dependencyCachePort %d contradicts the rendered dependency cache port %d: the operator would pin a worker GOPROXY address the cache never serves" (int $secure.dependencyCachePort) (int $secure.dependencyCache.port)) }}
+{{- end }}
+{{- $args = append $args (printf "--dependency-cache-service=%s/%s-dependency-cache" .Release.Namespace .Release.Name) }}
+{{- end }}
 {{- $effectiveBrokerTokenReviewRole := $secure.brokerTokenReviewClusterRole | default "courier-broker-tokenreview" }}
 {{- if $hasBrokerTokenReviewRole }}
 {{- if ne $explicitBrokerTokenReviewRole (printf "--broker-tokenreview-cluster-role=%s" $effectiveBrokerTokenReviewRole) }}

@@ -188,6 +188,49 @@ secure:
   probeImage: "busybox:1.38@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4"
   dependencyCacheService: ""
   dependencyCachePort: 0
+  # -- Dedicated read-only dependency cache for secure workers (#136). When
+  #    enabled the release renders a single-replica cache Deployment, its
+  #    ClusterIP Service (`<release>-dependency-cache`), the store PVC, a
+  #    ServiceAccount with no token mount, and a NetworkPolicy that admits
+  #    ingress on the cache port only from secure.runNamespace worker pods
+  #    and denies all cache egress (the server performs no outbound I/O by
+  #    construction). The operator is pointed at the rendered Service
+  #    automatically; leave secure.dependencyCacheService empty. The cache
+  #    serves ONLY administrator-populated Go module artifacts: a worker
+  #    request for anything else gets an approval diagnostic and the cache
+  #    never fetches upstream, proxies, or redirects.
+  #    Population is an administrator action through a trusted path — from a
+  #    trusted machine:
+  #      GOMODCACHE=$(mktemp -d) go mod download all
+  #      cp -r "$GOMODCACHE/cache/download/." <store>/
+  #    then copy <store> into the PVC (e.g. a short-lived Job mounting the
+  #    store volume read-write, pinned to the cache pod's node — the cache
+  #    pod itself mounts the store read-only and has no shell). Workers reach
+  #    the cache as an operator-pinned ClusterIP IP literal with GOSUMDB=off;
+  #    go verifies artifacts against the workspace go.sum.
+  dependencyCache:
+    enabled: false
+    # -- Cache port; the Service, the Deployment, and the worker egress rule
+    #    all use it, and preflight probes it. Keep the default unless it
+    #    collides in the operator namespace.
+    port: 8123
+    # -- Store PVC size; module zips are the dominant content.
+    storage: 10Gi
+    # -- One replica: the store volume is read-only, so replicas would share
+    #    it safely, but each extra replica adds nothing the ClusterIP pin
+    #    needs.
+    replicas: 1
+    image:
+      repository: ghcr.io/misospace/courier
+      tag: ""
+      digest: ""
+      pullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        memory: 512Mi
   # -- Name of the ClusterRole granting per-run brokers TokenReview
 #    creation. The chart renders the ClusterRole and passes the same name to
 #    the operator, whose per-run ClusterRoleBindings reference it. Two

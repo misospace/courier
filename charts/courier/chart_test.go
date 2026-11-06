@@ -309,6 +309,21 @@ func runHelmOutput(t *testing.T, chartDir string, args ...string) (string, error
 	return string(output), err
 }
 
+// chartDoc returns the first rendered document of the given kind whose body
+// contains the needle. Renderers interleave template sources, so the kind
+// alone can be ambiguous; the needle pins the document. The kind matches the
+// whole "kind:" line so "Service" does not match "ServiceAccount".
+func chartDoc(t *testing.T, rendered, kind, needle string) string {
+	t.Helper()
+	for _, doc := range strings.Split(rendered, "\n---") {
+		if strings.Contains(doc, "kind: "+kind+"\n") && strings.Contains(doc, needle) {
+			return doc
+		}
+	}
+	t.Fatalf("no %s document containing %q found in:\n%s", kind, needle, rendered)
+	return ""
+}
+
 func TestServiceMonitorOptional(t *testing.T) {
 	if _, err := exec.LookPath("helm"); err != nil {
 		t.Skip("helm is not installed")
@@ -1819,5 +1834,115 @@ func TestChartRejectsOwnershipBoundaryThatStrandsRuns(t *testing.T) {
 		"--set", "ownership.namespaces[0]=Bad_Name")
 	if err == nil || !strings.Contains(out, "DNS-1123 label") {
 		t.Fatalf("expected an invalid owned namespace to fail, err = %v:\n%s", err, out)
+	}
+}
+
+func TestChartRendersDependencyCache(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
+		t.Fatalf("configure chart repository: %v", err)
+	}
+	runHelm(t, chartDir, "dependency", "build")
+
+	secureBase := []string{
+		"--set", "secure.enabled=true",
+		"--set", "secure.runNamespace=courier-runs",
+		"--set", "secure.providers[0].name=github",
+		"--set", "secure.providers[0].type=github",
+		"--set", "secure.providers[0].endpoint=https://api.github.com/",
+		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
+	}
+
+	// Disabled by default: no cache resources and no cache operator flag.
+	disabled := runHelm(t, chartDir, append(append([]string{"template", "courier", "."}, secureBase...),
+		"--set", "secure.dependencyCache.enabled=false")...)
+	for _, unwanted := range []string{
+		"kind: PersistentVolumeClaim",
+		"dependency-cache",
+	} {
+		if strings.Contains(disabled, unwanted) {
+			t.Fatalf("dependency-cache-disabled secure chart output unexpectedly contains %q", unwanted)
+		}
+	}
+
+	enabled := runHelm(t, chartDir,
+		append(append([]string{"template", "courier", "."}, secureBase...),
+			"--set", "secure.dependencyCache.enabled=true")...)
+	for _, want := range []string{
+		"name: courier-dependency-cache",
+		"kind: PersistentVolumeClaim",
+		"kind: Service",
+		"kind: Deployment",
+		"kind: NetworkPolicy",
+		"/usr/local/bin/courier-dependency-cache",
+		"--root=/var/lib/courier/dependency-cache",
+		"--dependency-cache-service=default/courier-dependency-cache",
+		"automountServiceAccountToken: false",
+		"readOnly: true",
+		"courier.misospace.dev/component: worker",
+	} {
+		if !strings.Contains(enabled, want) {
+			t.Fatalf("dependency-cache-enabled chart output is missing %q", want)
+		}
+	}
+	// The store volume mounts read-only in the serving pod, and the cache
+	// policy denies egress (no egress rules rendered).
+	if !strings.Contains(enabled, "mountPath: /var/lib/courier/dependency-cache") {
+		t.Fatalf("cache Deployment does not mount the store:\n%s", enabled)
+	}
+	cachePolicy := chartDoc(t, enabled, "NetworkPolicy", "courier-dependency-cache")
+	if strings.Contains(cachePolicy, "egress:") {
+		t.Fatalf("cache NetworkPolicy must deny all egress:\n%s", cachePolicy)
+	}
+	if !strings.Contains(cachePolicy, "kubernetes.io/metadata.name: courier-runs") {
+		t.Fatalf("cache NetworkPolicy must admit only the run namespace:\n%s", cachePolicy)
+	}
+
+	// Release identity scopes every selector: two courier releases sharing a
+	// namespace must not route each other's workers to the wrong approved
+	// store, fight over cache pod ownership, or share a policy boundary.
+	cacheService := chartDoc(t, enabled, "Service", "courier-dependency-cache")
+	selectorPart := cacheService[strings.Index(cacheService, "selector:"):]
+	if !strings.Contains(selectorPart, "app.kubernetes.io/instance: courier") {
+		t.Fatalf("cache Service selector must carry release identity:\n%s", cacheService)
+	}
+	cacheDeployment := chartDoc(t, enabled, "Deployment", "--root=/var/lib/courier/dependency-cache")
+	matchLabels := cacheDeployment[strings.Index(cacheDeployment, "matchLabels:"):]
+	if !strings.Contains(matchLabels, "app.kubernetes.io/instance: courier") {
+		t.Fatalf("cache Deployment selector must carry release identity:\n%s", cacheDeployment)
+	}
+	templateBody := cacheDeployment[strings.Index(cacheDeployment, "\n  template:"):]
+	if !strings.Contains(templateBody, "\n        app.kubernetes.io/instance: courier") {
+		t.Fatalf("cache pod template labels must carry release identity:\n%s", cacheDeployment)
+	}
+	if !strings.Contains(cachePolicy, "app.kubernetes.io/instance: courier") {
+		t.Fatalf("cache NetworkPolicy pod selector must carry release identity:\n%s", cachePolicy)
+	}
+
+	// An external dependencyCacheService alongside the rendered one is
+	// rejected: two silent sources of approved modules is not a
+	// configuration, it is an accident.
+	out, err := runHelmOutput(t, chartDir,
+		append(append([]string{"template", "courier", "."}, secureBase...),
+			"--set", "secure.dependencyCache.enabled=true",
+			"--set", "secure.dependencyCacheService=cache-system/go-cache")...)
+	if err == nil || !strings.Contains(out, "mutually exclusive") {
+		t.Fatalf("expected enabled cache plus external dependencyCacheService to fail, err = %v:\n%s", err, out)
+	}
+
+	// A dependencyCachePort that contradicts the rendered Service port would
+	// pin workers to a GOPROXY address the cache never serves.
+	out, err = runHelmOutput(t, chartDir,
+		append(append([]string{"template", "courier", "."}, secureBase...),
+			"--set", "secure.dependencyCache.enabled=true",
+			"--set", "secure.dependencyCachePort=9999")...)
+	if err == nil || !strings.Contains(out, "contradicts the rendered dependency cache port") {
+		t.Fatalf("expected contradicting cache port to fail, err = %v:\n%s", err, out)
 	}
 }
