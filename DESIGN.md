@@ -2736,7 +2736,10 @@ preference (highest release, then highest prerelease, then the chronologically
 newest pseudo-version by `.info` time), so tagless modules resolve
 `module@latest`. The handler is GET/HEAD only, unauthenticated (the network
 boundary is the defense), ignores caller-selected headers, rate-limits per
-source IP over a bounded address table, and bounds artifact sizes per type.
+source IP over a bounded address table, and bounds artifact sizes per type;
+the version listing scans the `@v` directory under an entry bound with a
+batched read and bounds the list response body, refusing cleanly when a
+populated store exceeds either bound.
 
 Store resolution is confined: requests validate as canonical escaped module
 paths and versions and then resolve beneath the store root through `os.Root`,

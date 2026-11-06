@@ -34,15 +34,17 @@ func main() {
 func runArgs(args []string) error {
 	flags := flag.NewFlagSet("courier-dependency-cache", flag.ContinueOnError)
 	var (
-		addr        string
-		root        string
-		maxInfo     int64
-		maxMod      int64
-		maxZip      int64
-		rateLimit   float64
-		burst       int
-		maxIPs      int
-		logRequests bool
+		addr           string
+		root           string
+		maxInfo        int64
+		maxMod         int64
+		maxZip         int64
+		maxListEntries int
+		maxListBytes   int64
+		rateLimit      float64
+		burst          int
+		maxIPs         int
+		logRequests    bool
 	)
 	defaults := dependencycache.DefaultLimits()
 	flags.StringVar(&addr, "addr", ":8123", "listen address (the chart pins the matching ClusterIP port)")
@@ -50,6 +52,8 @@ func runArgs(args []string) error {
 	flags.Int64Var(&maxInfo, "max-info-bytes", defaults.MaxInfoBytes, "largest .info artifact served")
 	flags.Int64Var(&maxMod, "max-mod-bytes", defaults.MaxModBytes, "largest .mod artifact served")
 	flags.Int64Var(&maxZip, "max-zip-bytes", defaults.MaxZipBytes, "largest .zip artifact served (the go command refuses larger module zips)")
+	flags.IntVar(&maxListEntries, "max-list-entries", defaults.MaxListEntries, "bound on the entries scanned per module @v directory (0 uses the built-in bound)")
+	flags.Int64Var(&maxListBytes, "max-list-bytes", dependencycache.DefaultMaxListBytes, "bound on a @v/list response body in bytes (0 uses the built-in bound)")
 	flags.Float64Var(&rateLimit, "rate", 20, "requests per second per source address (0 disables the limit)")
 	flags.IntVar(&burst, "burst", 64, "per-source burst allowance")
 	flags.IntVar(&maxIPs, "max-tracked-addrs", 1024, "bound on the rate limiter's address table")
@@ -69,6 +73,7 @@ func runArgs(args []string) error {
 
 	store, err := dependencycache.NewStoreWithLimits(root, dependencycache.Limits{
 		MaxInfoBytes: maxInfo, MaxModBytes: maxMod, MaxZipBytes: maxZip,
+		MaxListEntries: maxListEntries,
 	})
 	if err != nil {
 		return err
@@ -77,6 +82,7 @@ func runArgs(args []string) error {
 		RequestsPerSecond:   rateLimit,
 		Burst:               burst,
 		MaxTrackedSourceIPs: maxIPs,
+		MaxListBytes:        maxListBytes,
 		Log: func(format string, args ...any) {
 			log.Printf("courier-dependency-cache: "+format, args...)
 		},

@@ -26,6 +26,13 @@ const (
 	WriteTimeout      = 600 * time.Second // bounded artifact writes (the zip bound is 500 MiB)
 	IdleTimeout       = 120 * time.Second
 	MaxHeaderBytes    = 8192
+	// DefaultMaxListBytes bounds a @v/list response body. It is generous
+	// relative to the store's listing scan bound (per line: an escaped
+	// version at most the filesystem's name-maximum plus a short RFC3339
+	// timestamp), so a store within its entry bound renders within this
+	// bound; the cap is the declared response-side backstop, and a body
+	// beyond it refuses cleanly rather than growing without bound.
+	DefaultMaxListBytes = 4 << 20
 )
 
 // LogFunc receives the cache's minimal request log. The request key (module
@@ -39,12 +46,15 @@ type Options struct {
 	// Limits bound served artifact sizes. Zero uses DefaultLimits.
 	// RequestsPerSecond and Burst bound each client IP's request rate;
 	// RequestsPerSecond <= 0 disables rate limiting. (Artifact size bounds
-	// live on the Store, not the handler.)
+	// and the listing scan bound live on the Store, not the handler.)
 	RequestsPerSecond float64
 	Burst             int
 	// MaxTrackedSourceIPs bounds the rate-limiter's address table; a full
 	// table evicts one tracked address rather than refusing new callers.
 	MaxTrackedSourceIPs int
+	// MaxListBytes bounds a @v/list response body; zero uses
+	// DefaultMaxListBytes rather than disabling the bound.
+	MaxListBytes int64
 	// Log, when set, receives one line per request. LogRequests=false
 	// restricts the log to denials and misses, minimizing the approved-key
 	// exfiltration surface while keeping every refusal auditable.
@@ -57,15 +67,20 @@ type Options struct {
 // redirects, no CONNECT or proxying, no authentication, no caller-selected
 // headers, bounded artifacts, and per-IP rate limiting.
 type Handler struct {
-	store   *Store
-	limiter *ipLimiter
-	log     LogFunc
-	logAll  bool
+	store        *Store
+	limiter      *ipLimiter
+	log          LogFunc
+	logAll       bool
+	maxListBytes int64
 }
 
 // NewHandler builds the worker-facing handler.
 func NewHandler(store *Store, opts Options) *Handler {
 	handler := &Handler{store: store, log: opts.Log, logAll: opts.LogRequests}
+	handler.maxListBytes = opts.MaxListBytes
+	if handler.maxListBytes <= 0 {
+		handler.maxListBytes = DefaultMaxListBytes
+	}
 	if opts.RequestsPerSecond > 0 {
 		burst := opts.Burst
 		if burst <= 0 {
@@ -220,14 +235,23 @@ func (h *Handler) serve(w *responseRecorder, r *http.Request) {
 			h.reportMiss(w, modulePath, "", err)
 			return
 		}
+		// The response body is bounded: a list that would not fit refuses
+		// cleanly instead of growing without bound.
 		var body strings.Builder
+		size := 0
 		for _, version := range versions {
-			body.WriteString(version.Version)
+			line := version.Version
 			if version.Time != "" {
-				body.WriteString(" ")
-				body.WriteString(version.Time)
+				line += " " + version.Time
 			}
-			body.WriteString("\n")
+			line += "\n"
+			if int64(size+len(line)) > h.maxListBytes {
+				h.reportMiss(w, modulePath, "", &NotApprovedError{ModulePath: modulePath,
+					Detail: fmt.Sprintf("the version list exceeds the server's %d byte response bound; fix the population", h.maxListBytes)})
+				return
+			}
+			size += len(line)
+			body.WriteString(line)
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("X-Content-Type-Options", "nosniff")

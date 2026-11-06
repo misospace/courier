@@ -247,6 +247,44 @@ func TestHandlerIgnoresCallerHeaders(t *testing.T) {
 	}
 }
 
+func TestHandlerListResponseIsBounded(t *testing.T) {
+	// A @v/list body that would exceed the response bound refuses cleanly
+	// with the approval diagnostic instead of growing without bound.
+	root := t.TempDir()
+	for i := 0; i < 40; i++ {
+		approveAll(t, root, "example.com/many", fmt.Sprintf("v1.0.%d", i))
+	}
+	store, err := NewStore(root)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+
+	handler := NewHandler(store, Options{MaxListBytes: 512})
+	recorder := handlerRequest(t, handler, http.MethodGet, "/example.com/many/@v/list", "10.0.0.1:1", nil)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("an oversized list must refuse with 404, got %d body %q", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "response bound") {
+		t.Fatalf("diagnostic must name the response bound: %q", recorder.Body.String())
+	}
+
+	// Within the bound the full list renders.
+	generous := NewHandler(store, Options{MaxListBytes: 8192})
+	recorder = handlerRequest(t, generous, http.MethodGet, "/example.com/many/@v/list", "10.0.0.1:1", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("a list within the bound must serve, got %d: %q", recorder.Code, recorder.Body.String())
+	}
+	if lines := strings.Count(recorder.Body.String(), "\n"); lines != 40 {
+		t.Fatalf("want 40 listed versions, got %d", lines)
+	}
+
+	// @latest is a single bounded line and unaffected by a tight list bound.
+	recorder = handlerRequest(t, handler, http.MethodGet, "/example.com/many/@latest", "10.0.0.1:1", nil)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "v1.0.39") {
+		t.Fatalf("@latest must resolve within a tight list bound: %d %q", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestHandlerRateLimitIsBoundedPerAddress(t *testing.T) {
 	handler, _ := newTestHandler(t, func(opts *Options) {
 		opts.RequestsPerSecond = 0.001

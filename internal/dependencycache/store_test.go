@@ -507,6 +507,71 @@ func TestStoreRefusesNullBytesBeforeTheFilesystem(t *testing.T) {
 	}
 }
 
+func TestStoreVersionsBoundsTheDirectoryScan(t *testing.T) {
+	// The listing scan is bounded: a populated @v directory beyond the entry
+	// bound refuses cleanly, and the batched read stops at the bound, so a
+	// huge directory cannot drive unbounded allocation before the refusal.
+	writeJunk := func(t *testing.T, root string, count int) {
+		t.Helper()
+		dir := filepath.Join(root, "example.com", "huge", "@v")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < count; i++ {
+			if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("junk-%04d.lock", i)), nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	limits := DefaultLimits()
+	limits.MaxListEntries = 16
+
+	// Over the bound: refuse with a diagnostic naming the bound — for @v/list
+	// and for @latest, which resolves through the same listing.
+	store, _ := newTestStore(t, limits, func(root string) {
+		writeJunk(t, root, 40)
+	})
+	var notApproved *NotApprovedError
+	if _, err := store.Versions("example.com/huge"); !asNotApproved(err, &notApproved) {
+		t.Fatalf("Versions over the entry bound: want NotApprovedError, got %v", err)
+	} else if !strings.Contains(notApproved.Detail, "entries") {
+		t.Fatalf("diagnostic must name the entry bound, got %q", notApproved.Detail)
+	}
+	if _, err := store.Latest("example.com/huge"); !asNotApproved(err, &notApproved) {
+		t.Fatalf("@latest over the entry bound: want NotApprovedError, got %v", err)
+	}
+
+	// Under the bound the listing still works and junk is filtered.
+	store, _ = newTestStore(t, limits, func(root string) {
+		writeJunk(t, root, 5)
+		approveAll(t, root, "example.com/huge", "v1.0.0")
+	})
+	versions, err := store.Versions("example.com/huge")
+	if err != nil {
+		t.Fatalf("Versions under the bound: %v", err)
+	}
+	if len(versions) != 1 || versions[0].Version != "v1.0.0" {
+		t.Fatalf("want the one approved version, got %+v", versions)
+	}
+
+	// Allocation proof: scanning a directory far beyond the bound allocates
+	// for the bounded scan only, never for the whole directory — a full read
+	// of 5000 entries would cost hundreds of KiB.
+	store, _ = newTestStore(t, limits, func(root string) {
+		writeJunk(t, root, 5000)
+	})
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, err = store.Versions("example.com/huge")
+	runtime.ReadMemStats(&after)
+	if !asNotApproved(err, &notApproved) {
+		t.Fatalf("Versions over the bound must refuse, got %v", err)
+	}
+	if grew := after.TotalAlloc - before.TotalAlloc; grew > 128<<10 {
+		t.Fatalf("the bounded scan allocated %d bytes for a 5000-entry directory; the read is not bounded", grew)
+	}
+}
+
 func TestNewStoreRequiresADirectory(t *testing.T) {
 	if _, err := NewStore(filepath.Join(t.TempDir(), "absent")); err == nil {
 		t.Fatal("NewStore on an absent root must fail")

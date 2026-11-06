@@ -52,24 +52,30 @@ const (
 // ArtifactExts is the complete-set extension list.
 var ArtifactExts = [...]string{ExtInfo, ExtMod, ExtZip}
 
-// Limits bound every artifact the cache serves. A populated artifact beyond
-// its bound is refused, not served: bounds are a server-side property, and a
-// store that carries an oversized file is a population error an administrator
-// must fix (the worker's diagnostic says so). MaxZipBytes mirrors the Go
-// toolchain's own 500 MiB module-zip bound; nothing larger can be a valid
-// module zip.
+// Limits bound what the cache serves from a populated store. An artifact
+// beyond its bound is refused, not served: bounds are a server-side property,
+// and a store that carries an oversized file is a population error an
+// administrator must fix (the worker's diagnostic says so). MaxZipBytes
+// mirrors the Go toolchain's own 500 MiB module-zip bound; nothing larger can
+// be a valid module zip. MaxListEntries bounds how many @v directory entries
+// the version listing will scan — a directory beyond it is a population error
+// too, and the batched scan stops reading there, so a huge populated @v
+// directory cannot drive unbounded allocation; zero falls back to the
+// built-in bound rather than disabling it.
 type Limits struct {
-	MaxInfoBytes int64
-	MaxModBytes  int64
-	MaxZipBytes  int64
+	MaxInfoBytes   int64
+	MaxModBytes    int64
+	MaxZipBytes    int64
+	MaxListEntries int
 }
 
 // DefaultLimits returns the built-in bounds.
 func DefaultLimits() Limits {
 	return Limits{
-		MaxInfoBytes: 1 << 20,
-		MaxModBytes:  4 << 20,
-		MaxZipBytes:  500 << 20,
+		MaxInfoBytes:   1 << 20,
+		MaxModBytes:    4 << 20,
+		MaxZipBytes:    500 << 20,
+		MaxListEntries: 4096,
 	}
 }
 
@@ -351,9 +357,33 @@ func (s *Store) Versions(modulePath string) ([]VersionInfo, error) {
 		return nil, fmt.Errorf("dependency-cache: list %s: %w", modulePath, err)
 	}
 	defer dir.Close()
-	entries, err := dir.ReadDir(-1)
-	if err != nil {
-		return nil, fmt.Errorf("dependency-cache: list %s: %w", modulePath, err)
+	// The listing scan is bounded and batched: a populated @v directory
+	// beyond the entry bound is a population error, and the scan stops
+	// reading there, so a huge directory cannot drive unbounded allocation
+	// before the refusal. Per-line size is inherently bounded as well —
+	// artifact file names cannot exceed the filesystem's name maximum and a
+	// parseable RFC3339 timestamp is short — so a bounded entry count bounds
+	// every downstream use of the list, including the handler's response.
+	entryCap := s.limits.MaxListEntries
+	if entryCap <= 0 {
+		entryCap = DefaultLimits().MaxListEntries
+	}
+	const scanBatch = 256
+	var entries []os.DirEntry
+	for scanned := 0; ; {
+		batch, err := dir.ReadDir(scanBatch)
+		entries = append(entries, batch...)
+		scanned += len(batch)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("dependency-cache: list %s: %w", modulePath, err)
+		}
+		if scanned > entryCap {
+			return nil, &NotApprovedError{ModulePath: modulePath,
+				Detail: fmt.Sprintf("the @v directory holds more than %d entries; fix the population", entryCap)}
+		}
 	}
 
 	seen := make(map[string]bool)
