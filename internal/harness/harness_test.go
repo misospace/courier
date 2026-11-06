@@ -3554,3 +3554,31 @@ func TestOpenAITranscriptWithNonSystemMessageRendersVerbatim(t *testing.T) {
 		}
 	}
 }
+
+// The degenerate edge of the promotion: an all-system transcript whose every
+// message is empty promotes nothing — an empty user turn invents content the
+// transcript never carried, so the renderer sends the transcript unchanged
+// and a provider that requires a user query refuses it. Pinned transcripts
+// always carry the goal, so production never constructs this; the pin keeps
+// the promotion from ever papering over it.
+func TestOpenAIAllEmptySystemTranscriptPromotesNothing(t *testing.T) {
+	gateway, mock, close := gatewayFor(gatewayResponse{body: sse(contentChunk("ok"), finishChunk("stop"))})
+	defer close()
+	if _, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "qwen3.8-27b", Messages: []Message{
+		{Role: "system", Content: ""},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(mock.calls[0].rawBody), &wire); err != nil {
+		t.Fatal(err)
+	}
+	if len(wire.Messages) != 1 || wire.Messages[0].Role != "system" {
+		t.Fatalf("messages = %+v; want the empty system message rendered unchanged, nothing promoted", wire.Messages)
+	}
+}
