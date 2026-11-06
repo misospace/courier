@@ -148,23 +148,63 @@ func NewStoreWithLimits(root string, limits Limits) (*Store, error) {
 // Root returns the store's root directory.
 func (s *Store) Root() string { return s.root }
 
-// errStoreSymlink marks a store path element that is a symlink. The store
-// layout is populated by the ordinary toolchain, which produces only ordinary
-// files and directories, so a symlink anywhere on an artifact path is a
-// population error — and refusing it (rather than following it) is what keeps
+// errStoreSymlink marks a store path element that is a symlink,
+// errStoreNotRegular a final artifact element that is not an ordinary file,
+// and errStoreNotDir a required-directory element that is not a directory.
+// The store layout is populated by the ordinary toolchain, which produces
+// only ordinary files and directories, so each is a population error — and
+// refusing it (rather than following, serving, or listing it) is what keeps
 // an approved-looking path from resolving to content the administrator never
-// placed there.
-var errStoreSymlink = errors.New("symlink in store population")
+// placed there, and what keeps an artifact set that is not a real
+// .info/.mod/.zip set from being approved.
+var (
+	errStoreSymlink    = errors.New("symlink in store population")
+	errStoreNotRegular = errors.New("non-ordinary file in store population")
+	errStoreNotDir     = errors.New("non-directory in store population")
+)
 
-// statArtifact Lstats one root-relative store path ("<escaped-module>/@v/<file>")
-// element by element without following symlinks: a symlink at any element is
-// refused with errStoreSymlink, and every element but the last must be a real
-// directory. os.Root already guarantees the lookup cannot escape the store
-// root even through a symlink; the element walk additionally enforces the
-// population contract that every path element is an ordinary directory or
-// file, so a populated symlink can never redirect an artifact read — out of
-// the root, or to another location inside it.
+// populationRefusal renders the approval refusal for a store path that
+// violates the population contract, naming the offending store location in
+// deployment-admin terms. ok is false for errors outside that family (those
+// stay generic storage errors).
+func populationRefusal(err error, relPath string) (*NotApprovedError, bool) {
+	switch {
+	case errors.Is(err, errStoreSymlink):
+		return &NotApprovedError{Detail: fmt.Sprintf(
+			"store population at %q holds a symlink; the store must contain only ordinary files and directories; fix the population", relPath)}, true
+	case errors.Is(err, errStoreNotRegular):
+		return &NotApprovedError{Detail: fmt.Sprintf(
+			"store population at %q is not an ordinary file; fix the population", relPath)}, true
+	case errors.Is(err, errStoreNotDir):
+		return &NotApprovedError{Detail: fmt.Sprintf(
+			"store population at %q is not a directory; fix the population", relPath)}, true
+	}
+	return nil, false
+}
+
+// statArtifact Lstats one root-relative artifact path
+// ("<escaped-module>/@v/<file>"): every element is inspected through the
+// confined root without following symlinks, every interior element must be a
+// real directory, and the final element must be an ordinary file — a
+// directory at an artifact path is a population error, not a servable
+// artifact.
 func (s *Store) statArtifact(relPath string) (fs.FileInfo, error) {
+	return s.walkStore(relPath, false)
+}
+
+// statStoreDir is statArtifact for a store path that must be a directory
+// (the module's @v directory), with the same per-element symlink refusal.
+func (s *Store) statStoreDir(relPath string) (fs.FileInfo, error) {
+	return s.walkStore(relPath, true)
+}
+
+// walkStore is the confined, symlink-refusing element walk shared by
+// statArtifact and statStoreDir. os.Root already guarantees the lookup
+// cannot escape the store root even through a symlink; the walk additionally
+// enforces the population contract that every path element is an ordinary
+// directory or file, so a populated symlink can never redirect an artifact
+// read — out of the root, or to another location inside it.
+func (s *Store) walkStore(relPath string, wantDir bool) (fs.FileInfo, error) {
 	parts := strings.Split(relPath, "/")
 	prefix := ""
 	var info fs.FileInfo
@@ -180,10 +220,13 @@ func (s *Store) statArtifact(relPath string) (fs.FileInfo, error) {
 		if next.Mode()&fs.ModeSymlink != 0 {
 			return nil, fmt.Errorf("%w at %q", errStoreSymlink, prefix)
 		}
-		if i < len(parts)-1 && !next.IsDir() {
-			return nil, fmt.Errorf("dependency-cache: store path element %q is not a directory", prefix)
+		if !next.IsDir() && (i < len(parts)-1 || wantDir) {
+			return nil, fmt.Errorf("%w at %q", errStoreNotDir, prefix)
 		}
 		info = next
+	}
+	if !wantDir && !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w at %q", errStoreNotRegular, relPath)
 	}
 	return info, nil
 }
@@ -215,14 +258,15 @@ func (s *Store) Open(modulePath, version, ext string) (*os.File, int64, error) {
 	for _, artifactExt := range ArtifactExts {
 		artifactRel := dirRel + "/" + escapedVersion + artifactExt
 		if _, err := s.statArtifact(artifactRel); err != nil {
-			switch {
-			case errors.Is(err, fs.ErrNotExist):
+			if errors.Is(err, fs.ErrNotExist) {
 				missing = append(missing, artifactExt)
-			case errors.Is(err, errStoreSymlink):
-				return nil, 0, symlinkPopulationError(modulePath, version, artifactRel)
-			default:
-				return nil, 0, fmt.Errorf("dependency-cache: inspect %s@%s: %w", modulePath, version, err)
+				continue
 			}
+			if refusal, ok := populationRefusal(err, artifactRel); ok {
+				refusal.ModulePath, refusal.Version = modulePath, version
+				return nil, 0, refusal
+			}
+			return nil, 0, fmt.Errorf("dependency-cache: inspect %s@%s: %w", modulePath, version, err)
 		}
 	}
 	if len(missing) > 0 {
@@ -234,15 +278,15 @@ func (s *Store) Open(modulePath, version, ext string) (*os.File, int64, error) {
 	if _, err := s.statArtifact(name); err != nil {
 		// The complete set existed a moment ago; treat any loss as a miss
 		// rather than serving a partial read of a re-population.
-		switch {
-		case errors.Is(err, fs.ErrNotExist):
+		if errors.Is(err, fs.ErrNotExist) {
 			return nil, 0, &NotApprovedError{ModulePath: modulePath, Version: version,
 				Detail: "artifact disappeared during the request; the store must not be re-populated while serving"}
-		case errors.Is(err, errStoreSymlink):
-			return nil, 0, symlinkPopulationError(modulePath, version, name)
-		default:
-			return nil, 0, fmt.Errorf("dependency-cache: open %s@%s: %w", modulePath, version, err)
 		}
+		if refusal, ok := populationRefusal(err, name); ok {
+			refusal.ModulePath, refusal.Version = modulePath, version
+			return nil, 0, refusal
+		}
+		return nil, 0, fmt.Errorf("dependency-cache: open %s@%s: %w", modulePath, version, err)
 	}
 	file, err := s.rooted.Open(name)
 	if err != nil {
@@ -263,7 +307,8 @@ func (s *Store) Open(modulePath, version, ext string) (*os.File, int64, error) {
 	}
 	if !openInfo.Mode().IsRegular() {
 		_ = file.Close()
-		return nil, 0, symlinkPopulationError(modulePath, version, dirRel)
+		return nil, 0, &NotApprovedError{ModulePath: modulePath, Version: version,
+			Detail: fmt.Sprintf("store population at %q is not an ordinary file; fix the population", name)}
 	}
 	if bound := s.limits.maxFor(ext); openInfo.Size() > bound {
 		_ = file.Close()
@@ -271,14 +316,6 @@ func (s *Store) Open(modulePath, version, ext string) (*os.File, int64, error) {
 			Detail: fmt.Sprintf("%s artifact exceeds the server's %d byte bound; fix the population", ext, bound)}
 	}
 	return file, openInfo.Size(), nil
-}
-
-// symlinkPopulationError is the approval refusal for a store path that
-// carries a symlink (the artifact-path element walk refuses it before any
-// read). It names the offending store location in deployment-admin terms.
-func symlinkPopulationError(modulePath, version, dirRel string) *NotApprovedError {
-	return &NotApprovedError{ModulePath: modulePath, Version: version,
-		Detail: fmt.Sprintf("store population at %q holds a symlink; the store must contain only ordinary files and directories; fix the population", dirRel)}
 }
 
 // VersionInfo is one approved version of a module: its canonical (unescaped)
@@ -298,20 +335,16 @@ func (s *Store) Versions(modulePath string) ([]VersionInfo, error) {
 			Detail: fmt.Sprintf("invalid module path: %v", err)}
 	}
 	dirRel := escapedModule + "/@v"
-	dirInfo, err := s.statArtifact(dirRel)
-	if err != nil {
-		switch {
-		case errors.Is(err, fs.ErrNotExist):
+	if _, err := s.statStoreDir(dirRel); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
 			return nil, &NotApprovedError{ModulePath: modulePath,
 				Detail: "module is not populated in this deployment's dependency cache"}
-		case errors.Is(err, errStoreSymlink):
-			return nil, symlinkPopulationError(modulePath, "", dirRel)
+		}
+		if refusal, ok := populationRefusal(err, dirRel); ok {
+			refusal.ModulePath = modulePath
+			return nil, refusal
 		}
 		return nil, fmt.Errorf("dependency-cache: list %s: %w", modulePath, err)
-	}
-	if !dirInfo.IsDir() {
-		return nil, &NotApprovedError{ModulePath: modulePath,
-			Detail: fmt.Sprintf("store population at %q is not a directory; fix the population", dirRel)}
 	}
 	dir, err := s.rooted.Open(dirRel)
 	if err != nil {

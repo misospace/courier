@@ -2716,6 +2716,48 @@ pod template, so a values change rolls the manager on a normal upgrade. The
 chart never renders LaneProfile objects, keeping the CRD-ordering hazard
 structurally closed. (#74)
 
+## Dependency cache for secure workers
+
+Secure workers resolve Go dependencies only through a dedicated, read-only
+module cache (`internal/dependencycache`, served by the
+`courier-dependency-cache` binary and rendered by `secure.dependencyCache` in
+the chart). The store is the Go module cache wire layout
+(`<root>/<escaped-module>/@v/<escaped-version>.{info,mod,zip}`), populated
+ahead of time with the ordinary toolchain from a trusted machine; approval is
+exactly population — a module version is served only when its complete
+artifact set exists in the store as ordinary files.
+
+The cache performs no upstream I/O: the binary has no outbound HTTP client and
+never fetches, fills, redirects, or proxies; a miss is answered locally with an
+actionable 404 approval diagnostic that the `go` command surfaces verbatim. It
+serves the read-only GOPROXY subset — `<module>/@v/list`, `<module>/@latest`,
+and per-version artifacts — with `@latest` resolved by the go command's own
+preference (highest release, then highest prerelease, then the chronologically
+newest pseudo-version by `.info` time), so tagless modules resolve
+`module@latest`. The handler is GET/HEAD only, unauthenticated (the network
+boundary is the defense), ignores caller-selected headers, rate-limits per
+source IP over a bounded address table, and bounds artifact sizes per type.
+
+Store resolution is confined: requests validate as canonical escaped module
+paths and versions and then resolve beneath the store root through `os.Root`,
+with an element walk that refuses symlinks and non-directory or non-ordinary-
+file elements — no request, hostile or from a mis-populated store, can reach a
+file outside the store or redirect through a populated symlink. Listing and
+`@latest` metadata reads travel the same bounded path under the `.info` size
+bound. The approved request key appears in the request log: the documented
+bounded exfiltration channel (HARNESS.md §2); `--log-requests=false` restricts
+logging to denials and misses.
+
+The chart renders the cache Deployment (distroless manager image, read-only
+store mount, no service-account token, all capabilities dropped), its
+ClusterIP Service, the store PVC, a token-less ServiceAccount, and a
+NetworkPolicy admitting ingress only from `secure.runNamespace` worker pods
+while denying all cache egress. The operator's `--dependency-cache-service`
+pin is rendered automatically, is mutually exclusive with an external cache
+service, and must agree with the rendered Service port; release-identity
+labels scope every selector, so two courier releases sharing a namespace
+cannot route each other's workers to the wrong approved store.
+
 ## Deployment-provided skill bundles
 
 Skill bundles are deployment-owned directories of operator-authored skill

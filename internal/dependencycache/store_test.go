@@ -434,6 +434,79 @@ func TestStoreListRefusesOversizedInfoWithoutUnboundedRead(t *testing.T) {
 	}
 }
 
+func TestStoreRefusesNonFileArtifacts(t *testing.T) {
+	// A directory at an artifact path is a population error, not a servable
+	// artifact: a version whose set holds one must neither serve (any of its
+	// artifacts) nor list, or approval would cover a set the go command
+	// cannot consume.
+	store, _ := newTestStore(t, DefaultLimits(), func(root string) {
+		approveAll(t, root, "example.com/broken", "v1.0.0")
+		if err := os.Remove(filepath.Join(root, "example.com", "broken", "@v", "v1.0.0.mod")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(root, "example.com", "broken", "@v", "v1.0.0.mod"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	})
+	var notApproved *NotApprovedError
+	for _, ext := range ArtifactExts {
+		if _, _, err := store.Open("example.com/broken", "v1.0.0", ext); !asNotApproved(err, &notApproved) {
+			t.Fatalf("Open(%s) of a version with a non-file artifact: want NotApprovedError, got %v", ext, err)
+		} else if !strings.Contains(notApproved.Detail, "ordinary file") {
+			t.Fatalf("diagnostic must name the non-file artifact, got %q", notApproved.Detail)
+		}
+	}
+	versions, err := store.Versions("example.com/broken")
+	if err != nil {
+		t.Fatalf("Versions: %v", err)
+	}
+	if len(versions) != 0 {
+		t.Fatalf("a version with a non-file artifact must not be listed, got %+v", versions)
+	}
+	if _, err := store.Latest("example.com/broken"); !asNotApproved(err, &notApproved) {
+		t.Fatalf("@latest of a module with no approvable version: want NotApprovedError, got %v", err)
+	}
+
+	// A file where the store layout requires a directory is the same
+	// population error family.
+	store, _ = newTestStore(t, DefaultLimits(), func(root string) {
+		if err := os.MkdirAll(filepath.Join(root, "example.com", "flat"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "example.com", "flat", "@v"), []byte("not a directory"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if _, err := store.Versions("example.com/flat"); !asNotApproved(err, &notApproved) {
+		t.Fatalf("Versions on a file @v: want NotApprovedError, got %v", err)
+	} else if !strings.Contains(notApproved.Detail, "not a directory") {
+		t.Fatalf("diagnostic must name the non-directory, got %q", notApproved.Detail)
+	}
+}
+
+func TestStoreRefusesNullBytesBeforeTheFilesystem(t *testing.T) {
+	// Null bytes in the request key are refused by module/version validation
+	// before any store path is built (the HTTP layer rejects them earlier
+	// still): no lookup may reach the filesystem with one.
+	store, _ := newTestStore(t, DefaultLimits(), func(root string) {
+		approveAll(t, root, "example.com/hello", "v1.0.0")
+	})
+	var notApproved *NotApprovedError
+	for _, attempt := range []struct{ module, version string }{
+		{"example.com/ho\x00x", "v1.0.0"},
+		{"example.com/hello", "v1.0\x00.0"},
+		{"example.com/hello", "v1.0.0\x00"},
+	} {
+		if _, _, err := store.Open(attempt.module, attempt.version, ExtInfo); !asNotApproved(err, &notApproved) {
+			t.Fatalf("Open(%q, %q) with a null byte: want NotApprovedError, got %v", attempt.module, attempt.version, err)
+		}
+	}
+	// A null byte in the module path refuses the listing too.
+	if _, err := store.Versions("example.com/ho\x00x"); !asNotApproved(err, &notApproved) {
+		t.Fatalf("Versions with a null byte: want NotApprovedError, got %v", err)
+	}
+}
+
 func TestNewStoreRequiresADirectory(t *testing.T) {
 	if _, err := NewStore(filepath.Join(t.TempDir(), "absent")); err == nil {
 		t.Fatal("NewStore on an absent root must fail")

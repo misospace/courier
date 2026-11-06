@@ -17,6 +17,7 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/managed-by: courier
+    app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: dependency-cache
   annotations:
     # The cache holds no identity: it serves files and needs no API access.
@@ -30,6 +31,7 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/managed-by: courier
+    app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: dependency-cache
 spec:
   accessModes: [ReadWriteOnce]
@@ -44,6 +46,7 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/managed-by: courier
+    app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: dependency-cache
 spec:
   type: ClusterIP
@@ -54,6 +57,7 @@ spec:
       protocol: TCP
   selector:
     app.kubernetes.io/managed-by: courier
+    app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: dependency-cache
 ---
 apiVersion: apps/v1
@@ -63,6 +67,7 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/managed-by: courier
+    app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: dependency-cache
 spec:
   replicas: {{ $cache.replicas }}
@@ -71,11 +76,13 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/managed-by: courier
+      app.kubernetes.io/instance: {{ .Release.Name }}
       app.kubernetes.io/component: dependency-cache
   template:
     metadata:
       labels:
         app.kubernetes.io/managed-by: courier
+        app.kubernetes.io/instance: {{ .Release.Name }}
         app.kubernetes.io/component: dependency-cache
     spec:
       serviceAccountName: {{ .Release.Name }}-dependency-cache
@@ -140,11 +147,13 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/managed-by: courier
+    app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: dependency-cache
 spec:
   podSelector:
     matchLabels:
       app.kubernetes.io/managed-by: courier
+      app.kubernetes.io/instance: {{ .Release.Name }}
       app.kubernetes.io/component: dependency-cache
   policyTypes: [Ingress, Egress]
   ingress:

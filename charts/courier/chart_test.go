@@ -309,6 +309,21 @@ func runHelmOutput(t *testing.T, chartDir string, args ...string) (string, error
 	return string(output), err
 }
 
+// chartDoc returns the first rendered document of the given kind whose body
+// contains the needle. Renderers interleave template sources, so the kind
+// alone can be ambiguous; the needle pins the document. The kind matches the
+// whole "kind:" line so "Service" does not match "ServiceAccount".
+func chartDoc(t *testing.T, rendered, kind, needle string) string {
+	t.Helper()
+	for _, doc := range strings.Split(rendered, "\n---") {
+		if strings.Contains(doc, "kind: "+kind+"\n") && strings.Contains(doc, needle) {
+			return doc
+		}
+	}
+	t.Fatalf("no %s document containing %q found in:\n%s", kind, needle, rendered)
+	return ""
+}
+
 func TestServiceMonitorOptional(t *testing.T) {
 	if _, err := exec.LookPath("helm"); err != nil {
 		t.Skip("helm is not installed")
@@ -1881,12 +1896,33 @@ func TestChartRendersDependencyCache(t *testing.T) {
 	if !strings.Contains(enabled, "mountPath: /var/lib/courier/dependency-cache") {
 		t.Fatalf("cache Deployment does not mount the store:\n%s", enabled)
 	}
-	cachePolicy := strings.Split(enabled, "kind: NetworkPolicy")[1]
+	cachePolicy := chartDoc(t, enabled, "NetworkPolicy", "courier-dependency-cache")
 	if strings.Contains(cachePolicy, "egress:") {
 		t.Fatalf("cache NetworkPolicy must deny all egress:\n%s", cachePolicy)
 	}
 	if !strings.Contains(cachePolicy, "kubernetes.io/metadata.name: courier-runs") {
 		t.Fatalf("cache NetworkPolicy must admit only the run namespace:\n%s", cachePolicy)
+	}
+
+	// Release identity scopes every selector: two courier releases sharing a
+	// namespace must not route each other's workers to the wrong approved
+	// store, fight over cache pod ownership, or share a policy boundary.
+	cacheService := chartDoc(t, enabled, "Service", "courier-dependency-cache")
+	selectorPart := cacheService[strings.Index(cacheService, "selector:"):]
+	if !strings.Contains(selectorPart, "app.kubernetes.io/instance: courier") {
+		t.Fatalf("cache Service selector must carry release identity:\n%s", cacheService)
+	}
+	cacheDeployment := chartDoc(t, enabled, "Deployment", "--root=/var/lib/courier/dependency-cache")
+	matchLabels := cacheDeployment[strings.Index(cacheDeployment, "matchLabels:"):]
+	if !strings.Contains(matchLabels, "app.kubernetes.io/instance: courier") {
+		t.Fatalf("cache Deployment selector must carry release identity:\n%s", cacheDeployment)
+	}
+	templateBody := cacheDeployment[strings.Index(cacheDeployment, "\n  template:"):]
+	if !strings.Contains(templateBody, "\n        app.kubernetes.io/instance: courier") {
+		t.Fatalf("cache pod template labels must carry release identity:\n%s", cacheDeployment)
+	}
+	if !strings.Contains(cachePolicy, "app.kubernetes.io/instance: courier") {
+		t.Fatalf("cache NetworkPolicy pod selector must carry release identity:\n%s", cachePolicy)
 	}
 
 	// An external dependencyCacheService alongside the rendered one is
