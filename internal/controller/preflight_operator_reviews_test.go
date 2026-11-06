@@ -95,6 +95,8 @@ func TestCheckOperatorAccessReviewScoping(t *testing.T) {
 				{"", "services", "delete", "", runNamespace}:                              1,
 				{"networking.k8s.io", "networkpolicies", "create", "", runNamespace}:      1,
 				{"networking.k8s.io", "networkpolicies", "delete", "", runNamespace}:      1,
+				{"networking.k8s.io", "networkpolicies", "get", "", runNamespace}:         1,
+				{"networking.k8s.io", "networkpolicies", "update", "", runNamespace}:      1,
 				{"rbac.authorization.k8s.io", "roles", "create", "", runNamespace}:        1,
 				{"rbac.authorization.k8s.io", "rolebindings", "create", "", runNamespace}: 1,
 				{"rbac.authorization.k8s.io", "clusterrolebindings", "create", "", ""}:    1,

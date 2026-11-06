@@ -253,6 +253,12 @@ func (s *SecureControl) operatorAccessReviews(run *courier.CoderRun, registratio
 		{group: core, resource: "services", verb: "delete", namespace: runNamespace},
 		{group: "networking.k8s.io", resource: "networkpolicies", verb: "create", namespace: runNamespace},
 		{group: "networking.k8s.io", resource: "networkpolicies", verb: "delete", namespace: runNamespace},
+		// Provisioning converges an existing policy to its rendered spec on
+		// every pass (#712), so the proof must cover the read and the update
+		// a drifted policy needs, not only the create that provisions a new
+		// one.
+		{group: "networking.k8s.io", resource: "networkpolicies", verb: "get", namespace: runNamespace},
+		{group: "networking.k8s.io", resource: "networkpolicies", verb: "update", namespace: runNamespace},
 		{group: "rbac.authorization.k8s.io", resource: "roles", verb: "create", namespace: runNamespace},
 		{group: "rbac.authorization.k8s.io", resource: "rolebindings", verb: "create", namespace: runNamespace},
 		{group: "rbac.authorization.k8s.io", resource: "clusterrolebindings", verb: "create"},

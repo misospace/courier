@@ -10,6 +10,7 @@ import (
 	courier "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/topology"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -42,7 +43,7 @@ func cachedInformerReadRestricted(obj client.Object) bool {
 	switch obj.(type) {
 	case *corev1.Secret, *corev1.Service, *corev1.Namespace,
 		*corev1.ServiceAccount, *corev1.Node, *rbacv1.Role,
-		*rbacv1.RoleBinding, *corev1.ConfigMap:
+		*rbacv1.RoleBinding, *corev1.ConfigMap, *networkingv1.NetworkPolicy:
 		return true
 	}
 	return false

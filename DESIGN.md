@@ -2611,7 +2611,12 @@ never clears still retries — only not in a tight loop. An ordinary preflight
 error is not gated at all, because the design classifies it as transient.
 A permanent misconfiguration is only a verdict if the launch path can tell it
 from a transient one, and the deployment's own facts are what tell it: the
-operator's provisioning grants — the namespaced creates and deletes the secure
+operator's provisioning grants — the namespaced creates, the network-policy
+updates that converge an existing policy to its rendered spec on every
+provisioning pass (a policy provisioned before a rendering change must reach
+that change, written in place so no moment passes in which a pod has no
+policy, and rendered-whole so convergence cannot weaken a provisioned
+boundary, #712), the deletes the secure
 topology needs, the deletes the teardown path issues, the reads the secure
 launch path makes on its own behalf, and
 the cluster-scoped grants the proof itself uses — and the

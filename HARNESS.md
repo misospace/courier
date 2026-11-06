@@ -242,6 +242,9 @@ selected topology, not a configurable shared-broker fallback.
   operator-pinned ClusterIP/port; it has no DNS egress. The operator
   refreshes that address on cache Service replacement and reprobes before new
   dispatch; stale addresses fail closed with a cache-unavailable diagnostic.
+  Provisioning converges every existing run policy to its rendered spec on
+  each pass — an update in place, never a merge and never a gap without a
+  policy — so a rendering change reaches runs provisioned before it.
   Deny all worker access to the Kubernetes API, metadata endpoints,
   other cluster services, other runs, broker, forge, and model gateway. The
   worker uses no host network, host mounts/sockets, or privileged resources.

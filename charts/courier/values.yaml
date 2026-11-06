@@ -411,7 +411,7 @@ rbac:
           verbs: [get]
         - apiGroups: [networking.k8s.io]
           resources: [networkpolicies]
-          verbs: [create, delete, get, list]
+          verbs: [create, delete, get, list, update]
         - apiGroups: [rbac.authorization.k8s.io]
           resources: [roles]
           verbs: [create, delete, get, list]
