@@ -178,7 +178,7 @@ func (c *Coordinator) fenceWorker(opID string, cause error) {
 	c.workerFenceMu.Lock()
 	defer c.workerFenceMu.Unlock()
 	if c.workerFenceErr == nil {
-		c.workerFenceErr = &workerFence{reason: fmt.Sprintf("the worker is fenced: termination of operation %s could not be verified (%v); no further workspace operation may run against it", opID, cause)}
+		c.workerFenceErr = &workerFence{reason: fmt.Sprintf(noticeWorkerFencedFmt, opID, cause)}
 		c.prerequisite.observe(fencedPrerequisite())
 	}
 }
@@ -1252,7 +1252,7 @@ func (c *Coordinator) runDelegate(ctx context.Context, call ToolCall, result Too
 	dispatchedTip, err := c.prepareSnapshot(ctx, brief.ID)
 	if err != nil {
 		result.IsError = true
-		result.Content = "workspace snapshot could not be prepared: " + safeToolError(err)
+		result.Content = noticeSnapshotPreparePrefix + safeToolError(err)
 		return result
 	}
 	summary, completed, unavailable := c.runBrief(ctx, registered)
@@ -1310,7 +1310,7 @@ func (c *Coordinator) runDelegate(ctx context.Context, call ToolCall, result Too
 		checkpoint := &courierv1alpha1.Checkpoint{CompletedBriefs: c.briefs.CompletedBriefs()}
 		if err := c.status.CheckpointPublished(ctx, checkpoint, lastCommit); err != nil {
 			result.IsError = true
-			result.Content = "completed brief could not be recorded durably: " + safeToolError(err)
+			result.Content = noticeBriefRecordPrefix + safeToolError(err)
 			return result
 		}
 	}
@@ -1405,7 +1405,7 @@ func (c *Coordinator) runBrief(ctx context.Context, brief Brief) (summary string
 			// transcript is unchanged, so this is a brief failure like any
 			// other — tool-visible, bounded, never a silent truncation —
 			// and the coordinator re-delegates under a fresh brief ID.
-			return "sub-agent context could not be compacted: " + safeToolError(turn.harnessErr), false, nil
+			return noticeSubagentCompactPrefix + safeToolError(turn.harnessErr), false, nil
 		}
 		if turn.streamErr != nil {
 			if classification, ok := providerClassificationOf(turn.streamErr); ok && classification.Deferred() {
@@ -1415,13 +1415,13 @@ func (c *Coordinator) runBrief(ctx context.Context, brief Brief) (summary string
 			// tool-visible data for the coordinator, which owns the
 			// brief's fate; the coordinator's own next turn surfaces a
 			// gateway outage as the §8 infrastructure failure.
-			return "sub-agent stream failed: " + safeToolError(turn.streamErr), false, nil
+			return noticeSubagentStreamPrefix + safeToolError(turn.streamErr), false, nil
 		}
 		if turn.final {
 			return turn.text, true, nil
 		}
 		if turn.toolResults == nil {
-			return "sub-agent ended without a result", false, nil
+			return noticeSubagentNoResult, false, nil
 		}
 	}
 }
@@ -1435,10 +1435,10 @@ func (c *Coordinator) runBrief(ctx context.Context, brief Brief) (summary string
 // coordinator's own loop ends the run. Empty when the brief may continue.
 func (c *Coordinator) delegatedTripAbort() string {
 	if c.hasBootstrapBlocker() {
-		return "workspace bootstrap failed; the brief is aborted"
+		return noticeBriefBootstrapAbort
 	}
 	if c.prerequisite.peek() != nil {
-		return "workspace prerequisite failed; the brief is aborted"
+		return noticeBriefPrerequisiteAbort
 	}
 	return ""
 }

@@ -1228,9 +1228,11 @@ about model behavior or output; nothing about the gateway endpoint, key,
 or the provider behind it; nothing about the worker-side environment the
 model's commands run in; nothing about runtime-resolved values (verified
 input limits, probe results); nothing about the dynamic parts of a
-templated notice (brief IDs, role names, the visible-skill list) or the
-validation errors that quote model-provided arguments — those are data, and
-their trusted identity rides the covered identities above; and it is not an
+templated notice (brief IDs, role names, the visible-skill list), the
+validation errors that quote model-provided arguments, or the subsystem
+error text one of the coordinator's own composed prefixes wraps — the
+trusted-authored prefix is pinned, the tail is data, and its trusted
+identity rides the covered identities above; and it is not an
 authorization grant — the
 run's authority lives in the broker policy and the role boundary, not in
 this digest. It is computed by the same trusted binary it describes, so it

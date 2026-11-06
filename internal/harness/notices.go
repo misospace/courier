@@ -44,6 +44,17 @@ const (
 	noticeSkillAssetsFmt       = "\n\nSupporting assets (read-only, mounted at the same paths in the worker pod):\n"
 	noticeSkillRepoFilesFmt    = "\n\nThis is a repository-local skill: its supporting files, if any, live in the repository checkout under .agents/skills/%s/."
 	noticeSkillAssetsTruncated = "- (listing truncated at the byte bound; use the shell tool to list the remaining assets)\n"
+	// Fixed prefixes the coordinator's own delegate paths compose in front
+	// of a subsystem error's bounded text (#730 review): the template is
+	// trusted-authored surface, the tail is subsystem data.
+	noticeSnapshotPreparePrefix  = "workspace snapshot could not be prepared: "
+	noticeBriefRecordPrefix      = "completed brief could not be recorded durably: "
+	noticeSubagentCompactPrefix  = "sub-agent context could not be compacted: "
+	noticeSubagentStreamPrefix   = "sub-agent stream failed: "
+	noticeSubagentNoResult       = "sub-agent ended without a result"
+	noticeBriefBootstrapAbort    = "workspace bootstrap failed; the brief is aborted"
+	noticeBriefPrerequisiteAbort = "workspace prerequisite failed; the brief is aborted"
+	noticeWorkerFencedFmt        = "the worker is fenced: termination of operation %s could not be verified (%v); no further workspace operation may run against it"
 	// The brief ledger's validation and sentinel texts, rendered to the
 	// model through safeToolError on the delegate and cancel paths.
 	noticeBriefRequiresID        = "harness: brief requires an ID"
@@ -83,6 +94,14 @@ var fixedNoticeTable = []fixedNotice{
 	{name: "delegate.arguments", text: noticeDelegateArgs},
 	{name: "delegate.role-unbound", text: noticeRoleUnboundFmt},
 	{name: "delegate.binding-unavailable", text: noticeBindingUnavailable},
+	{name: "delegate.snapshot-prepare", text: noticeSnapshotPreparePrefix},
+	{name: "delegate.checkpoint-record", text: noticeBriefRecordPrefix},
+	{name: "brief.compaction-failed", text: noticeSubagentCompactPrefix},
+	{name: "brief.stream-failed", text: noticeSubagentStreamPrefix},
+	{name: "brief.no-result", text: noticeSubagentNoResult},
+	{name: "brief.bootstrap-aborted", text: noticeBriefBootstrapAbort},
+	{name: "brief.prerequisite-aborted", text: noticeBriefPrerequisiteAbort},
+	{name: "dispatch.termination-unverified", text: noticeWorkerFencedFmt},
 	{name: "check.arguments", text: noticeCheckArgs},
 	{name: "check.nul-byte", text: noticeCheckNUL},
 	{name: "check.launch-failed", text: noticeCheckLaunchFailed},
