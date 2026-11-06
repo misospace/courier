@@ -63,6 +63,7 @@ func TestUncachedReadObjectsCoverNoWatchKinds(t *testing.T) {
 		"Namespace":      false,
 		"Node":           false,
 		"Role":           false,
+		"NetworkPolicy":  false,
 	}
 	// Kinds the chart grants watch on and the cache legitimately holds. They
 	// must never be forced uncached: doing so would drop the watch-driven

@@ -9,6 +9,8 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -43,7 +45,7 @@ const brokerVerdictGrace = 90 * time.Second
 // +kubebuilder:rbac:groups="",resources=services,verbs=create;delete;get;list
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get
-// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=create;delete;get;list
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=create;delete;get;list;update
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=create;delete;get;list
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=create;delete;get;list
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,verbs=create;delete;get;list
@@ -872,8 +874,13 @@ func (s *SecureControl) ensureFinalizer(ctx context.Context, run *courier.CoderR
 }
 
 // provisionStatic creates every non-workload object of the topology. Each
-// create tolerates AlreadyExists; nothing here ever mutates an existing
-// object, so replacement rounds cannot weaken a provisioned boundary.
+// create tolerates AlreadyExists. The NetworkPolicies are the one exception:
+// each converges to its rendered spec on every pass (#712), so a rendering
+// change reaches runs provisioned before it. The convergence replaces the
+// live spec with the rendered one rather than merging, so a replacement round
+// cannot weaken a provisioned boundary, and the update happens in place, so
+// no moment passes in which a pod has no policy at all. Every other object
+// here is never mutated.
 func (s *SecureControl) provisionStatic(ctx context.Context, run *courier.CoderRun, policy *courier.PublicationPolicy) error {
 	for _, sa := range topology.ServiceAccounts(run) {
 		if err := s.ensureObject(ctx, sa); err != nil {
@@ -890,7 +897,7 @@ func (s *SecureControl) provisionStatic(ctx context.Context, run *courier.CoderR
 		return err
 	}
 	for _, policy := range topology.NetworkPolicies(run, s.cachePointer(ctx), s.gatewayPointer()) {
-		if err := s.ensureObject(ctx, policy); err != nil {
+		if err := s.ensureNetworkPolicy(ctx, policy); err != nil {
 			return err
 		}
 	}
@@ -1117,6 +1124,45 @@ func (s *SecureControl) selectedRegistration(run *courier.CoderRun) (*forge.Regi
 func (s *SecureControl) ensureObject(ctx context.Context, object client.Object) error {
 	if err := s.Client.Create(ctx, object); err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("secure topology: create %T %s: %w", object, object.GetName(), err)
+	}
+	return nil
+}
+
+// ensureNetworkPolicy reconciles one rendered policy against the live object
+// (#712). Create-only provisioning left a policy frozen at the rendering that
+// was current when the run was provisioned, so a rendering change — the
+// control policy's ingress repair in #711, a moved dependency-cache pin —
+// reached only newly provisioned runs. A missing policy is created; an
+// existing one whose spec differs from the rendered spec is updated in place,
+// so no moment passes in which the run's pods have no policy at all. The
+// update writes the rendered spec whole — the operator never merges the live
+// policy into the rendered one — so convergence cannot weaken a provisioned
+// boundary, and an unchanged spec is left untouched, so an idempotent pass
+// issues no write. Convergence covers the spec alone: the object's own labels
+// are not part of what the policy enforces, so a label-scheme rendering change
+// still reaches only newly provisioned runs. The live read goes through the
+// uncached reader:
+// NetworkPolicy is a point-read kind the chart grants no watch, so a cached
+// read would lazily start an informer the RBAC cannot sustain.
+func (s *SecureControl) ensureNetworkPolicy(ctx context.Context, rendered *networkingv1.NetworkPolicy) error {
+	live := &networkingv1.NetworkPolicy{}
+	err := s.reader().Get(ctx, client.ObjectKeyFromObject(rendered), live)
+	if apierrors.IsNotFound(err) {
+		if err := s.Client.Create(ctx, rendered); err != nil && !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("secure topology: create network policy %s: %w", rendered.Name, err)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("secure topology: read network policy %s: %w", rendered.Name, err)
+	}
+	if apiequality.Semantic.DeepEqual(rendered.Spec, live.Spec) {
+		return nil
+	}
+	updated := live.DeepCopy()
+	updated.Spec = *rendered.Spec.DeepCopy()
+	if err := s.Client.Update(ctx, updated); err != nil {
+		return fmt.Errorf("secure topology: update network policy %s: %w", rendered.Name, err)
 	}
 	return nil
 }

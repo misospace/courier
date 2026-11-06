@@ -534,7 +534,7 @@ func TestPreflightOperatorReadGrantsNamespaceScopedEnvtest(t *testing.T) {
 		Rules: []rbacv1.PolicyRule{
 			{APIGroups: []string{""}, Resources: []string{"secrets", "serviceaccounts", "pods", "services"}, Verbs: []string{"create", "delete"}},
 			{APIGroups: []string{""}, Resources: []string{"configmaps"}, Verbs: []string{"delete"}},
-			{APIGroups: []string{"networking.k8s.io"}, Resources: []string{"networkpolicies"}, Verbs: []string{"create", "delete"}},
+			{APIGroups: []string{"networking.k8s.io"}, Resources: []string{"networkpolicies"}, Verbs: []string{"create", "delete", "update"}},
 			{APIGroups: []string{"rbac.authorization.k8s.io"}, Resources: []string{"roles", "rolebindings", "clusterrolebindings"}, Verbs: []string{"create", "delete"}},
 			{APIGroups: []string{""}, Resources: []string{"nodes"}, Verbs: []string{"list"}},
 			{APIGroups: []string{""}, Resources: []string{"namespaces"}, Verbs: []string{"get"}},
@@ -569,6 +569,8 @@ func TestPreflightOperatorReadGrantsNamespaceScopedEnvtest(t *testing.T) {
 			{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"list"}},
 			{APIGroups: []string{""}, Resources: []string{"secrets", "services"}, Verbs: []string{"get"}},
 			{APIGroups: []string{courier.GroupVersion.Group}, Resources: []string{"laneprofiles"}, Verbs: []string{"get"}},
+			// Provisioning reads each policy by name to converge it (#712).
+			{APIGroups: []string{"networking.k8s.io"}, Resources: []string{"networkpolicies"}, Verbs: []string{"get"}},
 		},
 	}
 	if err := c.Create(context.Background(), readRole); err != nil {
