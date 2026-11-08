@@ -79,7 +79,7 @@ func TestDispatchTasksReportContractGuard(t *testing.T) {
 			defer server.Close()
 
 			id := encodeWorkIDForTaskType(t, pair.taskType)
-			client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+			client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -135,7 +135,7 @@ func TestDispatchTasksReportContractRejectsUnknownOutcomes(t *testing.T) {
 	defer server.Close()
 
 	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{ID: "issue-1", Repo: "acme/widgets", Number: 42}})
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +199,7 @@ func TestDispatchTasksReportBlockedExternalPendingUpstream(t *testing.T) {
 			defer server.Close()
 
 			id := encodeWorkIDForTaskType(t, want.taskType)
-			client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+			client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 			if err != nil {
 				t.Fatal(err)
 			}

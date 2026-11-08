@@ -44,7 +44,7 @@ func ciparkWorkItem() source.WorkItem {
 	return source.WorkItem{ID: EncodeWorkID(Task{
 		Type:        "followup-pr",
 		PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77},
-		PRFixItem:   &PRFixItem{ID: "queue-item-1", Generation: ciparkGen},
+		PRFixItem:   &PRFixItem{ID: "queue-item-1", Generation: ciparkGen, OriginalClaimant: "worker"},
 	})}
 }
 
@@ -59,7 +59,7 @@ func ciparkImplementItem() source.WorkItem {
 // queue lane and an always-open pull request state checker.
 func ciParkClient(t *testing.T, serverURL string) (*HTTPClient, *Adapter) {
 	t.Helper()
-	client, err := NewClientWithLane(serverURL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(serverURL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,6 +69,7 @@ func ciParkClient(t *testing.T, serverURL string) (*HTTPClient, *Adapter) {
 		}
 		return PullRequestState{State: "open"}, nil
 	}))
+	client.WithOwnershipBindings(map[string]string{"worker": "normal"})
 	return client, New(client)
 }
 
@@ -205,7 +206,7 @@ func TestDispatchCIParkAdapterLifecycle(t *testing.T) {
 				}
 			}))
 			defer server.Close()
-			client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+			client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1238,7 +1239,7 @@ func (s *ciParkDispatch) nextTask(w http.ResponseWriter) {
 		"type":        "followup-pr",
 		"shouldRun":   true,
 		"pullRequest": map[string]any{"repoFullName": "acme/widgets", "number": 77},
-		"prFixItem":   map[string]any{"id": "queue-item-1", "generation": s.generation},
+		"prFixItem":   map[string]any{"id": "queue-item-1", "generation": s.generation, "originalClaimant": "worker"},
 	})
 }
 

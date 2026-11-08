@@ -41,7 +41,7 @@ func TestAssignmentFlowsFromDispatchOfferToCoordinatorGoal(t *testing.T) {
 					"number":       1342,
 					"url":          "https://github.com/acme/widgets/pull/1342",
 				},
-				"prFixItem": map[string]any{"id": "fix-1342-1", "generation": 1},
+				"prFixItem": map[string]any{"id": "fix-1342-1", "generation": 1, "originalClaimant": "worker"},
 				"reasons":   []string{conflictReason, "PR comment: resolve it"},
 			})
 		case "/api/pr-fix-queue/ack":
@@ -57,6 +57,7 @@ func TestAssignmentFlowsFromDispatchOfferToCoordinatorGoal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	api.WithOwnershipBindings(map[string]string{"worker": "normal"})
 	api.WithPullRequestStateChecker(dispatch.PullRequestStateCheckerFunc(func(context.Context, string, int) (dispatch.PullRequestState, error) {
 		return dispatch.PullRequestState{State: "open"}, nil
 	}))

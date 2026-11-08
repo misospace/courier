@@ -47,7 +47,7 @@ const (
 // drive, mirroring the CI-park fixture construction.
 func retryTestClient(t *testing.T, serverURL string) *HTTPClient {
 	t.Helper()
-	client, err := NewClientWithLane(serverURL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(serverURL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

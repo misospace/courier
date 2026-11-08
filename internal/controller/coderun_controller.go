@@ -482,6 +482,16 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	if claimer, ok := adapter.(source.ClaimerWithReceipt); ok {
 		claimed, err := claimer.ClaimWithReceipt(ctx, item)
 		if err != nil {
+			if errors.Is(err, source.ErrStaleWork) {
+				// The source refused this attempt outright — the configured
+				// ownership gate does not authorize it for this connector
+				// (#761). The attempt must never execute, and a retryable
+				// refusal would leave the run Pending, holding its lane's
+				// capacity forever. The run is dropped the way the stale-work
+				// path drops it: the source keeps the attempt, released for
+				// the lane that owns it.
+				return ctrl.Result{}, r.Delete(ctx, &run)
+			}
 			return ctrl.Result{}, err
 		}
 		if claimed.Context != "" && len(claimed.Context) > source.MaxSourceContextBytes {

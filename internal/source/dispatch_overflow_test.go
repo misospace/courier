@@ -36,7 +36,7 @@ func TestRunnerMakesProgressAfterExclusionOverflow(t *testing.T) {
 		return dispatch.EncodeWorkID(dispatch.Task{
 			Type:        "followup-pr",
 			PullRequest: &dispatch.PullRequest{Repo: "acme/widgets", Number: number},
-			PRFixItem:   &dispatch.PRFixItem{ID: fmt.Sprintf("item-%d", number), Generation: 1},
+			PRFixItem:   &dispatch.PRFixItem{ID: fmt.Sprintf("item-%d", number), Generation: 1, OriginalClaimant: "worker"},
 		})
 	}
 
@@ -78,7 +78,7 @@ func TestRunnerMakesProgressAfterExclusionOverflow(t *testing.T) {
 			"type":        "followup-pr",
 			"shouldRun":   true,
 			"pullRequest": map[string]any{"repoFullName": "acme/widgets", "number": number},
-			"prFixItem":   map[string]any{"id": fmt.Sprintf("item-%d", number), "generation": 1},
+			"prFixItem":   map[string]any{"id": fmt.Sprintf("item-%d", number), "generation": 1, "originalClaimant": "worker"},
 		}
 	}
 	var mu sync.Mutex
@@ -120,6 +120,7 @@ func TestRunnerMakesProgressAfterExclusionOverflow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	httpClient.WithOwnershipBindings(map[string]string{"worker": ""})
 	httpClient.WithPRFixExclusions(true).WithPullRequestStateChecker(dispatch.PullRequestStateCheckerFunc(
 		func(context.Context, string, int) (dispatch.PullRequestState, error) {
 			return dispatch.PullRequestState{State: "open"}, nil
