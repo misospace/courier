@@ -586,7 +586,12 @@ func (c *HTTPClient) discover(ctx context.Context, query url.Values) (items []so
 			// way. Discovery surfaces no work and no error, so an ownership
 			// refusal never fails the poll loop: the lane stays available
 			// and the item stays discoverable for its owning lane (#761).
-			_ = c.declineOwnership(ctx, task, reason, why)
+			// The decline outcome is logged, not returned, so a refused
+			// release stays visible without turning the refusal into a
+			// failed poll.
+			if decline := c.declineOwnership(ctx, task, reason, why); decline != nil {
+				log.FromContext(ctx).Info("dispatch client: followup-pr handout declined by configured ownership", "reason", reason, "decline", decline.Error())
+			}
 			return nil, nil
 		}
 		state, err := c.checkPullRequestState(ctx, task.PullRequest)

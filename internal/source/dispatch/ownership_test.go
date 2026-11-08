@@ -243,14 +243,53 @@ func TestOwnershipGateDeclinesReceiptlessHandoutWithoutRelease(t *testing.T) {
 func TestOwnershipGateDeclineLatchesPerGeneration(t *testing.T) {
 	server, marks := ownershipServer(t, func() map[string]any { return ownershipTaskBody("frontier") })
 	client := newOwnershipClient(t, server.URL, "normal", map[string]string{"local": "normal", "frontier": "frontier"})
+	counter := attachOwnershipDiagnostics(t, client)
 	for i := 0; i < 2; i++ {
 		items, err := client.Discover(context.Background())
 		if items != nil || err != nil {
 			t.Fatalf("poll %d: items = %#v err = %v, want the handout declined without failing the poll", i, items, err)
 		}
 	}
+	if got := counter(reasonOwnershipLaneMismatch); got != 2 {
+		t.Fatalf("diagnostic %s = %v, want one per poll while the release stays latched", reasonOwnershipLaneMismatch, got)
+	}
 	if len(*marks) != 1 {
 		t.Fatalf("marks = %#v, want exactly one release per generation", *marks)
+	}
+}
+
+// A release the deployment refuses still settles the decline: the mark call
+// is attempted once, latched for the generation, and the poll stays clean so
+// the lane keeps discovering while the source's stale-handout reclaimer
+// remains the bounded recovery path.
+func TestOwnershipGateDeclineSurvivesRefusedRelease(t *testing.T) {
+	var marks int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/next-task"):
+			_ = json.NewEncoder(w).Encode(ownershipTaskBody("frontier"))
+		case r.URL.Path == "/api/pr-fix-queue/mark":
+			marks++
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			t.Fatalf("unexpected request %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	client := newOwnershipClient(t, server.URL, "normal", map[string]string{"local": "normal", "frontier": "frontier"})
+	counter := attachOwnershipDiagnostics(t, client)
+	for i := 0; i < 2; i++ {
+		items, err := client.Discover(context.Background())
+		if items != nil || err != nil {
+			t.Fatalf("poll %d: items = %#v err = %v, want the handout declined without failing the poll", i, items, err)
+		}
+	}
+	if got := counter(reasonOwnershipLaneMismatch); got != 2 {
+		t.Fatalf("diagnostic %s = %v, want one per poll", reasonOwnershipLaneMismatch, got)
+	}
+	if marks != 1 {
+		t.Fatalf("marks = %d, want exactly one refused release attempt per generation", marks)
 	}
 }
 
