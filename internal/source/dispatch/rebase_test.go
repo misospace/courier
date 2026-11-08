@@ -38,7 +38,7 @@ func openPRChecker() PullRequestStateChecker {
 // test wiring; rebase toggles the versioned rebase-only intake declaration.
 func newTestClient(t *testing.T, serverURL string, rebase bool) *HTTPClient {
 	t.Helper()
-	client, err := NewClientWithLane(serverURL, "worker", "rebase", "token", time.Second)
+	client, err := newTestDispatchClient(serverURL, "worker", "rebase", "token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

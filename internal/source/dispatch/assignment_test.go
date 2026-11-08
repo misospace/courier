@@ -31,7 +31,7 @@ func discoverAssignment(t *testing.T, task Task) source.WorkItem {
 		_ = json.NewEncoder(w).Encode(task)
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1896,18 +1896,37 @@ gate runs before the merged/closed stale mark, so foreign work is never marked
 stale, and before rebase classification, so a foreign or evidence-less rebase
 offer is declined by ownership even when the rebase capability is negotiated;
 deterministic-rebase execution operates only on already-accepted runs and
-cannot bypass it. Because acceptance is the only gate, the generation-fenced
-hand-out acknowledgement (`agentName` + `generation`, with 403/409 refusals
-treated as moot) is the admission-boundary recheck for ownership that changes
-after discovery. The gate is unconditional: when the connected Dispatch does
+cannot bypass it. The gate is unconditional: when the connected Dispatch does
 not yet supply the evidence (an older peer), every fix-pr handout is declined
 gracefully through the shared receipt-fenced decline — never claimed,
 materialized, or marked stale; released through the generation-fenced
 waiting-external mark at most once per generation per process; surfaced as a
 connector diagnostic (`ownership-evidence-missing`, `ownership-claimant-unknown`,
 `ownership-lane-mismatch`) without failing the poll loop — and legitimate
-repairs resume when the peer supplies evidence. The accepted claimant rides the
-durable run receipt.
+repairs resume when the peer supplies evidence.
+
+**Acceptance is not the only gate.** The accepted claimant rides the durable
+attempt identity (`workDescriptor.originalClaimant`, the same opaque work ID
+that carries the PR-fix id, generation, hand-out token, and fix type), so every
+boundary that can still refuse an attempt revalidates the same evidence
+against the same configured bindings: the claim/admission boundary
+(`ClaimWithReceipt`), the hand-out acknowledgement (`AckHandout`, which tells
+Dispatch this agent owns the attempt and therefore must never acknowledge an
+unauthorized one), and the pre-launch revalidation (`PreLaunch`). The
+pre-launch revalidation is the boundary the admission path and the recovery
+path both pass through, so an attempt that was materialized before the gate
+existed — or one whose connector restarted under a different binding
+configuration — is refused instead of executing foreign work. A refusal at any
+of these boundaries releases the reservation with the exact receipt
+(repo, PR, generation) the attempt carries, never marks the item stale, never
+resets another writer's attempt, and never changes a label; the item stays
+discoverable for the lane that owns it. The refusal is terminal for the run: it
+carries `source.ErrStaleWork`, so the core drops the run instead of leaving it
+Pending, where it would reserve its lane's capacity and be re-admitted into the
+same refusal forever. The bare Dispatch connector carries the queue lane of
+the binding that owns its Dispatch agent identity, so it authorizes the same
+PR repair the binding does; a bare agent that owns no configured binding has
+no lane and authorizes no PR repair at all.
 
 ### Repository development bootstrap execution
 

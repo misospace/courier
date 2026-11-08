@@ -33,14 +33,14 @@ func TestHTTPClientAckHandoutPostsGenerationPinnedReceipt(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient(server.URL, "worker", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	id := EncodeWorkID(Task{
 		Type:        "followup-pr",
 		PullRequest: &PullRequest{Repo: "Acme/Widgets", Number: 42},
-		PRFixItem:   &PRFixItem{ID: "fix-42", Generation: 3, HandoutToken: "handout-3"},
+		PRFixItem:   &PRFixItem{ID: "fix-42", Generation: 3, HandoutToken: "handout-3", OriginalClaimant: "worker"},
 	})
 	if err := client.AckHandout(context.Background(), source.WorkItem{ID: id}); err != nil {
 		t.Fatalf("AckHandout: %v", err)
@@ -69,14 +69,14 @@ func TestHTTPClientAckHandoutTreatsMovedOnHandOutAsNoOp(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			http.Error(w, refusal.body, refusal.code)
 		}))
-		client, err := NewClient(server.URL, "worker", "token", time.Second)
+		client, err := newTestDispatchClient(server.URL, "worker", "", "token", time.Second)
 		if err != nil {
 			t.Fatal(err)
 		}
 		id := EncodeWorkID(Task{
 			Type:        "followup-pr",
 			PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42},
-			PRFixItem:   &PRFixItem{ID: "fix-42", Generation: 3, HandoutToken: "handout-3"},
+			PRFixItem:   &PRFixItem{ID: "fix-42", Generation: 3, HandoutToken: "handout-3", OriginalClaimant: "worker"},
 		})
 		if err := client.AckHandout(context.Background(), source.WorkItem{ID: id}); err != nil {
 			t.Fatalf("status %d body %s: AckHandout = %v, want settled no-op", refusal.code, refusal.body, err)
@@ -106,14 +106,14 @@ func TestHTTPClientAckHandoutPropagatesUnexpectedRefusals(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, refusal.body, refusal.code)
 		}))
-		client, err := NewClient(server.URL, "worker", "token", time.Second)
+		client, err := newTestDispatchClient(server.URL, "worker", "", "token", time.Second)
 		if err != nil {
 			t.Fatal(err)
 		}
 		id := EncodeWorkID(Task{
 			Type:        "followup-pr",
 			PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42},
-			PRFixItem:   &PRFixItem{ID: "fix-42", Generation: 3, HandoutToken: "handout-3"},
+			PRFixItem:   &PRFixItem{ID: "fix-42", Generation: 3, HandoutToken: "handout-3", OriginalClaimant: "worker"},
 		})
 		if err := client.AckHandout(context.Background(), source.WorkItem{ID: id}); err == nil {
 			t.Fatalf("status %d body %s: AckHandout = nil, want error", refusal.code, refusal.body)
@@ -127,14 +127,14 @@ func TestHTTPClientAckHandoutPropagatesUnknownConflictReason(t *testing.T) {
 		http.Error(w, `{"error":"pr fix queue item generation mismatch","reason":"ledger-diverged"}`, http.StatusConflict)
 	}))
 	defer server.Close()
-	client, err := NewClient(server.URL, "worker", "token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "", "token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	id := EncodeWorkID(Task{
 		Type:        "followup-pr",
 		PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42},
-		PRFixItem:   &PRFixItem{ID: "fix-42", Generation: 3, HandoutToken: "handout-3"},
+		PRFixItem:   &PRFixItem{ID: "fix-42", Generation: 3, HandoutToken: "handout-3", OriginalClaimant: "worker"},
 	})
 	if err := client.AckHandout(context.Background(), source.WorkItem{ID: id}); err == nil {
 		t.Fatal("AckHandout on unknown 409 reason = nil, want error")
@@ -148,14 +148,14 @@ func TestHTTPClientAckHandoutRejectsInvalidDescriptor(t *testing.T) {
 		_, _ = w.Write([]byte("{}"))
 	}))
 	defer server.Close()
-	client, err := NewClient(server.URL, "worker", "token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "", "token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	id := EncodeWorkID(Task{
 		Type:        "followup-pr",
 		PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42},
-		PRFixItem:   &PRFixItem{ID: "fix-42", Generation: 3, HandoutToken: "handout-3"},
+		PRFixItem:   &PRFixItem{ID: "fix-42", Generation: 3, HandoutToken: "handout-3", OriginalClaimant: "worker"},
 	})
 	// Truncating drops the closing delimiter so decodeWorkID fails.
 	if err := client.AckHandout(context.Background(), source.WorkItem{ID: id[:len(id)-1]}); err == nil {
@@ -171,14 +171,14 @@ func TestHTTPClientAckHandoutPropagatesServerFailures(t *testing.T) {
 		http.Error(w, `{"error":"Failed to acknowledge pr-fix hand-out"}`, http.StatusInternalServerError)
 	}))
 	defer server.Close()
-	client, err := NewClient(server.URL, "worker", "token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "", "token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	id := EncodeWorkID(Task{
 		Type:        "followup-pr",
 		PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42},
-		PRFixItem:   &PRFixItem{ID: "fix-42", Generation: 3, HandoutToken: "handout-3"},
+		PRFixItem:   &PRFixItem{ID: "fix-42", Generation: 3, HandoutToken: "handout-3", OriginalClaimant: "worker"},
 	})
 	if err := client.AckHandout(context.Background(), source.WorkItem{ID: id}); err == nil {
 		t.Fatal("AckHandout on 500 = nil, want error")
@@ -192,7 +192,7 @@ func TestHTTPClientAckHandoutIgnoresNonHandOutWork(t *testing.T) {
 		_, _ = w.Write([]byte("{}"))
 	}))
 	defer server.Close()
-	client, err := NewClient(server.URL, "worker", "token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "", "token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

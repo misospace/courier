@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -922,4 +924,30 @@ func launchFuncForAdmission(c client.Client, image string) LaunchFunc {
 		Pod:    executor.PodConfig{Image: image},
 	}
 	return launcher.Launch
+}
+
+// refusingReceiptAdmissionSource refuses the claim the way the configured
+// ownership gate does when a PR-repair attempt is not authorized for this
+// connector (#761): the attempt must never execute.
+type refusingReceiptAdmissionSource struct{ admissionSource }
+
+func (*refusingReceiptAdmissionSource) ClaimWithReceipt(_ context.Context, _ source.WorkItem) (source.WorkItem, error) {
+	return source.WorkItem{}, fmt.Errorf("%w: configured ownership gate refused the attempt", source.ErrStaleWork)
+}
+
+// A run whose claim the source refuses outright is dropped instead of left
+// Pending: a Pending run reserves its lane's capacity, so a retryable refusal
+// would hold the lane's only slot forever.
+func TestAdmissionDropsRunWhoseClaimIsRefused(t *testing.T) {
+	client := admissionClient(t, admissionLane("local", 1), admissionRun("refused", "local", courierv1alpha1.PhasePending))
+	reconciler := admissionReconciler(client)
+	reconciler.Sources = NewSourceRegistry(map[string]source.Adapter{"test": &refusingReceiptAdmissionSource{}})
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("refused")); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	var run courierv1alpha1.CoderRun
+	err := client.Get(context.Background(), admissionKey("refused"), &run)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("get refused run error = %v, want NotFound; a refused claim must not leave the run Pending", err)
+	}
 }

@@ -301,6 +301,26 @@ func TestDispatchOwnershipBindings(t *testing.T) {
 	}
 }
 
+// TestDispatchBindingLane pins the lane the bare Dispatch connector carries:
+// the lane of the binding that owns its Dispatch agent identity, and no lane
+// at all when that agent owns no binding — a bare agent that is not a
+// configured binding authorizes no PR repair (#761).
+func TestDispatchBindingLane(t *testing.T) {
+	bindings := dispatchOwnershipBindings([]dispatchBinding{
+		{queueLane: "queue-a", laneProfile: "lane-a", agentName: "courier"},
+		{queueLane: "queue-b", laneProfile: "lane-b", agentName: "courier-queue-b", sourceAgent: "courier-queue-b"},
+	})
+	if got := dispatchBindingLane(bindings, "courier"); got != "queue-a" {
+		t.Fatalf("dispatchBindingLane(courier) = %q, want queue-a", got)
+	}
+	if got := dispatchBindingLane(bindings, " courier-queue-b"); got != "queue-b" {
+		t.Fatalf("dispatchBindingLane(courier-queue-b) = %q, want queue-b", got)
+	}
+	if got := dispatchBindingLane(bindings, "other-agent"); got != "" {
+		t.Fatalf("dispatchBindingLane(other-agent) = %q, want no lane", got)
+	}
+}
+
 // TestBuildSecureControlRejectsTaintedCredential covers the whole
 // pod-exposed Secret set: every flag that injects a Secret into a
 // model-controlled coordinator pod taints a registration that references it,

@@ -60,7 +60,7 @@ func ownershipServer(t *testing.T, served func() map[string]any) (*httptest.Serv
 // configured ownership bindings and an always-open PR state checker.
 func newOwnershipClient(t *testing.T, serverURL, lane string, bindings map[string]string) *HTTPClient {
 	t.Helper()
-	client, err := NewClientWithLane(serverURL, "worker", lane, "token", time.Second)
+	client, err := newTestDispatchClient(serverURL, "worker", lane, "token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestOwnershipGateAcceptsEveryClaimantInSharedLane(t *testing.T) {
 		return body
 	})
 	client := newOwnershipClient(t, server.URL, "normal", map[string]string{"local": "normal", "hyper": "normal", "cloud": "normal"})
-	var lastContext string
+	var lastItem source.WorkItem
 	for _, claimant := range claimants {
 		items, err := client.Discover(context.Background())
 		if err != nil {
@@ -111,17 +111,17 @@ func TestOwnershipGateAcceptsEveryClaimantInSharedLane(t *testing.T) {
 		if len(items) != 1 || items[0].Mode != "fix-pr" || items[0].Repo != "acme/widgets" || items[0].Ref != 42 {
 			t.Fatalf("claimant %q: items = %#v", claimant, items)
 		}
-		lastContext = items[0].Context
+		lastItem = items[0]
 	}
 	if len(*marks) != 0 {
 		t.Fatalf("marks = %#v, want none for accepted handouts", *marks)
 	}
-	var receipt dispatchContext
-	if err := json.Unmarshal([]byte(lastContext), &receipt); err != nil {
-		t.Fatal(err)
+	descriptor, err := decodeWorkID(lastItem.ID)
+	if err != nil {
+		t.Fatalf("decode work ID: %v", err)
 	}
-	if receipt.OriginalClaimant != "cloud" {
-		t.Fatalf("receipt claimant = %q, want the evidence carried into the durable receipt", receipt.OriginalClaimant)
+	if descriptor.OriginalClaimant != "cloud" {
+		t.Fatalf("attempt claimant = %q, want the evidence carried into the durable attempt identity", descriptor.OriginalClaimant)
 	}
 }
 
@@ -325,5 +325,139 @@ func TestOwnershipGateAppliesThroughDiscoverForCapacity(t *testing.T) {
 	}
 	if len(*marks) != 1 || (*marks)[0]["status"] != "WAITING_EXTERNAL" || (*marks)[0]["generation"] != float64(4) {
 		t.Fatalf("marks = %#v, want exactly one exact-receipt release", *marks)
+	}
+}
+
+// Ownership can change between discovery and admission: the claim consults
+// the configured bindings again, so a handout that was authorized when it was
+// discovered is refused when the attempt is admitted. The refusal releases the
+// reservation with the exact receipt and is terminal for the run, so the core
+// drops the attempt instead of re-admitting it into the same refusal.
+func TestOwnershipGateRechecksOwnershipAtClaimBoundary(t *testing.T) {
+	server, marks := ownershipServer(t, func() map[string]any { return ownershipTaskBody("cloud") })
+	client := newOwnershipClient(t, server.URL, "normal", map[string]string{"cloud": "normal"})
+	items, err := client.Discover(context.Background())
+	if err != nil || len(items) != 1 {
+		t.Fatalf("Discover() items = %#v err = %v, want the authorized handout", items, err)
+	}
+	// The deployment's binding map changes before the attempt is admitted.
+	client.WithOwnershipBindings(map[string]string{"cloud": "frontier"})
+	_, err = client.ClaimWithReceipt(context.Background(), items[0].ID, items[0].Context)
+	if !errors.Is(err, ErrOwnershipDeclined) {
+		t.Fatalf("ClaimWithReceipt() error = %v, want the ownership decline", err)
+	}
+	if !errors.Is(err, source.ErrStaleWork) {
+		t.Fatalf("ClaimWithReceipt() error = %v, want a refusal that is terminal for the run", err)
+	}
+	if len(*marks) != 1 {
+		t.Fatalf("marks = %#v, want exactly one release", *marks)
+	}
+	if mark := (*marks)[0]; mark["status"] != "WAITING_EXTERNAL" || mark["repo"] != "acme/widgets" || mark["pr"] != float64(42) || mark["generation"] != float64(4) {
+		t.Fatalf("release mark = %#v, want the exact receipt", mark)
+	}
+}
+
+// An attempt materialized before the gate existed carries no ownership
+// evidence. The pre-launch revalidation refuses it before any coordinator
+// starts, releases the exact receipt, and never marks the item stale: the
+// work stays discoverable for the lane that owns it.
+func TestOwnershipGateRejectsEvidenceLessAttemptAtPreLaunch(t *testing.T) {
+	server, marks := ownershipServer(t, func() map[string]any { return ownershipTaskBody("cloud") })
+	client := newOwnershipClient(t, server.URL, "normal", map[string]string{"cloud": "normal"})
+	id := EncodeWorkID(Task{
+		Type:        "followup-pr",
+		PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42},
+		PRFixItem:   &PRFixItem{ID: "fix-9", Generation: 4, HandoutToken: "hand-4"},
+	})
+	err := client.PreLaunch(context.Background(), id)
+	if !errors.Is(err, ErrOwnershipDeclined) || !errors.Is(err, source.ErrStaleWork) {
+		t.Fatalf("PreLaunch() error = %v, want the terminal ownership refusal", err)
+	}
+	if len(*marks) != 1 {
+		t.Fatalf("marks = %#v, want exactly one release", *marks)
+	}
+	if mark := (*marks)[0]; mark["status"] != "WAITING_EXTERNAL" || mark["generation"] != float64(4) {
+		t.Fatalf("release mark = %#v, want the exact receipt and no stale mark", mark)
+	}
+}
+
+// Ownership that changed after discovery is refused at the pre-launch
+// revalidation too: the attempt was authorized when it was offered and is not
+// authorized any more when a coordinator would start.
+func TestOwnershipGateRechecksOwnershipAtPreLaunch(t *testing.T) {
+	server, marks := ownershipServer(t, func() map[string]any { return ownershipTaskBody("cloud") })
+	client := newOwnershipClient(t, server.URL, "normal", map[string]string{"cloud": "normal"})
+	items, err := client.Discover(context.Background())
+	if err != nil || len(items) != 1 {
+		t.Fatalf("Discover() items = %#v err = %v, want the authorized handout", items, err)
+	}
+	client.WithOwnershipBindings(map[string]string{"cloud": "frontier"})
+	if err := client.PreLaunch(context.Background(), items[0].ID); !errors.Is(err, ErrOwnershipDeclined) {
+		t.Fatalf("PreLaunch() error = %v, want the ownership decline", err)
+	}
+	if len(*marks) != 1 || (*marks)[0]["status"] != "WAITING_EXTERNAL" {
+		t.Fatalf("marks = %#v, want exactly one waiting-external release", *marks)
+	}
+}
+
+// The hand-out acknowledgement is a boundary too: it tells Dispatch this
+// agent owns the attempt, so an attempt the configured bindings do not
+// authorize is never acknowledged and its reservation is released instead.
+func TestOwnershipGateRejectsForeignAttemptAtHandoutAcknowledgement(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client := newOwnershipClient(t, server.URL, "normal", map[string]string{"local": "normal", "frontier": "frontier"})
+	id := EncodeWorkID(Task{
+		Type:        "followup-pr",
+		PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42},
+		PRFixItem:   &PRFixItem{ID: "fix-9", Generation: 4, HandoutToken: "hand-4", OriginalClaimant: "frontier"},
+	})
+	if err := client.AckHandout(context.Background(), source.WorkItem{ID: id}); !errors.Is(err, ErrOwnershipDeclined) {
+		t.Fatalf("AckHandout() error = %v, want the ownership decline", err)
+	}
+	for _, path := range paths {
+		if path == "/api/pr-fix-queue/ack" {
+			t.Fatalf("paths = %#v, want no acknowledgement of an unauthorized hand-out", paths)
+		}
+	}
+	if len(paths) != 1 || paths[0] != "/api/pr-fix-queue/mark" {
+		t.Fatalf("paths = %#v, want exactly the receipt-fenced release", paths)
+	}
+}
+
+// Cross-agent repair inside one lane survives every boundary: a handout
+// claimed through another binding of the same lane is accepted at the claim,
+// at the hand-out acknowledgement, and at the pre-launch revalidation, and no
+// reservation is released for it.
+func TestOwnershipGateAcceptsSharedLaneClaimantThroughTheLifecycle(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client := newOwnershipClient(t, server.URL, "normal", map[string]string{"local": "normal", "cloud": "normal"})
+	id := EncodeWorkID(Task{
+		Type:        "followup-pr",
+		PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42},
+		PRFixItem:   &PRFixItem{ID: "fix-9", Generation: 4, HandoutToken: "hand-4", OriginalClaimant: "cloud"},
+	})
+	if _, err := client.ClaimWithReceipt(context.Background(), id, ""); err != nil {
+		t.Fatalf("ClaimWithReceipt() error = %v, want the shared-lane acceptance", err)
+	}
+	if err := client.AckHandout(context.Background(), source.WorkItem{ID: id}); err != nil {
+		t.Fatalf("AckHandout() error = %v, want the shared-lane acceptance", err)
+	}
+	if err := client.PreLaunch(context.Background(), id); err != nil {
+		t.Fatalf("PreLaunch() error = %v, want the shared-lane acceptance", err)
+	}
+	for _, path := range paths {
+		if path == "/api/pr-fix-queue/mark" {
+			t.Fatalf("paths = %#v, want no release for an authorized attempt", paths)
+		}
 	}
 }

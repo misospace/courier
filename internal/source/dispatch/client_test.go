@@ -24,7 +24,7 @@ func TestHTTPClientDiscoverForCapacityUsesCapacityParameter(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(Task{Type: "idle"})
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func TestHTTPClientDiscoverMapsTasksAndQueueLane(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClientWithLane(server.URL+"/prefix/", "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL+"/prefix/", "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestHTTPClientDiscoverExcludingEncodesCanonicalUniqueQueueKeys(t *testing.T
 		_ = json.NewEncoder(w).Encode(map[string]any{"type": "idle", "shouldRun": false, "prFixExclusions": map[string]any{"version": 1, "skipped": []any{}}})
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL+"/prefix/", "worker", "cloud", "token", time.Second)
+	client, err := newTestDispatchClient(server.URL+"/prefix/", "worker", "cloud", "token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func TestHTTPClientDiscoverExcludingBoundsFilteredUniqueKeys(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(Task{Type: "idle"})
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL, "worker", "cloud", "token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "cloud", "token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func TestHTTPClientDiscoverExcludingTruncatesToContractMaximum(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"type": "idle", "shouldRun": false, "prFixExclusions": map[string]any{"version": 1, "skipped": []any{}}})
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL, "worker", "cloud", "token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "cloud", "token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +164,7 @@ func TestHTTPClientDiscoverExcludingKeepsExactContractMaximum(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"type": "idle", "shouldRun": false, "prFixExclusions": map[string]any{"version": 1, "skipped": []any{}}})
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL, "worker", "cloud", "token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "cloud", "token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +182,7 @@ func TestHTTPClientDiscoverExcludingDefaultsToOrdinaryDiscover(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(Task{Type: "idle"})
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL, "worker", "cloud", "token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "cloud", "token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +207,7 @@ func TestHTTPClientDiscoverExcludingOlderServerIgnoresParams(t *testing.T) {
 				_ = json.NewEncoder(w).Encode(task)
 			}))
 			defer server.Close()
-			client, err := NewClientWithLane(server.URL, "worker", "cloud", "token", time.Second)
+			client, err := newTestDispatchClient(server.URL, "worker", "cloud", "token", time.Second)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -291,7 +291,7 @@ func TestHTTPClientDiscoverMapsFollowupPR(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +316,7 @@ func TestHTTPClientDiscoverMapsFollowupPR(t *testing.T) {
 }
 
 func TestHTTPClientPRFixGenerationChangesWorkID(t *testing.T) {
-	base := Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}}
+	base := Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1, OriginalClaimant: "worker"}}
 	if got, want := EncodeWorkID(base), EncodeWorkID(base); got != want {
 		t.Fatalf("same PR-fix item IDs differ: %q != %q", got, want)
 	}
@@ -357,14 +357,14 @@ func TestHTTPClientPreLaunchAllowsOpenFollowup(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	client.WithPullRequestStateChecker(PullRequestStateCheckerFunc(func(context.Context, string, int) (PullRequestState, error) {
 		return PullRequestState{State: "open"}, nil
 	}))
-	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
+	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1, OriginalClaimant: "worker"}})
 	if err := client.PreLaunch(context.Background(), id); err != nil {
 		t.Fatalf("PreLaunch() error = %v", err)
 	}
@@ -387,14 +387,14 @@ func TestHTTPClientPreLaunchRejectsClosedFollowup(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	client.WithPullRequestStateChecker(PullRequestStateCheckerFunc(func(context.Context, string, int) (PullRequestState, error) {
 		return PullRequestState{State: "closed"}, nil
 	}))
-	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
+	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1, OriginalClaimant: "worker"}})
 	if err := client.PreLaunch(context.Background(), id); !errors.Is(err, source.ErrStaleWork) {
 		t.Fatalf("PreLaunch() error = %v, want ErrStaleWork", err)
 	}
@@ -417,14 +417,14 @@ func TestHTTPClientPreLaunchRejectsMergedFollowup(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	client.WithPullRequestStateChecker(PullRequestStateCheckerFunc(func(context.Context, string, int) (PullRequestState, error) {
 		return PullRequestState{State: "closed", Merged: true}, nil
 	}))
-	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
+	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1, OriginalClaimant: "worker"}})
 	if err := client.PreLaunch(context.Background(), id); !errors.Is(err, source.ErrStaleWork) {
 		t.Fatalf("PreLaunch() error = %v, want ErrStaleWork", err)
 	}
@@ -451,7 +451,7 @@ func TestHTTPClientDiscoverMarksClosedUnmergedFollowupStale(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -486,7 +486,7 @@ func TestHTTPClientDiscoverMarksMergedFollowupStale(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -516,14 +516,14 @@ func TestHTTPClientPreLaunchStaleGenerationMismatchMapsToSuperseded(t *testing.T
 	}))
 	defer server.Close()
 
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	client.WithPullRequestStateChecker(PullRequestStateCheckerFunc(func(context.Context, string, int) (PullRequestState, error) {
 		return PullRequestState{State: "closed"}, nil
 	}))
-	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
+	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1, OriginalClaimant: "worker"}})
 	if err := client.PreLaunch(context.Background(), id); !errors.Is(err, source.ErrSuperseded) {
 		t.Fatalf("PreLaunch() error = %v, want ErrSuperseded", err)
 	}
@@ -543,7 +543,7 @@ func TestHTTPClientDiscoverStaleGenerationMismatchMapsToSuperseded(t *testing.T)
 	}))
 	defer server.Close()
 
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -566,7 +566,7 @@ func TestHTTPClientDiscoverRejectsFollowupWithoutStateChecker(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -582,7 +582,7 @@ func TestHTTPClientIdleReturnsNoWork(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -616,7 +616,7 @@ func TestHTTPClientClaimResolvesImplementIssueIDFromState(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -651,7 +651,7 @@ func TestHTTPClientImplementNeedsHumanUsesBlockedStatus(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -675,7 +675,7 @@ func TestHTTPClientLinkedFollowupLifecycleDoesNotCallIssueEndpoints(t *testing.T
 	}))
 	defer server.Close()
 
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -685,8 +685,11 @@ func TestHTTPClientLinkedFollowupLifecycleDoesNotCallIssueEndpoints(t *testing.T
 		PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42, URL: "https://github.com/acme/widgets/pull/42"},
 	})
 	ctx := context.Background()
-	if err := client.Claim(ctx, id); err != nil {
-		t.Fatal(err)
+	// A linked follow-up carries no queue identity, so it carries no ownership
+	// evidence either: the configured-ownership gate refuses the claim without
+	// accepting the work and without any release call.
+	if err := client.Claim(ctx, id); !errors.Is(err, ErrOwnershipDeclined) {
+		t.Fatalf("Claim() error = %v, want the ownership decline", err)
 	}
 	if err := client.Release(ctx, id); err != nil {
 		t.Fatal(err)
@@ -715,7 +718,7 @@ func TestHTTPClientReportMapsObservedPR(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL+"/prefix/", "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL+"/prefix/", "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -758,7 +761,7 @@ func TestHTTPClientReportBlockedExternalIsWaitingExternal(t *testing.T) {
 			w.WriteHeader(http.StatusNoContent)
 		}))
 		defer server.Close()
-		client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+		client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -817,7 +820,7 @@ func TestHTTPClientReportBlockedExternalIsWaitingExternal(t *testing.T) {
 			w.WriteHeader(http.StatusNoContent)
 		}))
 		defer server.Close()
-		client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+		client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -860,7 +863,7 @@ func TestHTTPClientReportWaitingExternalNoBlockedMark(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -888,7 +891,7 @@ func TestHTTPClientReportNoChangeSettlesWithoutAnAttempt(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -914,7 +917,7 @@ func TestHTTPClientReportCarriesIdempotencyKey(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL+"/prefix/", "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL+"/prefix/", "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -935,7 +938,7 @@ func TestHTTPClientReportOmitsIdempotencyKeyWhenUnsupported(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -959,7 +962,7 @@ func TestHTTPClientReportOmitsEmptyIdempotencyKey(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -985,7 +988,7 @@ func TestHTTPClientReportEmbedsTelemetry(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL+"/prefix/", "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL+"/prefix/", "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1020,7 +1023,7 @@ func TestHTTPClientReportOmitsAbsentTelemetry(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL+"/prefix/", "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL+"/prefix/", "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1046,7 +1049,7 @@ func TestHTTPClientReportCarriesStartedAt(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL+"/prefix/", "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL+"/prefix/", "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1070,7 +1073,7 @@ func TestHTTPClientReportOmitsStartedAtWhenNil(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1090,7 +1093,7 @@ func TestHTTPClientReportIgnoresLifecycleWithoutResult(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1113,11 +1116,11 @@ func TestHTTPClientReportUsesTaskReportAndPRFixQueueOnlyForFollowups(t *testing.
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	id := EncodeWorkID(Task{Type: "followup-pr", Issue: &Issue{ID: "issue-id", Repo: "acme/widgets", Number: 41}, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
+	id := EncodeWorkID(Task{Type: "followup-pr", Issue: &Issue{ID: "issue-id", Repo: "acme/widgets", Number: 41}, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1, OriginalClaimant: "worker"}})
 	if err := client.Report(context.Background(), id, source.Lifecycle{Result: source.ResultBlocked, Error: "blocked"}); err != nil {
 		t.Fatal(err)
 	}
@@ -1145,11 +1148,11 @@ func TestHTTPClientReportBlockedBlockedReportParksPRFix(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	id := EncodeWorkID(Task{Type: "followup-pr", Issue: &Issue{ID: "issue-id", Repo: "acme/widgets", Number: 41}, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
+	id := EncodeWorkID(Task{Type: "followup-pr", Issue: &Issue{ID: "issue-id", Repo: "acme/widgets", Number: 41}, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1, OriginalClaimant: "worker"}})
 	if err := client.Report(context.Background(), id, source.Lifecycle{Result: source.ResultBlocked, Error: "blocked", BlockedReportParksPRFix: true}); err != nil {
 		t.Fatal(err)
 	}
@@ -1177,11 +1180,11 @@ func TestHTTPClientReportMapsBlockedAndFailed(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77, URL: "https://github.com/acme/widgets/pull/77"}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
+	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77, URL: "https://github.com/acme/widgets/pull/77"}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1, OriginalClaimant: "worker"}})
 	failedID := EncodeWorkID(Task{Type: "implement", Issue: &Issue{ID: "issue-id", Repo: "acme/widgets", Number: 42}})
 	if err := client.Report(context.Background(), id, source.Lifecycle{State: source.StateNeedsHuman, Result: source.ResultBlocked, Error: "blocked"}); err != nil {
 		t.Fatal(err)
@@ -1248,11 +1251,11 @@ func TestHTTPClientReportHandedOffDoesNotParkPRFix(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
+	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1, OriginalClaimant: "worker"}})
 	if err := client.Report(context.Background(), id, source.Lifecycle{Result: source.ResultHandedOff, PR: "88", Error: "external verification failed"}); err != nil {
 		t.Fatal(err)
 	}
@@ -1282,7 +1285,7 @@ func TestHTTPClientReportHandedOffImplementDoesNotParkPRFix(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1332,7 +1335,7 @@ func TestWorkIdentityIgnoresTaskURLForQueueBackedFollowups(t *testing.T) {
 }
 
 func TestEncodeWorkIDDropsNonPullRequestURLs(t *testing.T) {
-	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 113, URL: "https://github.com/acme/widgets/actions/runs/1/job/2"}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
+	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 113, URL: "https://github.com/acme/widgets/actions/runs/1/job/2"}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1, OriginalClaimant: "worker"}})
 	d, err := decodeWorkID(id)
 	if err != nil {
 		t.Fatal(err)
@@ -1361,7 +1364,7 @@ func TestHTTPClientQueueBackedFollowupEchoesAttemptToken(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1401,7 +1404,7 @@ func TestHTTPClientLinkedFollowupReportOmitsAttemptToken(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1424,7 +1427,7 @@ func TestHTTPClientFollowupReportWithoutLinkedIssueOmitsIssueNumber(t *testing.T
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1447,7 +1450,7 @@ func TestHTTPClientRedactsTokenFromAPIError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1541,7 +1544,7 @@ func TestHTTPClientReportMapsPRFixGenerationMismatchToSuperseded(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1565,7 +1568,7 @@ func TestHTTPClientReportOtherConflictIsNotSuperseded(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1593,7 +1596,7 @@ func TestHTTPClientReportServerErrorIsNotSuperseded(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1620,7 +1623,7 @@ func TestNewClientValidation(t *testing.T) {
 			}
 		})
 	}
-	if _, err := NewClientWithLane("http://example.test", "worker", "normal", "token", 0); err != nil {
+	if _, err := newTestDispatchClient("http://example.test", "worker", "normal", "token", 0); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1641,7 +1644,7 @@ func TestHTTPClientClaimOmitsLaneQuery(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "secret-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
