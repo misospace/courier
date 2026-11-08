@@ -127,17 +127,13 @@ func TestOwnershipGateAcceptsEveryClaimantInSharedLane(t *testing.T) {
 
 // A claimant bound to a different queue lane is declined: the exact receipt
 // is released once through the recoverable waiting-external mark, nothing is
-// materialized, and the error carries the ownership sentinel with the
-// receipt evidence.
+// materialized, and the poll itself stays clean so the lane keeps discovering.
 func TestOwnershipGateDeclinesCrossLaneClaimantOnNormalClient(t *testing.T) {
 	server, marks := ownershipServer(t, func() map[string]any { return ownershipTaskBody("frontier") })
 	client := newOwnershipClient(t, server.URL, "normal", map[string]string{"local": "normal", "frontier": "frontier"})
 	items, err := client.Discover(context.Background())
-	if items != nil || !errors.Is(err, ErrOwnershipDeclined) {
-		t.Fatalf("items = %#v err = %v, want the ownership decline", items, err)
-	}
-	if !strings.Contains(err.Error(), "receipt fix-9@4") || !strings.Contains(err.Error(), `handout "hand-4"`) {
-		t.Fatalf("err = %v, want the exact receipt evidence", err)
+	if items != nil || err != nil {
+		t.Fatalf("items = %#v err = %v, want the handout declined without failing the poll", items, err)
 	}
 	if len(*marks) != 1 {
 		t.Fatalf("marks = %#v, want exactly one release", *marks)
@@ -153,8 +149,8 @@ func TestOwnershipGateDeclinesCrossLaneClaimantOnFrontierClient(t *testing.T) {
 	server, marks := ownershipServer(t, func() map[string]any { return ownershipTaskBody("local") })
 	client := newOwnershipClient(t, server.URL, "frontier", map[string]string{"local": "normal", "frontier": "frontier"})
 	items, err := client.Discover(context.Background())
-	if items != nil || !errors.Is(err, ErrOwnershipDeclined) {
-		t.Fatalf("items = %#v err = %v, want the ownership decline", items, err)
+	if items != nil || err != nil {
+		t.Fatalf("items = %#v err = %v, want the handout declined without failing the poll", items, err)
 	}
 	if len(*marks) != 1 || (*marks)[0]["status"] != "WAITING_EXTERNAL" {
 		t.Fatalf("marks = %#v, want exactly one waiting-external release", *marks)
@@ -181,8 +177,8 @@ func TestOwnershipGateDeclinesUnknownClaimant(t *testing.T) {
 				t.Fatalf("diagnostic %s = %v before the poll, want none", tc.reason, got)
 			}
 			items, err := client.Discover(context.Background())
-			if items != nil || !errors.Is(err, ErrOwnershipDeclined) {
-				t.Fatalf("items = %#v err = %v, want the ownership decline", items, err)
+			if items != nil || err != nil {
+				t.Fatalf("items = %#v err = %v, want the handout declined without failing the poll", items, err)
 			}
 			if got := counter(tc.reason); got != 1 {
 				t.Fatalf("diagnostic %s = %v, want exactly one", tc.reason, got)
@@ -206,8 +202,8 @@ func TestOwnershipGateDeclinesMissingEvidence(t *testing.T) {
 			t.Fatalf("diagnostic %s = %v before the poll, want none", reasonOwnershipEvidenceMissing, got)
 		}
 		items, err := client.Discover(context.Background())
-		if items != nil || !errors.Is(err, ErrOwnershipDeclined) {
-			t.Fatalf("items = %#v err = %v, want the ownership decline", items, err)
+		if items != nil || err != nil {
+			t.Fatalf("items = %#v err = %v, want the handout declined without failing the poll", items, err)
 		}
 		if got := counter(reasonOwnershipEvidenceMissing); got != 1 {
 			t.Fatalf("diagnostic %s = %v, want exactly one", reasonOwnershipEvidenceMissing, got)
@@ -222,7 +218,8 @@ func TestOwnershipGateDeclinesMissingEvidence(t *testing.T) {
 }
 
 // A followup-pr handout with no PR-fix item at all carries neither receipt
-// nor evidence: declined without acceptance and without any release call.
+// nor evidence: declined without acceptance and without any release call,
+// and the poll stays clean.
 func TestOwnershipGateDeclinesReceiptlessHandoutWithoutRelease(t *testing.T) {
 	server, marks := ownershipServer(t, func() map[string]any {
 		return map[string]any{
@@ -232,11 +229,8 @@ func TestOwnershipGateDeclinesReceiptlessHandoutWithoutRelease(t *testing.T) {
 	})
 	client := newOwnershipClient(t, server.URL, "normal", map[string]string{"local": "normal"})
 	items, err := client.Discover(context.Background())
-	if items != nil || !errors.Is(err, ErrOwnershipDeclined) {
-		t.Fatalf("items = %#v err = %v, want the ownership decline", items, err)
-	}
-	if !strings.Contains(err.Error(), "followup-pr offer carries no valid PR-fix receipt") {
-		t.Fatalf("err = %v, want the receipt-less wording", err)
+	if items != nil || err != nil {
+		t.Fatalf("items = %#v err = %v, want the handout declined without failing the poll", items, err)
 	}
 	if len(*marks) != 0 {
 		t.Fatalf("marks = %#v, want no release call without a receipt", *marks)
@@ -244,15 +238,15 @@ func TestOwnershipGateDeclinesReceiptlessHandoutWithoutRelease(t *testing.T) {
 }
 
 // The decline latches per generation: after one settled decline, a later poll
-// of the same item makes no further release call but still surfaces the
-// settled ownership decline.
+// of the same item makes no further release call and still materializes
+// nothing.
 func TestOwnershipGateDeclineLatchesPerGeneration(t *testing.T) {
 	server, marks := ownershipServer(t, func() map[string]any { return ownershipTaskBody("frontier") })
 	client := newOwnershipClient(t, server.URL, "normal", map[string]string{"local": "normal", "frontier": "frontier"})
 	for i := 0; i < 2; i++ {
 		items, err := client.Discover(context.Background())
-		if items != nil || !errors.Is(err, ErrOwnershipDeclined) {
-			t.Fatalf("poll %d: items = %#v err = %v, want the ownership decline", i, items, err)
+		if items != nil || err != nil {
+			t.Fatalf("poll %d: items = %#v err = %v, want the handout declined without failing the poll", i, items, err)
 		}
 	}
 	if len(*marks) != 1 {
@@ -291,11 +285,8 @@ func TestOwnershipGateRunsBeforeRebaseClassification(t *testing.T) {
 		t.Fatalf("diagnostic %s = %v before the poll, want none", reasonOwnershipClaimantUnknown, got)
 	}
 	items, err := client.Discover(context.Background())
-	if items != nil || !errors.Is(err, ErrOwnershipDeclined) {
-		t.Fatalf("items = %#v err = %v, want the ownership decline", items, err)
-	}
-	if errors.Is(err, ErrRebaseDeclined) {
-		t.Fatalf("err = %v, want an ownership decline, not a rebase decline", err)
+	if items != nil || err != nil {
+		t.Fatalf("items = %#v err = %v, want the handout declined without failing the poll", items, err)
 	}
 	if got := counter(reasonOwnershipClaimantUnknown); got != 1 {
 		t.Fatalf("diagnostic %s = %v, want exactly one", reasonOwnershipClaimantUnknown, got)
@@ -320,8 +311,8 @@ func TestOwnershipGateAppliesThroughDiscoverForCapacity(t *testing.T) {
 	client.WithPRFixExclusions(true)
 	oldID := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "fix-9", Generation: 4}})
 	items, err := client.DiscoverForCapacity(context.Background(), "pool-a", []source.WorkItem{{ID: oldID}})
-	if items != nil || !errors.Is(err, ErrOwnershipDeclined) {
-		t.Fatalf("items = %#v err = %v, want the ownership decline", items, err)
+	if items != nil || err != nil {
+		t.Fatalf("items = %#v err = %v, want the handout declined without failing the poll", items, err)
 	}
 	if len(*marks) != 1 || (*marks)[0]["status"] != "WAITING_EXTERNAL" || (*marks)[0]["generation"] != float64(4) {
 		t.Fatalf("marks = %#v, want exactly one exact-receipt release", *marks)

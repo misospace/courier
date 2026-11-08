@@ -580,7 +580,14 @@ func (c *HTTPClient) discover(ctx context.Context, query url.Values) (items []so
 			claimant = strings.TrimSpace(task.PRFixItem.OriginalClaimant)
 		}
 		if reason, why := c.ownershipVerdict(claimant); reason != "" {
-			return nil, c.declineOwnership(ctx, task, reason, why)
+			// The decline path releases the reservation (or latches for this
+			// generation when the release is refused) and emits the
+			// ownership diagnostic; the refusal itself is settled either
+			// way. Discovery surfaces no work and no error, so an ownership
+			// refusal never fails the poll loop: the lane stays available
+			// and the item stays discoverable for its owning lane (#761).
+			_ = c.declineOwnership(ctx, task, reason, why)
+			return nil, nil
 		}
 		state, err := c.checkPullRequestState(ctx, task.PullRequest)
 		if err != nil {
