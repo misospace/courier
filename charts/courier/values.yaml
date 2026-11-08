@@ -216,9 +216,10 @@ secure:
     port: 8123
     # -- Store PVC size; module zips are the dominant content.
     storage: 10Gi
-    # -- One replica: the store volume is read-only, so replicas would share
-    #    it safely, but each extra replica adds nothing the ClusterIP pin
-    #    needs.
+    # -- Must be 1: the store PVC is ReadWriteOnce, so the store volume can
+    #    attach on only one node; a second replica would strand in
+    #    ContainerCreating behind the healthy-looking Service. The chart
+    #    rejects any other value at render time.
     replicas: 1
     image:
       repository: ghcr.io/misospace/courier

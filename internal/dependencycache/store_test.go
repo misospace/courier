@@ -1,13 +1,19 @@
 package dependencycache
 
 import (
+	"bytes"
+	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // newTestStore populates a store root with approved module versions and
@@ -511,42 +517,30 @@ func TestStoreVersionsBoundsTheDirectoryScan(t *testing.T) {
 	// The listing scan is bounded: a populated @v directory beyond the entry
 	// bound refuses cleanly, and the batched read stops at the bound, so a
 	// huge directory cannot drive unbounded allocation before the refusal.
-	writeJunk := func(t *testing.T, root string, count int) {
-		t.Helper()
-		dir := filepath.Join(root, "example.com", "huge", "@v")
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		for i := 0; i < count; i++ {
-			if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("junk-%04d.lock", i)), nil, 0o644); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
 	limits := DefaultLimits()
-	limits.MaxListEntries = 16
+	limits.MaxListEntries = scanAllocEntryBound
 
 	// Over the bound: refuse with a diagnostic naming the bound — for @v/list
 	// and for @latest, which resolves through the same listing.
 	store, _ := newTestStore(t, limits, func(root string) {
-		writeJunk(t, root, 40)
+		writeJunkEntries(t, root, 40)
 	})
 	var notApproved *NotApprovedError
-	if _, err := store.Versions("example.com/huge"); !asNotApproved(err, &notApproved) {
+	if _, err := store.Versions(scanAllocModule); !asNotApproved(err, &notApproved) {
 		t.Fatalf("Versions over the entry bound: want NotApprovedError, got %v", err)
 	} else if !strings.Contains(notApproved.Detail, "entries") {
 		t.Fatalf("diagnostic must name the entry bound, got %q", notApproved.Detail)
 	}
-	if _, err := store.Latest("example.com/huge"); !asNotApproved(err, &notApproved) {
+	if _, err := store.Latest(scanAllocModule); !asNotApproved(err, &notApproved) {
 		t.Fatalf("@latest over the entry bound: want NotApprovedError, got %v", err)
 	}
 
 	// Under the bound the listing still works and junk is filtered.
 	store, _ = newTestStore(t, limits, func(root string) {
-		writeJunk(t, root, 5)
-		approveAll(t, root, "example.com/huge", "v1.0.0")
+		writeJunkEntries(t, root, 5)
+		approveAll(t, root, scanAllocModule, "v1.0.0")
 	})
-	versions, err := store.Versions("example.com/huge")
+	versions, err := store.Versions(scanAllocModule)
 	if err != nil {
 		t.Fatalf("Versions under the bound: %v", err)
 	}
@@ -554,22 +548,207 @@ func TestStoreVersionsBoundsTheDirectoryScan(t *testing.T) {
 		t.Fatalf("want the one approved version, got %+v", versions)
 	}
 
-	// Allocation proof: scanning a directory far beyond the bound allocates
-	// for the bounded scan only, never for the whole directory — a full read
-	// of 5000 entries would cost hundreds of KiB.
-	store, _ = newTestStore(t, limits, func(root string) {
-		writeJunk(t, root, 5000)
+	// Allocation proof: the bounded scan must not cost more on a directory far
+	// beyond the entry bound than on a directory only a batch beyond it. The
+	// scan stops at the bound on both, so it never reads the whole directory;
+	// a scan that read every entry of the huge directory, or that read past
+	// one batch of entries, would cost the difference between the two
+	// directories.
+	//
+	// The measurement runs in its own process, because the allocation
+	// counter a process reports counts every allocation in that process: in
+	// this test binary a background goroutine, a garbage collection cycle,
+	// or any other allocation in the same window would be charged to the
+	// scan, which is how a bound that the scan met used to fail for a scan
+	// that stayed bounded.
+	hugeStore, hugeRoot := newTestStore(t, limits, func(root string) {
+		writeJunkEntries(t, root, scanAllocHugeEntries)
 	})
-	var before, after runtime.MemStats
-	runtime.ReadMemStats(&before)
-	_, err = store.Versions("example.com/huge")
-	runtime.ReadMemStats(&after)
-	if !asNotApproved(err, &notApproved) {
+	if _, err := hugeStore.Versions(scanAllocModule); !asNotApproved(err, &notApproved) {
 		t.Fatalf("Versions over the bound must refuse, got %v", err)
 	}
-	if grew := after.TotalAlloc - before.TotalAlloc; grew > 128<<10 {
-		t.Fatalf("the bounded scan allocated %d bytes for a 5000-entry directory; the read is not bounded", grew)
+	baselineRoot := t.TempDir()
+	writeJunkEntries(t, baselineRoot, scanAllocBaselineEntries)
+	baselineCost, hugeCost := scanAllocations(t, baselineRoot, hugeRoot)
+	if grew := int64(hugeCost) - int64(baselineCost); grew > scanAllocGrowthBound {
+		t.Fatalf("the bounded scan allocated %d more bytes for a %d-entry directory than for a %d-entry directory; the read is not bounded",
+			grew, scanAllocHugeEntries, scanAllocBaselineEntries)
 	}
+	if hugeCost > scanAllocCeiling {
+		t.Fatalf("the bounded scan allocated %d bytes for a %d-entry directory; the read is not bounded", hugeCost, scanAllocHugeEntries)
+	}
+}
+
+// writeJunkEntries populates a store root with junk @v entries that no
+// version listing can approve: the scan still reads them, so a directory of
+// them is a directory the scan has to bound.
+func writeJunkEntries(t *testing.T, root string, count int) {
+	t.Helper()
+	dir := filepath.Join(root, filepath.FromSlash(scanAllocModule), "@v")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < count; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("junk-%04d.lock", i)), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// The bounded listing scan's allocation proof. The scan is measured in a
+// process that does nothing else, so the measured total is the scan's own
+// allocation and no other allocation in the test process can fail the
+// assertion.
+const (
+	// scanAllocModule is the module whose @v directory the measuring scan
+	// reads.
+	scanAllocModule = "example.com/huge"
+	// scanAllocEntryBound is the entry bound the measuring scan runs under: the
+	// scan must refuse the populated directory well before reading it whole.
+	scanAllocEntryBound = 16
+	// scanAllocBaselineEntries and scanAllocHugeEntries are the sizes of the
+	// two @v directories the measuring child scans. They differ only in size,
+	// and both hold more entries than the scan reads in one batch, so a
+	// bounded scan reads the same entries of both and costs the same on both.
+	scanAllocBaselineEntries = 300
+	scanAllocHugeEntries     = 5000
+	// scanAllocGrowthBound is how much more the bounded scan may cost on the
+	// huge directory than on the baseline one. A bounded scan stops at the
+	// entry bound on both, so the difference is nothing; a scan that read
+	// past one batch of entries would cost the difference between the two
+	// directories, which is orders of magnitude over this bound.
+	scanAllocGrowthBound = 128 << 10
+	// scanAllocCeiling is the allocation total the bounded scan must stay
+	// under whatever the directory holds. The bounded scan costs a small
+	// fraction of it, so the ceiling only fires on a scan whose read grew
+	// without bound.
+	scanAllocCeiling = 1 << 20
+	// scanAllocProbes is how many scans the measuring child times per
+	// directory. The smallest measured total is the scan's own cost: the
+	// first scan pays for one-time initialization, and any other allocation
+	// in the measuring child can only add to a total.
+	scanAllocProbes = 5
+	// scanAllocTimeout bounds the measuring child's whole run. A child that
+	// never reports is a failed measurement, not a hung test.
+	scanAllocTimeout = 30 * time.Second
+	// scanAllocWaitDelay bounds the drain of the measuring child's output
+	// after it is killed, so a child holding its pipe cannot stretch the
+	// parent's wait.
+	scanAllocWaitDelay = 30 * time.Second
+)
+
+// The measuring child's inputs: the two populated store roots it scans and the
+// file it reports the measured allocation totals in.
+const (
+	scanAllocBaselineRootEnv = "COURIER_DEPENDENCYCACHE_SCAN_ALLOC_BASELINE_ROOT"
+	scanAllocHugeRootEnv     = "COURIER_DEPENDENCYCACHE_SCAN_ALLOC_HUGE_ROOT"
+	scanAllocOutEnv          = "COURIER_DEPENDENCYCACHE_SCAN_ALLOC_OUT"
+)
+
+// TestStoreVersionsScanAllocationProbe is the measuring child of
+// TestStoreVersionsBoundsTheDirectoryScan. It reports the allocations of the
+// bounded listing scan from a process that does nothing else but scan, so the
+// reported totals are the scan's own allocations rather than this test
+// binary's running total. Outside a probe run it skips.
+func TestStoreVersionsScanAllocationProbe(t *testing.T) {
+	baselineRoot := os.Getenv(scanAllocBaselineRootEnv)
+	hugeRoot := os.Getenv(scanAllocHugeRootEnv)
+	out := os.Getenv(scanAllocOutEnv)
+	if baselineRoot == "" || hugeRoot == "" || out == "" {
+		t.Skip("the scan allocation probe runs only as the measuring child of TestStoreVersionsBoundsTheDirectoryScan")
+	}
+	limits := DefaultLimits()
+	limits.MaxListEntries = scanAllocEntryBound
+	baseline := scanAllocProbeCost(t, limits, baselineRoot)
+	huge := scanAllocProbeCost(t, limits, hugeRoot)
+	report := fmt.Sprintf("%d\n%d\n", baseline, huge)
+	if err := os.WriteFile(out, []byte(report), 0o644); err != nil {
+		t.Fatalf("write the measured allocation totals: %v", err)
+	}
+}
+
+// scanAllocProbeCost measures what the bounded listing scan allocates over
+// one populated store root, in bytes. The smallest of the measured totals is
+// the scan's own cost: the first scan pays for one-time initialization, and
+// any other allocation in the measuring child can only add to a total.
+func scanAllocProbeCost(t *testing.T, limits Limits, root string) uint64 {
+	t.Helper()
+	store, err := NewStoreWithLimits(root, limits)
+	if err != nil {
+		t.Fatalf("NewStoreWithLimits: %v", err)
+	}
+	best := uint64(math.MaxUint64)
+	for probe := 0; probe < scanAllocProbes; probe++ {
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		_, err := store.Versions(scanAllocModule)
+		runtime.ReadMemStats(&after)
+		var notApproved *NotApprovedError
+		if !asNotApproved(err, &notApproved) {
+			t.Fatalf("Versions over the entry bound must refuse, got %v", err)
+		}
+		if grew := after.TotalAlloc - before.TotalAlloc; grew < best {
+			best = grew
+		}
+	}
+	return best
+}
+
+// scanAllocations measures the bounded listing scan's allocations over a
+// baseline and a huge @v directory and returns both totals in bytes. It
+// re-executes this test binary as the measuring child, because the allocation
+// counter a process reports covers that whole process: only a process that
+// does nothing but scan can attribute a measured total to the scan.
+func scanAllocations(t *testing.T, baselineRoot, hugeRoot string) (baseline, huge uint64) {
+	t.Helper()
+	out := filepath.Join(t.TempDir(), "scan-alloc")
+	ctx, cancel := context.WithTimeout(context.Background(), scanAllocTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestStoreVersionsScanAllocationProbe$", "-test.count=1")
+	cmd.Env = append(scanProbeEnv(),
+		scanAllocBaselineRootEnv+"="+baselineRoot,
+		scanAllocHugeRootEnv+"="+hugeRoot,
+		scanAllocOutEnv+"="+out)
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	cmd.WaitDelay = scanAllocWaitDelay
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("the scan allocation probe did not report a measurement: %v\n%s", err, output.String())
+	}
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("the scan allocation probe reported no measurement: %v\n%s", err, output.String())
+	}
+	totals := strings.Fields(string(data))
+	if len(totals) != 2 {
+		t.Fatalf("the scan allocation probe reported %q: want two totals", data)
+	}
+	measured := make([]uint64, 0, 2)
+	for _, total := range totals {
+		grew, err := strconv.ParseUint(total, 10, 64)
+		if err != nil {
+			t.Fatalf("the scan allocation probe reported %q: %v", total, err)
+		}
+		measured = append(measured, grew)
+	}
+	return measured[0], measured[1]
+}
+
+// scanProbeEnv is the measuring child's environment: the parent's, minus the
+// coverage output directory. The child runs without a coverage flag of its
+// own, so it writes no coverage counters; dropping the directory keeps the
+// parent's coverage data free of anything the child emitted.
+func scanProbeEnv() []string {
+	env := os.Environ()
+	kept := make([]string, 0, len(env))
+	for _, entry := range env {
+		if key, _, ok := strings.Cut(entry, "="); ok && key == "GOCOVERDIR" {
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	return kept
 }
 
 func TestNewStoreRequiresADirectory(t *testing.T) {
