@@ -512,14 +512,3 @@ func respondCriteriaViolation(w http.ResponseWriter, cerr *CriteriaError) {
 		CoverageDerived: cerr.CoverageDerived,
 	})
 }
-
-// LoadTLSIdentity is available to callers that need to validate cert material before serving.
-func LoadTLSIdentity(certFile, keyFile string) (tls.Certificate, error) {
-	if certFile == "" || keyFile == "" {
-		return tls.Certificate{}, errors.New("TLS certificate and key are required")
-	}
-	if _, err := os.Stat(certFile); err != nil {
-		return tls.Certificate{}, err
-	}
-	return tls.LoadX509KeyPair(certFile, keyFile)
-}

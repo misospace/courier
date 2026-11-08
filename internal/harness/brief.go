@@ -224,14 +224,6 @@ func (r *BriefRegistry) Cancelled(briefID string) bool {
 	return ok
 }
 
-// Lookup returns a registered brief.
-func (r *BriefRegistry) Lookup(briefID string) (Brief, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	brief, ok := r.briefs[briefID]
-	return brief, ok
-}
-
 // settledStateBlock renders the brief's settled state — the decisions the
 // delegate applies exactly and the files it owns — in the exact text
 // briefText renders them, so a compaction digest can re-inject those bytes

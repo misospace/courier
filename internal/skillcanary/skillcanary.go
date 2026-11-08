@@ -1075,20 +1075,6 @@ func samePins(envelope string, expected []skills.Pin) bool {
 	return true
 }
 
-// checkoutEntries lists the entries the checkout directory holds.
-func checkoutEntries(dir string) ([]string, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, fmt.Errorf("skillcanary: read the checkout directory %s: %w", dir, err)
-	}
-	names := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		names = append(names, entry.Name())
-	}
-	sort.Strings(names)
-	return names, nil
-}
-
 // checkoutDigest is the content identity of a checkout tree: every regular
 // file's relative path and its bytes, in path order. A change to a file's
 // content changes the digest, so the canary can tell an edited checkout

@@ -84,12 +84,6 @@ func newClient(baseURL, token string, requestTimeout time.Duration, clients ...H
 	return &Client{baseURL: u, token: token, httpClient: httpClient, requestTimeout: requestTimeout}, nil
 }
 
-// NewGitHubClient is an explicit constructor alias for callers that prefer a
-// descriptive name. It is equivalent to NewClient.
-func NewGitHubClient(baseURL, token string, httpClient ...HTTPDoer) (*Client, error) {
-	return NewClient(baseURL, token, httpClient...)
-}
-
 // New creates a client against GitHub.com. Use NewClient when a GitHub
 // Enterprise base URL is required.
 func New(token string, httpClient ...HTTPDoer) (*Client, error) {
@@ -417,11 +411,6 @@ func (c *Client) CreatePullRequest(ctx context.Context, owner, repo string, in C
 	return out, err
 }
 
-// CreatePR is a short alias for CreatePullRequest.
-func (c *Client) CreatePR(ctx context.Context, owner, repo string, in CreatePullRequestRequest) (PullRequest, error) {
-	return c.CreatePullRequest(ctx, owner, repo, in)
-}
-
 // UpdatePullRequest updates metadata on an existing pull request. It does not
 // merge the pull request; no merge endpoint is part of this client.
 func (c *Client) UpdatePullRequest(ctx context.Context, owner, repo string, number int, in UpdatePullRequestRequest) (PullRequest, error) {
@@ -430,21 +419,11 @@ func (c *Client) UpdatePullRequest(ctx context.Context, owner, repo string, numb
 	return out, err
 }
 
-// UpdatePR is a short alias for UpdatePullRequest.
-func (c *Client) UpdatePR(ctx context.Context, owner, repo string, number int, in UpdatePullRequestRequest) (PullRequest, error) {
-	return c.UpdatePullRequest(ctx, owner, repo, number, in)
-}
-
 // AddComment adds a comment to a pull request conversation.
 func (c *Client) AddComment(ctx context.Context, owner, repo string, number int, body string) (Comment, error) {
 	var out Comment
 	err := c.doJSON(ctx, http.MethodPost, repoEndpoint(owner, repo, "issues", strconv.Itoa(number), "comments"), CommentRequest{Body: body}, &out)
 	return out, err
-}
-
-// CommentPR is a short alias for AddComment.
-func (c *Client) CommentPR(ctx context.Context, owner, repo string, number int, body string) (Comment, error) {
-	return c.AddComment(ctx, owner, repo, number, body)
 }
 
 // CreateComment posts a comment to an issue or pull request conversation,
@@ -505,11 +484,6 @@ func (c *Client) GetPullRequest(ctx context.Context, owner, repo string, number 
 	var out PullRequest
 	err := c.doJSON(ctx, http.MethodGet, repoEndpoint(owner, repo, "pulls", strconv.Itoa(number)), nil, &out)
 	return out, err
-}
-
-// ReadPR is a short alias for GetPullRequest.
-func (c *Client) ReadPR(ctx context.Context, owner, repo string, number int) (PullRequest, error) {
-	return c.GetPullRequest(ctx, owner, repo, number)
 }
 
 // PullRequestsForHeadAllPages paginates the all-state GitHub head query, whose
@@ -604,11 +578,6 @@ func (c *Client) GetCommitStatuses(ctx context.Context, owner, repo, ref string)
 
 func pageQuery(page int) string {
 	return "page=" + strconv.Itoa(page) + "&per_page=100"
-}
-
-// GetChecks is a concise alias for GetCheckRuns.
-func (c *Client) GetChecks(ctx context.Context, owner, repo, ref string) (CheckRuns, error) {
-	return c.GetCheckRuns(ctx, owner, repo, ref)
 }
 
 func repoEndpoint(owner, repo string, parts ...string) string {
