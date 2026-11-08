@@ -589,14 +589,26 @@ func main() {
 			setupLog.Error(err, "unable to configure Dispatch source: GitHub pull request state lookup is unavailable")
 			os.Exit(1)
 		}
+		// The resolved binding map is the only ownership authority for PR
+		// repair (#761): a followup-pr handout is accepted only when its
+		// original claimant is bound here to the receiving binding's queue
+		// lane. Claimant identities outside it are not Courier-owned work,
+		// even when their Dispatch lane matches.
+		ownershipBindings := dispatchOwnershipBindings(bindings)
 		// The bare adapter remains registered for lifecycle compatibility with
-		// retained runs created before source-agent routing was introduced.
-		legacyClient, err := dispatch.NewClientWithLane(dispatchBaseURL, strings.TrimSpace(dispatchAgentName), "", token, dispatchHTTPTimeout)
+		// retained runs created before source-agent routing was introduced,
+		// and it serves every run in a single-binding deployment. It is the
+		// same Dispatch agent as the binding that owns that identity, so it
+		// carries that binding's queue lane and the same ownership authority:
+		// a bare agent that is not itself a configured binding has no lane and
+		// authorizes no PR repair at all.
+		legacyClient, err := dispatch.NewClientWithLane(dispatchBaseURL, strings.TrimSpace(dispatchAgentName), dispatchBindingLane(ownershipBindings, strings.TrimSpace(dispatchAgentName)), token, dispatchHTTPTimeout)
 		if err != nil {
 			setupLog.Error(err, "unable to configure legacy Dispatch client")
 			os.Exit(1)
 		}
 		legacyClient.WithPullRequestStateChecker(checker)
+		legacyClient.WithOwnershipBindings(ownershipBindings)
 		if dispatchPRFixExclusions {
 			legacyClient.WithPRFixExclusions(true)
 		}
@@ -608,6 +620,7 @@ func main() {
 				os.Exit(1)
 			}
 			bindingClient.WithPullRequestStateChecker(checker)
+			bindingClient.WithOwnershipBindings(ownershipBindings)
 			if dispatchPRFixExclusions {
 				bindingClient.WithPRFixExclusions(true)
 			}
@@ -983,6 +996,26 @@ type dispatchBinding struct {
 	laneProfile string
 	agentName   string
 	sourceAgent string
+}
+
+// dispatchOwnershipBindings maps each configured binding's Dispatch agent
+// name to its configured Dispatch queue lane: the ownership authority every
+// binding client consults before accepting a PR-repair handout (#761).
+func dispatchOwnershipBindings(bindings []dispatchBinding) map[string]string {
+	ownershipBindings := make(map[string]string, len(bindings))
+	for _, binding := range bindings {
+		ownershipBindings[binding.agentName] = binding.queueLane
+	}
+	return ownershipBindings
+}
+
+// dispatchBindingLane resolves the configured Dispatch queue lane bound to one
+// Dispatch agent name, or the empty string when that agent is not itself a
+// configured binding (#761). The bare adapter uses it to carry the lane of the
+// binding that owns its Dispatch identity; an agent that owns no binding has
+// no lane and authorizes no PR repair.
+func dispatchBindingLane(ownershipBindings map[string]string, agentName string) string {
+	return ownershipBindings[strings.TrimSpace(agentName)]
 }
 
 // resolveDispatchBindings normalizes the single-binding shorthand and repeated

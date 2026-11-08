@@ -83,6 +83,12 @@ type PRFixItem struct {
 	Generation   int    `json:"generation"`
 	HandoutToken string `json:"handoutToken,omitempty"`
 	FixType      string `json:"fixType,omitempty"`
+	// OriginalClaimant is the Dispatch identity that originally claimed or
+	// holds this PR-fix item: the ownership-evidence contract Dispatch
+	// #1569 supplies. Courier never infers ownership from the handout
+	// recipient, the PR author, a branch prefix, or the fix type; the
+	// claimant on the item is the only ownership evidence it consults.
+	OriginalClaimant string `json:"originalClaimant,omitempty"`
 }
 
 // Issue identifies the issue associated with a Dispatch task.
@@ -136,6 +142,14 @@ type workDescriptor struct {
 	// and settlement (#715). It never changes the wire task type: every
 	// Dispatch exchange still speaks followup-pr.
 	FixType string `json:"fixType,omitempty"`
+	// OriginalClaimant preserves the ownership evidence Dispatch supplies for
+	// the PR-fix item through the opaque ID, so every boundary that can still
+	// refuse the attempt — the claim, the hand-out acknowledgement, the
+	// pre-launch revalidation, and the recovery path — revalidates the same
+	// evidence the acceptance gate consulted (#761). It is never inferred from
+	// the handout recipient, the pull-request author, a branch prefix, or the
+	// fix type.
+	OriginalClaimant string `json:"originalClaimant,omitempty"`
 }
 
 // APIError reports a non-2xx Dispatch response.
@@ -206,14 +220,25 @@ type HTTPClient struct {
 	// nothing and stay operational with Dispatch deployments that predate the
 	// contract entirely.
 	rebaseCapabilityEnabled bool
-	// rebaseDeclines records, per declined generation, that the decline was
+	// ownershipBindings is the configured-ownership authority for PR repair:
+	// claimant Dispatch agent name → configured Dispatch queue lane. A
+	// followup-pr handout is accepted only when its original claimant is
+	// bound here to the receiving connector's own queue lane. A nil map
+	// keeps the gate active — every claimant is then unknown — so the gate
+	// is unconditional and an older Dispatch peer that supplies no evidence
+	// has every fix-pr handout declined gracefully.
+	ownershipBindings map[string]string
+	// handoutDeclines records, per declined generation, that the decline was
 	// already settled with the deployment: the recoverable release landed, or
-	// the deployment refused it and the refusal stands as the evidence. A
-	// declined generation must not be re-released on every later poll — one
-	// release per generation per process — so the decline keeps surfacing
-	// with its ownership evidence intact while the source's own stale-handout
-	// reclaimer remains the documented bounded recovery path.
-	rebaseDeclines sync.Map
+	// the deployment refused it and the refusal stands as the evidence. The
+	// latch covers both decline kinds — a rebase offer Courier cannot safely
+	// execute, and a followup-pr handout its configured ownership bindings do
+	// not authorize. A declined generation must not be re-released on every
+	// later poll — one release per generation per process — so the decline
+	// keeps surfacing with its ownership evidence intact while the source's
+	// own stale-handout reclaimer remains the documented bounded recovery
+	// path.
+	handoutDeclines sync.Map
 }
 
 // NewClient creates a Dispatch HTTP client without a queue lane override.
@@ -279,6 +304,21 @@ func (c *HTTPClient) WithPRFixExclusionLimit(limit int) *HTTPClient {
 // operational with Dispatch deployments that predate the contract.
 func (c *HTTPClient) WithRebaseCapability(enabled bool) *HTTPClient {
 	c.rebaseCapabilityEnabled = enabled
+	return c
+}
+
+// WithOwnershipBindings installs the configured-ownership authority for PR
+// repair (#761): a map of claimant Dispatch agent name → configured Dispatch
+// queue lane. The map is copied on set, so later mutation of the caller's
+// map cannot change a live client's verdicts. The gate itself is always on:
+// with no bindings configured, every claimant is unknown and every fix-pr
+// handout is declined through the receipt-fenced ownership path.
+func (c *HTTPClient) WithOwnershipBindings(bindings map[string]string) *HTTPClient {
+	installed := make(map[string]string, len(bindings))
+	for claimant, lane := range bindings {
+		installed[claimant] = lane
+	}
+	c.ownershipBindings = installed
 	return c
 }
 
@@ -525,6 +565,35 @@ func (c *HTTPClient) discover(ctx context.Context, query url.Values) (items []so
 	}
 	mode := "resolve-issue"
 	if task.Type == "followup-pr" {
+		// Configured-ownership gate (#761): a followup-pr handout is accepted
+		// only when the Dispatch evidence on the item names an original
+		// claimant that Courier's configured dispatch bindings bind to this
+		// connector's own queue lane. The gate runs before the merged/closed
+		// stale check so foreign work is never marked stale, and before the
+		// rebase classification so a foreign or evidence-less rebase offer is
+		// declined by ownership even when the capability is negotiated. The
+		// configured queue-lane values are compared with exact string
+		// equality; no alias normalization, prefix match, or case folding is
+		// applied, and LaneProfile names are never Dispatch lane identities.
+		claimant := ""
+		if task.PRFixItem != nil {
+			claimant = strings.TrimSpace(task.PRFixItem.OriginalClaimant)
+		}
+		if reason, why := c.ownershipVerdict(claimant); reason != "" {
+			// The decline path releases the reservation (or latches for this
+			// generation when the release is refused) and emits the
+			// ownership diagnostic; the refusal itself is settled either
+			// way. Discovery surfaces no work and no error, so an ownership
+			// refusal never fails the poll loop: the lane stays available
+			// and the item stays discoverable for its owning lane (#761).
+			// The decline outcome is logged, not returned, so a refused
+			// release stays visible without turning the refusal into a
+			// failed poll.
+			if decline := c.declineOwnership(ctx, task, reason, why); decline != nil {
+				log.FromContext(ctx).Info("dispatch client: followup-pr handout declined by configured ownership", "reason", reason, "decline", decline.Error())
+			}
+			return nil, nil
+		}
 		state, err := c.checkPullRequestState(ctx, task.PullRequest)
 		if err != nil {
 			return nil, err
@@ -769,6 +838,16 @@ func (c *HTTPClient) ClaimWithReceipt(ctx context.Context, id, existingContext s
 		return "", err
 	}
 	if d.Type == "followup-pr" {
+		// The configured-ownership gate is rechecked at the claim/admission
+		// boundary (#761), not only where the handout was discovered: the
+		// bindings this connector enforces are the authority, and an attempt
+		// whose evidence does not name an authorized claimant must not be
+		// admitted for execution. The refusal releases the reservation with
+		// the exact receipt and keeps the item discoverable for the lane that
+		// owns it.
+		if err := c.refuseOwnership(ctx, d); err != nil {
+			return "", err
+		}
 		return encodeDispatchContext(existingContext, "", d.PRFixID, d.Generation), nil
 	}
 	if d.IssueID == "" {
@@ -955,6 +1034,16 @@ func (c *HTTPClient) AckHandout(ctx context.Context, item source.WorkItem) error
 	if d.Type != "followup-pr" || d.PRFixID == "" || d.Generation < 1 {
 		// Not a queue-backed PR-fix attempt: nothing to acknowledge.
 		return nil
+	}
+	// The configured-ownership gate is rechecked before the hand-out is
+	// acknowledged (#761): an acknowledgement tells Dispatch this agent owns
+	// the attempt, so a hand-out the configured bindings do not authorize must
+	// never be acknowledged. The refusal leaves the hand-out stamped to this
+	// agent — the attempt may already be executing — and the claim and
+	// pre-launch boundaries release the exact receipt for every attempt this
+	// connector refuses to execute.
+	if err := c.refuseOwnershipAck(d); err != nil {
+		return err
 	}
 	repo := strings.ToLower(d.Repo)
 	if d.Repo == "" || !dispatchRepoPattern.MatchString(repo) || d.Number <= 0 || d.Number > maxSafeInteger || d.Generation > maxSafeInteger {
@@ -1233,6 +1322,16 @@ func (c *HTTPClient) PreLaunch(ctx context.Context, id string) error {
 		c.diagnostics.Diagnostic(c.connectorName, connector.SignalRevalidation, reasonRevalidationCurrent)
 		return nil
 	}
+	// The configured-ownership gate is rechecked here, the last boundary
+	// before a coordinator starts (#761). This is the boundary the admission
+	// path and the recovery path both pass through — a run that was claimed
+	// before this gate existed, or one whose connector restarted under a
+	// different binding configuration, is refused here instead of executing
+	// foreign work. The refusal runs before the merged/closed check so work
+	// this connector does not own is never marked stale.
+	if err := c.refuseOwnership(ctx, d); err != nil {
+		return err
+	}
 	pullRequest := &PullRequest{Repo: d.Repo, Number: d.Number}
 	state, err := c.checkPullRequestState(ctx, pullRequest)
 	if err != nil {
@@ -1369,6 +1468,7 @@ func EncodeWorkID(task Task) string {
 		d.Generation = task.PRFixItem.Generation
 		d.HandoutToken = task.PRFixItem.HandoutToken
 		d.FixType = task.PRFixItem.FixType
+		d.OriginalClaimant = strings.TrimSpace(task.PRFixItem.OriginalClaimant)
 	}
 	if task.Issue != nil {
 		if task.Type == "implement" {

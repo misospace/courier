@@ -20,16 +20,7 @@ func followupTask(reasons []string) Task {
 		ShouldRun:   true,
 		Issue:       &Issue{ID: "issue-id", Repo: "acme/widgets", Number: 41},
 		PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42, URL: "https://github.com/acme/widgets/pull/42"},
-		PRFixItem:   &PRFixItem{ID: "queue-item", Generation: 1},
-		Reasons:     reasons,
-	}
-}
-
-func linkedFollowupTask(reasons []string) Task {
-	return Task{
-		Type:        "followup-pr",
-		ShouldRun:   true,
-		PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42, URL: "https://github.com/acme/widgets/pull/42"},
+		PRFixItem:   &PRFixItem{ID: "queue-item", Generation: 1, OriginalClaimant: "worker"},
 		Reasons:     reasons,
 	}
 }
@@ -40,10 +31,11 @@ func discoverAssignment(t *testing.T, task Task) source.WorkItem {
 		_ = json.NewEncoder(w).Encode(task)
 	}))
 	defer server.Close()
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "token", time.Second)
+	client, err := newTestDispatchClient(server.URL, "worker", "normal", "token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
+	client.WithOwnershipBindings(map[string]string{"worker": "normal"})
 	client.WithPullRequestStateChecker(PullRequestStateCheckerFunc(func(context.Context, string, int) (PullRequestState, error) {
 		return PullRequestState{State: "open"}, nil
 	}))
@@ -100,12 +92,6 @@ func TestHTTPClientDiscoverAssignment(t *testing.T) {
 			task:        followupTask([]string{"Failing check: unit-test (failure)", "Merge conflict detected: PR is CONFLICTING"}),
 			wantKind:    source.AssignmentMergeConflict,
 			wantReasons: []string{"Failing check: unit-test (failure)", "Merge conflict detected: PR is CONFLICTING"},
-		},
-		{
-			name:        "linked followup without prFixItem",
-			task:        linkedFollowupTask([]string{"Failing check: unit-test (failure)"}),
-			wantKind:    source.AssignmentCIFailure,
-			wantReasons: []string{"Failing check: unit-test (failure)"},
 		},
 		{
 			name:        "offer without reasons",

@@ -1877,6 +1877,65 @@ duplicate materialization. At rollout, runners also recognize prior
 identity. The CRD must be installed before an operator that writes
 `sourceAgent` is rolled out.
 
+#### Dispatch PR-repair ownership gate
+
+Every `followup-pr` handout is authorized against the resolved Dispatch
+bindings before acceptance (#761). The item's `originalClaimant` — the
+Dispatch identity that originally claimed the PR-fix work, supplied by the
+ownership-evidence contract (misospace/dispatch#1569) — must name a claimant
+present in the configured binding map (`agentName → queueLane`, built once
+from `resolveDispatchBindings`) and that claimant's configured queue lane must
+equal the receiving connector's own queue lane by exact string equality. This
+preserves cross-agent repair inside one lane (local, cloud, and hyper consumers
+sharing the normal lane repair each other's PRs) while rejecting
+normal-to-frontier and frontier-to-normal repair in both directions and any
+claimant outside the configured bindings; LaneProfile names are never Dispatch
+queue-lane identities, and no alias normalization, prefix matching, or
+recipient/author/branch/fix-type inference participates in the verdict. The
+claimant is compared after trimming surrounding whitespace on both sides —
+the configured binding names are trimmed the same way at startup — and no
+other normalization applies. The gate runs before the merged/closed stale
+mark, so foreign work is never marked stale, and before rebase
+classification, so a foreign or evidence-less rebase offer is declined by
+ownership even when the rebase capability is negotiated;
+deterministic-rebase execution operates only on already-accepted runs and
+cannot bypass it. The gate is unconditional: when the connected Dispatch does
+not yet supply the evidence (an older peer), every fix-pr handout is declined
+gracefully through the shared receipt-fenced decline — never claimed,
+materialized, or marked stale; released through the generation-fenced
+waiting-external mark at most once per generation per process; surfaced as a
+connector diagnostic (`ownership-evidence-missing`, `ownership-claimant-unknown`,
+`ownership-lane-mismatch`) without failing the poll loop — and legitimate
+repairs resume when the peer supplies evidence.
+
+**Acceptance is not the only gate.** The accepted claimant rides the durable
+attempt identity (`workDescriptor.originalClaimant`, the same opaque work ID
+that carries the PR-fix id, generation, hand-out token, and fix type), so every
+boundary that can still refuse an attempt revalidates the same evidence
+against the same configured bindings: the claim/admission boundary
+(`ClaimWithReceipt`), the hand-out acknowledgement (`AckHandout`, which tells
+Dispatch this agent owns the attempt and therefore must never acknowledge an
+unauthorized one), and the pre-launch revalidation (`PreLaunch`). The
+pre-launch revalidation is the boundary the admission path and the recovery
+path both pass through, so an attempt that was materialized before the gate
+existed — or one whose connector restarted under a different binding
+configuration — is refused instead of executing foreign work. A refusal at any
+of these boundaries releases the reservation with the exact receipt
+(repo, PR, generation — the release is generation-scoped, not
+hand-out-token-scoped), never marks the item stale, never resets another
+writer's attempt, and never changes a label; the item stays discoverable for
+the lane that owns it. The hand-out acknowledgement is the one exception: it
+is a ledger note rather than an execution boundary, and the attempt it
+acknowledges may already be executing, so an unauthorized hand-out is refused
+without a release and stays reclaimable by the source's bounded stale-handout
+reclaimer. The refusal is terminal for the run: it
+carries `source.ErrStaleWork`, so the core drops the run instead of leaving it
+Pending, where it would reserve its lane's capacity and be re-admitted into the
+same refusal forever. The bare Dispatch connector carries the queue lane of
+the binding that owns its Dispatch agent identity, so it authorizes the same
+PR repair the binding does; a bare agent that owns no configured binding has
+no lane and authorizes no PR repair at all.
+
 ### Repository development bootstrap execution
 
 Courier executes an opt-in, repository-owned development bootstrap after

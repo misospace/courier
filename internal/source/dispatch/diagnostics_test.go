@@ -46,6 +46,10 @@ func newDiagnosticsFixture(t *testing.T, configure func(*HTTPClient), handle fun
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The configured-ownership authority the shared PR-repair fixtures need:
+	// the fixture client polls no queue lane, so its fixture claimant is bound
+	// to that empty lane.
+	client.WithOwnershipBindings(testOwnershipBindings(""))
 	if configure != nil {
 		configure(client)
 	}
@@ -72,7 +76,7 @@ func followupWorkID(number int) string {
 	return EncodeWorkID(Task{
 		Type:        "followup-pr",
 		PullRequest: &PullRequest{Repo: "acme/widgets", Number: number},
-		PRFixItem:   &PRFixItem{ID: fmt.Sprintf("item-%d", number), Generation: 1},
+		PRFixItem:   &PRFixItem{ID: fmt.Sprintf("item-%d", number), Generation: 1, OriginalClaimant: "worker"},
 	})
 }
 

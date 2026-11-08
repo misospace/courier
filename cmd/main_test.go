@@ -282,6 +282,45 @@ func TestResolveDispatchBindingsBoundsTheBareConnectorIdentity(t *testing.T) {
 	}
 }
 
+// TestDispatchOwnershipBindings pins the ownership map the binding clients
+// receive (#761): each configured binding's Dispatch agent name maps to its
+// configured Dispatch queue lane, and that resolved map is the only
+// ownership authority for PR repair.
+func TestDispatchOwnershipBindings(t *testing.T) {
+	bindings := []dispatchBinding{
+		{queueLane: "queue-a", laneProfile: "lane-a", agentName: "courier"},
+		{queueLane: "queue-b", laneProfile: "lane-b", agentName: "courier-queue-b", sourceAgent: "courier-queue-b"},
+	}
+	got := dispatchOwnershipBindings(bindings)
+	want := map[string]string{"courier": "queue-a", "courier-queue-b": "queue-b"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("dispatchOwnershipBindings() = %#v, want %#v", got, want)
+	}
+	if empty := dispatchOwnershipBindings(nil); empty == nil || len(empty) != 0 {
+		t.Fatalf("dispatchOwnershipBindings(nil) = %#v, want an empty map", empty)
+	}
+}
+
+// TestDispatchBindingLane pins the lane the bare Dispatch connector carries:
+// the lane of the binding that owns its Dispatch agent identity, and no lane
+// at all when that agent owns no binding — a bare agent that is not a
+// configured binding authorizes no PR repair (#761).
+func TestDispatchBindingLane(t *testing.T) {
+	bindings := dispatchOwnershipBindings([]dispatchBinding{
+		{queueLane: "queue-a", laneProfile: "lane-a", agentName: "courier"},
+		{queueLane: "queue-b", laneProfile: "lane-b", agentName: "courier-queue-b", sourceAgent: "courier-queue-b"},
+	})
+	if got := dispatchBindingLane(bindings, "courier"); got != "queue-a" {
+		t.Fatalf("dispatchBindingLane(courier) = %q, want queue-a", got)
+	}
+	if got := dispatchBindingLane(bindings, " courier-queue-b"); got != "queue-b" {
+		t.Fatalf("dispatchBindingLane(courier-queue-b) = %q, want queue-b", got)
+	}
+	if got := dispatchBindingLane(bindings, "other-agent"); got != "" {
+		t.Fatalf("dispatchBindingLane(other-agent) = %q, want no lane", got)
+	}
+}
+
 // TestBuildSecureControlRejectsTaintedCredential covers the whole
 // pod-exposed Secret set: every flag that injects a Secret into a
 // model-controlled coordinator pod taints a registration that references it,
