@@ -2393,6 +2393,17 @@ func TestChartRejectsDependencyCacheReplicaScaling(t *testing.T) {
 		t.Fatalf("expected a dependency-cache replica count below one to fail, err = %v:\n%s", err, out)
 	}
 
+	// A fractional count passes the int truncation but the Deployment would
+	// render a replica count Kubernetes cannot accept, so the guard rejects
+	// the original value, not its truncation.
+	out, err = runHelmOutput(t, chartDir,
+		append(append([]string{"template", "courier", "."}, secureBase...),
+			"--set", "secure.dependencyCache.enabled=true",
+			"--set", "secure.dependencyCache.replicas=1.5")...)
+	if err == nil || !strings.Contains(out, "secure.dependencyCache.replicas") {
+		t.Fatalf("expected a fractional dependency-cache replica count to fail, err = %v:\n%s", err, out)
+	}
+
 	// The invalid value is rejected even when the cache is not rendered
 	// yet, so it cannot reach a cluster on the release that turns it on.
 	out, err = runHelmOutput(t, chartDir,
