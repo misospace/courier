@@ -362,6 +362,304 @@ else
     done < "$sources_file"
   fi
 fi
+
+# Mise pin drift (#768): the pinned launcher version must agree across
+# hack/bootstrap.sh, Dockerfile, and .mise/config.toml (the keep-together
+# contract in bootstrap.sh's bump comment), and the linux-x64 digest must
+# match between bootstrap.sh and the Dockerfile so a mise bump cannot land
+# half-applied with one file still carrying the previous release's digest.
+# Extraction is fail-closed: an unreadable, missing, duplicated, malformed,
+# or commented-out pin reports FAIL. A version string that is not a mise
+# release number (mise releases are CalVer: three dot-separated numbers)
+# fails even when all three pins agree, and the binary pins must carry the
+# "v" prefix, so a consistently formatted corruption cannot pass as
+# aligned. Each bootstrap case branch must pin exactly one well-formed
+# digest bound to the pinned version's release asset name, matching what
+# resolve_mise_digest hands to the runtime checksum check; a bare count of
+# well-formed digest lines could not tell which release a digest belongs
+# to. Assignment accounting guards the pre-case initializers: a non-empty
+# assignment before resolve_mise_digest runs would make it return early
+# with an unverified digest. The asset binding is verified for real: all
+# four branch digests are compared against the SHASUMS256.txt of the pinned
+# mise release, fetched from github.com/jdx/mise. Without that comparison a
+# stale digest carried over from another mise release (or a digest of a
+# different asset in the same release) is still well-formed and would pass.
+# The fetch is fail-closed: an unreachable release or a checksum file that
+# does not name an asset is a FAIL, not a pass, because a digest that
+# cannot be verified provides no provenance. The regression mutations are
+# checked for effect as well: a mutation that leaves the pinned digest in
+# place would verify clean, so such a case is a FAIL rather than a green
+# regression.
+bootstrap_sh="$script_dir/bootstrap.sh"
+mise_config="$script_dir/../.mise/config.toml"
+bs_version="$(sed -n 's/^MISE_VERSION=//p' "$bootstrap_sh" 2>/dev/null)" || bs_version=
+docker_version="$(sed -n 's/^ARG MISE_VERSION=//p' "$dockerfile" 2>/dev/null)" || docker_version=
+min_version="$(sed -n 's/^min_version = "\(.*\)"$/\1/p' "$mise_config" 2>/dev/null)" || min_version=
+mise_release_number() {
+  printf '%s' "$1" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'
+}
+case_n=$((case_n + 1))
+if mise_release_number "${bs_version#v}" && mise_release_number "${docker_version#v}" &&
+  mise_release_number "$min_version" &&
+  [ "$bs_version" = "v$min_version" ] && [ "$docker_version" = "v$min_version" ]; then
+  report PASS "mise pin: version aligned and well-formed across bootstrap.sh, Dockerfile, config.toml ($bs_version)"
+else
+  report FAIL "mise pin: version aligned and well-formed across bootstrap.sh, Dockerfile, config.toml" \
+    "bootstrap.sh=[$bs_version] Dockerfile=[$docker_version] config.toml=[$min_version]"
+fi
+mise_branch_check() {
+  local label="$1" suffix="$2" desc block asset digests
+  desc="mise pin: $label branch pins one digest for mise-\${MISE_VERSION}-$suffix"
+  block="$(sed -n "\\|$label)|,/;;/p" "$bootstrap_sh" 2>/dev/null)" || block=
+  asset="$(printf '%s\n' "$block" | sed -n 's/^[[:space:]]*mise_asset="\(.*\)"$/\1/p')"
+  digests="$(printf '%s\n' "$block" | sed -n 's/^[[:space:]]*mise_sha256=//p')"
+  case_n=$((case_n + 1))
+  if [ "$asset" = 'mise-${MISE_VERSION}-'"$suffix" ] &&
+    [ "$(printf '%s\n' "$digests" | grep -c . || true)" -eq 1 ] &&
+    [ "$(printf '%s\n' "$digests" | grep -cE '^[0-9a-f]{64}$' || true)" -eq 1 ]; then
+    report PASS "$desc"
+  else
+    report FAIL "$desc" "asset=[$asset] digests=[$digests]"
+  fi
+}
+mise_branch_check 'Linux/x86_64' linux-x64
+mise_branch_check 'Linux/aarch64' linux-arm64
+mise_branch_check 'Darwin/arm64' macos-arm64
+mise_branch_check 'Darwin/x86_64' macos-x64
+case_n=$((case_n + 1))
+bs_sha_total="$(grep -cE '^[[:space:]]*mise_sha256=' "$bootstrap_sh" || true)"
+bs_sha_empty="$(grep -cE '^[[:space:]]*mise_sha256=$' "$bootstrap_sh" || true)"
+bs_asset_total="$(grep -cE '^[[:space:]]*mise_asset=' "$bootstrap_sh" || true)"
+bs_asset_empty="$(grep -cE '^[[:space:]]*mise_asset=$' "$bootstrap_sh" || true)"
+if [ "$bs_sha_total" -eq 5 ] && [ "$bs_sha_empty" -eq 1 ] &&
+  [ "$bs_asset_total" -eq 5 ] && [ "$bs_asset_empty" -eq 1 ]; then
+  report PASS "mise pin: bootstrap.sh asset and digest assignments accounted for (4 branches + 1 empty initializer each)"
+else
+  report FAIL "mise pin: bootstrap.sh asset and digest assignments accounted for (4 branches + 1 empty initializer each)" \
+    "digests=$bs_sha_total (empty: $bs_sha_empty) assets=$bs_asset_total (empty: $bs_asset_empty)"
+fi
+bs_x64="$(sed -n '\|Linux/x86_64)|,/;;/s/^[[:space:]]*mise_sha256=//p' "$bootstrap_sh" 2>/dev/null)" || bs_x64=
+docker_x64="$(grep -oE '[0-9a-f]{64}[[:space:]]+/tmp/mise' "$dockerfile" | cut -d' ' -f1 || true)"
+case_n=$((case_n + 1))
+if [ "$(printf '%s\n' "$bs_x64" | grep -cE '^[0-9a-f]{64}$' || true)" -eq 1 ] &&
+  [ -n "$docker_x64" ] && [ "$bs_x64" = "$docker_x64" ]; then
+  report PASS "mise pin: linux-x64 digest aligned between bootstrap.sh and Dockerfile"
+else
+  report FAIL "mise pin: linux-x64 digest aligned between bootstrap.sh and Dockerfile" \
+    "bootstrap.sh=[$bs_x64] Dockerfile=[$docker_x64]"
+fi
+
+# The downloader preference mirrors hack/bootstrap.sh so a host that can
+# run the bootstrap can also run this check. One retry softens a transient
+# failure; the check itself stays fail-closed.
+fetch_url() {
+  local url="$1" dest="$2" attempt
+  for attempt in 1 2; do
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL -o "$dest" "$url" && return 0
+    elif command -v wget >/dev/null 2>&1; then
+      wget -nv -O "$dest" "$url" && return 0
+    elif command -v node >/dev/null 2>&1; then
+      node -e '
+const [url, dest] = process.argv.slice(1);
+fetch(url).then((r) => {
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.arrayBuffer();
+}).then((b) => require("fs").writeFileSync(dest, Buffer.from(b))
+).catch((e) => { console.error(`download failed: ${e.message}`); process.exit(1); });
+' "$url" "$dest" && return 0
+    else
+      return 127
+    fi
+  done
+  return 1
+}
+
+# Returns every checksum in the release checksum file $1 that names the
+# mise asset $2 (the version, "v" prefixed) for the platform suffix $3.
+# An empty result means the release does not publish that asset.
+mise_asset_digests() {
+  local shasums="$1" version="$2" suffix="$3"
+  [ -r "$shasums" ] || return 0
+  grep -E "^[0-9a-f]{64}[[:space:]]+\./mise-${version}-${suffix}\$" "$shasums" 2>/dev/null | cut -d' ' -f1 || true
+}
+
+# The first checksum the release file lists for the asset, or an empty
+# string when the release does not publish it.
+mise_first_digest() {
+  local all
+  all="$(mise_asset_digests "$1" "$2" "$3")"
+  printf '%s\n' "$all" | sed -n '1p'
+}
+
+# Verifies every branch digest in bootstrap.sh $1 against the release
+# checksum file $2. Prints a reason and returns 1 on the first mismatch;
+# prints nothing and returns 0 when each digest matches exactly one
+# checksum line for its release asset. The asset name is rebuilt from the
+# version pinned in the file under test, so a version bump whose digests
+# were not updated fails on the asset lookup, and a digest carried over
+# from another release or asset fails on the comparison.
+mise_verify_branch_digests() {
+  local bs="$1" shasums="$2" version pair label suffix want got
+  [ -r "$shasums" ] || { printf 'release checksum file unreadable\n'; return 1; }
+  version="$(sed -n 's/^MISE_VERSION=//p' "$bs" 2>/dev/null)" || version=
+  if ! mise_release_number "${version#v}" || [ "${version#v}" = "$version" ]; then
+    printf 'bootstrap.sh pins malformed MISE_VERSION [%s]\n' "$version"; return 1
+  fi
+  for pair in \
+    'Linux/x86_64:linux-x64' \
+    'Linux/aarch64:linux-arm64' \
+    'Darwin/arm64:macos-arm64' \
+    'Darwin/x86_64:macos-x64'; do
+    label="${pair%%:*}"
+    suffix="${pair##*:}"
+    want="$(sed -n "\\|$label)|,/;;/s/^[[:space:]]*mise_sha256=//p" "$bs" 2>/dev/null |
+      sed -n 's/^\([0-9a-f]\{64\}\)[[:space:]]*$/\1/p')"
+    if [ "$(printf '%s\n' "$want" | grep -c . || true)" -ne 1 ]; then
+      printf '%s branch does not pin exactly one well-formed digest\n' "$label"; return 1
+    fi
+    got="$(mise_asset_digests "$shasums" "$version" "$suffix")"
+    if [ "$(printf '%s\n' "$got" | grep -c . || true)" -ne 1 ]; then
+      printf 'mise-%s-%s appears %s times in SHASUMS256.txt\n' \
+        "$version" "$suffix" "$(printf '%s\n' "$got" | grep -c . || true)"; return 1
+    fi
+    if [ "$want" != "$got" ]; then
+      printf '%s digest %s does not match the %s release digest %s for mise-%s-%s\n' \
+        "$label" "$want" "$version" "$got" "$version" "$suffix"; return 1
+    fi
+  done
+}
+
+case_n=$((case_n + 1))
+mise_shasums="$work/mise-shasums.txt"
+mise_shasums_url="https://github.com/jdx/mise/releases/download/${bs_version}/SHASUMS256.txt"
+if fetch_url "$mise_shasums_url" "$mise_shasums"; then
+  mise_reason="$(mise_verify_branch_digests "$bootstrap_sh" "$mise_shasums")" || true
+  if [ -z "$mise_reason" ]; then
+    report PASS "mise pin: all four branch digests match the ${bs_version} release SHASUMS256.txt"
+  else
+    report FAIL "mise pin: all four branch digests match the ${bs_version} release SHASUMS256.txt" "$mise_reason"
+  fi
+else
+  report FAIL "mise pin: all four branch digests match the ${bs_version} release SHASUMS256.txt" \
+    "could not fetch $mise_shasums_url (the digest verification is fail-closed)"
+fi
+
+# Regression cases run the same verification against mutated copies of
+# bootstrap.sh, each of which must be rejected. The digest mutations are
+# well-formed 64-hex digests, so only the asset binding can catch them:
+# one is the linux-x64 digest copied into the linux-arm64 branch, the
+# other is the digest of a different asset in the same release. The
+# version mutation keeps the digests and moves the pin, so the asset
+# lookup itself must fail.
+#
+# Every mutation must actually change the value it claims to change: a
+# mutation that rewrote a branch with the release's own digest would
+# verify clean and would pass for the wrong reason, so such a case fails
+# loudly instead of reporting a green regression.
+mise_digest_reject_case() {
+  local desc="$1" bs="$2" label="$3" suffix="$4" reason expected actual
+  case_n=$((case_n + 1))
+  expected="$(mise_first_digest "$mise_shasums" "$bs_version" "$suffix")"
+  actual="$(sed -n "\\|$label)|,/;;/s/^[[:space:]]*mise_sha256=//p" "$bs" 2>/dev/null |
+    sed -n 's/^\([0-9a-f]\{64\}\)[[:space:]]*$/\1/p')"
+  if [ -z "$expected" ]; then
+    report FAIL "mise pin fail-closed: $desc" \
+      "the release checksum file does not publish the $suffix asset, so the mutation cannot be checked"
+    return
+  fi
+  if [ "$actual" = "$expected" ]; then
+    report FAIL "mise pin fail-closed: $desc" \
+      "the mutation did not replace the $suffix digest (mutated=[$actual] release=[$expected])"
+    return
+  fi
+  reason="$(mise_verify_branch_digests "$bs" "$mise_shasums")" || true
+  if [ -n "$reason" ]; then
+    report PASS "mise pin fail-closed: $desc" "$reason"
+  else
+    report FAIL "mise pin fail-closed: $desc" "mutated bootstrap.sh passed the digest verification"
+  fi
+}
+
+mise_version_reject_case() {
+  local desc="$1" bs="$2" reason pinned
+  case_n=$((case_n + 1))
+  pinned="$(sed -n 's/^MISE_VERSION=//p' "$bs" 2>/dev/null)" || pinned=
+  if [ "$pinned" = "$bs_version" ]; then
+    report FAIL "mise pin fail-closed: $desc" "the mutation did not change MISE_VERSION"
+    return
+  fi
+  reason="$(mise_verify_branch_digests "$bs" "$mise_shasums")" || true
+  if [ -n "$reason" ]; then
+    report PASS "mise pin fail-closed: $desc" "$reason"
+  else
+    report FAIL "mise pin fail-closed: $desc" "mutated bootstrap.sh passed the digest verification"
+  fi
+}
+
+bs_x64_digest="$(printf '%s\n' "$bs_x64" | sed -n '1p')"
+sed '\|Linux/aarch64)|,/;;/s/^[[:space:]]*mise_sha256=.*/\tmise_sha256='"$bs_x64_digest"'/' \
+  "$bootstrap_sh" > "$work/bootstrap-stale-arm64.sh"
+mise_digest_reject_case "stale linux-arm64 digest (carries the linux-x64 digest)" \
+  "$work/bootstrap-stale-arm64.sh" 'Linux/aarch64' linux-arm64
+
+# The macos-arm64 mutation carries the digest of a different asset in the
+# same release, so only the asset binding can catch it. The preferred
+# asset is the linux-x64-musl binary; when a release stops publishing
+# it, the digest of another published asset of the same release is used
+# (linux-arm64, then macos-x64). Every candidate is a real asset of the
+# pinned release, so the case stays a wrong-digest case instead of
+# degrading into a copy of the linux-arm64 mutation. The last resort, a
+# corrupted copy of the macos-arm64 digest, is still a well-formed digest
+# that the verification has to reject.
+mutation_digest=""
+mutation_asset=""
+for candidate in linux-x64-musl linux-arm64 macos-x64; do
+  candidate_digest="$(mise_first_digest "$mise_shasums" "$bs_version" "$candidate")"
+  if [ -z "$candidate_digest" ]; then
+    continue
+  fi
+  mutation_digest="$candidate_digest"
+  mutation_asset="mise-${bs_version}-${candidate}"
+  break
+done
+if [ -z "$mutation_digest" ]; then
+  expected_macos="$(mise_first_digest "$mise_shasums" "$bs_version" macos-arm64)"
+  last_char="$(printf '%s' "$expected_macos" | sed 's/.*\(.\)$/\1/')"
+  if [ "$last_char" = "0" ]; then
+    mutation_digest="${expected_macos%?}1"
+  else
+    mutation_digest="${expected_macos%?}0"
+  fi
+  mutation_asset="a corrupted copy of the macos-arm64 digest"
+fi
+sed '\|Darwin/arm64)|,/;;/s/^[[:space:]]*mise_sha256=.*/\tmise_sha256='"$mutation_digest"'/' \
+  "$bootstrap_sh" > "$work/bootstrap-stale-macos-arm64.sh"
+mise_digest_reject_case "stale macos-arm64 digest (digest of a different release asset: $mutation_asset)" \
+  "$work/bootstrap-stale-macos-arm64.sh" 'Darwin/arm64' macos-arm64
+
+# The version mutation keeps the digests and moves the pin, so the asset
+# lookup itself must fail. The stale version is picked so it differs from
+# the pinned one on every release instead of naming one fixed release.
+stale_version=""
+for candidate in v2026.10.13 v2026.9.0 v2020.1.1; do
+  if [ "$candidate" = "$bs_version" ]; then
+    continue
+  fi
+  stale_version="$candidate"
+  break
+done
+if [ -z "$stale_version" ]; then
+  case_n=$((case_n + 1))
+  report FAIL "mise pin fail-closed: pinned version changed without updating the digests" \
+    "no stale version candidate differs from the pinned $bs_version"
+else
+  sed "s/^MISE_VERSION=.*/MISE_VERSION=$stale_version/" \
+    "$bootstrap_sh" > "$work/bootstrap-stale-version.sh"
+  mise_version_reject_case "pinned version changed without updating the digests ($stale_version)" \
+    "$work/bootstrap-stale-version.sh"
+fi
+
 echo
 echo "total: $((pass + fail)) passed: $pass failed: $fail"
 if [ "$fail" -gt 0 ]; then
