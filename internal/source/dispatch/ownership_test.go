@@ -402,7 +402,10 @@ func TestOwnershipGateRechecksOwnershipAtPreLaunch(t *testing.T) {
 
 // The hand-out acknowledgement is a boundary too: it tells Dispatch this
 // agent owns the attempt, so an attempt the configured bindings do not
-// authorize is never acknowledged and its reservation is released instead.
+// authorize is never acknowledged. The refusal does not release the
+// reservation: the attempt may already be executing, and the claim and
+// pre-launch boundaries release the exact receipt for every attempt this
+// connector refuses to execute.
 func TestOwnershipGateRejectsForeignAttemptAtHandoutAcknowledgement(t *testing.T) {
 	var paths []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -416,16 +419,15 @@ func TestOwnershipGateRejectsForeignAttemptAtHandoutAcknowledgement(t *testing.T
 		PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42},
 		PRFixItem:   &PRFixItem{ID: "fix-9", Generation: 4, HandoutToken: "hand-4", OriginalClaimant: "frontier"},
 	})
-	if err := client.AckHandout(context.Background(), source.WorkItem{ID: id}); !errors.Is(err, ErrOwnershipDeclined) {
+	err := client.AckHandout(context.Background(), source.WorkItem{ID: id})
+	if !errors.Is(err, ErrOwnershipDeclined) {
 		t.Fatalf("AckHandout() error = %v, want the ownership decline", err)
 	}
-	for _, path := range paths {
-		if path == "/api/pr-fix-queue/ack" {
-			t.Fatalf("paths = %#v, want no acknowledgement of an unauthorized hand-out", paths)
-		}
+	if !strings.Contains(err.Error(), "receipt fix-9@4") {
+		t.Fatalf("AckHandout() error = %v, want the exact receipt evidence", err)
 	}
-	if len(paths) != 1 || paths[0] != "/api/pr-fix-queue/mark" {
-		t.Fatalf("paths = %#v, want exactly the receipt-fenced release", paths)
+	if len(paths) != 0 {
+		t.Fatalf("paths = %#v, want no acknowledgement and no release of a possibly live attempt", paths)
 	}
 }
 

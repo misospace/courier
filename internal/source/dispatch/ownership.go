@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/misospace/courier/internal/connector"
 	"github.com/misospace/courier/internal/source"
 )
 
@@ -72,4 +73,25 @@ func (c *HTTPClient) refuseOwnership(ctx context.Context, d workDescriptor) erro
 		return nil
 	}
 	return fmt.Errorf("%w: %w", source.ErrStaleWork, decline)
+}
+
+// refuseOwnershipAck refuses to acknowledge a hand-out the configured
+// bindings do not authorize, without releasing the reservation.
+//
+// The acknowledgement is a ledger note: it tells Dispatch this agent's run
+// owns the attempt, so a hand-out the bindings do not authorize must never be
+// acknowledged. It is not an execution boundary, though — the run that owns
+// the attempt may already be executing it — so the refusal leaves the hand-out
+// stamped to this agent and reclaimable by the source's bounded stale-handout
+// reclaimer. Releasing it here would park an attempt whose coordinator is
+// still running. The claim and pre-launch boundaries release the exact receipt
+// for every attempt this connector refuses to execute, so no reservation is
+// left held once such an attempt is dropped.
+func (c *HTTPClient) refuseOwnershipAck(d workDescriptor) error {
+	reason, why := c.ownershipVerdict(d.OriginalClaimant)
+	if reason == "" {
+		return nil
+	}
+	c.diagnostics.Diagnostic(c.connectorName, connector.SignalProtocolError, reason)
+	return fmt.Errorf("%w: %s; receipt %s@%d (handout %q) is not acknowledged", ErrOwnershipDeclined, why, d.PRFixID, d.Generation, d.HandoutToken)
 }

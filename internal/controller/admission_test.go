@@ -951,3 +951,30 @@ func TestAdmissionDropsRunWhoseClaimIsRefused(t *testing.T) {
 		t.Fatalf("get refused run error = %v, want NotFound; a refused claim must not leave the run Pending", err)
 	}
 }
+
+// transientReceiptAdmissionSource fails the claim the way a transport failure
+// does: the attempt is neither accepted nor refused for good.
+type transientReceiptAdmissionSource struct{ admissionSource }
+
+func (*transientReceiptAdmissionSource) ClaimWithReceipt(_ context.Context, _ source.WorkItem) (source.WorkItem, error) {
+	return source.WorkItem{}, errors.New("dispatch connection refused the claim")
+}
+
+// A claim that failed for a transient reason keeps the run Pending: only an
+// outright refusal from the source (the configured ownership gate, #761)
+// ends the run.
+func TestAdmissionKeepsRunPendingWhenClaimFailsTransiently(t *testing.T) {
+	client := admissionClient(t, admissionLane("local", 1), admissionRun("transient", "local", courierv1alpha1.PhasePending))
+	reconciler := admissionReconciler(client)
+	reconciler.Sources = NewSourceRegistry(map[string]source.Adapter{"test": &transientReceiptAdmissionSource{}})
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("transient")); err == nil {
+		t.Fatal("Reconcile() error = nil, want the claim failure")
+	}
+	var run courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("transient"), &run); err != nil {
+		t.Fatalf("get transient run: %v, want the run kept for a retry", err)
+	}
+	if run.Status.Phase != courierv1alpha1.PhasePending {
+		t.Fatalf("phase = %q, want Pending", run.Status.Phase)
+	}
+}

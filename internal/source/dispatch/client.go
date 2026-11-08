@@ -1026,9 +1026,11 @@ func (c *HTTPClient) AckHandout(ctx context.Context, item source.WorkItem) error
 	// The configured-ownership gate is rechecked before the hand-out is
 	// acknowledged (#761): an acknowledgement tells Dispatch this agent owns
 	// the attempt, so a hand-out the configured bindings do not authorize must
-	// never be acknowledged. The refusal releases the reservation with the
-	// exact receipt and keeps the item discoverable for the lane that owns it.
-	if err := c.refuseOwnership(ctx, d); err != nil {
+	// never be acknowledged. The refusal leaves the hand-out stamped to this
+	// agent — the attempt may already be executing — and the claim and
+	// pre-launch boundaries release the exact receipt for every attempt this
+	// connector refuses to execute.
+	if err := c.refuseOwnershipAck(d); err != nil {
 		return err
 	}
 	repo := strings.ToLower(d.Repo)
