@@ -368,30 +368,75 @@ fi
 # contract in bootstrap.sh's bump comment), and the linux-x64 digest must
 # match between bootstrap.sh and the Dockerfile so a mise bump cannot land
 # half-applied with one file still carrying the previous release's digest.
-# Extraction is fail-closed: an unreadable or malformed pin reports FAIL.
+# Extraction is fail-closed: an unreadable, missing, duplicated, malformed,
+# or commented-out pin reports FAIL. A version string that is not a mise
+# release number (mise releases are CalVer: three dot-separated numbers)
+# fails even when all three pins agree, and the binary pins must carry the
+# "v" prefix, so a consistently formatted corruption cannot pass as
+# aligned. Each bootstrap case branch must pin exactly one well-formed
+# digest bound to the pinned version's release asset name, matching what
+# resolve_mise_digest hands to the runtime checksum check; a bare count of
+# well-formed digest lines could not tell which release a digest belongs
+# to. Assignment accounting guards the pre-case initializers: a non-empty
+# assignment before resolve_mise_digest runs would make it return early
+# with an unverified digest.
 bootstrap_sh="$script_dir/bootstrap.sh"
 mise_config="$script_dir/../.mise/config.toml"
-bs_version="$(sed -n 's/^MISE_VERSION=//p' "$bootstrap_sh")"
-docker_version="$(sed -n 's/^ARG MISE_VERSION=//p' "$dockerfile")"
-min_version="$(sed -n 's/^min_version = "\(.*\)"$/\1/p' "$mise_config")"
+bs_version="$(sed -n 's/^MISE_VERSION=//p' "$bootstrap_sh" 2>/dev/null)" || bs_version=
+docker_version="$(sed -n 's/^ARG MISE_VERSION=//p' "$dockerfile" 2>/dev/null)" || docker_version=
+min_version="$(sed -n 's/^min_version = "\(.*\)"$/\1/p' "$mise_config" 2>/dev/null)" || min_version=
+mise_release_number() {
+  printf '%s' "$1" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'
+}
 case_n=$((case_n + 1))
-if [ -n "$bs_version" ] && [ "$bs_version" = "$docker_version" ] &&
-  [ "$bs_version" = "v$min_version" ]; then
-  report PASS "mise pin: version aligned across bootstrap.sh, Dockerfile, config.toml ($bs_version)"
+if mise_release_number "${bs_version#v}" && mise_release_number "${docker_version#v}" &&
+  mise_release_number "$min_version" &&
+  [ "$bs_version" = "v$min_version" ] && [ "$docker_version" = "v$min_version" ]; then
+  report PASS "mise pin: version aligned and well-formed across bootstrap.sh, Dockerfile, config.toml ($bs_version)"
 else
-  report FAIL "mise pin: version aligned across bootstrap.sh, Dockerfile, config.toml" \
+  report FAIL "mise pin: version aligned and well-formed across bootstrap.sh, Dockerfile, config.toml" \
     "bootstrap.sh=[$bs_version] Dockerfile=[$docker_version] config.toml=[$min_version]"
 fi
-bs_x64="$(sed -n '/Linux\/x86_64)/,/;;/s/.*mise_sha256=//p' "$bootstrap_sh")"
-docker_x64="$(grep -oE '[0-9a-f]{64}  /tmp/mise' "$dockerfile" | cut -d' ' -f1 || true)"
-bs_digests="$(sed -n 's/.*mise_sha256=//p' "$bootstrap_sh")"
-bs_digest_count="$(printf '%s\n' "$bs_digests" | grep -cE '^[0-9a-f]{64}$' || true)"
+mise_branch_check() {
+  local label="$1" suffix="$2" desc block asset digests
+  desc="mise pin: $label branch pins one digest for mise-\${MISE_VERSION}-$suffix"
+  block="$(sed -n "\\|$label)|,/;;/p" "$bootstrap_sh" 2>/dev/null)" || block=
+  asset="$(printf '%s\n' "$block" | sed -n 's/^[[:space:]]*mise_asset="\(.*\)"$/\1/p')"
+  digests="$(printf '%s\n' "$block" | sed -n 's/^[[:space:]]*mise_sha256=//p')"
+  case_n=$((case_n + 1))
+  if [ "$asset" = 'mise-${MISE_VERSION}-'"$suffix" ] &&
+    [ "$(printf '%s\n' "$digests" | grep -c . || true)" -eq 1 ] &&
+    [ "$(printf '%s\n' "$digests" | grep -cE '^[0-9a-f]{64}$' || true)" -eq 1 ]; then
+    report PASS "$desc"
+  else
+    report FAIL "$desc" "asset=[$asset] digests=[$digests]"
+  fi
+}
+mise_branch_check 'Linux/x86_64' linux-x64
+mise_branch_check 'Linux/aarch64' linux-arm64
+mise_branch_check 'Darwin/arm64' macos-arm64
+mise_branch_check 'Darwin/x86_64' macos-x64
 case_n=$((case_n + 1))
-if [ -n "$bs_x64" ] && [ "$bs_x64" = "$docker_x64" ] && [ "$bs_digest_count" -eq 4 ]; then
+bs_sha_total="$(grep -cE '^[[:space:]]*mise_sha256=' "$bootstrap_sh" || true)"
+bs_sha_empty="$(grep -cE '^[[:space:]]*mise_sha256=$' "$bootstrap_sh" || true)"
+bs_asset_total="$(grep -cE '^[[:space:]]*mise_asset=' "$bootstrap_sh" || true)"
+bs_asset_empty="$(grep -cE '^[[:space:]]*mise_asset=$' "$bootstrap_sh" || true)"
+if [ "$bs_sha_total" -eq 5 ] && [ "$bs_sha_empty" -eq 1 ] &&
+  [ "$bs_asset_total" -eq 5 ] && [ "$bs_asset_empty" -eq 1 ]; then
+  report PASS "mise pin: bootstrap.sh asset and digest assignments accounted for (4 branches + 1 empty initializer each)"
+else
+  report FAIL "mise pin: bootstrap.sh asset and digest assignments accounted for (4 branches + 1 empty initializer each)" \
+    "digests=$bs_sha_total (empty: $bs_sha_empty) assets=$bs_asset_total (empty: $bs_asset_empty)"
+fi
+bs_x64="$(sed -n '\|Linux/x86_64)|,/;;/s/^[[:space:]]*mise_sha256=//p' "$bootstrap_sh" 2>/dev/null)" || bs_x64=
+docker_x64="$(grep -oE '[0-9a-f]{64}[[:space:]]+/tmp/mise' "$dockerfile" | cut -d' ' -f1 || true)"
+case_n=$((case_n + 1))
+if [ "$(printf '%s\n' "$bs_x64" | grep -cE '^[0-9a-f]{64}$' || true)" -eq 1 ] &&
+  [ -n "$docker_x64" ] && [ "$bs_x64" = "$docker_x64" ]; then
   report PASS "mise pin: linux-x64 digest aligned between bootstrap.sh and Dockerfile"
 else
   report FAIL "mise pin: linux-x64 digest aligned between bootstrap.sh and Dockerfile" \
-    "bootstrap.sh=[$bs_x64] Dockerfile=[$docker_x64] well-formed bootstrap digests: $bs_digest_count/4"
+    "bootstrap.sh=[$bs_x64] Dockerfile=[$docker_x64]"
 fi
 
 echo
