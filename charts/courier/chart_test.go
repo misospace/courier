@@ -2331,3 +2331,64 @@ func TestChartRendersDependencyCache(t *testing.T) {
 		t.Fatalf("expected contradicting cache port to fail, err = %v:\n%s", err, out)
 	}
 }
+
+func TestChartRejectsDependencyCacheReplicaScaling(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
+		t.Fatalf("configure chart repository: %v", err)
+	}
+	runHelm(t, chartDir, "dependency", "build")
+
+	secureBase := []string{
+		"--set", "secure.enabled=true",
+		"--set", "secure.runNamespace=courier-runs",
+		"--set", "secure.providers[0].name=github",
+		"--set", "secure.providers[0].type=github",
+		"--set", "secure.providers[0].endpoint=https://api.github.com/",
+		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
+	}
+
+	// The default render still succeeds, and the cache still serves from a
+	// single replica.
+	rendered := runHelm(t, chartDir,
+		append(append([]string{"template", "courier", "."}, secureBase...),
+			"--set", "secure.dependencyCache.enabled=true")...)
+	cacheDeployment := chartDoc(t, rendered, "Deployment", "--root=/var/lib/courier/dependency-cache")
+	if !strings.Contains(cacheDeployment, "replicas: 1") {
+		t.Fatalf("cache Deployment must render one replica by default:\n%s", cacheDeployment)
+	}
+
+	// A second replica cannot attach the ReadWriteOnce store volume on
+	// another node, so the render fails instead of deploying pods that
+	// strand in ContainerCreating behind a healthy-looking Service.
+	out, err := runHelmOutput(t, chartDir,
+		append(append([]string{"template", "courier", "."}, secureBase...),
+			"--set", "secure.dependencyCache.enabled=true",
+			"--set", "secure.dependencyCache.replicas=2")...)
+	if err == nil {
+		t.Fatalf("expected a dependency-cache replica count above one to fail:\n%s", out)
+	}
+	for _, want := range []string{
+		"secure.dependencyCache.replicas",
+		"ReadWriteOnce",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("dependency-cache replica failure is missing %q, err = %v:\n%s", want, err, out)
+		}
+	}
+
+	// The invalid value is rejected even when the cache is not rendered
+	// yet, so it cannot reach a cluster on the release that turns it on.
+	out, err = runHelmOutput(t, chartDir,
+		append(append([]string{"template", "courier", "."}, secureBase...),
+			"--set", "secure.dependencyCache.replicas=3")...)
+	if err == nil || !strings.Contains(out, "secure.dependencyCache.replicas") {
+		t.Fatalf("expected an invalid dependency-cache replica count to fail with the cache disabled, err = %v:\n%s", err, out)
+	}
+}

@@ -2759,7 +2759,12 @@ while denying all cache egress. The operator's `--dependency-cache-service`
 pin is rendered automatically, is mutually exclusive with an external cache
 service, and must agree with the rendered Service port; release-identity
 labels scope every selector, so two courier releases sharing a namespace
-cannot route each other's workers to the wrong approved store.
+cannot route each other's workers to the wrong approved store. The store PVC
+is ReadWriteOnce, so the cache is single-replica by construction: the chart
+fails the render when `secure.dependencyCache.replicas` exceeds 1, because a
+second replica's pod could not attach the store volume on another node while
+the cache Service still resolved and the failure surfaced far from its
+cause.
 
 ## Deployment-provided skill bundles
 

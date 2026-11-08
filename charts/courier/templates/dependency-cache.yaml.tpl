@@ -1,4 +1,8 @@
-{{- if and .Values.secure.enabled .Values.secure.dependencyCache.enabled }}
+{{- $cache := .Values.secure.dependencyCache }}
+{{- if gt (int $cache.replicas) 1 }}
+{{- fail (printf "secure.dependencyCache.replicas %d must be 1: the store PVC is ReadWriteOnce, so a second replica cannot attach the volume on another node (Multi-Attach error) and its pod would strand in ContainerCreating; set replicas back to 1" (int $cache.replicas)) }}
+{{- end }}
+{{- if and .Values.secure.enabled $cache.enabled }}
 {{- /* The dedicated read-only dependency cache (#136): a pre-populated
   module store served over the read-only GOPROXY subset to secure workers.
   The store volume mounts read-only in the serving pod — a compromised cache
@@ -6,7 +10,6 @@
   all cache egress: the server has no outbound client at all, and the policy
   is defense in depth (HARNESS.md §2). Population travels the administrator's
   trusted path (see secure.dependencyCache in values.yaml), never a worker. */}}
-{{- $cache := .Values.secure.dependencyCache }}
 {{- $imageTag := $cache.image.tag }}
 {{- if not $imageTag }}{{- $imageTag = .Chart.AppVersion }}{{- end }}
 ---

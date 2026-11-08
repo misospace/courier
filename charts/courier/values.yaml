@@ -216,9 +216,11 @@ secure:
     port: 8123
     # -- Store PVC size; module zips are the dominant content.
     storage: 10Gi
-    # -- One replica: the store volume is read-only, so replicas would share
-    #    it safely, but each extra replica adds nothing the ClusterIP pin
-    #    needs.
+    # -- Must be 1. The store PVC is ReadWriteOnce, so a second replica
+    #    cannot attach the volume on another node: its pod would strand in
+    #    ContainerCreating with a Multi-Attach error while the cache Service
+    #    still resolves, and the breakage would surface far from its cause.
+    #    The chart rejects a larger value at render time.
     replicas: 1
     image:
       repository: ghcr.io/misospace/courier
