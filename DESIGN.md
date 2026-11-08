@@ -2761,7 +2761,7 @@ service, and must agree with the rendered Service port; release-identity
 labels scope every selector, so two courier releases sharing a namespace
 cannot route each other's workers to the wrong approved store. The store PVC
 is ReadWriteOnce, so the cache is single-replica by construction: the chart
-fails the render when `secure.dependencyCache.replicas` exceeds 1, because a
+fails the render unless `secure.dependencyCache.replicas` is 1, because a
 second replica's pod could not attach the store volume on another node while
 the cache Service still resolved and the failure surfaced far from its
 cause.

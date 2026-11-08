@@ -2360,7 +2360,7 @@ func TestChartRejectsDependencyCacheReplicaScaling(t *testing.T) {
 		append(append([]string{"template", "courier", "."}, secureBase...),
 			"--set", "secure.dependencyCache.enabled=true")...)
 	cacheDeployment := chartDoc(t, rendered, "Deployment", "--root=/var/lib/courier/dependency-cache")
-	if !strings.Contains(cacheDeployment, "replicas: 1") {
+	if !strings.Contains(cacheDeployment, "\n  replicas: 1\n") {
 		t.Fatalf("cache Deployment must render one replica by default:\n%s", cacheDeployment)
 	}
 
@@ -2383,12 +2383,32 @@ func TestChartRejectsDependencyCacheReplicaScaling(t *testing.T) {
 		}
 	}
 
+	// Zero replicas leave the cache Service without a pod, so every secure
+	// worker fails its dependency-cache preflight probe.
+	out, err = runHelmOutput(t, chartDir,
+		append(append([]string{"template", "courier", "."}, secureBase...),
+			"--set", "secure.dependencyCache.enabled=true",
+			"--set", "secure.dependencyCache.replicas=0")...)
+	if err == nil || !strings.Contains(out, "secure.dependencyCache.replicas") {
+		t.Fatalf("expected a dependency-cache replica count below one to fail, err = %v:\n%s", err, out)
+	}
+
 	// The invalid value is rejected even when the cache is not rendered
 	// yet, so it cannot reach a cluster on the release that turns it on.
 	out, err = runHelmOutput(t, chartDir,
 		append(append([]string{"template", "courier", "."}, secureBase...),
-			"--set", "secure.dependencyCache.replicas=3")...)
+			"--set", "secure.dependencyCache.enabled=false",
+			"--set", "secure.dependencyCache.replicas=2")...)
 	if err == nil || !strings.Contains(out, "secure.dependencyCache.replicas") {
 		t.Fatalf("expected an invalid dependency-cache replica count to fail with the cache disabled, err = %v:\n%s", err, out)
+	}
+
+	// The guard does not depend on secure mode either: an operator who sets
+	// the value without enabling secure mode gets the same rejection.
+	out, err = runHelmOutput(t, chartDir,
+		"template", "courier", ".",
+		"--set", "secure.dependencyCache.replicas=2")
+	if err == nil || !strings.Contains(out, "secure.dependencyCache.replicas") {
+		t.Fatalf("expected an invalid dependency-cache replica count to fail with secure mode disabled, err = %v:\n%s", err, out)
 	}
 }

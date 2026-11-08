@@ -1,6 +1,9 @@
 {{- $cache := .Values.secure.dependencyCache }}
-{{- if gt (int $cache.replicas) 1 }}
-{{- fail (printf "secure.dependencyCache.replicas %d must be 1: the store PVC is ReadWriteOnce, so a second replica cannot attach the volume on another node (Multi-Attach error) and its pod would strand in ContainerCreating; set replicas back to 1" (int $cache.replicas)) }}
+{{- if $cache }}
+{{- $replicas := int $cache.replicas }}
+{{- if ne $replicas 1 }}
+{{- fail (printf "secure.dependencyCache.replicas %d must be 1: the store PVC is ReadWriteOnce, so exactly one cache pod can hold the store volume; a second replica would fail to attach it on another node (Multi-Attach error) and strand in ContainerCreating; set secure.dependencyCache.replicas back to 1" $replicas) }}
+{{- end }}
 {{- end }}
 {{- if and .Values.secure.enabled $cache.enabled }}
 {{- /* The dedicated read-only dependency cache (#136): a pre-populated

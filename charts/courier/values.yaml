@@ -216,11 +216,9 @@ secure:
     port: 8123
     # -- Store PVC size; module zips are the dominant content.
     storage: 10Gi
-    # -- Must be 1. The store PVC is ReadWriteOnce, so a second replica
-    #    cannot attach the volume on another node: its pod would strand in
-    #    ContainerCreating with a Multi-Attach error while the cache Service
-    #    still resolves, and the breakage would surface far from its cause.
-    #    The chart rejects a larger value at render time.
+    # -- Must be 1: the store PVC is ReadWriteOnce, so only one cache pod
+    #    can hold the store volume; the chart rejects any other value at
+    #    render time.
     replicas: 1
     image:
       repository: ghcr.io/misospace/courier
