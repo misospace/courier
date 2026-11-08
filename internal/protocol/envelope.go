@@ -152,12 +152,6 @@ func NewEnvelope(now time.Time, admissionWindow time.Duration, payload []byte) E
 	}
 }
 
-// EncodeKey renders an Ed25519 public key for immutable pod-creation
-// configuration (worker environment).
-func EncodeKey(key ed25519.PublicKey) string {
-	return base64.StdEncoding.EncodeToString(key)
-}
-
 // DecodeKey parses a base64-encoded Ed25519 public key.
 func DecodeKey(value string) (ed25519.PublicKey, error) {
 	raw, err := base64.StdEncoding.DecodeString(value)

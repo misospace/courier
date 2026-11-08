@@ -979,14 +979,6 @@ func (w *Workspace) RebaseInProgress(ctx context.Context) (bool, error) {
 	return statErr == nil, nil
 }
 
-// SyncToBase synchronizes a checked-out work branch with a remote base branch.
-func SyncToBase(ctx context.Context, directory, remoteName, base string) error {
-	if remoteName == "" {
-		remoteName = defaultRemote
-	}
-	return (&Workspace{Directory: directory, RemoteName: remoteName, Base: base}).SyncToBase(ctx)
-}
-
 // CommitMessage builds the durable handoff message for a completed brief.
 func CommitMessage(brief Brief) (string, error) {
 	summary := strings.TrimSpace(brief.Summary)
@@ -1040,11 +1032,6 @@ func (w *Workspace) CommitBrief(ctx context.Context, brief Brief) (string, error
 	return strings.TrimSpace(string(sha)), nil
 }
 
-// CommitBrief stages and commits one completed brief in directory.
-func CommitBrief(ctx context.Context, directory string, brief Brief) (string, error) {
-	return (&Workspace{Directory: directory}).CommitBrief(ctx, brief)
-}
-
 // Push publishes the current work branch using an explicit refspec.
 func (w *Workspace) Push(ctx context.Context) error {
 	if err := validateRef(w.Branch, "branch"); err != nil {
@@ -1078,14 +1065,6 @@ func (w *Workspace) PushForceWithLease(ctx context.Context, expectedRemoteHead s
 	return err
 }
 
-// Push publishes branch from directory to remoteName.
-func Push(ctx context.Context, directory, remoteName, branch string) error {
-	if remoteName == "" {
-		remoteName = defaultRemote
-	}
-	return (&Workspace{Directory: directory, RemoteName: remoteName, Branch: branch}).Push(ctx)
-}
-
 // BranchName returns the deterministic work-branch name for a run.  A missing
 // or non-positive ref is an error rather than a fallback, preventing unrelated
 // runs from colliding on a shared branch.
@@ -1113,11 +1092,6 @@ func BranchName(repo string, ref int, mode string) (string, error) {
 		return "", err
 	}
 	return branch, nil
-}
-
-// WorkBranch is an alias that names the purpose of BranchName at call sites.
-func WorkBranch(repo string, ref int, mode string) (string, error) {
-	return BranchName(repo, ref, mode)
 }
 
 func slug(value string) string {

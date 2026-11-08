@@ -882,13 +882,6 @@ func (g GitIdentity) Validate() error {
 	return nil
 }
 
-// Environment returns the run context a coordinator container receives. The
-// values are kept in environment variables rather than shell-expanded command
-// strings so repository names, framing, and goals cannot become shell syntax.
-func Environment(inv Invocation, executorName string) []EnvVar {
-	return EnvironmentWithConfig(inv, executorName, "", "", "", "", "", "", "", "", "", GitIdentity{})
-}
-
 // EnvironmentWithConfig extends the run context with the deployment-specific
 // git and bootstrap settings needed by the executable shim. Secrets are wired
 // separately by the Pod builder as SecretKeyRef values. remoteURL points at

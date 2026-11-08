@@ -455,23 +455,6 @@ func FetchRef(ctx context.Context, repoDir, endpoint, remoteRef, localRef, usern
 	return nil
 }
 
-// ResolveRef resolves one exact local ref to its full OID.
-func ResolveRef(ctx context.Context, repoDir, ref string) (string, bool, error) {
-	out, err := Hardened(ctx, repoDir, "rev-parse", "--verify", "--quiet", ref)
-	if err != nil {
-		var commandErr *CommandError
-		if errors.As(err, &commandErr) && commandErr.ExitCode() == 1 {
-			return "", false, nil
-		}
-		return "", false, fmt.Errorf("git resolve ref: %w", err)
-	}
-	oid := strings.TrimSpace(string(out))
-	if validOID(oid) != nil {
-		return "", false, errors.New("git resolve ref: invalid resolved object ID")
-	}
-	return strings.ToLower(oid), true, nil
-}
-
 // localBundlePath validates that a bundle path is an absolute regular
 // non-symlink file, the same contract the broker's import applies.
 func localBundlePath(bundlePath string) (string, error) {

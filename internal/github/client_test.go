@@ -166,7 +166,7 @@ func TestReadPullRequestAndChecks(t *testing.T) {
 	if err != nil || pr.Head.SHA != "abc" {
 		t.Fatalf("pull request = %#v, %v", pr, err)
 	}
-	checks, err := client.GetChecks(context.Background(), "acme", "demo", "feature/one")
+	checks, err := client.GetCheckRuns(context.Background(), "acme", "demo", "feature/one")
 	if err != nil || checks.TotalCount != 1 || checks.CheckRuns[0].Conclusion != "success" {
 		t.Fatalf("checks = %#v, %v", checks, err)
 	}
