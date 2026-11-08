@@ -601,6 +601,12 @@ func main() {
 			legacyClient.WithPRFixExclusions(true)
 		}
 		sources.Register("dispatch", dispatch.New(legacyClient, dispatch.WithConnectorDiagnostics(diagnostics)))
+		// The resolved binding map is the only ownership authority for PR
+		// repair (#761): a followup-pr handout is accepted only when its
+		// original claimant is bound here to the receiving binding's queue
+		// lane. Claimant identities outside it are not Courier-owned work,
+		// even when their Dispatch lane matches.
+		ownershipBindings := dispatchOwnershipBindings(bindings)
 		for _, binding := range bindings {
 			bindingClient, err := dispatch.NewClientWithLane(dispatchBaseURL, binding.agentName, binding.queueLane, token, dispatchHTTPTimeout)
 			if err != nil {
@@ -608,6 +614,7 @@ func main() {
 				os.Exit(1)
 			}
 			bindingClient.WithPullRequestStateChecker(checker)
+			bindingClient.WithOwnershipBindings(ownershipBindings)
 			if dispatchPRFixExclusions {
 				bindingClient.WithPRFixExclusions(true)
 			}
@@ -983,6 +990,17 @@ type dispatchBinding struct {
 	laneProfile string
 	agentName   string
 	sourceAgent string
+}
+
+// dispatchOwnershipBindings maps each configured binding's Dispatch agent
+// name to its configured Dispatch queue lane: the ownership authority every
+// binding client consults before accepting a PR-repair handout (#761).
+func dispatchOwnershipBindings(bindings []dispatchBinding) map[string]string {
+	ownershipBindings := make(map[string]string, len(bindings))
+	for _, binding := range bindings {
+		ownershipBindings[binding.agentName] = binding.queueLane
+	}
+	return ownershipBindings
 }
 
 // resolveDispatchBindings normalizes the single-binding shorthand and repeated

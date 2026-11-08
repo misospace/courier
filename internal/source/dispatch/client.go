@@ -83,6 +83,12 @@ type PRFixItem struct {
 	Generation   int    `json:"generation"`
 	HandoutToken string `json:"handoutToken,omitempty"`
 	FixType      string `json:"fixType,omitempty"`
+	// OriginalClaimant is the Dispatch identity that originally claimed or
+	// holds this PR-fix item: the ownership-evidence contract Dispatch
+	// #1569 supplies. Courier never infers ownership from the handout
+	// recipient, the PR author, a branch prefix, or the fix type; the
+	// claimant on the item is the only ownership evidence it consults.
+	OriginalClaimant string `json:"originalClaimant,omitempty"`
 }
 
 // Issue identifies the issue associated with a Dispatch task.
@@ -206,14 +212,25 @@ type HTTPClient struct {
 	// nothing and stay operational with Dispatch deployments that predate the
 	// contract entirely.
 	rebaseCapabilityEnabled bool
-	// rebaseDeclines records, per declined generation, that the decline was
+	// ownershipBindings is the configured-ownership authority for PR repair:
+	// claimant Dispatch agent name → configured Dispatch queue lane. A
+	// followup-pr handout is accepted only when its original claimant is
+	// bound here to the receiving connector's own queue lane. A nil map
+	// keeps the gate active — every claimant is then unknown — so the gate
+	// is unconditional and an older Dispatch peer that supplies no evidence
+	// has every fix-pr handout declined gracefully.
+	ownershipBindings map[string]string
+	// handoutDeclines records, per declined generation, that the decline was
 	// already settled with the deployment: the recoverable release landed, or
-	// the deployment refused it and the refusal stands as the evidence. A
-	// declined generation must not be re-released on every later poll — one
-	// release per generation per process — so the decline keeps surfacing
-	// with its ownership evidence intact while the source's own stale-handout
-	// reclaimer remains the documented bounded recovery path.
-	rebaseDeclines sync.Map
+	// the deployment refused it and the refusal stands as the evidence. The
+	// latch covers both decline kinds — a rebase offer Courier cannot safely
+	// execute, and a followup-pr handout its configured ownership bindings do
+	// not authorize. A declined generation must not be re-released on every
+	// later poll — one release per generation per process — so the decline
+	// keeps surfacing with its ownership evidence intact while the source's
+	// own stale-handout reclaimer remains the documented bounded recovery
+	// path.
+	handoutDeclines sync.Map
 }
 
 // NewClient creates a Dispatch HTTP client without a queue lane override.
@@ -279,6 +296,21 @@ func (c *HTTPClient) WithPRFixExclusionLimit(limit int) *HTTPClient {
 // operational with Dispatch deployments that predate the contract.
 func (c *HTTPClient) WithRebaseCapability(enabled bool) *HTTPClient {
 	c.rebaseCapabilityEnabled = enabled
+	return c
+}
+
+// WithOwnershipBindings installs the configured-ownership authority for PR
+// repair (#761): a map of claimant Dispatch agent name → configured Dispatch
+// queue lane. The map is copied on set, so later mutation of the caller's
+// map cannot change a live client's verdicts. The gate itself is always on:
+// with no bindings configured, every claimant is unknown and every fix-pr
+// handout is declined through the receipt-fenced ownership path.
+func (c *HTTPClient) WithOwnershipBindings(bindings map[string]string) *HTTPClient {
+	installed := make(map[string]string, len(bindings))
+	for claimant, lane := range bindings {
+		installed[claimant] = lane
+	}
+	c.ownershipBindings = installed
 	return c
 }
 
@@ -525,6 +557,33 @@ func (c *HTTPClient) discover(ctx context.Context, query url.Values) (items []so
 	}
 	mode := "resolve-issue"
 	if task.Type == "followup-pr" {
+		// Configured-ownership gate (#761): a followup-pr handout is accepted
+		// only when the Dispatch evidence on the item names an original
+		// claimant that Courier's configured dispatch bindings bind to this
+		// connector's own queue lane. The gate runs before the merged/closed
+		// stale check so foreign work is never marked stale, and before the
+		// rebase classification so a foreign or evidence-less rebase offer is
+		// declined by ownership even when the capability is negotiated. The
+		// configured queue-lane values are compared with exact string
+		// equality; no alias normalization, prefix match, or case folding is
+		// applied, and LaneProfile names are never Dispatch lane identities.
+		claimant := ""
+		if task.PRFixItem != nil {
+			claimant = strings.TrimSpace(task.PRFixItem.OriginalClaimant)
+		}
+		boundLane, known := c.ownershipBindings[claimant]
+		var ownershipReason, ownershipWhy string
+		switch {
+		case task.PRFixItem == nil || claimant == "":
+			ownershipReason, ownershipWhy = reasonOwnershipEvidenceMissing, "the followup-pr handout carries no original-claimant evidence"
+		case !known:
+			ownershipReason, ownershipWhy = reasonOwnershipClaimantUnknown, fmt.Sprintf("original claimant %q is not in Courier's configured dispatch bindings", claimant)
+		case boundLane != c.queueLane:
+			ownershipReason, ownershipWhy = reasonOwnershipLaneMismatch, fmt.Sprintf("original claimant %q is bound to queue lane %q, not this connector's queue lane %q", claimant, boundLane, c.queueLane)
+		}
+		if ownershipReason != "" {
+			return nil, c.declineOwnership(ctx, task, ownershipReason, ownershipWhy)
+		}
 		state, err := c.checkPullRequestState(ctx, task.PullRequest)
 		if err != nil {
 			return nil, err
@@ -568,6 +627,7 @@ func (c *HTTPClient) discover(ctx context.Context, query url.Values) (items []so
 		receipt.PRFixID, receipt.Generation = task.PRFixItem.ID, task.PRFixItem.Generation
 		receipt.HandoutToken = task.PRFixItem.HandoutToken
 		receipt.FixType = task.PRFixItem.FixType
+		receipt.OriginalClaimant = strings.TrimSpace(task.PRFixItem.OriginalClaimant)
 		encoded, _ := json.Marshal(receipt)
 		context = string(encoded)
 	}
@@ -582,6 +642,10 @@ type dispatchContext struct {
 	// FixType survives in the durable receipt so a rebase-marked attempt
 	// stays rebase-marked through recovery and settlement (#715).
 	FixType string `json:"fixType,omitempty"`
+	// OriginalClaimant survives in the durable receipt so the ownership
+	// evidence that authorized the handout (#761) stays attached to the
+	// attempt for the rest of its lifecycle.
+	OriginalClaimant string `json:"originalClaimant,omitempty"`
 }
 
 func encodeDispatchContext(existing, token, fixID string, generation int) string {

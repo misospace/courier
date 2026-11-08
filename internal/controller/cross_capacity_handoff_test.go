@@ -66,7 +66,7 @@ func TestCrossCapacityHandoffCoolsExhaustedProfileOnly(t *testing.T) {
 					if tc.mode == courierv1alpha1.ModeResolveIssue {
 						return map[string]any{"shouldRun": true, "type": "implement", "issue": map[string]any{"id": "issue-327", "repoFullName": "acme/widgets", "number": 327}}
 					}
-					return map[string]any{"shouldRun": true, "type": "followup-pr", "pullRequest": map[string]any{"repoFullName": "acme/widgets", "number": 42}, "prFixItem": map[string]any{"id": "fix-42", "generation": 3, "handoutToken": "handout-3"}}
+					return map[string]any{"shouldRun": true, "type": "followup-pr", "pullRequest": map[string]any{"repoFullName": "acme/widgets", "number": 42}, "prFixItem": map[string]any{"id": "fix-42", "generation": 3, "handoutToken": "handout-3", "originalClaimant": "courier-cloud"}}
 				}
 				switch {
 				case r.Method == http.MethodGet && r.URL.Path == "/api/agents/courier-cloud/next-task":
@@ -147,6 +147,7 @@ func TestCrossCapacityHandoffCoolsExhaustedProfileOnly(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				httpClient = httpClient.WithOwnershipBindings(map[string]string{"courier-cloud": "", "courier-local": ""})
 				httpClient = httpClient.WithPullRequestStateChecker(dispatch.PullRequestStateCheckerFunc(func(context.Context, string, int) (dispatch.PullRequestState, error) {
 					return dispatch.PullRequestState{State: "open"}, nil
 				}))

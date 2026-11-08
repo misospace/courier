@@ -1877,6 +1877,38 @@ duplicate materialization. At rollout, runners also recognize prior
 identity. The CRD must be installed before an operator that writes
 `sourceAgent` is rolled out.
 
+#### Dispatch PR-repair ownership gate
+
+Every `followup-pr` handout is authorized against the resolved Dispatch
+bindings before acceptance (#761). The item's `originalClaimant` — the
+Dispatch identity that originally claimed the PR-fix work, supplied by the
+ownership-evidence contract (misospace/dispatch#1569) — must name a claimant
+present in the configured binding map (`agentName → queueLane`, built once
+from `resolveDispatchBindings`) and that claimant's configured queue lane must
+equal the receiving connector's own queue lane by exact string equality. This
+preserves cross-agent repair inside one lane (local, cloud, and hyper consumers
+sharing the normal lane repair each other's PRs) while rejecting
+normal-to-frontier and frontier-to-normal repair in both directions and any
+claimant outside the configured bindings; LaneProfile names are never Dispatch
+queue-lane identities, and no alias normalization, prefix matching, or
+recipient/author/branch/fix-type inference participates in the verdict. The
+gate runs before the merged/closed stale mark, so foreign work is never marked
+stale, and before rebase classification, so a foreign or evidence-less rebase
+offer is declined by ownership even when the rebase capability is negotiated;
+deterministic-rebase execution operates only on already-accepted runs and
+cannot bypass it. Because acceptance is the only gate, the generation-fenced
+hand-out acknowledgement (`agentName` + `generation`, with 403/409 refusals
+treated as moot) is the admission-boundary recheck for ownership that changes
+after discovery. The gate is unconditional: when the connected Dispatch does
+not yet supply the evidence (an older peer), every fix-pr handout is declined
+gracefully through the shared receipt-fenced decline — never claimed,
+materialized, or marked stale; released through the generation-fenced
+waiting-external mark at most once per generation per process; surfaced as a
+connector diagnostic (`ownership-evidence-missing`, `ownership-claimant-unknown`,
+`ownership-lane-mismatch`) without failing the poll loop — and legitimate
+repairs resume when the peer supplies evidence. The accepted claimant rides the
+durable run receipt.
+
 ### Repository development bootstrap execution
 
 Courier executes an opt-in, repository-owned development bootstrap after

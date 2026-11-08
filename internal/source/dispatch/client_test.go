@@ -254,7 +254,7 @@ func TestHTTPClientDiscoverExcludingAllowsNewerGeneration(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"type": "followup-pr", "shouldRun": true,
 			"pullRequest":     PullRequest{Repo: "acme/widgets", Number: 42},
-			"prFixItem":       PRFixItem{ID: "item", Generation: 4},
+			"prFixItem":       PRFixItem{ID: "item", Generation: 4, OriginalClaimant: "worker"},
 			"prFixExclusions": map[string]any{"version": 1},
 		})
 	}))
@@ -264,6 +264,7 @@ func TestHTTPClientDiscoverExcludingAllowsNewerGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	client.WithPRFixExclusions(true)
+	client.WithOwnershipBindings(map[string]string{"worker": ""})
 	client.WithPullRequestStateChecker(PullRequestStateCheckerFunc(func(context.Context, string, int) (PullRequestState, error) {
 		return PullRequestState{State: "open"}, nil
 	}))
@@ -285,7 +286,7 @@ func TestHTTPClientDiscoverMapsFollowupPR(t *testing.T) {
 			ShouldRun:   true,
 			Issue:       &Issue{ID: "issue-id", Repo: "acme/widgets", Number: 41},
 			PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42, URL: "https://github.com/acme/widgets/pull/42"},
-			PRFixItem:   &PRFixItem{ID: "queue-item", Generation: 1},
+			PRFixItem:   &PRFixItem{ID: "queue-item", Generation: 1, OriginalClaimant: "worker"},
 		})
 	}))
 	defer server.Close()
@@ -294,6 +295,7 @@ func TestHTTPClientDiscoverMapsFollowupPR(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	client.WithOwnershipBindings(map[string]string{"worker": "normal"})
 	client.WithPullRequestStateChecker(PullRequestStateCheckerFunc(func(context.Context, string, int) (PullRequestState, error) {
 		return PullRequestState{State: "open"}, nil
 	}))
@@ -436,7 +438,7 @@ func TestHTTPClientDiscoverMarksClosedUnmergedFollowupStale(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/agents/worker/next-task":
-			_ = json.NewEncoder(w).Encode(Task{Type: "followup-pr", ShouldRun: true, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
+			_ = json.NewEncoder(w).Encode(Task{Type: "followup-pr", ShouldRun: true, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1, OriginalClaimant: "worker"}})
 		case "/api/pr-fix-queue/mark":
 			body, _ := io.ReadAll(r.Body)
 			if err := json.Unmarshal(body, &request); err != nil {
@@ -453,6 +455,7 @@ func TestHTTPClientDiscoverMarksClosedUnmergedFollowupStale(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	client.WithOwnershipBindings(map[string]string{"worker": "normal"})
 	client.WithPullRequestStateChecker(PullRequestStateCheckerFunc(func(context.Context, string, int) (PullRequestState, error) {
 		return PullRequestState{State: "closed"}, nil
 	}))
@@ -470,7 +473,7 @@ func TestHTTPClientDiscoverMarksMergedFollowupStale(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/agents/worker/next-task":
-			_ = json.NewEncoder(w).Encode(Task{Type: "followup-pr", ShouldRun: true, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
+			_ = json.NewEncoder(w).Encode(Task{Type: "followup-pr", ShouldRun: true, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1, OriginalClaimant: "worker"}})
 		case "/api/pr-fix-queue/mark":
 			body, _ := io.ReadAll(r.Body)
 			if err := json.Unmarshal(body, &request); err != nil {
@@ -487,6 +490,7 @@ func TestHTTPClientDiscoverMarksMergedFollowupStale(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	client.WithOwnershipBindings(map[string]string{"worker": "normal"})
 	client.WithPullRequestStateChecker(PullRequestStateCheckerFunc(func(context.Context, string, int) (PullRequestState, error) {
 		return PullRequestState{State: "closed", Merged: true}, nil
 	}))
@@ -529,7 +533,7 @@ func TestHTTPClientDiscoverStaleGenerationMismatchMapsToSuperseded(t *testing.T)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/agents/worker/next-task":
-			_ = json.NewEncoder(w).Encode(Task{Type: "followup-pr", ShouldRun: true, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
+			_ = json.NewEncoder(w).Encode(Task{Type: "followup-pr", ShouldRun: true, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1, OriginalClaimant: "worker"}})
 		case "/api/pr-fix-queue/mark":
 			w.WriteHeader(http.StatusConflict)
 			_, _ = w.Write([]byte(`{"error":"PR fix queue item generation mismatch: expected generation 1 did not match the item's current generation"}`))
@@ -543,6 +547,7 @@ func TestHTTPClientDiscoverStaleGenerationMismatchMapsToSuperseded(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	client.WithOwnershipBindings(map[string]string{"worker": "normal"})
 	client.WithPullRequestStateChecker(PullRequestStateCheckerFunc(func(context.Context, string, int) (PullRequestState, error) {
 		return PullRequestState{State: "closed", Merged: true}, nil
 	}))
@@ -557,7 +562,7 @@ func TestHTTPClientDiscoverStaleGenerationMismatchMapsToSuperseded(t *testing.T)
 
 func TestHTTPClientDiscoverRejectsFollowupWithoutStateChecker(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(Task{Type: "followup-pr", ShouldRun: true, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
+		_ = json.NewEncoder(w).Encode(Task{Type: "followup-pr", ShouldRun: true, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1, OriginalClaimant: "worker"}})
 	}))
 	defer server.Close()
 
@@ -565,6 +570,7 @@ func TestHTTPClientDiscoverRejectsFollowupWithoutStateChecker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	client.WithOwnershipBindings(map[string]string{"worker": "normal"})
 	if _, err := client.Discover(context.Background()); !errors.Is(err, ErrPRStateCheckerNeeded) {
 		t.Fatalf("Discover() error = %v, want ErrPRStateCheckerNeeded", err)
 	}

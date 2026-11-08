@@ -43,6 +43,10 @@ func newTestClient(t *testing.T, serverURL string, rebase bool) *HTTPClient {
 		t.Fatal(err)
 	}
 	client.WithPullRequestStateChecker(openPRChecker())
+	// The configured-ownership gate (#761) runs before the rebase
+	// classification, so the rebase fixtures carry a same-lane claimant: the
+	// "local" agent is bound to this connector's own "rebase" queue lane.
+	client.WithOwnershipBindings(map[string]string{"local": "rebase"})
 	if rebase {
 		client.WithRebaseCapability(true)
 	}
@@ -97,7 +101,7 @@ func serveRebaseOffer(t *testing.T, intake map[string]any) http.HandlerFunc {
 		body := map[string]any{
 			"type": "followup-pr", "shouldRun": true,
 			"pullRequest": map[string]any{"repoFullName": "acme/widgets", "number": 42, "state": "open"},
-			"prFixItem":   map[string]any{"id": "fix-1", "generation": 3, "handoutToken": "hand-9", "fixType": "REBASE"},
+			"prFixItem":   map[string]any{"id": "fix-1", "generation": 3, "handoutToken": "hand-9", "fixType": "REBASE", "originalClaimant": "local"},
 		}
 		if intake != nil {
 			body["intake"] = intake
@@ -158,7 +162,7 @@ func TestRebaseDiscoveryDeclinesUnnegotiatedRebaseWork(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"type": "followup-pr", "shouldRun": true,
 				"pullRequest": map[string]any{"repoFullName": "acme/widgets", "number": 42},
-				"prFixItem":   map[string]any{"id": "fix-1", "generation": 3, "handoutToken": "hand-9", "fixType": "REBASE"},
+				"prFixItem":   map[string]any{"id": "fix-1", "generation": 3, "handoutToken": "hand-9", "fixType": "REBASE", "originalClaimant": "local"},
 			})
 		case r.URL.Path == "/api/pr-fix-queue/mark":
 			var body map[string]any
@@ -196,7 +200,7 @@ func TestRebaseDiscoveryDeclinesReceiptlessRebaseOffer(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"type": "followup-pr", "shouldRun": true,
 				"pullRequest": map[string]any{"repoFullName": "acme/widgets", "number": 42},
-				"prFixItem":   map[string]any{"id": "", "generation": 0, "fixType": "REBASE"},
+				"prFixItem":   map[string]any{"id": "", "generation": 0, "fixType": "REBASE", "originalClaimant": "local"},
 			})
 		case r.URL.Path == "/api/pr-fix-queue/mark":
 			marks++
@@ -227,7 +231,7 @@ func TestRebaseDiscoveryNeverAcceptsOrdinaryWorkUnderRebaseOnly(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"type": "followup-pr", "shouldRun": true,
 				"pullRequest": map[string]any{"repoFullName": "acme/widgets", "number": 42},
-				"prFixItem":   map[string]any{"id": "fix-2", "generation": 1, "fixType": "ci-failure"},
+				"prFixItem":   map[string]any{"id": "fix-2", "generation": 1, "fixType": "ci-failure", "originalClaimant": "local"},
 				"intake":      rebaseIntakeAckBody(),
 			})
 		case r.URL.Path == "/api/pr-fix-queue/mark":
@@ -510,7 +514,7 @@ func TestOrdinaryDiscoveryUnchangedWithoutRebaseCapability(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"type": "followup-pr", "shouldRun": true,
 			"pullRequest": map[string]any{"repoFullName": "acme/widgets", "number": 42},
-			"prFixItem":   map[string]any{"id": "fix-3", "generation": 5},
+			"prFixItem":   map[string]any{"id": "fix-3", "generation": 5, "originalClaimant": "local"},
 		})
 	}))
 	defer server.Close()
@@ -580,7 +584,7 @@ func TestRebaseDeclineReleaseIsAttemptedOncePerGeneration(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"type": "followup-pr", "shouldRun": true,
 				"pullRequest": map[string]any{"repoFullName": "acme/widgets", "number": 42},
-				"prFixItem":   map[string]any{"id": "fix-1", "generation": 3, "handoutToken": "hand-9", "fixType": "REBASE"},
+				"prFixItem":   map[string]any{"id": "fix-1", "generation": 3, "handoutToken": "hand-9", "fixType": "REBASE", "originalClaimant": "local"},
 			})
 		case r.URL.Path == "/api/pr-fix-queue/mark":
 			marks++
@@ -611,7 +615,7 @@ func TestRebaseDeclineReleaseSucceedsOnce(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"type": "followup-pr", "shouldRun": true,
 				"pullRequest": map[string]any{"repoFullName": "acme/widgets", "number": 42},
-				"prFixItem":   map[string]any{"id": "fix-1", "generation": 3, "fixType": "REBASE"},
+				"prFixItem":   map[string]any{"id": "fix-1", "generation": 3, "fixType": "REBASE", "originalClaimant": "local"},
 			})
 		case r.URL.Path == "/api/pr-fix-queue/mark":
 			marks++

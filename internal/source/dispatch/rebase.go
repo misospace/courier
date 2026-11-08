@@ -68,6 +68,12 @@ const rebaseCapabilityRequest = "rebase-executor:1"
 // or executed; the error carries the receipt evidence the decline preserves.
 var ErrRebaseDeclined = errors.New("dispatch client: rebase work declined")
 
+// ErrOwnershipDeclined marks a followup-pr handout Courier refused under the
+// configured-ownership bindings (#761). The handout was never claimed,
+// materialized, or executed; the error carries the receipt evidence the
+// decline preserves.
+var ErrOwnershipDeclined = errors.New("dispatch client: followup-pr ownership declined")
+
 // isRebaseFixType reports whether a PR-fix item's FixType classifies the
 // followup as rebase work. The comparison is case-insensitive because the
 // queue's classification is source-owned data, not a protocol constant; the
@@ -124,6 +130,54 @@ func validateRebaseIntake(raw json.RawMessage) (ok bool, reason string) {
 	return false, reasonRebaseCapabilityMissing
 }
 
+// declineHandout is the shared receipt-fenced decline core behind
+// declineRebase and declineOwnership. It emits no diagnostics — each wrapper
+// owns its own vocabulary reason — and keeps the exact decline semantics for
+// both kinds: an offer without a valid receipt is declined without a release
+// call, and otherwise the release is the generation-fenced waiting-external
+// mark presented with the exact receipt (repo, PR, generation) the offer
+// carried, so the source keeps the item discoverable for its rightful
+// consumer without consuming attempt budget, fabricating completion, or
+// touching any other writer's attempt.
+//
+// When the deployment refuses that release — an older Dispatch without the
+// waiting-external mark, or any refusal this client cannot prove moot — the
+// decline surfaces with the full ownership evidence and latches for this
+// exact generation in the shared per-generation latch: one release attempt
+// per generation per process, never an indefinite retry. The source's
+// stale-handout reclaimer remains the documented bounded recovery path for
+// the unacknowledged handout, and the work stays safely discoverable either
+// way. decline is the sentinel the returned error wraps, kind is the noun
+// the receipt-less message names, and note is the recoverable-wait note the
+// release carries.
+func (c *HTTPClient) declineHandout(ctx context.Context, task Task, decline error, kind, note, why string) error {
+	if task.PRFixItem == nil || strings.TrimSpace(task.PRFixItem.ID) == "" || task.PRFixItem.Generation < 1 {
+		// An offer without a valid receipt cannot be released against
+		// anything, and an attempt without a receipt could never be settled
+		// truthfully. Decline without acceptance and without a release call;
+		// there is nothing this client owns to hand back.
+		return fmt.Errorf("%w: %s carries no valid PR-fix receipt (%s); declined without acceptance or release", decline, kind, why)
+	}
+	receipt := fmt.Sprintf("receipt %s@%d (handout %q)", task.PRFixItem.ID, task.PRFixItem.Generation, task.PRFixItem.HandoutToken)
+	d := workDescriptor{Type: task.Type, PRFixID: task.PRFixItem.ID, Generation: task.PRFixItem.Generation, FixType: task.PRFixItem.FixType}
+	if task.PullRequest != nil {
+		d.Repo, d.Number = task.PullRequest.Repo, task.PullRequest.Number
+	}
+	key := fmt.Sprintf("%s/%d#%s@%d", d.Repo, d.Number, d.PRFixID, d.Generation)
+	if _, settled := c.handoutDeclines.Load(key); settled {
+		return fmt.Errorf("%w: %s; the decline of %s was already settled with this deployment, so no further release is attempted (bounded recovery: the source's stale-handout reclaimer)", decline, why, receipt)
+	}
+	err := c.markPRFixWaitingExternal(ctx, d, note)
+	// Either way this generation's decline is settled: the release landed, or
+	// the deployment refused it and the evidence stands — never a per-poll
+	// release loop.
+	c.handoutDeclines.Store(key, struct{}{})
+	if err == nil {
+		return fmt.Errorf("%w: %s; released %s through the recoverable waiting-external mark", decline, why, receipt)
+	}
+	return fmt.Errorf("%w: %s; release of %s was refused by the source (%v); the decline stands with ownership evidence preserved and will not be retried for this generation", decline, why, receipt, err)
+}
+
 // declineRebase releases a rebase offer Courier cannot safely execute and
 // returns the error discovery surfaces in its place. The offer is never
 // claimed, materialized, or executed; the release path is the defined
@@ -143,30 +197,24 @@ func validateRebaseIntake(raw json.RawMessage) (ok bool, reason string) {
 func (c *HTTPClient) declineRebase(ctx context.Context, task Task, why string) error {
 	c.diagnostics.Diagnostic(c.connectorName, connector.SignalProtocolError, reasonRebaseDeclined)
 	if task.PRFixItem == nil || strings.TrimSpace(task.PRFixItem.ID) == "" || task.PRFixItem.Generation < 1 {
-		// An offer without a valid receipt cannot be released against
-		// anything, and an attempt without a receipt could never be settled
-		// truthfully. Decline without acceptance and without a release call;
-		// there is nothing this client owns to hand back.
 		c.diagnostics.Diagnostic(c.connectorName, connector.SignalProtocolError, reasonRebaseTaskInvalid)
-		return fmt.Errorf("%w: rebase offer carries no valid PR-fix receipt (%s); declined without acceptance or release", ErrRebaseDeclined, why)
 	}
-	receipt := fmt.Sprintf("receipt %s@%d (handout %q)", task.PRFixItem.ID, task.PRFixItem.Generation, task.PRFixItem.HandoutToken)
-	d := workDescriptor{Type: task.Type, PRFixID: task.PRFixItem.ID, Generation: task.PRFixItem.Generation, FixType: task.PRFixItem.FixType}
-	if task.PullRequest != nil {
-		d.Repo, d.Number = task.PullRequest.Repo, task.PullRequest.Number
-	}
-	key := fmt.Sprintf("%s/%d#%s@%d", d.Repo, d.Number, d.PRFixID, d.Generation)
-	if _, settled := c.rebaseDeclines.Load(key); settled {
-		return fmt.Errorf("%w: %s; the decline of %s was already settled with this deployment, so no further release is attempted (bounded recovery: the source's stale-handout reclaimer)", ErrRebaseDeclined, why, receipt)
-	}
-	note := "Courier declined a rebase task it cannot safely execute: " + why + "; the item stays discoverable for a compatible rebase executor"
-	err := c.markPRFixWaitingExternal(ctx, d, note)
-	// Either way this generation's decline is settled: the release landed, or
-	// the deployment refused it and the evidence stands — never a per-poll
-	// release loop.
-	c.rebaseDeclines.Store(key, struct{}{})
-	if err == nil {
-		return fmt.Errorf("%w: %s; released %s through the recoverable waiting-external mark", ErrRebaseDeclined, why, receipt)
-	}
-	return fmt.Errorf("%w: %s; release of %s was refused by the source (%v); the decline stands with ownership evidence preserved and will not be retried for this generation", ErrRebaseDeclined, why, receipt, err)
+	return c.declineHandout(ctx, task, ErrRebaseDeclined, "rebase offer",
+		"Courier declined a rebase task it cannot safely execute: "+why+"; the item stays discoverable for a compatible rebase executor",
+		why)
+}
+
+// declineOwnership releases a followup-pr handout Courier's configured
+// ownership bindings do not authorize (#761) and returns the error discovery
+// surfaces in its place. The handout is never claimed, materialized, or
+// executed; reason is the specific bounded ownership-diagnostic reason the
+// caller picked (evidence missing, claimant unknown, or lane mismatch) and
+// why is the human-readable refusal. The release path is the same shared
+// receipt-fenced core the rebase decline uses, so the item stays discoverable
+// for its owning lane.
+func (c *HTTPClient) declineOwnership(ctx context.Context, task Task, reason, why string) error {
+	c.diagnostics.Diagnostic(c.connectorName, connector.SignalProtocolError, reason)
+	return c.declineHandout(ctx, task, ErrOwnershipDeclined, "followup-pr offer",
+		"Courier declined a followup-pr handout its configured bindings do not authorize: "+why+"; the item stays discoverable for its owning lane",
+		why)
 }

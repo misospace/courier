@@ -62,7 +62,7 @@ func TestLegacyDispatchCapacityHandoffAdmitsSuccessor(t *testing.T) {
 					if tc.mode == courierv1alpha1.ModeResolveIssue {
 						_ = json.NewEncoder(w).Encode(map[string]any{"type": "implement", "shouldRun": true, "issue": map[string]any{"id": "issue-327", "repoFullName": "acme/widgets", "number": 327}})
 					} else {
-						_ = json.NewEncoder(w).Encode(map[string]any{"type": "followup-pr", "shouldRun": true, "pullRequest": map[string]any{"repoFullName": "acme/widgets", "number": 42}, "prFixItem": map[string]any{"id": "fix-42", "generation": 4, "handoutToken": "handout-4"}})
+						_ = json.NewEncoder(w).Encode(map[string]any{"type": "followup-pr", "shouldRun": true, "pullRequest": map[string]any{"repoFullName": "acme/widgets", "number": 42}, "prFixItem": map[string]any{"id": "fix-42", "generation": 4, "handoutToken": "handout-4", "originalClaimant": "worker"}})
 					}
 				case r.Method == http.MethodPost && r.URL.Path == "/api/issues/claim":
 					_ = json.NewEncoder(w).Encode(map[string]any{"claimToken": "successor-claim"})
@@ -135,6 +135,7 @@ func TestLegacyDispatchCapacityHandoffAdmitsSuccessor(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			httpClient = httpClient.WithOwnershipBindings(map[string]string{"worker": ""})
 			httpClient = httpClient.WithPullRequestStateChecker(dispatch.PullRequestStateCheckerFunc(func(context.Context, string, int) (dispatch.PullRequestState, error) {
 				return dispatch.PullRequestState{State: "open"}, nil
 			}))

@@ -80,6 +80,14 @@ const (
 	reasonRebaseTaskInvalid       = "rebase-task-invalid"
 	reasonRebaseDeclined          = "rebase-declined"
 
+	// Configured-ownership gate reasons (#761). They name the exact failed
+	// ownership verdict so a handout Courier's configured dispatch bindings
+	// do not authorize is visible in the connector diagnostics instead of
+	// silently flowing another lane's PR repair into this connector.
+	reasonOwnershipEvidenceMissing = "ownership-evidence-missing"
+	reasonOwnershipClaimantUnknown = "ownership-claimant-unknown"
+	reasonOwnershipLaneMismatch    = "ownership-lane-mismatch"
+
 	reasonReportPublished        = "published"
 	reasonReportUnsupported      = "unsupported"
 	reasonReportRetryable        = "retryable"
@@ -112,7 +120,7 @@ func reasonVocabulary() map[string][]string {
 	return map[string][]string{
 		connector.SignalExclusion:     {connector.ReasonOverflow},
 		connector.SignalAck:           {reasonAckOK, reasonAckMissing, reasonAckInvalid, reasonAckVersionUnsupported},
-		connector.SignalProtocolError: {reasonTransportError, reasonAuthError, reasonHTTP4xx, reasonHTTP5xx, reasonMalformedResponse, reasonUnsupportedTaskType, reasonInvalidDescriptor, reasonRebaseCapabilityMissing, reasonRebaseCapabilityInvalid, reasonRebaseCapabilityVersion, reasonRebaseScopeWrong, reasonRebaseScopeUnenforced, reasonRebaseCapabilityDenied, reasonRebaseFilterIgnored, reasonRebaseTaskInvalid, reasonRebaseDeclined},
+		connector.SignalProtocolError: {reasonTransportError, reasonAuthError, reasonHTTP4xx, reasonHTTP5xx, reasonMalformedResponse, reasonUnsupportedTaskType, reasonInvalidDescriptor, reasonRebaseCapabilityMissing, reasonRebaseCapabilityInvalid, reasonRebaseCapabilityVersion, reasonRebaseScopeWrong, reasonRebaseScopeUnenforced, reasonRebaseCapabilityDenied, reasonRebaseFilterIgnored, reasonRebaseTaskInvalid, reasonRebaseDeclined, reasonOwnershipEvidenceMissing, reasonOwnershipClaimantUnknown, reasonOwnershipLaneMismatch},
 		connector.SignalReport:        {reasonReportPublished, reasonReportUnsupported, reasonReportRetryable, reasonReportPermanentRefusal},
 		connector.SignalRevalidation:  {reasonRevalidationCurrent, reasonRevalidationStaleHead, reasonRevalidationClosedUnmerged, reasonRevalidationMerged},
 		connector.SignalIdentity:      {reasonIdentityGenerationAdvanced, reasonIdentitySuperseded, reasonIdentityClaimReleased, reasonIdentityFenceHeld, reasonIdentityFenceGone, reasonIdentityOpportunityMissing, reasonIdentityHeadSuperseded, reasonIdentityFenceSettled, reasonIdentityRequeueStaleGeneration, reasonIdentityRequeueSuperseded, reasonIdentityRequeueItemClosed, reasonIdentityRequeueHumanHold},

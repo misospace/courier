@@ -69,6 +69,7 @@ func ciParkClient(t *testing.T, serverURL string) (*HTTPClient, *Adapter) {
 		}
 		return PullRequestState{State: "open"}, nil
 	}))
+	client.WithOwnershipBindings(map[string]string{"worker": "normal"})
 	return client, New(client)
 }
 
@@ -1238,7 +1239,7 @@ func (s *ciParkDispatch) nextTask(w http.ResponseWriter) {
 		"type":        "followup-pr",
 		"shouldRun":   true,
 		"pullRequest": map[string]any{"repoFullName": "acme/widgets", "number": 77},
-		"prFixItem":   map[string]any{"id": "queue-item-1", "generation": s.generation},
+		"prFixItem":   map[string]any{"id": "queue-item-1", "generation": s.generation, "originalClaimant": "worker"},
 	})
 }
 
