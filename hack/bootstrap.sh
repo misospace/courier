@@ -22,7 +22,7 @@ cd "$REPO_ROOT"
 # Pinned mise launcher. To bump: raise MISE_VERSION here and in .mise/config.toml
 # (min_version), and replace the digests with those from the release's
 # SHASUMS256.txt (https://github.com/jdx/mise/releases).
-MISE_VERSION=v2026.10.13
+MISE_VERSION=v2026.10.17
 
 log() { printf 'bootstrap: %s\n' "$*"; }
 fail() { printf 'bootstrap: %s\n' "$*" >&2; exit 1; }
@@ -51,19 +51,19 @@ resolve_mise_digest() {
 	case "$(uname -s)/$(uname -m)" in
 		Linux/x86_64)
 			mise_asset="mise-${MISE_VERSION}-linux-x64"
-			mise_sha256=94c45523c7b6760b7da704f16051171ca32e8447a849a02266a439a4455e9a12
+			mise_sha256=fe6dd17e68e09682b31d2e7bb7bb755d22636ac1af5d94621e300f2ca9e9fe8a
 			;;
 		Linux/aarch64)
 			mise_asset="mise-${MISE_VERSION}-linux-arm64"
-			mise_sha256=983fabf36625566f216400b907b33b4daca99adb5bc3d3cdab123b5e791575b2
+			mise_sha256=e90904144ba4377c5fbe385f429830282c68f3b4f9c690bf6c5a2ae9b74a809b
 			;;
 		Darwin/arm64)
 			mise_asset="mise-${MISE_VERSION}-macos-arm64"
-			mise_sha256=92fd6898dc213808d1c81f0bead9668dbea036e5946c94c0e82554603205a3aa
+			mise_sha256=9e27709db5eb1e900d83149418d3067309f2a5004d4994d94246ab658ba4a3ce
 			;;
 		Darwin/x86_64)
 			mise_asset="mise-${MISE_VERSION}-macos-x64"
-			mise_sha256=4e4a996f4747eb59d55497fdd4b0d60d3add9a06c0dc5d65a70402015ee445d0
+			mise_sha256=dac5d6db5e315d8e4f096c6ead9279d342e09fdcb5c373d0df5c7dcce8195746
 			;;
 		*)
 			fail "unsupported platform $(uname -s)/$(uname -m): no pinned digest to verify mise against; install mise ${MISE_VERSION} yourself and run 'mise run bootstrap' directly"

@@ -362,6 +362,38 @@ else
     done < "$sources_file"
   fi
 fi
+
+# Mise pin drift (#768): the pinned launcher version must agree across
+# hack/bootstrap.sh, Dockerfile, and .mise/config.toml (the keep-together
+# contract in bootstrap.sh's bump comment), and the linux-x64 digest must
+# match between bootstrap.sh and the Dockerfile so a mise bump cannot land
+# half-applied with one file still carrying the previous release's digest.
+# Extraction is fail-closed: an unreadable or malformed pin reports FAIL.
+bootstrap_sh="$script_dir/bootstrap.sh"
+mise_config="$script_dir/../.mise/config.toml"
+bs_version="$(sed -n 's/^MISE_VERSION=//p' "$bootstrap_sh")"
+docker_version="$(sed -n 's/^ARG MISE_VERSION=//p' "$dockerfile")"
+min_version="$(sed -n 's/^min_version = "\(.*\)"$/\1/p' "$mise_config")"
+case_n=$((case_n + 1))
+if [ -n "$bs_version" ] && [ "$bs_version" = "$docker_version" ] &&
+  [ "$bs_version" = "v$min_version" ]; then
+  report PASS "mise pin: version aligned across bootstrap.sh, Dockerfile, config.toml ($bs_version)"
+else
+  report FAIL "mise pin: version aligned across bootstrap.sh, Dockerfile, config.toml" \
+    "bootstrap.sh=[$bs_version] Dockerfile=[$docker_version] config.toml=[$min_version]"
+fi
+bs_x64="$(sed -n '/Linux\/x86_64)/,/;;/s/.*mise_sha256=//p' "$bootstrap_sh")"
+docker_x64="$(grep -oE '[0-9a-f]{64}  /tmp/mise' "$dockerfile" | cut -d' ' -f1 || true)"
+bs_digests="$(sed -n 's/.*mise_sha256=//p' "$bootstrap_sh")"
+bs_digest_count="$(printf '%s\n' "$bs_digests" | grep -cE '^[0-9a-f]{64}$' || true)"
+case_n=$((case_n + 1))
+if [ -n "$bs_x64" ] && [ "$bs_x64" = "$docker_x64" ] && [ "$bs_digest_count" -eq 4 ]; then
+  report PASS "mise pin: linux-x64 digest aligned between bootstrap.sh and Dockerfile"
+else
+  report FAIL "mise pin: linux-x64 digest aligned between bootstrap.sh and Dockerfile" \
+    "bootstrap.sh=[$bs_x64] Dockerfile=[$docker_x64] well-formed bootstrap digests: $bs_digest_count/4"
+fi
+
 echo
 echo "total: $((pass + fail)) passed: $pass failed: $fail"
 if [ "$fail" -gt 0 ]; then
