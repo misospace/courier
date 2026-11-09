@@ -10,7 +10,7 @@ require (
 	github.com/prometheus/client_model v0.6.3
 	github.com/prometheus/common v0.73.1
 	github.com/prometheus/prometheus v0.316.0
-	golang.org/x/mod v0.42.0
+	golang.org/x/mod v0.43.0
 	golang.org/x/sys v0.50.0
 	golang.org/x/time v0.16.0
 	k8s.io/api v0.37.2
