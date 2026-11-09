@@ -520,8 +520,8 @@ func TestOrdinaryDiscoveryDeclaresOwnershipEvidenceCapability(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"type": "followup-pr", "shouldRun": true,
 			"pullRequest": map[string]any{"repoFullName": "acme/widgets", "number": 42},
-			"prFixItem": map[string]any{"id": "fix-3", "generation": 5},
-			"ownership": map[string]any{"contract": 1, "owningLane": "NORMAL", "originalClaimant": "local", "provenance": "agent-label", "prAuthor": "bot"},
+			"prFixItem":   map[string]any{"id": "fix-3", "generation": 5},
+			"ownership":   map[string]any{"contract": 1, "owningLane": "NORMAL", "originalClaimant": "local", "provenance": "agent-label", "prAuthor": "bot"},
 		})
 	}))
 	defer server.Close()
