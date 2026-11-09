@@ -9,6 +9,44 @@ import (
 	"github.com/misospace/courier/internal/source"
 )
 
+// prOwnershipEvidenceCapabilityRequest is the exact capabilities value this
+// client version sends for the #1569 ownership-evidence contract. The
+// request is constant so the request and the accepted acknowledgment
+// version cannot drift apart silently.
+const prOwnershipEvidenceCapabilityRequest = "pr-ownership-evidence:1"
+
+// OwnershipEvidence is Dispatch's #1569 ownership-evidence block, emitted on
+// followup-pr tasks only to polls that declared the pr-ownership-evidence
+// intake capability (dispatch#1582): a poll that never negotiated receives
+// no block at all, which is exactly how the evidence stays invisible to
+// unversioned consumers. Courier reads only the claimant; the remaining
+// fields are Dispatch's own provenance record.
+type OwnershipEvidence struct {
+	// OriginalClaimant is the Dispatch identity that originally claimed or
+	// holds this PR-fix item. It is the only ownership evidence Courier
+	// consults; it is never inferred from the handout recipient, the PR
+	// author, a branch prefix, or the fix type.
+	OriginalClaimant string `json:"originalClaimant"`
+}
+
+// originalClaimantEvidence resolves the original claimant Dispatch supplied
+// for one followup-pr task. The negotiated ownership block is authoritative;
+// the prFixItem field is the forward-compatible fallback for a peer that
+// inlines the evidence there instead. An absent block and an absent field
+// both resolve to empty — the same evidence-missing verdict either way, so
+// the gate fails closed identically against old and new peers.
+func originalClaimantEvidence(task Task) string {
+	if task.Ownership != nil {
+		if claimant := strings.TrimSpace(task.Ownership.OriginalClaimant); claimant != "" {
+			return claimant
+		}
+	}
+	if task.PRFixItem != nil {
+		return strings.TrimSpace(task.PRFixItem.OriginalClaimant)
+	}
+	return ""
+}
+
 // ownershipVerdict evaluates Courier's configured-ownership gate for one
 // followup-pr attempt (#761). The verdict is Courier's own and never the
 // peer's: the original claimant Dispatch names on the PR-fix item must be

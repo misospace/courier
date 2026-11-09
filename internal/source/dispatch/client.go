@@ -69,7 +69,13 @@ type Task struct {
 	Issue       *Issue       `json:"issue,omitempty"`
 	PullRequest *PullRequest `json:"pullRequest,omitempty"`
 	PRFixItem   *PRFixItem   `json:"prFixItem,omitempty"`
-	Reasons     []string     `json:"reasons,omitempty"`
+	// Ownership is the #1569 evidence block Dispatch emits only to polls
+	// that declared the pr-ownership-evidence intake capability
+	// (dispatch#1582). Absent on un-negotiated polls and on non-followup-pr
+	// tasks, which is how an older or unversioned peer fails the ownership
+	// gate closed.
+	Ownership *OwnershipEvidence `json:"ownership,omitempty"`
+	Reasons   []string           `json:"reasons,omitempty"`
 }
 
 // PRFixItem identifies one generation of a queued PR followup. FixType is
@@ -472,7 +478,17 @@ func (c *HTTPClient) discover(ctx context.Context, query url.Values) (items []so
 	}()
 	var response nextTaskResponse
 	endpoint := "/api/agents/" + url.PathEscape(c.agentName) + "/next-task"
-	queryParts := make([]string, 0, 2)
+	queryParts := make([]string, 0, 3)
+	// The #1569 ownership-evidence capability rides every next-task call
+	// whose connector enforces the configured-ownership gate — that is
+	// every connector, followup-pr and rebase alike, because the gate
+	// revalidates before the rebase classification too (dispatch#1582).
+	// A peer that does not know the capability grants nothing and emits no
+	// ownership block; the gate then declines every followup-pr as
+	// evidence-missing, which is the same fail-closed posture as before
+	// the capability existed. The rebase-executor declaration is prepended
+	// because the rebase-only intake contract requires it.
+	capabilities := prOwnershipEvidenceCapabilityRequest
 	if c.rebaseCapabilityEnabled {
 		// The versioned rebase-only intake declaration rides every next-task
 		// call of a rebase executor connector (#715): the rebase-only work
@@ -482,11 +498,12 @@ func (c *HTTPClient) discover(ctx context.Context, query url.Values) (items []so
 		// parameters (400) or ignores them; either way the response
 		// validation below is what keeps that skew from becoming silent
 		// acceptance.
+		capabilities = rebaseCapabilityRequest + "," + capabilities
 		queryParts = append(queryParts,
 			workScopeQueryParam+"="+rebaseOnlyScope,
-			workScopeVersionQueryParam+"="+rebaseOnlyScopeVersion,
-			capabilityQueryParam+"="+rebaseCapabilityRequest)
+			workScopeVersionQueryParam+"="+rebaseOnlyScopeVersion)
 	}
+	queryParts = append(queryParts, capabilityQueryParam+"="+capabilities)
 	if query != nil {
 		if encoded := query.Encode(); encoded != "" {
 			queryParts = append(queryParts, encoded)
@@ -575,10 +592,7 @@ func (c *HTTPClient) discover(ctx context.Context, query url.Values) (items []so
 		// configured queue-lane values are compared with exact string
 		// equality; no alias normalization, prefix match, or case folding is
 		// applied, and LaneProfile names are never Dispatch lane identities.
-		claimant := ""
-		if task.PRFixItem != nil {
-			claimant = strings.TrimSpace(task.PRFixItem.OriginalClaimant)
-		}
+		claimant := originalClaimantEvidence(task)
 		if reason, why := c.ownershipVerdict(claimant); reason != "" {
 			// The decline path releases the reservation (or latches for this
 			// generation when the release is refused) and emits the
@@ -1468,7 +1482,7 @@ func EncodeWorkID(task Task) string {
 		d.Generation = task.PRFixItem.Generation
 		d.HandoutToken = task.PRFixItem.HandoutToken
 		d.FixType = task.PRFixItem.FixType
-		d.OriginalClaimant = strings.TrimSpace(task.PRFixItem.OriginalClaimant)
+		d.OriginalClaimant = originalClaimantEvidence(task)
 	}
 	if task.Issue != nil {
 		if task.Type == "implement" {
