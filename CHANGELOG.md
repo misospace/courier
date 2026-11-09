@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.23](https://github.com/misospace/courier/compare/v0.1.22...v0.1.23) (2026-11-09)
+
+
+### Features
+
+* **deps:** update module golang.org/x/mod (v0.42.0 → v0.43.0) ([#784](https://github.com/misospace/courier/issues/784)) ([29dcb15](https://github.com/misospace/courier/commit/29dcb1569b7859cf2ab842af479db77e62434d97))
+
+
+### Bug Fixes
+
+* **deps:** update dependency astro (7.4.7 → 7.4.8) ([#782](https://github.com/misospace/courier/issues/782)) ([2b610f3](https://github.com/misospace/courier/commit/2b610f39a14f8c82dd8937ece8f75cc21dd231f7))
+* **dispatch:** negotiate pr-ownership-evidence and read the ownership block ([#785](https://github.com/misospace/courier/issues/785)) ([9e0e2f3](https://github.com/misospace/courier/commit/9e0e2f375446625738bdca94f521fc34af423112))
+
+
+### Chores
+
+* **deps:** lock file maintenance ([#780](https://github.com/misospace/courier/issues/780)) ([c5e5055](https://github.com/misospace/courier/commit/c5e50551e51043c185fa82759107308ae1a6de40))
+
 ## [0.1.22](https://github.com/misospace/courier/compare/v0.1.21...v0.1.22) (2026-11-09)
 
 
