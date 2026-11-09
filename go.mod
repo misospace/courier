@@ -11,7 +11,7 @@ require (
 	github.com/prometheus/common v0.73.1
 	github.com/prometheus/prometheus v0.316.0
 	golang.org/x/mod v0.42.0
-	golang.org/x/sys v0.49.0
+	golang.org/x/sys v0.50.0
 	golang.org/x/time v0.16.0
 	k8s.io/api v0.37.2
 	k8s.io/apimachinery v0.37.2
