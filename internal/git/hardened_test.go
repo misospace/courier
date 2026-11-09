@@ -149,3 +149,87 @@ func TestHardenedStderrCapIsDiscarded(t *testing.T) {
 		t.Fatalf("stdout = %q, want %q", out, "ok")
 	}
 }
+
+// TestHardenedEnvCarriesScopedSafeDirectory pins the #778 fix: a hardened
+// call that runs in a directory names exactly that directory in
+// safe.directory through the env config, because the executor's global
+// safe.directory exception is invisible to the replaced environment and a
+// workspace top-level directory can be owned by someone other than the
+// runtime uid. The exception must be scoped — never the wildcard, which
+// would let a foreign repository's config and its diff drivers execute —
+// and ext transport must stay refused alongside it. A call with no
+// directory keeps the ownership gate fully armed.
+func TestHardenedEnvCarriesScopedSafeDirectory(t *testing.T) {
+	fakeGit(t, "#!/bin/sh\n"+
+		"printf 'count=%s\\nkey0=%s\\nvalue0=%s\\nkey1=%s\\nvalue1=%s\\n' \\\n"+
+		"  \"$GIT_CONFIG_COUNT\" \"$GIT_CONFIG_KEY_0\" \"$GIT_CONFIG_VALUE_0\" \\\n"+
+		"  \"${GIT_CONFIG_KEY_1-unset}\" \"${GIT_CONFIG_VALUE_1-unset}\"\n")
+
+	dir := t.TempDir()
+	out, err := Hardened(context.Background(), dir, "diff")
+	if err != nil {
+		t.Fatalf("hardened call with a directory: %v", err)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"count=2",
+		"key0=protocol.ext.allow",
+		"value0=never",
+		"key1=safe.directory",
+		"value1=" + dir,
+	} {
+		if !strings.Contains(got, want+"\n") {
+			t.Fatalf("hardened env for %s = %q, want %q", dir, got, want)
+		}
+	}
+	if strings.Contains(got, "value1=*") {
+		t.Fatalf("hardened env carries the safe.directory wildcard: %q", got)
+	}
+
+	out, err = Hardened(context.Background(), "", "diff")
+	if err != nil {
+		t.Fatalf("hardened call without a directory: %v", err)
+	}
+	got = string(out)
+	if !strings.Contains(got, "count=1\n") || strings.Contains(got, "key1=safe.directory") {
+		t.Fatalf("hardened env with no directory = %q, want the ownership gate unmodified", got)
+	}
+	if !strings.Contains(got, "key0=protocol.ext.allow\nvalue0=never\n") {
+		t.Fatalf("hardened env with no directory lost the ext-transport refusal: %q", got)
+	}
+}
+
+// TestHardenedScopedSafeDirectoryEndsDubiousOwnership pins the #778
+// contract end to end with git's own different-owner test hook: a hardened
+// call in a repository whose ownership reads as foreign succeeds because
+// the environment carries the exception for that one directory, while a
+// hardened call from a subdirectory of the same repository — where the
+// exception names the subdirectory, not the discovered top level — stays
+// refused. The second case is the scoping proof: the exception never
+// widens to a wildcard, so a repository other than the named courier
+// directory still fails closed.
+func TestHardenedScopedSafeDirectoryEndsDubiousOwnership(t *testing.T) {
+	repo := t.TempDir()
+	initRepo(t, repo)
+	writeFile(t, filepath.Join(repo, "tracked.txt"), "base\n")
+	commit(t, repo, "base")
+	hook := []string{"GIT_TEST_ASSUME_DIFFERENT_OWNER=1"}
+
+	out, _, err := hardened(context.Background(), repo, hook, []string{"rev-parse", "--verify", "HEAD"})
+	if err != nil {
+		t.Fatalf("hardened call with the scoped exception was still refused: %v", err)
+	}
+	if strings.TrimSpace(string(out)) == "" {
+		t.Fatal("hardened call with the scoped exception produced no OID")
+	}
+
+	sub := filepath.Join(repo, "sub")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = hardened(context.Background(), sub, hook, []string{"rev-parse", "--git-dir"})
+	var commandErr *CommandError
+	if !errors.As(err, &commandErr) || commandErr.ExitCode() != 128 {
+		t.Fatalf("hardened call whose exception names a subdirectory = %v, want the exit-128 ownership refusal", err)
+	}
+}
