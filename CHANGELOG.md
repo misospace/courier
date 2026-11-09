@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.1.22](https://github.com/misospace/courier/compare/v0.1.21...v0.1.22) (2026-11-09)
+
+
+### Features
+
+* **deps:** update module golang.org/x/sys (v0.49.0 → v0.50.0) ([#781](https://github.com/misospace/courier/issues/781)) ([8dd9bdf](https://github.com/misospace/courier/commit/8dd9bdf99b3bd810bf3c972f5186921ba47e30bc))
+
+
+### Bug Fixes
+
+* **chart:** fail the render on dependency-cache replica scaling ([#770](https://github.com/misospace/courier/issues/770)) ([109f773](https://github.com/misospace/courier/commit/109f77310415e45f80db7295aeb56afa025d36fc))
+* **dependencycache:** measure the bounded scan without the process-wide counter ([#774](https://github.com/misospace/courier/issues/774)) ([b19ddfb](https://github.com/misospace/courier/commit/b19ddfbee6021d10b1cb2b8938b9c71ad6a0cf96)), closes [#771](https://github.com/misospace/courier/issues/771)
+* **dispatch:** enforce configured ownership lanes for PR repair ([#769](https://github.com/misospace/courier/issues/769)) ([d816aa8](https://github.com/misospace/courier/commit/d816aa8f282e1da8192701e4a36644a273f95bfa))
+* **git:** carry a scoped safe.directory exception into the hardened env ([#779](https://github.com/misospace/courier/issues/779)) ([5a71db9](https://github.com/misospace/courier/commit/5a71db9000dab868b0ef497aa9b2da9ee5d5bd12))
+
+
+### Chores
+
+* align mise pins at v2026.10.17 and add drift check ([#773](https://github.com/misospace/courier/issues/773)) ([d58ce6c](https://github.com/misospace/courier/commit/d58ce6c34a24e22884ebd5453e25e5f9ddfeeb05))
+* **container:** update image golang (2920bb1 → e519d3b) ([#777](https://github.com/misospace/courier/issues/777)) ([33a955e](https://github.com/misospace/courier/commit/33a955e68ab76264f588542f997b24bebd1ca3fd))
+* **container:** update image node (bc0a2af → add5c17) ([#776](https://github.com/misospace/courier/issues/776)) ([e60215b](https://github.com/misospace/courier/commit/e60215be10bd5a6652749dd0580953ac9136f170))
+
 ## [0.1.21](https://github.com/misospace/courier/compare/v0.1.20...v0.1.21) (2026-11-06)
 
 
