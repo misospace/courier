@@ -95,7 +95,7 @@ func serveRebaseOffer(t *testing.T, intake map[string]any) http.HandlerFunc {
 			return
 		}
 		q := r.URL.Query()
-		if q.Get("work_scope") != "rebase-only" || q.Get("work_scope_version") != "1" || q.Get("capabilities") != "rebase-executor:1" {
+		if q.Get("work_scope") != "rebase-only" || q.Get("work_scope_version") != "1" || q.Get("capabilities") != "rebase-executor:1,pr-ownership-evidence:1" {
 			t.Fatalf("rebase-only intake declaration missing or wrong: %s", r.URL.RawQuery)
 		}
 		body := map[string]any{
@@ -502,19 +502,26 @@ func TestRebaseDiscoveryNegotiationFailureWithoutReceiptReleasesNothing(t *testi
 	}
 }
 
-// Old Dispatch with an ordinary (non-rebase) connector keeps working exactly
-// as before: no intake declaration is sent at all, ordinary followups still
-// map to fix-pr, and REBASE work never arrives to be mishandled.
-func TestOrdinaryDiscoveryUnchangedWithoutRebaseCapability(t *testing.T) {
+// An ordinary (non-rebase) connector declares the #1569 ownership-evidence
+// capability on every poll — the configured-ownership gate revalidates
+// followup-pr handouts there, so the evidence must actually be negotiable.
+// It still sends no rebase-only work scope, ordinary followups still map to
+// fix-pr, and a peer that answers without the negotiated ownership block
+// fails the gate closed instead of being mishandled.
+func TestOrdinaryDiscoveryDeclaresOwnershipEvidenceCapability(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Has("capabilities") || r.URL.Query().Has("work_scope") || r.URL.Query().Has("work_scope_version") {
-			t.Fatalf("ordinary connector sent the intake declaration: %s", r.URL.RawQuery)
+		if r.URL.Query().Get("capabilities") != "pr-ownership-evidence:1" {
+			t.Fatalf("ordinary connector sent the wrong intake declaration: %s", r.URL.RawQuery)
+		}
+		if r.URL.Query().Has("work_scope") || r.URL.Query().Has("work_scope_version") {
+			t.Fatalf("ordinary connector must not send the rebase-only scope: %s", r.URL.RawQuery)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"type": "followup-pr", "shouldRun": true,
 			"pullRequest": map[string]any{"repoFullName": "acme/widgets", "number": 42},
-			"prFixItem":   map[string]any{"id": "fix-3", "generation": 5, "originalClaimant": "local"},
+			"prFixItem": map[string]any{"id": "fix-3", "generation": 5},
+			"ownership": map[string]any{"contract": 1, "owningLane": "NORMAL", "originalClaimant": "local", "provenance": "agent-label", "prAuthor": "bot"},
 		})
 	}))
 	defer server.Close()
@@ -524,6 +531,32 @@ func TestOrdinaryDiscoveryUnchangedWithoutRebaseCapability(t *testing.T) {
 	}
 	if len(items) != 1 || items[0].Mode != "fix-pr" {
 		t.Fatalf("items = %#v, want one fix-pr item", items)
+	}
+}
+
+// An ordinary connector against an old peer that grants nothing and emits no
+// ownership block keeps the fail-closed posture: the handout is declined as
+// evidence-missing and the lane stays available.
+func TestOrdinaryDiscoveryFailsClosedWithoutOwnershipEvidence(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/pr-fix-queue/mark" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"type": "followup-pr", "shouldRun": true,
+			"pullRequest": map[string]any{"repoFullName": "acme/widgets", "number": 42},
+			"prFixItem":   map[string]any{"id": "fix-4", "generation": 6, "handoutToken": "hand-10"},
+		})
+	}))
+	defer server.Close()
+	items, err := newTestClient(t, server.URL, false).Discover(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("items = %#v, want no items: unversioned peer's handout must fail the gate closed", items)
 	}
 }
 
