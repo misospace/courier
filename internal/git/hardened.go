@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -18,18 +19,58 @@ import (
 // helpers disabled. Protocol ext transport is disabled through the config
 // count so every hardened invocation refuses `ext::` URLs even if a hostile
 // repository or bundle names one.
-func hardenedEnv() []string {
-	return []string{
+//
+// When directory is non-empty the environment also carries a safe.directory
+// exception for exactly that one path (#778): a CoderRun workspace's
+// top-level directory can be root-owned while its contents belong to the
+// runtime uid (the emptyDir mountpoint), and the executor's global
+// safe.directory exception written by TrustDirectory is invisible to
+// hardened calls because they replace the whole environment. Without the
+// exception every hardened read against the workspace — the rebase-assist
+// diffs first among them — is refused as dubious ownership, and git diff
+// answers that refusal with a --no-index usage and exit 129. The exception
+// is never a wildcard and never looser than the path the command runs in:
+// git matches the entry verbatim against the physical repository top level,
+// so a repository reached through any other path — or discovered above a
+// named subdirectory — stays refused, and its config (including diff
+// drivers that could execute commands) is still never honored.
+func hardenedEnv(directory string) []string {
+	env := []string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + os.DevNull,
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_CONFIG_GLOBAL=" + os.DevNull,
-		"GIT_CONFIG_COUNT=1",
 		"GIT_CONFIG_KEY_0=protocol.ext.allow",
 		"GIT_CONFIG_VALUE_0=never",
 		"GIT_OPTIONAL_LOCKS=0",
 	}
+	if safeDir := hardenedSafeDirectory(directory); safeDir != "" {
+		return append(env,
+			"GIT_CONFIG_COUNT=2",
+			"GIT_CONFIG_KEY_1=safe.directory",
+			"GIT_CONFIG_VALUE_1="+safeDir,
+		)
+	}
+	return append(env, "GIT_CONFIG_COUNT=1")
+}
+
+// hardenedSafeDirectory applies the same scope rule TrustDirectory enforces
+// for the global exception: only a clean absolute path without control
+// characters becomes a safe.directory entry. Git refuses a relative entry
+// outright, so an out-of-scope directory gets no entry at all and the
+// ownership gate stays armed. Every production caller passes an absolute
+// repository top level; anything else fails closed rather than widening
+// trust.
+func hardenedSafeDirectory(directory string) string {
+	if directory == "" {
+		return ""
+	}
+	directory = filepath.Clean(directory)
+	if !filepath.IsAbs(directory) || strings.ContainsAny(directory, "\x00\n\r") {
+		return ""
+	}
+	return directory
 }
 
 // Hardened runs one git command with the hostile-repository environment and
@@ -52,6 +93,9 @@ func Hardened(ctx context.Context, directory string, args ...string) ([]byte, er
 
 // HardenedWithEnv runs one hardened git command with additional environment
 // variables (used for object-directory quarantine during bundle inspection).
+// Extra variables layer after the hardened ones and win on a name clash, so
+// they must never carry GIT_CONFIG_* entries: that would edit the hardened
+// config count the safe.directory and ext-transport entries depend on.
 func HardenedWithEnv(ctx context.Context, directory string, extra []string, args ...string) ([]byte, error) {
 	stdout, _, err := hardened(ctx, directory, extra, args)
 	return stdout, err
@@ -181,7 +225,7 @@ func hardened(ctx context.Context, directory string, extra []string, args []stri
 	if directory != "" {
 		cmd.Dir = directory
 	}
-	cmd.Env = append(hardenedEnv(), extra...)
+	cmd.Env = append(hardenedEnv(directory), extra...)
 	var stdout, stderr boundedBuffer
 	// Output past the cap is dropped, never buffered, and the command is
 	// stopped: an untrusted repository must not be able to make the
@@ -222,7 +266,7 @@ func hardenedLines(ctx context.Context, directory string, extra []string, args [
 	if directory != "" {
 		cmd.Dir = directory
 	}
-	cmd.Env = append(hardenedEnv(), extra...)
+	cmd.Env = append(hardenedEnv(directory), extra...)
 	var stderr boundedBuffer
 	stderr.limit = maxStderrBytes
 	cmd.Stderr = &stderr
