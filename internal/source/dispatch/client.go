@@ -224,7 +224,11 @@ type HTTPClient struct {
 	// exact matching intake acknowledgment. It is a per-binding operator
 	// choice, never a startup default, so ordinary lanes keep negotiating
 	// nothing and stay operational with Dispatch deployments that predate the
-	// contract entirely.
+	// contract entirely. Since #787 it also shapes the configured-ownership
+	// verdict at every boundary: rebase-marked attempts on a connector that
+	// enables it skip the lane-equality arm, and withdrawing the
+	// configuration returns them to the full gate at the next refusal
+	// boundary.
 	rebaseCapabilityEnabled bool
 	// ownershipBindings is the configured-ownership authority for PR repair:
 	// claimant Dispatch agent name → configured Dispatch queue lane. A
@@ -584,16 +588,25 @@ func (c *HTTPClient) discover(ctx context.Context, query url.Values) (items []so
 	if task.Type == "followup-pr" {
 		// Configured-ownership gate (#761): a followup-pr handout is accepted
 		// only when the Dispatch evidence on the item names an original
-		// claimant that Courier's configured dispatch bindings bind to this
-		// connector's own queue lane. The gate runs before the merged/closed
-		// stale check so foreign work is never marked stale, and before the
-		// rebase classification so a foreign or evidence-less rebase offer is
-		// declined by ownership even when the capability is negotiated. The
+		// claimant that Courier's configured dispatch bindings know, and — for
+		// fix-pr work — bind to this connector's own queue lane. The gate runs
+		// before the merged/closed stale check so foreign work is never marked
+		// stale, and before the rebase classification so a foreign or
+		// evidence-less rebase offer is declined by ownership even when the
+		// capability is negotiated. A REBASE-marked offer on a connector that
+		// negotiated the rebase-executor contract is the one exception
+		// (#787): REBASE exclusivity is the DISPATCH_REBASE_AGENTS pool, not
+		// the lane column (misospace/dispatch#1327), so the verdict there is
+		// known-claimant membership without the lane comparison. The
 		// configured queue-lane values are compared with exact string
 		// equality; no alias normalization, prefix match, or case folding is
 		// applied, and LaneProfile names are never Dispatch lane identities.
 		claimant := originalClaimantEvidence(task)
-		if reason, why := c.ownershipVerdict(claimant); reason != "" {
+		fixType := ""
+		if task.PRFixItem != nil {
+			fixType = task.PRFixItem.FixType
+		}
+		if reason, why := c.ownershipVerdict(claimant, fixType); reason != "" {
 			// The decline path releases the reservation (or latches for this
 			// generation when the release is refused) and emits the
 			// ownership diagnostic; the refusal itself is settled either

@@ -1884,15 +1884,31 @@ bindings before acceptance (#761). The item's `originalClaimant` — the
 Dispatch identity that originally claimed the PR-fix work, supplied by the
 ownership-evidence contract (misospace/dispatch#1569) — must name a claimant
 present in the configured binding map (`agentName → queueLane`, built once
-from `resolveDispatchBindings`) and that claimant's configured queue lane must
-equal the receiving connector's own queue lane by exact string equality. This
-preserves cross-agent repair inside one lane (local, cloud, and hyper consumers
-sharing the normal lane repair each other's PRs) while rejecting
-normal-to-frontier and frontier-to-normal repair in both directions and any
-claimant outside the configured bindings; LaneProfile names are never Dispatch
-queue-lane identities, and no alias normalization, prefix matching, or
-recipient/author/branch/fix-type inference participates in the verdict. The
-claimant is compared after trimming surrounding whitespace on both sides —
+from `resolveDispatchBindings`). For fix-pr work that claimant's configured
+queue lane must also equal the receiving connector's own queue lane by exact
+string equality. This preserves cross-agent repair inside one lane (local,
+cloud, and hyper consumers sharing the normal lane repair each other's PRs)
+while rejecting normal-to-frontier and frontier-to-normal repair in both
+directions and any claimant outside the configured bindings; LaneProfile names
+are never Dispatch queue-lane identities, and no alias normalization or prefix
+matching applies. The claimant stays the only ownership evidence — it is never
+inferred from the recipient, author, branch, or fix type — and the fix type
+only selects the shape of the lane arm. The lane comparison is dropped for one
+case (#787): on a connector that negotiated the rebase-executor intake
+contract, the verdict for a REBASE-marked item is known-claimant membership
+alone. REBASE exclusivity is the `DISPATCH_REBASE_AGENTS` local-only pool, not
+the queue-lane column (misospace/dispatch#1327): the claimant is the original
+fixer on its own lane while the rebase connector polls on its own, so lane
+equality could never hold there, and enforcing it declined every pool-routed
+rebase handout and drove the fail-closed waiting-external park loop (#786).
+Evidence stays required on that path — a REBASE-marked offer whose claimant is
+absent or outside the bindings is still declined by ownership — and every
+other attempt keeps full lane equality: a REBASE-marked offer reaching a
+connector that never negotiated the capability keeps the full verdict, so a
+cross-lane or evidence-less claimant is declined by ownership first and a
+same-lane one passes ownership only to meet the rebase classification's
+unsupported decline.
+The claimant is compared after trimming surrounding whitespace on both sides —
 the configured binding names are trimmed the same way at startup — and no
 other normalization applies. The gate runs before the merged/closed stale
 mark, so foreign work is never marked stale, and before rebase
@@ -1912,7 +1928,14 @@ repairs resume when the peer supplies evidence.
 attempt identity (`workDescriptor.originalClaimant`, the same opaque work ID
 that carries the PR-fix id, generation, hand-out token, and fix type), so every
 boundary that can still refuse an attempt revalidates the same evidence
-against the same configured bindings: the claim/admission boundary
+against the same configured bindings, with the same verdict shape: the
+rebase-marked fix type also rides the durable identity, so the claim,
+acknowledgement, and pre-launch boundaries apply the membership-only verdict
+to rebase-marked attempts, keyed on the same per-binding rebase-executor
+configuration — negotiation itself is enforced fail-closed at discovery, and
+withdrawing the configuration returns a rebase-marked attempt to the full gate
+at the next boundary — while every other attempt keeps lane equality
+everywhere (#787): the claim/admission boundary
 (`ClaimWithReceipt`), the hand-out acknowledgement (`AckHandout`, which tells
 Dispatch this agent owns the attempt and therefore must never acknowledge an
 unauthorized one), and the pre-launch revalidation (`PreLaunch`). The

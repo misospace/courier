@@ -50,15 +50,32 @@ func originalClaimantEvidence(task Task) string {
 // ownershipVerdict evaluates Courier's configured-ownership gate for one
 // followup-pr attempt (#761). The verdict is Courier's own and never the
 // peer's: the original claimant Dispatch names on the PR-fix item must be
-// present in the configured binding map, and that claimant's configured queue
-// lane must equal the receiving connector's own queue lane by exact string
-// equality. No alias normalization, prefix match, or case folding applies,
-// LaneProfile names are never Dispatch queue-lane identities, and ownership is
-// never inferred from the handout recipient, the pull-request author, a branch
-// prefix, or the fix type.
+// present in the configured binding map. For fix-pr work that claimant's
+// configured queue lane must also equal the receiving connector's own queue
+// lane by exact string equality. No alias normalization, prefix match, or
+// case folding applies, LaneProfile names are never Dispatch queue-lane
+// identities, and ownership is never inferred from the handout recipient, the
+// pull-request author, or a branch prefix. The item's fix type is the source's
+// own classification — the same trusted carrier #715 already rides through the
+// durable attempt identity — and it selects only the shape of the lane arm,
+// never the claimant.
+//
+// The lane-equality arm is the one exception for rebase work (#787): when
+// this connector negotiated the rebase-executor contract and the item is
+// REBASE-marked, the verdict is known-claimant membership alone. Per
+// misospace/dispatch#1327 a REBASE item's exclusivity is the
+// DISPATCH_REBASE_AGENTS local-only pool, not the queue-lane column — the
+// claimant is the original fixer on its own lane while the rebase connector
+// polls on its own — so lane equality could never hold and would decline
+// every pool-routed handout. Evidence stays required: an absent claimant or
+// one outside the configured bindings is still declined on the rebase path,
+// and every other attempt — ordinary fix-pr work anywhere, and a REBASE-marked
+// offer reaching a connector that never negotiated the capability, which the
+// rebase classification declines on top of this gate — keeps full lane
+// equality.
 //
 // An empty reason means the attempt is authorized for this connector.
-func (c *HTTPClient) ownershipVerdict(claimant string) (reason, why string) {
+func (c *HTTPClient) ownershipVerdict(claimant, fixType string) (reason, why string) {
 	claimant = strings.TrimSpace(claimant)
 	if claimant == "" {
 		return reasonOwnershipEvidenceMissing, "the followup-pr attempt carries no original-claimant evidence"
@@ -66,6 +83,9 @@ func (c *HTTPClient) ownershipVerdict(claimant string) (reason, why string) {
 	boundLane, known := c.ownershipBindings[claimant]
 	if !known {
 		return reasonOwnershipClaimantUnknown, fmt.Sprintf("original claimant %q is not in Courier's configured dispatch bindings", claimant)
+	}
+	if c.rebaseCapabilityEnabled && isRebaseFixType(fixType) {
+		return "", ""
 	}
 	if boundLane != c.queueLane {
 		return reasonOwnershipLaneMismatch, fmt.Sprintf("original claimant %q is bound to queue lane %q, not this connector's queue lane %q", claimant, boundLane, c.queueLane)
@@ -91,7 +111,7 @@ func (c *HTTPClient) ownershipVerdict(claimant string) (reason, why string) {
 // (ErrOwnershipDeclined) keeps the reason visible to a caller that reads the
 // error directly.
 func (c *HTTPClient) refuseOwnership(ctx context.Context, d workDescriptor) error {
-	reason, why := c.ownershipVerdict(d.OriginalClaimant)
+	reason, why := c.ownershipVerdict(d.OriginalClaimant, d.FixType)
 	if reason == "" {
 		return nil
 	}
@@ -126,7 +146,7 @@ func (c *HTTPClient) refuseOwnership(ctx context.Context, d workDescriptor) erro
 // for every attempt this connector refuses to execute, so no reservation is
 // left held once such an attempt is dropped.
 func (c *HTTPClient) refuseOwnershipAck(d workDescriptor) error {
-	reason, why := c.ownershipVerdict(d.OriginalClaimant)
+	reason, why := c.ownershipVerdict(d.OriginalClaimant, d.FixType)
 	if reason == "" {
 		return nil
 	}

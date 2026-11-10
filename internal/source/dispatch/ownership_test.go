@@ -293,6 +293,201 @@ func TestOwnershipGateDeclineSurvivesRefusedRelease(t *testing.T) {
 	}
 }
 
+// rebaseOwnershipTaskBody is the Dispatch-shaped next-task response for one
+// queued rebase-marked handout on acme/widgets#42, generation 4, under a
+// fully negotiated v1 rebase-only intake, carrying the claimant evidence on
+// the item. An empty claimant reproduces the evidence-less shape.
+func rebaseOwnershipTaskBody(fixType, claimant string) map[string]any {
+	body := ownershipTaskBody(claimant)
+	body["prFixItem"].(map[string]any)["fixType"] = fixType
+	body["intake"] = rebaseIntakeAckBody()
+	return body
+}
+
+// #787: on a connector that negotiated the rebase-executor contract, a
+// REBASE-marked handout whose claimant is known but bound to a DIFFERENT
+// queue lane is accepted as rebase work. Per misospace/dispatch#1327 REBASE
+// exclusivity is the DISPATCH_REBASE_AGENTS pool, not the lane column, so no
+// claimant can ever be bound to the rebase connector's lane; applying the
+// lane-equality arm here declines every pool-routed rebase offer. The rebase
+// mark is matched the same way the rebase classification matches it — case-
+// and whitespace-tolerant — even though the lane comparison itself stays
+// exact.
+func TestOwnershipGateSkipsLaneEqualityForNegotiatedRebaseOffer(t *testing.T) {
+	for _, fixType := range []string{"REBASE", "rebase", " Rebase "} {
+		t.Run(fixType, func(t *testing.T) {
+			server, marks := ownershipServer(t, func() map[string]any { return rebaseOwnershipTaskBody(fixType, "local") })
+			client := newOwnershipClient(t, server.URL, "normal", map[string]string{"local": "local"})
+			client.WithRebaseCapability(true)
+			counter := attachOwnershipDiagnostics(t, client)
+			items, err := client.Discover(context.Background())
+			if err != nil || len(items) != 1 || items[0].Mode != "rebase" {
+				t.Fatalf("items = %#v err = %v, want the cross-lane rebase handout accepted as rebase work", items, err)
+			}
+			if len(*marks) != 0 {
+				t.Fatalf("marks = %#v, want no release for an accepted handout", *marks)
+			}
+			for _, reason := range []string{reasonOwnershipLaneMismatch, reasonOwnershipClaimantUnknown, reasonOwnershipEvidenceMissing, reasonRebaseDeclined} {
+				if got := counter(reason); got > 0 {
+					t.Fatalf("diagnostic %s = %v, want none", reason, got)
+				}
+			}
+			descriptor, err := decodeWorkID(items[0].ID)
+			if err != nil {
+				t.Fatalf("decode work ID: %v", err)
+			}
+			if descriptor.FixType != fixType || descriptor.OriginalClaimant != "local" {
+				t.Fatalf("descriptor = %#v, want the rebase mark and claimant preserved verbatim on the durable attempt identity", descriptor)
+			}
+		})
+	}
+}
+
+// The membership and evidence arms keep their authority at the lifecycle
+// boundaries on the rebase path: a rebase-marked attempt with no claimant
+// evidence is refused at the hand-out acknowledgement — without releasing
+// the possibly live attempt — and at the pre-launch revalidation, where the
+// refusal releases the exact receipt.
+func TestOwnershipGateDeclinesEvidenceLessRebaseAttemptAtBoundaries(t *testing.T) {
+	id := EncodeWorkID(Task{
+		Type:        "followup-pr",
+		PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42},
+		PRFixItem:   &PRFixItem{ID: "fix-9", Generation: 4, HandoutToken: "hand-4", FixType: "REBASE"},
+	})
+	t.Run("acknowledgement", func(t *testing.T) {
+		var paths []string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			paths = append(paths, r.URL.Path)
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer server.Close()
+		client := newOwnershipClient(t, server.URL, "normal", map[string]string{"local": "local"})
+		client.WithRebaseCapability(true)
+		if err := client.AckHandout(context.Background(), source.WorkItem{ID: id}); !errors.Is(err, ErrOwnershipDeclined) {
+			t.Fatalf("AckHandout() error = %v, want the ownership decline", err)
+		}
+		if len(paths) != 0 {
+			t.Fatalf("paths = %#v, want no acknowledgement and no release of a possibly live attempt", paths)
+		}
+	})
+	t.Run("pre-launch", func(t *testing.T) {
+		server, marks := ownershipServer(t, func() map[string]any { return ownershipTaskBody("local") })
+		client := newOwnershipClient(t, server.URL, "normal", map[string]string{"local": "local"})
+		client.WithRebaseCapability(true)
+		err := client.PreLaunch(context.Background(), id)
+		if !errors.Is(err, ErrOwnershipDeclined) || !errors.Is(err, source.ErrStaleWork) {
+			t.Fatalf("PreLaunch() error = %v, want the terminal ownership refusal", err)
+		}
+		if len(*marks) != 1 || (*marks)[0]["status"] != "WAITING_EXTERNAL" || (*marks)[0]["generation"] != float64(4) {
+			t.Fatalf("marks = %#v, want exactly one exact-receipt release", *marks)
+		}
+	})
+}
+
+// The known-claimant arms stay required on the rebase path (#761's protection
+// against fabricated or evidence-less offers): a REBASE-marked handout with no
+// claimant evidence is declined by ownership and released once, even under a
+// fully negotiated intake.
+func TestOwnershipGateDeclinesEvidenceLessRebaseOfferOnNegotiatedConnector(t *testing.T) {
+	server, marks := ownershipServer(t, func() map[string]any { return rebaseOwnershipTaskBody("REBASE", "") })
+	client := newOwnershipClient(t, server.URL, "normal", map[string]string{"local": "local"})
+	client.WithRebaseCapability(true)
+	counter := attachOwnershipDiagnostics(t, client)
+	items, err := client.Discover(context.Background())
+	if items != nil || err != nil {
+		t.Fatalf("items = %#v err = %v, want the handout declined without failing the poll", items, err)
+	}
+	if got := counter(reasonOwnershipEvidenceMissing); got != 1 {
+		t.Fatalf("diagnostic %s = %v, want exactly one", reasonOwnershipEvidenceMissing, got)
+	}
+	if len(*marks) != 1 || (*marks)[0]["status"] != "WAITING_EXTERNAL" || (*marks)[0]["generation"] != float64(4) {
+		t.Fatalf("marks = %#v, want exactly one exact-receipt release", *marks)
+	}
+}
+
+// The fix-pr path on a normal connector keeps declining REBASE-marked offers:
+// with the capability not negotiated, full lane equality still applies, so a
+// cross-lane claimant is declined by ownership before the rebase
+// classification ever runs.
+func TestOwnershipGateDeclinesCrossLaneRebaseOfferOnNormalConnector(t *testing.T) {
+	server, marks := ownershipServer(t, func() map[string]any {
+		body := ownershipTaskBody("local")
+		body["prFixItem"].(map[string]any)["fixType"] = "REBASE"
+		return body
+	})
+	client := newOwnershipClient(t, server.URL, "normal", map[string]string{"local": "local"})
+	counter := attachOwnershipDiagnostics(t, client)
+	items, err := client.Discover(context.Background())
+	if items != nil || err != nil {
+		t.Fatalf("items = %#v err = %v, want the handout declined without failing the poll", items, err)
+	}
+	if got := counter(reasonOwnershipLaneMismatch); got != 1 {
+		t.Fatalf("diagnostic %s = %v, want exactly one", reasonOwnershipLaneMismatch, got)
+	}
+	if got := counter(reasonRebaseDeclined); got != -1 {
+		t.Fatalf("diagnostic %s = %v, want none — ownership declined first", reasonRebaseDeclined, got)
+	}
+	if len(*marks) != 1 || (*marks)[0]["status"] != "WAITING_EXTERNAL" {
+		t.Fatalf("marks = %#v, want exactly one waiting-external release", *marks)
+	}
+}
+
+// The rebase-path exception is carried by the durable attempt identity, not
+// just the discovery verdict: a REBASE-marked attempt whose claimant is bound
+// to another lane passes the claim, the hand-out acknowledgement, and the
+// pre-launch revalidation on the negotiated connector, and no reservation is
+// released for it. Without this, the doom loop would only move downstream.
+func TestOwnershipGateSkipsLaneEqualityForRebaseAttemptThroughTheLifecycle(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client := newOwnershipClient(t, server.URL, "normal", map[string]string{"local": "local"})
+	client.WithRebaseCapability(true)
+	id := EncodeWorkID(Task{
+		Type:        "followup-pr",
+		PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42},
+		PRFixItem:   &PRFixItem{ID: "fix-9", Generation: 4, HandoutToken: "hand-4", FixType: "REBASE", OriginalClaimant: "local"},
+	})
+	if _, err := client.ClaimWithReceipt(context.Background(), id, ""); err != nil {
+		t.Fatalf("ClaimWithReceipt() error = %v, want the rebase-path acceptance", err)
+	}
+	if err := client.AckHandout(context.Background(), source.WorkItem{ID: id}); err != nil {
+		t.Fatalf("AckHandout() error = %v, want the rebase-path acceptance", err)
+	}
+	if err := client.PreLaunch(context.Background(), id); err != nil {
+		t.Fatalf("PreLaunch() error = %v, want the rebase-path acceptance", err)
+	}
+	for _, path := range paths {
+		if path == "/api/pr-fix-queue/mark" {
+			t.Fatalf("paths = %#v, want no release for an authorized attempt", paths)
+		}
+	}
+}
+
+// The mirror at the lifecycle boundaries: on a connector that never
+// negotiated the rebase capability, a REBASE-marked attempt with a cross-lane
+// claimant is still refused with full lane equality — the fix-pr-path
+// protection survives every boundary that can still refuse the attempt.
+func TestOwnershipGateRechecksLaneEqualityForRebaseAttemptOnNormalConnector(t *testing.T) {
+	server, marks := ownershipServer(t, func() map[string]any { return ownershipTaskBody("local") })
+	client := newOwnershipClient(t, server.URL, "normal", map[string]string{"local": "frontier"})
+	id := EncodeWorkID(Task{
+		Type:        "followup-pr",
+		PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42},
+		PRFixItem:   &PRFixItem{ID: "fix-9", Generation: 4, HandoutToken: "hand-4", FixType: "REBASE", OriginalClaimant: "local"},
+	})
+	_, err := client.ClaimWithReceipt(context.Background(), id, "")
+	if !errors.Is(err, ErrOwnershipDeclined) || !errors.Is(err, source.ErrStaleWork) {
+		t.Fatalf("ClaimWithReceipt() error = %v, want the terminal ownership refusal", err)
+	}
+	if len(*marks) != 1 || (*marks)[0]["status"] != "WAITING_EXTERNAL" || (*marks)[0]["generation"] != float64(4) {
+		t.Fatalf("marks = %#v, want exactly one exact-receipt release", *marks)
+	}
+}
+
 // The ownership gate runs before the rebase classification: a REBASE-marked
 // handout under a fully negotiated intake is declined by ownership when its
 // claimant is foreign, never by the capability contract.
