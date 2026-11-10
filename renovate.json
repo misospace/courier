@@ -17,7 +17,7 @@
       "datasourceTemplate": "docker"
     },
     {
-      "description": "Every actions/setup-go go-version pin must name the same Go as .mise/config.toml; the built-in mise manager owns that side (same datasource and depName), this moves the workflow side into the same PR",
+      "description": "Every actions/setup-go go-version pin must name the same Go as .mise/config.toml; the built-in mise manager owns that side (github-tags golang/go), this puts the pins on the groupable golang-version datasource so they join the same PR",
       "customType": "regex",
       "fileMatch": [
         "^\\.github/workflows/[^/]+\\.ya?ml$"
@@ -26,15 +26,14 @@
         "\\bgo-version:\\s*[\"']?(?<currentValue>\\d+\\.\\d+(\\.\\d+)?)[\"']?"
       ],
       "depNameTemplate": "go",
-      "datasourceTemplate": "golang-version",
-      "versioningTemplate": "golang"
+      "datasourceTemplate": "golang-version"
     }
   ],
   "packageRules": [
     {
-      "description": "One PR per Go toolchain bump: mise's go tool (built-in mise manager), the workflow go-version pins (custom manager above), and the Dockerfile's golang base images (built-in docker manager) all move together",
-      "matchDatasources": ["docker", "golang-version"],
-      "matchDepNames": ["golang", "go"],
+      "description": "One PR per Go toolchain bump: mise's go tool (github-tags golang/go via the built-in mise manager), the workflow go-version pins (golang-version go via the custom manager above), and the Dockerfile's golang base images (docker) all move together",
+      "matchDatasources": ["docker", "golang-version", "github-tags"],
+      "matchDepNames": ["golang", "go", "golang/go"],
       "groupName": "go"
     },
     {
