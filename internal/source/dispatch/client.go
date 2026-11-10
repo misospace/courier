@@ -36,8 +36,10 @@ const (
 	// sends for a recoverable dependency block (source.ResultBlockedExternal).
 	// Dispatch is expected to treat it as a no-op for fix-attempt accounting:
 	// do not advance generation, do not increment fixAttempts, do not park
-	// the item for a human, and keep it discoverable so the source can
-	// re-issue the work once the prerequisite is satisfied. A legacy
+	// the item for a human, and keep it discoverable; the queue re-offers
+	// the work when its bounded recheck deadline (retryAt) elapses, and a
+	// queue-backed follow-up settles the wait through the structured
+	// externalWait contract (externalwait.go). A legacy
 	// Dispatch that does not yet recognise this outcome will reject the
 	// report; that is a known cross-repo gap tracked alongside #267.
 	outcomeWaitingExternal = "waiting-external"
@@ -1137,9 +1139,16 @@ func (c *HTTPClient) markPRFixBlocked(ctx context.Context, d workDescriptor, not
 // the issued PR-fix generation. Unlike a BLOCKED mark it must not surface to
 // a human; unlike a STALE mark it must not retire the work. Dispatch treats
 // it as a recoverable, generation-fenced wait: the attempt is not reissued,
-// fixAttempts is not advanced, and the item is left discoverable for the
-// next cycle once the prerequisite is satisfied. See DESIGN.md §267 for the
-// cross-repo contract this depends on.
+// fixAttempts is not advanced, and the item is left discoverable; the queue
+// re-offers the item when its bounded recheck deadline (retryAt) elapses.
+// See DESIGN.md §267 for the cross-repo contract this depends on.
+//
+// Dispatch's #1250 contract (misospace/dispatch#1273) requires the bounded
+// structured externalWait dependency on every new WAITING_EXTERNAL mark: a
+// mark without one fails closed to a PARKED/invalid_wait park that nothing
+// re-offers. Courier's wait has no forge-verifiable dependency, so it
+// presents the cooldown-recheck contract the queue re-offers on its bounded
+// deadline (externalwait.go).
 func (c *HTTPClient) markPRFixWaitingExternal(ctx context.Context, d workDescriptor, note string) error {
 	if d.Type != "followup-pr" || d.PRFixID == "" {
 		return nil
@@ -1149,7 +1158,8 @@ func (c *HTTPClient) markPRFixWaitingExternal(ctx context.Context, d workDescrip
 	}
 	return c.asSuperseded(c.do(ctx, http.MethodPost, "/api/pr-fix-queue/mark", map[string]any{
 		"repo": d.Repo, "pr": d.Number, "status": "WAITING_EXTERNAL", "note": note,
-		"generation": d.Generation,
+		"generation":   d.Generation,
+		"externalWait": cooldownExternalWait(d, note),
 	}, nil))
 }
 
@@ -1201,6 +1211,13 @@ func (c *HTTPClient) reportTaskWithPR(ctx context.Context, d workDescriptor, out
 		body["prFixItem"] = map[string]any{"id": d.PRFixID, "generation": d.Generation}
 		if d.HandoutToken != "" {
 			body["prFixItem"].(map[string]any)["handoutToken"] = d.HandoutToken
+		}
+		// A queue-backed waiting-external report settles the issued attempt
+		// through Dispatch's resolver, so it must carry the same structured
+		// cooldown-recheck contract the queue mark presents (#1250): a
+		// report without a valid dependency parks the item fail-closed.
+		if outcome == outcomeWaitingExternal {
+			body["externalWait"] = cooldownExternalWait(d, failure)
 		}
 	}
 	if number, rawURL := parsePullRequest(observedPR); number > 0 {

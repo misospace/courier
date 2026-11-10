@@ -140,6 +140,15 @@ func validateRebaseIntake(raw json.RawMessage) (ok bool, reason string) {
 // consumer without consuming attempt budget, fabricating completion, or
 // touching any other writer's attempt.
 //
+// The release presents Dispatch's #1250 structured external-wait contract
+// (misospace/dispatch#1273) with the cooldown-recheck predicate: a decline
+// waits on no forge-verifiable dependency, and that predicate keeps the item
+// out of offer until the queue's bounded recheck deadline elapses and the
+// item is reissued — the recoverable re-offer the decline documents. A mark
+// without the structured contract would fail closed to a PARKED/invalid_wait
+// park nothing re-offers, so the contract is part of the release, not
+// optional metadata.
+//
 // When the deployment refuses that release — an older Dispatch without the
 // waiting-external mark, or any refusal this client cannot prove moot — the
 // decline surfaces with the full ownership evidence and latches for this
@@ -181,11 +190,12 @@ func (c *HTTPClient) declineHandout(ctx context.Context, task Task, decline erro
 // declineRebase releases a rebase offer Courier cannot safely execute and
 // returns the error discovery surfaces in its place. The offer is never
 // claimed, materialized, or executed; the release path is the defined
-// recoverable wait — the generation-fenced waiting-external mark — presented
-// with the exact receipt (repo, PR, generation) the offer carried, so the
-// source keeps the item discoverable for a compatible consumer without
-// consuming attempt budget, fabricating completion, or touching any other
-// writer's attempt.
+// recoverable wait — the generation-fenced waiting-external mark with the
+// #1250 structured cooldown-recheck dependency (see declineHandout) —
+// presented with the exact receipt (repo, PR, generation) the offer
+// carried, so the source keeps the item discoverable for a compatible
+// consumer without consuming attempt budget, fabricating completion, or
+// touching any other writer's attempt.
 //
 // When the deployment refuses that release — an older Dispatch without the
 // waiting-external mark, or any refusal this client cannot prove moot — the
