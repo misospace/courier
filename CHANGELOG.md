@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.24](https://github.com/misospace/courier/compare/v0.1.23...v0.1.24) (2026-11-10)
+
+
+### Bug Fixes
+
+* **container:** update image golang (1.27.3 → 1.27.4) ([#794](https://github.com/misospace/courier/issues/794)) ([24dec3d](https://github.com/misospace/courier/commit/24dec3de73242613ee7f955636e763227775cafb))
+* **deps:** update dependency astro (7.4.8 → 7.4.9) ([#795](https://github.com/misospace/courier/issues/795)) ([4e1b92b](https://github.com/misospace/courier/commit/4e1b92b6628beae99833e438f7f917048e0710c0))
+* **dispatch:** exempt rebase-marked offers from the ownership lane-equality arm ([#788](https://github.com/misospace/courier/issues/788)) ([7757744](https://github.com/misospace/courier/commit/775774463121351ceb15f90a74b091331a585d62))
+* **topology:** carry a scoped safe.directory exception into the worker pod ([#792](https://github.com/misospace/courier/issues/792)) ([56766c4](https://github.com/misospace/courier/commit/56766c4b0e3fe72b8468f0f76d724bb76d5ad16e))
+
 ## [0.1.23](https://github.com/misospace/courier/compare/v0.1.22...v0.1.23) (2026-11-09)
 
 
