@@ -1,7 +1,7 @@
 min_version = "2026.10.17"
 
 [tools]
-go = "1.27.3"
+go = "1.27.4"
 helm = "4.3.1"
 
 [tasks.bootstrap]
