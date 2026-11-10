@@ -180,6 +180,9 @@ func TestWorkerPodToolchainCacheContract(t *testing.T) {
 	if env["COURIER_TOOLCHAIN_DIR"] != executor.ToolchainReferencePath {
 		t.Fatalf("COURIER_TOOLCHAIN_DIR = %q", env["COURIER_TOOLCHAIN_DIR"])
 	}
+	if env[executor.EnvtestStoreEnv] != executor.EnvtestStorePath {
+		t.Fatalf("%s = %q", executor.EnvtestStoreEnv, env[executor.EnvtestStoreEnv])
+	}
 }
 
 func TestControlPodIdentityContract(t *testing.T) {

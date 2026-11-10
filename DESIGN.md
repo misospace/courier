@@ -2006,6 +2006,26 @@ and the legacy executor's classification through `internal/devenv`:
   behavior, not a failure); so are a contract that differs from the base
   and one that is only half-committed (a config with no lock). All three
   skip classes dispatch nothing and are never executed.
+- **Hermetic toolchain resolution (#797).** Before mise resolves tools, both
+  fixed scripts run the hermetic toolchain wiring: when the worker image
+  bakes the toolchain contract (the repository's own pinned toolchain,
+  installed at build time with `mise install --locked` under the
+  lockfile's checksums into `/usr/local/share/courier/mise-data`, beside a
+  pre-materialized envtest asset store), the wiring pins mise to a per-run
+  writable overlay that symlinks the baked data dir — on the per-run
+  `toolchain-cache` volume when one is writable, so the environment
+  capture's `MISE_DATA_DIR` survives into every later task — and sets
+  `MISE_OFFLINE=true`: mise never issues an HTTP request, a pin the bake
+  cannot satisfy fails fast and locally with an actionable error instead of
+  stalling into the worker's network-policy black hole and dying as an
+  opaque exit 1, and the image layer is never written. When the image
+  carries no bake the wiring exports nothing and mise behaves networked,
+  as before #797. The worker environment carries
+  `COURIER_ENVTEST_STORE` naming the baked envtest store so a contract's
+  own setup-envtest step can resolve its assets offline; a deployment
+  image without the bake leaves consumers to fall back. The wiring is
+  fixed constants plus deployment-supplied environment — no brief-, model-,
+  or repository-supplied value can alter it.
 - **Bounded setup.** The secure harness dispatches the bootstrap task
   (`mise run bootstrap` plus its fixed diagnostic lines, emitted exactly
   once from the script's EXIT trap — the terminal emission that runs last
@@ -2066,19 +2086,28 @@ and the legacy executor's classification through `internal/devenv`:
   worker's credential-free context, which honors the existing
   dependency-egress policy (no bypass and no extra grant; a bootstrap that
   cannot reach its pinned downloads fails as the environment blocker
-  above). Receipts carry no secret values and no raw worker output: the
+  above). Receipts carry no secret values; a failed task's bounded stderr
+  tail rides the receipt as diagnostic evidence (#797 — the tail is what
+  names the exact download or pin that refused) and never enters the
+  durable reason or the model transcript: the
   legacy executor emits a `workspace.bootstrap` structured event with a
   fixed skip reason; the control pod emits a structured `workspace.bootstrap`
   receipt (status, failure reason, per-task elapsed time, exit codes,
-  environment-key count, and the mise executable path, version, and cache
-  location) through the same best-effort event emitter as session
+  environment-key count, the mise executable path, version, and cache
+  location, the resolved toolchain bake and offline mode, and the bounded
+  stderr tails a failed task returned) through the same best-effort event
+  emitter as session
   compaction, with diagnostic values validated to a fixed key set and a
   printable-ASCII charset.
 
 Every runtime image ships a pinned `mise` binary downloaded with checksum
 verification at build time — never fetched at runtime — so the approved
 contract above executes on provisioned images, and the tool versions it
-installs stay pinned by the repository's committed lockfile. Only an
+installs stay pinned by the repository's committed lockfile. The Go
+toolchain images bake that toolchain contract itself (#797): the pinned
+tools are installed into the data dir the devenv scripts pin mise to, so
+the contract resolves hermetically inside the worker's network contract —
+hermetic by construction, never by widening worker egress. Only an
 operator-selected worker image without mise ends deterministically
 blocked-external naming the missing mise executable; the same holds for the
 tool artifacts a contract installs: the secure worker's dependency-egress

@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/misospace/courier/internal/devenv"
 )
 
 func TestCoordinatorDockerfileUsesNumericIdentity(t *testing.T) {
@@ -157,6 +159,41 @@ func TestCoordinatorGoDockerfilePinsToolchainCachePath(t *testing.T) {
 	if !strings.Contains(stage, "mkdir -p /courier-toolchain-cache") ||
 		!strings.Contains(stage, "chown 65532:65532 /courier-toolchain-cache") {
 		t.Fatal("coordinator-go stage does not create /courier-toolchain-cache owned by 65532")
+	}
+}
+
+// The approved bootstrap contract is not hermetic against the secure
+// worker's network contract unless the tools the contract's own pins name
+// are baked into the image (#797): the coordinator-go stage must install the
+// repository's pinned toolchain into the data dir the devenv scripts pin
+// mise to, and pre-materialize the envtest asset store beside it, both from
+// the Makefile/.mise pins at build time — never fetched at runtime.
+func TestCoordinatorGoDockerfileBakesHermeticToolchainContract(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "Dockerfile"))
+	if err != nil {
+		t.Fatalf("read Dockerfile: %v", err)
+	}
+	dockerfile := string(data)
+
+	stageStart := strings.Index(dockerfile, "FROM coordinator AS coordinator-go")
+	if stageStart < 0 {
+		t.Fatal("Dockerfile does not define the coordinator-go stage")
+	}
+	stage := dockerfile[stageStart:]
+	stageEnd := strings.Index(stage, "\nFROM ")
+	if stageEnd < 0 {
+		stageEnd = len(stage)
+	}
+	stage = stage[:stageEnd]
+
+	if !strings.Contains(stage, "MISE_DATA_DIR="+devenv.DefaultToolchainDir) {
+		t.Fatal("coordinator-go stage does not bake the mise data dir into the devenv default toolchain dir")
+	}
+	if !strings.Contains(stage, "mise install --locked") {
+		t.Fatal("coordinator-go stage does not install the pinned toolchain from the committed lock")
+	}
+	if !strings.Contains(stage, "XDG_DATA_HOME="+EnvtestStorePath) {
+		t.Fatal("coordinator-go stage does not bake the envtest asset store into the devenv envtest store path")
 	}
 }
 

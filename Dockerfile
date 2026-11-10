@@ -137,6 +137,30 @@ ENV PATH=/usr/local/go/bin:${PATH} \
 	GOCACHE=/courier-toolchain-cache/go-build \
 	GOTOOLCHAIN=local
 
+# The baked toolchain contract (#797): the approved development bootstrap
+# contract dispatches `mise run bootstrap` inside the secure worker, whose
+# network resolves nothing but the dependency cache, so the tools the
+# repository's own .mise pins name are installed here, at build time, into
+# the data dir the devenv scripts pin mise to (COURIER_MISE_TOOLCHAIN_DIR
+# default /usr/local/share/courier/mise-data) — mise.lock verifies every
+# download. The envtest asset store is baked beside it under
+# /usr/local/share/courier/envtest-store from the same Makefile pins, so the
+# contract's setup-envtest step resolves offline. Images built from this
+# Dockerfile therefore satisfy the contract hermetically; a deployment image
+# without the bake keeps the networked fallbacks.
+COPY Makefile /tmp/courier-toolchain/Makefile
+COPY .mise/config.toml /tmp/courier-toolchain/.mise/config.toml
+COPY .mise/mise.lock /tmp/courier-toolchain/.mise/mise.lock
+RUN set -eux; \
+	cd /tmp/courier-toolchain && \
+	MISE_YES=1 MISE_DATA_DIR=/usr/local/share/courier/mise-data mise install --locked && \
+	se_pin="$(sed -n 's/^ENVTEST_VERSION ?= //p' Makefile)" && \
+	k8s="$(sed -n 's/^ENVTEST_K8S_VERSION ?= //p' Makefile)" && \
+	GOBIN=/tmp/courier-toolchain/bin go install "sigs.k8s.io/controller-runtime/tools/setup-envtest@${se_pin}" && \
+	XDG_DATA_HOME=/usr/local/share/courier/envtest-store /tmp/courier-toolchain/bin/setup-envtest use "${k8s}" && \
+	chmod -R a+rX /usr/local/share/courier && \
+	rm -rf /tmp/courier-toolchain /root/.cache /root/.local /courier-toolchain-cache/go-mod /courier-toolchain-cache/go-build /usr/local/share/courier/mise-data/downloads
+
 USER 65532:65532
 
 # Harness image: the secure topology's control, worker, and broker binaries
