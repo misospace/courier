@@ -559,6 +559,20 @@ func WorkerPod(run *courier.CoderRun, image string, controlIncarnationUID string
 		{Name: EnvWorkerPublicKey, Value: base64.StdEncoding.EncodeToString(publicKey)},
 		// The same toolchain reference the legacy coordinator env carries.
 		{Name: "COURIER_TOOLCHAIN_DIR", Value: executor.ToolchainReferencePath},
+		// The workspace emptyDir's mountpoint is root-owned — fsGroup adjusts
+		// the group and the setgid bit, never the owner — while the pod runs
+		// as the runtime uid, so git's ownership gate refuses the repository
+		// every worker task runs in: the fixed unpack task answers "detected
+		// dubious ownership in repository at /workspace" with exit 128, twice
+		// into the terminal blocked-external ending. The worker deliberately
+		// runs git unhardened (the sandbox owns its own repo config; a task
+		// user can edit the workspace's .git anyway, so the ownership gate
+		// adds nothing there), so the scoped exception rides the pod
+		// environment every task inherits: exactly the one courier-controlled
+		// workspace path, never a wildcard — #779's scope rule, worker side.
+		{Name: "GIT_CONFIG_COUNT", Value: "1"},
+		{Name: "GIT_CONFIG_KEY_0", Value: "safe.directory"},
+		{Name: "GIT_CONFIG_VALUE_0", Value: workerWorkspacePath},
 	}
 	if cache != nil && cache.IP != "" {
 		env = append(env,

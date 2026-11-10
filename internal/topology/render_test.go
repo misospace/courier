@@ -1443,3 +1443,40 @@ func TestSkillVolumeNamesAreUniqueAndLabelSafe(t *testing.T) {
 		}
 	}
 }
+
+// The worker's workspace emptyDir mountpoint is root-owned while the pod runs
+// as the runtime uid, so git's ownership gate refuses the repository every
+// task runs in — the fixed unpack task answered "detected dubious ownership
+// in repository at /workspace" with exit 128, twice into the terminal
+// blocked-external ending. The scoped safe.directory exception rides the pod
+// environment every task inherits: exactly the workspace path, never a
+// wildcard (#779's scope rule, worker side).
+func TestWorkerPodCarriesScopedWorkspaceSafeDirectory(t *testing.T) {
+	run := testRun("worker-safe-directory")
+	pub, _, _ := protocol.GenerateKey()
+	pod, err := WorkerPod(run, "harness:test", "incarnation-1", pub, nil, courier.DefaultPodResources(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	var key, value string
+	for _, e := range pod.Spec.Containers[0].Env {
+		switch e.Name {
+		case "GIT_CONFIG_COUNT":
+			count++
+			if e.Value != "1" {
+				t.Fatalf("GIT_CONFIG_COUNT = %q; want exactly one scoped config entry", e.Value)
+			}
+		case "GIT_CONFIG_KEY_0":
+			key = e.Value
+		case "GIT_CONFIG_VALUE_0":
+			value = e.Value
+		}
+	}
+	if count != 1 {
+		t.Fatalf("GIT_CONFIG_COUNT appears %d times; want exactly one", count)
+	}
+	if key != "safe.directory" || value != "/workspace" {
+		t.Fatalf("GIT_CONFIG_KEY_0=%q GIT_CONFIG_VALUE_0=%q; want safe.directory scoped to the workspace path", key, value)
+	}
+}
