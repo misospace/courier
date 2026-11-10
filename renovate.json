@@ -15,9 +15,28 @@
       ],
       "depNameTemplate": "busybox",
       "datasourceTemplate": "docker"
+    },
+    {
+      "description": "Every actions/setup-go go-version pin must name the same Go as .mise/config.toml; the built-in mise manager owns that side (same datasource and depName), this moves the workflow side into the same PR",
+      "customType": "regex",
+      "fileMatch": [
+        "^\\.github/workflows/[^/]+\\.ya?ml$"
+      ],
+      "matchStrings": [
+        "\\bgo-version:\\s*[\"']?(?<currentValue>\\d+\\.\\d+(\\.\\d+)?)[\"']?"
+      ],
+      "depNameTemplate": "go",
+      "datasourceTemplate": "golang-version",
+      "versioningTemplate": "golang"
     }
   ],
   "packageRules": [
+    {
+      "description": "One PR per Go toolchain bump: mise's go tool (built-in mise manager), the workflow go-version pins (custom manager above), and the Dockerfile's golang base images (built-in docker manager) all move together",
+      "matchDatasources": ["docker", "golang-version"],
+      "matchDepNames": ["golang", "go"],
+      "groupName": "go"
+    },
     {
       "description": "Keep GitHub Actions pinned to readable semver tags, not SHA digests (overrides the shared preset's pinDigests rule)",
       "matchManagers": ["github-actions"],
