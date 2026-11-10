@@ -2010,8 +2010,12 @@ and the legacy executor's classification through `internal/devenv`:
   fixed scripts run the hermetic toolchain wiring: when the worker image
   bakes the toolchain contract (the repository's own pinned toolchain,
   installed at build time with `mise install --locked` under the
-  lockfile's checksums into `/usr/local/share/courier/mise-data`, beside a
-  pre-materialized envtest asset store), the wiring pins mise to a per-run
+  lockfile's checksums into `/usr/local/share/courier/mise-data`, beside the
+  repository-local tools the contract's tools step installs — controller-gen
+  and setup-envtest from the Makefile pins, baked with their pins file under
+  `/usr/local/share/courier/tools` so `hack/tools.sh` copies them instead of
+  running a network-bound `go install` — and a pre-materialized envtest
+  asset store), the wiring pins mise to a per-run
   writable overlay that symlinks the baked data dir — on the per-run
   `toolchain-cache` volume when one is writable, so the environment
   capture's `MISE_DATA_DIR` survives into every later task — and sets
@@ -2023,7 +2027,9 @@ and the legacy executor's classification through `internal/devenv`:
   as before #797. The worker environment carries
   `COURIER_ENVTEST_STORE` naming the baked envtest store so a contract's
   own setup-envtest step can resolve its assets offline; a deployment
-  image without the bake leaves consumers to fall back. The wiring is
+  image without the bake leaves consumers to fall back. The tools step
+  honors the same contract: an offline run whose baked tools do not match
+  the base's Makefile pins fails fast naming the mismatch. The wiring is
   fixed constants plus deployment-supplied environment — no brief-, model-,
   or repository-supplied value can alter it.
 - **Bounded setup.** The secure harness dispatches the bootstrap task

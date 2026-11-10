@@ -195,6 +195,19 @@ func TestCoordinatorGoDockerfileBakesHermeticToolchainContract(t *testing.T) {
 	if !strings.Contains(stage, "XDG_DATA_HOME="+EnvtestStorePath) {
 		t.Fatal("coordinator-go stage does not bake the envtest asset store into the devenv envtest store path")
 	}
+	// The contract's tools step (hack/tools.sh) resolves repo-local tools
+	// offline only when the bake preserves their executables beside the mise
+	// data, with the pins file tools.sh compares against the Makefile (#797):
+	// a bake that discards them leaves the runtime bootstrap a network-bound
+	// go install.
+	const toolsBin = "/usr/local/share/courier/tools/bin"
+	if !strings.Contains(stage, "GOBIN="+toolsBin+" go install \"sigs.k8s.io/controller-tools/cmd/controller-gen@") ||
+		!strings.Contains(stage, "GOBIN="+toolsBin+" go install \"sigs.k8s.io/controller-runtime/tools/setup-envtest@") {
+		t.Fatal("coordinator-go stage does not bake the repo-local tools the contract's tools step resolves")
+	}
+	if !strings.Contains(stage, "/usr/local/share/courier/tools/.tool-pins") {
+		t.Fatal("coordinator-go stage does not record the baked tools' pins for hack/tools.sh to verify")
+	}
 }
 
 // coordinatorStage returns the Dockerfile text of the bootstrap coordinator

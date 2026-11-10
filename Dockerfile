@@ -140,24 +140,31 @@ ENV PATH=/usr/local/go/bin:${PATH} \
 # The baked toolchain contract (#797): the approved development bootstrap
 # contract dispatches `mise run bootstrap` inside the secure worker, whose
 # network resolves nothing but the dependency cache, so the tools the
-# repository's own .mise pins name are installed here, at build time, into
-# the data dir the devenv scripts pin mise to (COURIER_MISE_TOOLCHAIN_DIR
-# default /usr/local/share/courier/mise-data) — mise.lock verifies every
-# download. The envtest asset store is baked beside it under
-# /usr/local/share/courier/envtest-store from the same Makefile pins, so the
-# contract's setup-envtest step resolves offline. Images built from this
-# Dockerfile therefore satisfy the contract hermetically; a deployment image
-# without the bake keeps the networked fallbacks.
+# repository's own pins name are installed here, at build time — mise tools
+# into the data dir the devenv scripts pin mise to (COURIER_MISE_TOOLCHAIN_DIR
+# default /usr/local/share/courier/mise-data; mise.lock verifies every
+# download), and the repo-local tools hack/tools.sh installs (controller-gen,
+# setup-envtest, from the Makefile pins) beside it with their pins file, so
+# the contract's tools step resolves offline instead of running go install
+# through the network black hole. The envtest asset store is baked beside
+# them from the same Makefile pins, so the contract's setup-envtest step
+# resolves offline. Images built from this Dockerfile therefore satisfy the
+# contract hermetically; a deployment image without the bake keeps the
+# networked fallbacks.
 COPY Makefile /tmp/courier-toolchain/Makefile
 COPY .mise/config.toml /tmp/courier-toolchain/.mise/config.toml
 COPY .mise/mise.lock /tmp/courier-toolchain/.mise/mise.lock
 RUN set -eux; \
 	cd /tmp/courier-toolchain && \
 	MISE_YES=1 MISE_DATA_DIR=/usr/local/share/courier/mise-data mise install --locked && \
+	cg_pin="$(sed -n 's/^CONTROLLER_TOOLS_VERSION ?= //p' Makefile)" && \
 	se_pin="$(sed -n 's/^ENVTEST_VERSION ?= //p' Makefile)" && \
 	k8s="$(sed -n 's/^ENVTEST_K8S_VERSION ?= //p' Makefile)" && \
-	GOBIN=/tmp/courier-toolchain/bin go install "sigs.k8s.io/controller-runtime/tools/setup-envtest@${se_pin}" && \
-	XDG_DATA_HOME=/usr/local/share/courier/envtest-store /tmp/courier-toolchain/bin/setup-envtest use "${k8s}" && \
+	mkdir -p /usr/local/share/courier/tools/bin && \
+	GOBIN=/usr/local/share/courier/tools/bin go install "sigs.k8s.io/controller-tools/cmd/controller-gen@${cg_pin}" && \
+	GOBIN=/usr/local/share/courier/tools/bin go install "sigs.k8s.io/controller-runtime/tools/setup-envtest@${se_pin}" && \
+	printf 'controller-gen %s\nsetup-envtest %s\n' "$cg_pin" "$se_pin" > /usr/local/share/courier/tools/.tool-pins && \
+	XDG_DATA_HOME=/usr/local/share/courier/envtest-store /usr/local/share/courier/tools/bin/setup-envtest use "${k8s}" && \
 	chmod -R a+rX /usr/local/share/courier && \
 	rm -rf /tmp/courier-toolchain /root/.cache /root/.local /courier-toolchain-cache/go-mod /courier-toolchain-cache/go-build /usr/local/share/courier/mise-data/downloads
 

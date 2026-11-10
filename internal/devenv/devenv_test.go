@@ -579,7 +579,11 @@ func bakedToolchainDir(t *testing.T) string {
 }
 
 // offlineEchoStandIn is the mise stand-in for the hermetic-wiring tests: it
-// reports the environment the wiring left for mise to see.
+// reports the environment the wiring left for mise to see, and — while the
+// script is still running, because the EXIT trap removes a temp-fallback
+// overlay before the test could inspect it — the entries of the wired data
+// dir with their symlink targets (`overlay=<target>`, or the entry path
+// itself when it is not a symlink).
 func offlineEchoStandIn(t *testing.T, dir string) string {
 	t.Helper()
 	bin := filepath.Join(dir, "mise-bin")
@@ -589,7 +593,13 @@ func offlineEchoStandIn(t *testing.T, dir string) string {
 	script := "#!/bin/sh\n" +
 		"case \"$1\" in\n" +
 		"  --version) printf 'mise 2024.10.29 (stand-in)\\n' ;;\n" +
-		"  run) printf 'offline=%s\\n' \"${MISE_OFFLINE:-unset}\"; printf 'data=%s\\n' \"${MISE_DATA_DIR:-unset}\"; printf 'bootstrap-ran\\n' ;;\n" +
+		"  run) printf 'offline=%s\\n' \"${MISE_OFFLINE:-unset}\"; printf 'data=%s\\n' \"${MISE_DATA_DIR:-unset}\"; \\\n" +
+		"    if [ -n \"${MISE_DATA_DIR:-}\" ] && [ -d \"$MISE_DATA_DIR\" ]; then \\\n" +
+		"      for entry in \"$MISE_DATA_DIR\"/*; do \\\n" +
+		"        [ -e \"$entry\" ] || continue; \\\n" +
+		"        printf 'overlay=%s\\n' \"$(readlink \"$entry\" || printf '%s' \"$entry\")\"; \\\n" +
+		"      done; \\\n" +
+		"    fi; printf 'bootstrap-ran\\n' ;;\n" +
 		"  x) printf 'MISE_OFFLINE_SEEN=%s\\000MISE_DATA_DIR_SEEN=%s\\000' \"${MISE_OFFLINE:-unset}\" \"${MISE_DATA_DIR:-unset}\" ;;\n" +
 		"  *) printf 'unexpected mise invocation: %s\\n' \"$*\" >&2; exit 64 ;;\n" +
 		"esac\n"
@@ -689,7 +699,9 @@ func TestScriptsExecuteForReal(t *testing.T) {
 		}
 		// The writable overlay lives outside the baked dir and symlinks
 		// every baked entry, so mise reads the baked installs without the
-		// image layer ever being written.
+		// image layer ever being written. The stand-in reports the overlay's
+		// entries while the script runs — the EXIT trap removes a
+		// temp-fallback overlay before the test could read it from disk.
 		var dataDir string
 		for _, line := range strings.Split(stdout, "\n") {
 			if data, ok := strings.CutPrefix(line, "data="); ok && data != "unset" {
@@ -702,17 +714,9 @@ func TestScriptsExecuteForReal(t *testing.T) {
 		if strings.HasPrefix(dataDir, baked) {
 			t.Errorf("MISE_DATA_DIR = %q, want a writable overlay, not the baked dir itself", dataDir)
 		}
-		entries, err := os.ReadDir(dataDir)
-		if err != nil {
-			t.Fatalf("wired data dir: %v", err)
-		}
 		symlinked := map[string]bool{}
-		for _, e := range entries {
-			if e.Type()&os.ModeSymlink != 0 {
-				target, err := os.Readlink(filepath.Join(dataDir, e.Name()))
-				if err != nil {
-					t.Fatal(err)
-				}
+		for _, line := range strings.Split(stdout, "\n") {
+			if target, ok := strings.CutPrefix(line, "overlay="); ok {
 				symlinked[target] = true
 			}
 		}
