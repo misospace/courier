@@ -43,6 +43,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -654,7 +655,7 @@ func (c *canary) load() error {
 	passed := view.Origin == skills.OriginBundle &&
 		view.Digest == pinned &&
 		len(view.Files) > 0
-	if c.synthetic && !contains(view.Files, canaryAsset) {
+	if c.synthetic && !slices.Contains(view.Files, canaryAsset) {
 		passed = false
 	}
 	detail := fmt.Sprintf("%s origin %s digest %s; marker %s; assets %s",
@@ -736,7 +737,7 @@ func (c *canary) evidence() {
 		index, found := skillIndexMessage(first.Messages, c.skillSet)
 		c.check(CheckSkillIndex, found, indexDetail(index, found))
 		offered := toolNames(first.Tools)
-		c.check(CheckToolOffered, contains(offered, harness.ToolSkill), "tools offered: "+strings.Join(offered, ", "))
+		c.check(CheckToolOffered, slices.Contains(offered, harness.ToolSkill), "tools offered: "+strings.Join(offered, ", "))
 		if found {
 			if c.synthetic {
 				c.note("skill index: %s", excerpt(index))
@@ -1109,16 +1110,6 @@ func checkoutDigest(dir string) (string, error) {
 		hash.Write(content)
 	}
 	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
-}
-
-// contains reports whether the list holds the value.
-func contains(values []string, value string) bool {
-	for _, candidate := range values {
-		if candidate == value {
-			return true
-		}
-	}
-	return false
 }
 
 // excerpt bounds a text the report prints.

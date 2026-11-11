@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
@@ -98,7 +99,7 @@ func (a *Authenticator) Authenticate(ctx context.Context, token string) (Identit
 		// own text is not echoed into the error.
 		return Identity{}, &IdentityUnavailableError{Err: fmt.Errorf("review control token: the token could not be checked")}
 	}
-	if !status.Authenticated || !contains(status.Audiences, BrokerAudience) {
+	if !status.Authenticated || !slices.Contains(status.Audiences, BrokerAudience) {
 		return Identity{}, fmt.Errorf("token is unauthenticated or lacks broker audience")
 	}
 	user := status.User
@@ -195,13 +196,4 @@ func singleExtra(extra map[string]authenticationv1.ExtraValue, key string) (stri
 		return "", false
 	}
 	return values[0], values[0] != ""
-}
-
-func contains(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
 }
