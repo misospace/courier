@@ -37,7 +37,9 @@ func (f *integrationForge) ResolveRepository(_ context.Context, name string) (fo
 	return r, nil
 }
 func (f *integrationForge) ReadRef(_ context.Context, repo forge.Repository, ref string) (forge.RefState, error) {
-	out, err := exec.Command("git", "--git-dir", f.paths[repo.Canonical], "rev-parse", "--verify", "refs/heads/"+ref).CombinedOutput()
+	cmd := exec.Command("git", "--git-dir", f.paths[repo.Canonical], "rev-parse", "--verify", "refs/heads/"+ref)
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1")
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return forge.RefState{Ref: ref}, nil
 	}
@@ -119,7 +121,9 @@ func (f *integrationForge) tip(repo, ref string) string {
 	if f.paths[repo] == "" {
 		return ""
 	}
-	out, err := exec.Command("git", "--git-dir", f.paths[repo], "rev-parse", "--verify", "refs/heads/"+ref).Output()
+	cmd := exec.Command("git", "--git-dir", f.paths[repo], "rev-parse", "--verify", "refs/heads/"+ref)
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1")
+	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}
@@ -357,7 +361,7 @@ func igGit(t *testing.T, dir string, args ...string) []byte {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, out)

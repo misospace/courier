@@ -144,6 +144,7 @@ func TestGitPusherContributePinsBaseAndForkAndPushesOnlyFork(t *testing.T) {
 		t.Fatalf("upstream base tip = %s, want %s", got, base)
 	}
 	cmd := exec.Command("git", "--git-dir", remote, "rev-parse", "refs/heads/"+policy.WorkRef)
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1")
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Fatalf("upstream remote gained the work ref: %s", out)
@@ -283,7 +284,7 @@ func gitTransportCommand(t *testing.T, dir string, args ...string) []byte {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, out)
