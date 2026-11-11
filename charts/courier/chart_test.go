@@ -1,13 +1,16 @@
 package courier
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	courier "github.com/misospace/courier/api/v1alpha1"
 	bootstrap "github.com/misospace/courier/internal/bootstrap"
@@ -24,9 +27,7 @@ func TestChartRendersDispatchConfiguration(t *testing.T) {
 	}
 
 	chartDir := copyChart(t)
-	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
-		t.Fatalf("configure chart repository: %v", err)
-	}
+	configureChartRepository(t)
 	runHelm(t, chartDir, "dependency", "build")
 
 	enabled := runHelm(t, chartDir, "template", "courier", ".",
@@ -92,9 +93,7 @@ func TestChartRendersLabelSourceConfiguration(t *testing.T) {
 		t.Skip("helm is not installed")
 	}
 	chartDir := copyChart(t)
-	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
-		t.Fatalf("configure chart repository: %v", err)
-	}
+	configureChartRepository(t)
 	runHelm(t, chartDir, "dependency", "build")
 	enabled := runHelm(t, chartDir, "template", "courier", ".",
 		"--set", "labelSource.enabled=true",
@@ -141,9 +140,7 @@ func TestChartLabelSourceAcceptsOperatorCredentialSeam(t *testing.T) {
 		t.Skip("helm is not installed")
 	}
 	chartDir := copyChart(t)
-	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
-		t.Fatalf("configure chart repository: %v", err)
-	}
+	configureChartRepository(t)
 	runHelm(t, chartDir, "dependency", "build")
 
 	seamOnly := runHelm(t, chartDir, "template", "courier", ".",
@@ -312,6 +309,43 @@ func runHelmOutput(t *testing.T, chartDir string, args ...string) (string, error
 	return string(output), err
 }
 
+// configureChartRepository adds the chart's upstream helm repository. The
+// fetch is the only network step the chart tests need, so a refusal must
+// name itself instead of exiting silently: go test does not show the
+// subprocess streams of a failing test, so the command output is captured
+// into the report, and one transient refusal gets a bounded retry. The
+// repository config is process-global, so configuration and retry run once
+// per test run and a persistent refusal skips the remaining tests
+// immediately with the same captured output — the in-container image lane
+// admits no egress guarantee for a third-party Pages host, and chart
+// rendering is that lane's incidental coverage, not its contract: the CI
+// chart job owns the authoritative gate and runs this package after its own
+// hard repository-setup step, so a skip can never replace a runner-side
+// failure.
+var configureChartRepositoryOnce sync.Once
+var configureChartRepositoryFailure string
+
+func configureChartRepository(t *testing.T) {
+	t.Helper()
+	configureChartRepositoryOnce.Do(func() {
+		var output []byte
+		var err error
+		for attempt := 1; attempt <= 3; attempt++ {
+			output, err = exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").CombinedOutput()
+			if err == nil {
+				return
+			}
+			if attempt < 3 {
+				time.Sleep(time.Duration(attempt) * time.Second)
+			}
+		}
+		configureChartRepositoryFailure = fmt.Sprintf("skipping chart rendering: configure chart repository: %v\n%s", err, output)
+	})
+	if configureChartRepositoryFailure != "" {
+		t.Skip(configureChartRepositoryFailure)
+	}
+}
+
 // chartDoc returns the first rendered document of the given kind whose body
 // contains the needle. Renderers interleave template sources, so the kind
 // alone can be ambiguous; the needle pins the document. The kind matches the
@@ -333,9 +367,7 @@ func TestServiceMonitorOptional(t *testing.T) {
 	}
 
 	chartDir := copyChart(t)
-	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
-		t.Fatalf("configure chart repository: %v", err)
-	}
+	configureChartRepository(t)
 	runHelm(t, chartDir, "dependency", "build")
 
 	// Off by default: no ServiceMonitor and no metrics Service.
@@ -407,9 +439,7 @@ func TestChartRendersEvidenceIntake(t *testing.T) {
 	}
 
 	chartDir := copyChart(t)
-	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
-		t.Fatalf("configure chart repository: %v", err)
-	}
+	configureChartRepository(t)
 	runHelm(t, chartDir, "dependency", "build")
 
 	// Off by default: no intake flags and no evidence Service.
@@ -492,9 +522,7 @@ func TestChartRendersRetentionConfiguration(t *testing.T) {
 	}
 
 	chartDir := copyChart(t)
-	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
-		t.Fatalf("configure chart repository: %v", err)
-	}
+	configureChartRepository(t)
 	runHelm(t, chartDir, "dependency", "build")
 
 	out := runHelm(t, chartDir, "template", "courier", ".",
@@ -641,9 +669,7 @@ func TestChartRendersMultipleLaneBindings(t *testing.T) {
 	}
 
 	chartDir := copyChart(t)
-	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
-		t.Fatalf("configure chart repository: %v", err)
-	}
+	configureChartRepository(t)
 	runHelm(t, chartDir, "dependency", "build")
 
 	out := runHelm(t, chartDir, "template", "courier", ".",
@@ -683,6 +709,7 @@ func TestChartRejectsAmbiguousDispatchLaneValues(t *testing.T) {
 	}
 
 	chartDir := copyChart(t)
+	configureChartRepository(t)
 	runHelm(t, chartDir, "dependency", "build")
 
 	out, err := runHelmOutput(t, chartDir, "template", "courier", ".",
@@ -708,6 +735,7 @@ func TestChartRejectsDuplicateDispatchAgentIdentity(t *testing.T) {
 	}
 
 	chartDir := copyChart(t)
+	configureChartRepository(t)
 	runHelm(t, chartDir, "dependency", "build")
 
 	out, err := runHelmOutput(t, chartDir, "template", "courier", ".",
@@ -750,9 +778,7 @@ func TestChartRendersSecureTopologyConfiguration(t *testing.T) {
 	}
 
 	chartDir := copyChart(t)
-	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
-		t.Fatalf("configure chart repository: %v", err)
-	}
+	configureChartRepository(t)
 	runHelm(t, chartDir, "dependency", "build")
 
 	enabled := runHelm(t, chartDir, "template", "courier", ".",
@@ -936,9 +962,7 @@ func TestChartRendersModelGatewayNetworkPolicy(t *testing.T) {
 	}
 
 	chartDir := copyChart(t)
-	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
-		t.Fatalf("configure chart repository: %v", err)
-	}
+	configureChartRepository(t)
 	runHelm(t, chartDir, "dependency", "build")
 
 	// The chart hardcodes the operator's coordinator label keys; the guard
@@ -1081,9 +1105,7 @@ func TestChartRejectsPartialModelGatewayNetworkPolicy(t *testing.T) {
 	}
 
 	chartDir := copyChart(t)
-	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
-		t.Fatalf("configure chart repository: %v", err)
-	}
+	configureChartRepository(t)
 	runHelm(t, chartDir, "dependency", "build")
 
 	cases := []struct {
@@ -1204,9 +1226,7 @@ func TestChartRendersSecureBrokerBindingAuthority(t *testing.T) {
 		t.Skip("helm is not installed")
 	}
 	chartDir := copyChart(t)
-	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
-		t.Fatalf("configure chart repository: %v", err)
-	}
+	configureChartRepository(t)
 	runHelm(t, chartDir, "dependency", "build")
 
 	secureArgs := func(extra ...string) []string {
@@ -1289,9 +1309,7 @@ func TestChartRendersBootstrapLaneProfiles(t *testing.T) {
 	}
 
 	chartDir := copyChart(t)
-	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
-		t.Fatalf("configure chart repository: %v", err)
-	}
+	configureChartRepository(t)
 	runHelm(t, chartDir, "dependency", "build")
 
 	valuesFile := filepath.Join(chartDir, "values-lanes.yaml")
@@ -1398,9 +1416,7 @@ func TestChartRollsManagerOnBootstrapLaneChanges(t *testing.T) {
 	}
 
 	chartDir := copyChart(t)
-	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
-		t.Fatalf("configure chart repository: %v", err)
-	}
+	configureChartRepository(t)
 	runHelm(t, chartDir, "dependency", "build")
 
 	writeLaneValues := func(framing string) string {
@@ -1448,9 +1464,7 @@ func TestChartRejectsInvalidBootstrapLaneValues(t *testing.T) {
 	}
 
 	chartDir := copyChart(t)
-	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
-		t.Fatalf("configure chart repository: %v", err)
-	}
+	configureChartRepository(t)
 	runHelm(t, chartDir, "dependency", "build")
 
 	out, err := runHelmOutput(t, chartDir, "template", "courier", ".",
@@ -1555,9 +1569,7 @@ func TestChartRendersSkillBundles(t *testing.T) {
 		t.Skip("helm is not installed")
 	}
 	chartDir := copyChart(t)
-	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
-		t.Fatalf("configure chart repository: %v", err)
-	}
+	configureChartRepository(t)
 	runHelm(t, chartDir, "dependency", "build")
 	valuesFile := filepath.Join(chartDir, "values-skills.yaml")
 	bundleDir := t.TempDir()
@@ -1644,9 +1656,7 @@ func TestChartRejectsInvalidSkillBundleValues(t *testing.T) {
 		t.Skip("helm is not installed")
 	}
 	chartDir := copyChart(t)
-	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
-		t.Fatalf("configure chart repository: %v", err)
-	}
+	configureChartRepository(t)
 	runHelm(t, chartDir, "dependency", "build")
 
 	out, err := runHelmOutput(t, chartDir, "template", "courier", ".",
@@ -1705,9 +1715,7 @@ func TestChartRendersCronSchedules(t *testing.T) {
 		t.Skip("helm is not installed")
 	}
 	chartDir := copyChart(t)
-	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
-		t.Fatalf("configure chart repository: %v", err)
-	}
+	configureChartRepository(t)
 	runHelm(t, chartDir, "dependency", "build")
 	valuesFile := filepath.Join(chartDir, "values-cron.yaml")
 	values := `cron:
@@ -1780,9 +1788,7 @@ func TestChartRejectsInvalidCronValues(t *testing.T) {
 		t.Skip("helm is not installed")
 	}
 	chartDir := copyChart(t)
-	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
-		t.Fatalf("configure chart repository: %v", err)
-	}
+	configureChartRepository(t)
 	runHelm(t, chartDir, "dependency", "build")
 	out, err := runHelmOutput(t, chartDir, "template", "courier", ".",
 		"--set", "cron.schedules.Bad_Name.repo=misospace/courier",
@@ -1869,6 +1875,7 @@ func TestChartRendersSideBySideOwnershipConfiguration(t *testing.T) {
 	}
 
 	chartDir := copyChart(t)
+	configureChartRepository(t)
 	runHelm(t, chartDir, "dependency", "build")
 
 	// The default install carries no ownership surface at all: one
@@ -2086,6 +2093,7 @@ func TestChartRejectsOwnershipBoundaryThatStrandsRuns(t *testing.T) {
 	}
 
 	chartDir := copyChart(t)
+	configureChartRepository(t)
 	runHelm(t, chartDir, "dependency", "build")
 
 	secureBase := []string{
@@ -2228,9 +2236,7 @@ func TestChartRendersDependencyCache(t *testing.T) {
 	}
 
 	chartDir := copyChart(t)
-	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
-		t.Fatalf("configure chart repository: %v", err)
-	}
+	configureChartRepository(t)
 	runHelm(t, chartDir, "dependency", "build")
 
 	secureBase := []string{
@@ -2338,9 +2344,7 @@ func TestChartRejectsDependencyCacheReplicaScaling(t *testing.T) {
 	}
 
 	chartDir := copyChart(t)
-	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
-		t.Fatalf("configure chart repository: %v", err)
-	}
+	configureChartRepository(t)
 	runHelm(t, chartDir, "dependency", "build")
 
 	secureBase := []string{

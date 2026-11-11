@@ -19,6 +19,57 @@ import (
 // the parse reads. The two bounds must stay paired; change them together.
 const MaxCaptureBytes = 64 << 10
 
+// DefaultToolchainDir is the worker-image path the toolchain contract is
+// baked into at build time: a complete mise data dir (`mise install
+// --locked` against the repository's own pins) and, beside it, the
+// pre-materialized envtest asset store. Baking makes the approved
+// contract's toolchain path hermetic by construction against the secure
+// worker's network contract (#797): mise downloads nothing, because
+// everything the contract's tool pins resolve to already exists in the
+// image. A deployment whose image lacks the bake simply has no such
+// directory and keeps the pre-#797 networked behavior.
+const DefaultToolchainDir = "/usr/local/share/courier/mise-data"
+
+// ToolchainDirEnv is the worker environment variable a deployment may set
+// to relocate the baked toolchain dir. It is deployment-supplied only —
+// no brief-, model-, or repository-supplied value can set it, so the
+// scripts stay fixed constants plus trusted environment.
+const ToolchainDirEnv = "COURIER_MISE_TOOLCHAIN_DIR"
+
+// hermeticWiring is the shell both the bootstrap task and the
+// environment-capture task run before mise resolves tools (#797). When
+// the baked toolchain dir is present, mise is pinned to it for the rest
+// of the task: MISE_DATA_DIR points at a per-run writable overlay whose
+// entries symlink the baked dir (mise reads the baked installs but never
+// writes the image layer), and MISE_OFFLINE=true turns every mise HTTP
+// request into a fast, local refusal — a pin the bake cannot satisfy
+// fails in milliseconds with an actionable error instead of stalling
+// into the worker's network-policy black hole and dying as an opaque
+// exit 1. The overlay lives on the per-run toolchain-cache volume when
+// one is mounted writable, so the environment capture's MISE_DATA_DIR
+// survives into every later task and mise keeps resolving the baked
+// tools for the model's own commands; a topology without the volume
+// falls back to a temporary dir. When the baked dir is absent the wiring
+// exports nothing: networked mise, exactly the pre-#797 behavior.
+const hermeticWiring = "toolchain=\"${" + ToolchainDirEnv + ":-" + DefaultToolchainDir + "}\"\n" + "if [ -d \"$toolchain\" ]; then\n" +
+	"  cache_root=/courier-toolchain-cache\n" +
+	"  if [ ! -w \"$cache_root\" ]; then\n" +
+	"    cache_root=\"$(mktemp -d)\"\n" +
+	"    cache_tmp=\"$cache_root\"\n" +
+	"  fi\n" +
+	"  MISE_DATA_DIR=\"$cache_root/mise-data\"\n" +
+	"  if [ ! -d \"$MISE_DATA_DIR\" ]; then\n" +
+	"    mkdir -p \"$MISE_DATA_DIR\"\n" +
+	"    for entry in \"$toolchain\"/*; do\n" +
+	"      [ -e \"$entry\" ] || continue\n" +
+	"      ln -s \"$entry\" \"$MISE_DATA_DIR/$(basename \"$entry\")\"\n" +
+	"    done\n" +
+	"  fi\n" +
+	"  export MISE_DATA_DIR\n" +
+	"  MISE_OFFLINE=true\n" +
+	"  export MISE_OFFLINE\n" +
+	"fi\n"
+
 // oidPattern is the strict shape a base revision OID must have before it is
 // interpolated into a task script: bare lowercase hex, 160-bit (SHA-1) or
 // 256-bit (SHA-256) git object IDs only.
@@ -68,6 +119,12 @@ func validBaseOID(baseOID string) bool {
 // ParseBootstrapDiagnostics. The trap preserves the original exit code via
 // `exit "$rc"` and keeps a failing diag (`courier_diag || true`) from
 // changing it; no repo code can run after the trap.
+// Before mise resolves tools, the script runs the hermetic toolchain
+// wiring (#797): when the worker image bakes the toolchain contract, mise
+// resolves every pinned tool from the baked data dir under MISE_OFFLINE=true
+// and never touches the network; when the image carries no bake, the wiring
+// exports nothing and mise behaves exactly as before #797. See
+// hermeticWiring.
 // The bootstrap task and the environment capture are two separately
 // dispatched tasks: each gets its own liveness bound, never one shared
 // budget.
@@ -92,20 +149,29 @@ func BootstrapScript(baseOID string) (string, error) {
 		"base='" + baseOID + "'\n" +
 		"workspace=\"$(pwd)\"\n" +
 		"src=\"$(mktemp -d)\"\n" +
+		// Initialized before courier_diag is even defined: the EXIT trap can
+		// fire on a failure before the hermetic wiring below ever ran, and
+		// `set -u` must never abort the trusted terminal emission over an
+		// unset wiring variable.
+		"toolchain=''\n" +
+		"cache_tmp=''\n" +
 		"courier_diag() {\n" +
 		"  printf 'courier-mise-path=%s\\n' \"$(command -v mise)\"\n" +
 		"  printf 'courier-mise-version=%s\\n' \"$(mise --version)\"\n" +
 		"  printf 'courier-mise-data-dir=%s\\n' \"${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}\"\n" +
+		"  printf 'courier-mise-toolchain=%s\\n' \"$toolchain\"\n" +
+		"  printf 'courier-mise-offline=%s\\n' \"${MISE_OFFLINE:-false}\"\n" +
 		"}\n" +
 		// The trap is the single terminal emission: it runs last on success
 		// and on every failure path, preserves the original exit code, and
 		// neither a failing cleanup nor a failing diag can change it.
 		"archive=\"$(mktemp)\"\n" +
-		"trap 'rc=$?; rm -rf \"$src\" \"$archive\" || true; courier_diag || true; exit \"$rc\"' EXIT\n" +
+		"trap 'rc=$?; rm -rf \"$src\" \"$archive\" \"$cache_tmp\" || true; courier_diag || true; exit \"$rc\"' EXIT\n" +
 		"git archive --format=tar -o \"$archive\" \"$base\"\n" +
 		"tar -xf \"$archive\" -C \"$src\"\n" +
 		"test -f \"$src/" + ConfigPath + "\"\n" +
 		"cd \"$src\"\n" +
+		hermeticWiring +
 		"mise run bootstrap\n" +
 		"if [ -d \"$src/bin\" ]; then\n" +
 		"  mkdir -p \"$workspace/bin\"\n" +
@@ -136,11 +202,13 @@ func EnvCaptureScript(baseOID string) (string, error) {
 		"src=\"$(mktemp -d)\"\n" +
 		"capture=\"$(mktemp)\"\n" +
 		"archive=\"$(mktemp)\"\n" +
-		"trap 'rm -rf \"$src\" \"$capture\" \"$archive\" || true' EXIT\n" +
+		"cache_tmp=''\n" +
+		"trap 'rm -rf \"$src\" \"$capture\" \"$archive\" \"$cache_tmp\" || true' EXIT\n" +
 		"git archive --format=tar -o \"$archive\" \"$base\"\n" +
 		"tar -xf \"$archive\" -C \"$src\"\n" +
 		"test -f \"$src/" + ConfigPath + "\"\n" +
 		"cd \"$src\"\n" +
+		hermeticWiring +
 		"mise x -- env -0 > \"$capture\"\n" +
 		"size=\"$(wc -c < \"$capture\")\"\n" +
 		"test \"$size\" -le " + strconv.Itoa(MaxCaptureBytes) + "\n" +
@@ -151,9 +219,11 @@ func EnvCaptureScript(baseOID string) (string, error) {
 // script above. Any other courier-* line is not a diagnostic this package
 // agreed to consume.
 const (
-	diagMisePathKey    = "courier-mise-path"
-	diagMiseVersionKey = "courier-mise-version"
-	diagMiseDataDirKey = "courier-mise-data-dir"
+	diagMisePathKey      = "courier-mise-path"
+	diagMiseVersionKey   = "courier-mise-version"
+	diagMiseDataDirKey   = "courier-mise-data-dir"
+	diagMiseToolchainKey = "courier-mise-toolchain"
+	diagMiseOfflineKey   = "courier-mise-offline"
 )
 
 // maxDiagnosticValueBytes bounds one diagnostic value: diagnostics are
@@ -165,8 +235,9 @@ const maxDiagnosticValueBytes = 300
 var errMalformedEnvCapture = errors.New("malformed environment capture")
 
 // ParseBootstrapDiagnostics extracts the diagnostic lines the bootstrap
-// task emits — keys exactly courier-mise-path, courier-mise-version, and
-// courier-mise-data-dir — from the task's stdout. Any other line, of any
+// task emits — keys exactly courier-mise-path, courier-mise-version,
+// courier-mise-data-dir, courier-mise-toolchain, and courier-mise-offline
+// — from the task's stdout. Any other line, of any
 // shape, is ignored: worker output is untrusted and only these three
 // fixed-key facts are ever consumed. A value that is not printable ASCII
 // (0x20–0x7E) or that exceeds 300 bytes is dropped, never truncated. When a
@@ -184,7 +255,7 @@ func ParseBootstrapDiagnostics(stdout string) map[string]string {
 			continue
 		}
 		switch key {
-		case diagMisePathKey, diagMiseVersionKey, diagMiseDataDirKey:
+		case diagMisePathKey, diagMiseVersionKey, diagMiseDataDirKey, diagMiseToolchainKey, diagMiseOfflineKey:
 		default:
 			continue
 		}

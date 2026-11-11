@@ -3,10 +3,14 @@ package harness
 // BootstrapReceipt is the structured result of one bounded bootstrap
 // execution in the secure worker (#414): what executed, how long each
 // bounded command took, what it emitted, and the validated diagnostics
-// (mise executable path, version, data dir). Values are composed by
-// trusted control: elapsed and exit codes from protocol results,
-// diagnostics parsed from worker stdout under devenv's fixed-key charset
-// validation. No secret values, no raw worker output.
+// (mise executable path, version, data dir, toolchain bake, offline
+// mode). Values are composed by trusted control: elapsed and exit codes
+// from protocol results, diagnostics parsed from worker stdout under
+// devenv's fixed-key charset validation. No secret values; the stderr
+// tails are the contract task's own bounded output, carried as
+// observability-only diagnostic text (#797 — the tail is what names the
+// exact download or pin that refused) and never entering the durable
+// blocker reason or the model transcript.
 type BootstrapReceipt struct {
 	// Status is "applied" or "failed".
 	Status string
@@ -28,8 +32,17 @@ type BootstrapReceipt struct {
 	// produced.
 	EnvKeys int
 	// Diagnostics carries the validated bootstrap-task diagnostics
-	// (courier-mise-path, courier-mise-version, courier-mise-data-dir).
+	// (courier-mise-path, courier-mise-version, courier-mise-data-dir,
+	// courier-mise-toolchain, courier-mise-offline).
 	Diagnostics map[string]string
+	// BootstrapStderrTail is the bounded stderr tail the bootstrap task
+	// returned, when it failed; "" on success or when the task never ran.
+	// Untrusted but bounded (protocol's 64 KiB tail bound) diagnostic
+	// text: observability only, never a durable reason.
+	BootstrapStderrTail string
+	// CaptureStderrTail is the bounded stderr tail the environment-capture
+	// task returned, when it failed; "" otherwise.
+	CaptureStderrTail string
 }
 
 // Bootstrap receipt status values.

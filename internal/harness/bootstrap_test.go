@@ -787,6 +787,15 @@ func TestBootstrapReceiptSinkReceivesFailedReceiptOnNonzeroExit(t *testing.T) {
 	if len(receipt.Diagnostics) != 0 {
 		t.Fatalf("diagnostics = %v, want none when the bootstrap failed before reporting", receipt.Diagnostics)
 	}
+	// The failed task's bounded stderr tail rides the receipt as diagnostic
+	// evidence (#797): it names the download or pin that refused, without
+	// entering the durable reason.
+	if receipt.BootstrapStderrTail != "fatal: mise failed\nsecond line" {
+		t.Errorf("bootstrap stderr tail = %q, want the task's bounded tail", receipt.BootstrapStderrTail)
+	}
+	if receipt.CaptureStderrTail != "" {
+		t.Errorf("capture stderr tail = %q, want empty when the capture never ran", receipt.CaptureStderrTail)
+	}
 	if got := worker.dispatchCount(); got != 1 {
 		t.Fatalf("worker dispatches = %d, want 1 (no capture after a failed bootstrap)", got)
 	}

@@ -559,6 +559,9 @@ func WorkerPod(run *courier.CoderRun, image string, controlIncarnationUID string
 		{Name: EnvWorkerPublicKey, Value: base64.StdEncoding.EncodeToString(publicKey)},
 		// The same toolchain reference the legacy coordinator env carries.
 		{Name: "COURIER_TOOLCHAIN_DIR", Value: executor.ToolchainReferencePath},
+		// The baked envtest asset store the contract's bootstrap resolves
+		// offline (#797); consumers guard on the directory's presence.
+		{Name: executor.EnvtestStoreEnv, Value: executor.EnvtestStorePath},
 		// The workspace emptyDir's mountpoint is root-owned — fsGroup adjusts
 		// the group and the setgid bit, never the owner — while the pod runs
 		// as the runtime uid, so git's ownership gate refuses the repository

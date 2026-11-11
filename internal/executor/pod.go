@@ -40,6 +40,14 @@ const (
 	scratchPath            = "/var/tmp/courier-scratch"
 	ToolchainCachePath     = "/courier-toolchain-cache" // read-write; lane toolchain caches (GOMODCACHE etc.) live here, path pinned by the runtime image
 	ToolchainReferencePath = "/courier-toolchain"       // same volume, read-only; the coordinator's inspection entry point
+	// EnvtestStorePath is where the runtime image bakes the pre-materialized
+	// envtest asset store (#797): the contract's bootstrap resolves envtest
+	// assets from it under the worker's offline contract instead of
+	// downloading from the internet. Images without the bake have no such
+	// directory; consumers guard on its presence and fall back.
+	EnvtestStorePath = "/usr/local/share/courier/envtest-store"
+	// EnvtestStoreEnv carries EnvtestStorePath into the worker environment.
+	EnvtestStoreEnv = "COURIER_ENVTEST_STORE"
 )
 
 // PodConfig controls runtime-specific details without putting provider or

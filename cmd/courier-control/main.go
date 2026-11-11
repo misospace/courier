@@ -772,13 +772,16 @@ func (s modelRequestSink) ModelRequestObserved(observation harness.RequestObserv
 // bootstrapReceiptSink adapts the harness's structured bootstrap receipts
 // (#414) onto the run's structured event log: one workspace.bootstrap line
 // carrying the status, the fixed failure reason when failed, each bounded
-// task's elapsed milliseconds and exit code, the environment-key count, and
-// the validated mise diagnostics (executable path, version, data dir). The
-// receipt is composed trusted-side and carries no secret values and no raw
-// worker output. The status maps onto the event's status vocabulary —
-// "applied" emits ok, "failed" emits error — and detail is Verbose so the
-// receipt reaches the log store at info level. Emission is best-effort: a
-// dropped event is noted on stderr and the run continues.
+// task's elapsed milliseconds and exit code, the environment-key count, the
+// validated mise diagnostics (executable path, version, data dir, toolchain
+// bake, offline mode), and the bounded stderr tails a failed task returned —
+// the tail is what names the exact download or pin that refused (#797). The
+// receipt is composed trusted-side and carries no secret values; the tails
+// are untrusted but bounded task output, observability only, and never enter
+// the durable failure reason. The status maps onto the event's status
+// vocabulary — "applied" emits ok, "failed" emits error — and detail is
+// Verbose so the receipt reaches the log store at info level. Emission is
+// best-effort: a dropped event is noted on stderr and the run continues.
 type bootstrapReceiptSink struct {
 	emitter    *courierlog.Emitter
 	stderr     io.Writer
@@ -800,6 +803,15 @@ func (s bootstrapReceiptSink) BootstrapRecorded(receipt harness.BootstrapReceipt
 		"capture_exit_code":    receipt.CaptureExitCode,
 		"env_keys":             receipt.EnvKeys,
 		"mise_diagnostics":     receipt.Diagnostics,
+	}
+	// The bounded stderr tails are diagnostic evidence of a refusal (#797):
+	// emitted only when a task actually returned one, so an applied receipt
+	// carries no empty-tail fields.
+	if receipt.BootstrapStderrTail != "" {
+		detail["bootstrap_stderr"] = receipt.BootstrapStderrTail
+	}
+	if receipt.CaptureStderrTail != "" {
+		detail["capture_stderr"] = receipt.CaptureStderrTail
 	}
 	err := s.emitter.Emit(courierlog.Event{
 		Type:    courierlog.EventWorkspaceBootstrap,

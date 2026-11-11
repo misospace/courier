@@ -106,7 +106,16 @@ run_tools_steps() {
 	# envtest assets only — the suite itself stays behind an explicit task.
 	k8s=$(sed -n 's/^ENVTEST_K8S_VERSION ?= //p' Makefile)
 	[ -n "$k8s" ] || fail "could not read ENVTEST_K8S_VERSION from Makefile"
-	assets=$(bin/setup-envtest use -p path "$k8s")
+	# Under the offline toolchain contract (a secure worker with the baked
+	# toolchain image, see #797) the assets resolve only from the image's
+	# pre-materialized store: networked index fetches are refused by the
+	# worker's network contract, so installed-only resolution names the
+	# missing pin honestly instead of dying on a download.
+	if [ "${MISE_OFFLINE:-}" = "true" ] && [ -n "${COURIER_ENVTEST_STORE:-}" ] && [ -d "$COURIER_ENVTEST_STORE" ]; then
+		assets=$(XDG_DATA_HOME="$COURIER_ENVTEST_STORE" ENVTEST_INSTALLED_ONLY=true bin/setup-envtest use -p path "$k8s")
+	else
+		assets=$(bin/setup-envtest use -p path "$k8s")
+	fi
 
 	log "environment ready"
 	printf 'git: %s (%s)\n' "$git_version" "$(command -v git)"

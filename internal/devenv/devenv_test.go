@@ -281,6 +281,13 @@ func TestBootstrapAndEnvCaptureScripts(t *testing.T) {
 		"cd \"$src\"",
 		"mise run bootstrap",
 		"courier-mise-path=",
+		// The hermetic toolchain wiring (#797) runs before mise resolves
+		// tools, and the diagnostics report what it wired.
+		`toolchain="${COURIER_MISE_TOOLCHAIN_DIR:-` + DefaultToolchainDir + `}"`,
+		"MISE_OFFLINE=true\n",
+		"export MISE_OFFLINE\n",
+		"courier-mise-toolchain=",
+		"courier-mise-offline=",
 	} {
 		if !strings.Contains(bootstrap, want) {
 			t.Errorf("BootstrapScript = %q, want it to contain %q", bootstrap, want)
@@ -292,7 +299,7 @@ func TestBootstrapAndEnvCaptureScripts(t *testing.T) {
 	// repository-local bin/ transfer (#446 review) runs only after a
 	// successful bootstrap and before the trap deletes the materialization.
 	if strings.Count(bootstrap, "courier_diag || true") != 1 ||
-		!strings.Contains(bootstrap, `trap 'rc=$?; rm -rf "$src" "$archive" || true; courier_diag || true; exit "$rc"' EXIT`) ||
+		!strings.Contains(bootstrap, `trap 'rc=$?; rm -rf "$src" "$archive" "$cache_tmp" || true; courier_diag || true; exit "$rc"' EXIT`) ||
 		!strings.Contains(bootstrap, "mise run bootstrap\nif [ -d \"$src/bin\" ]; then\n  mkdir -p \"$workspace/bin\"\n  cp -a \"$src/bin/.\" \"$workspace/bin/\"\nfi\n") ||
 		!strings.HasSuffix(bootstrap, "fi\n") {
 		t.Errorf("BootstrapScript = %q, want a single terminal EXIT-trap emission, and a post-bootstrap bin/ transfer as the final statement", bootstrap)
@@ -311,6 +318,10 @@ func TestBootstrapAndEnvCaptureScripts(t *testing.T) {
 		"mise x -- env -0 > \"$capture\"",
 		"test \"$size\" -le " + strconv.Itoa(MaxCaptureBytes),
 		"cat \"$capture\"",
+		// The capture wires the same hermetic toolchain contract before
+		// mise resolves the activated environment (#797).
+		`toolchain="${COURIER_MISE_TOOLCHAIN_DIR:-` + DefaultToolchainDir + `}"`,
+		"export MISE_OFFLINE\n",
 	} {
 		if !strings.Contains(capture, want) {
 			t.Errorf("EnvCaptureScript = %q, want it to contain %q", capture, want)
@@ -363,11 +374,15 @@ func TestScriptsRejectInvalidBaseOID(t *testing.T) {
 func TestParseBootstrapDiagnostics(t *testing.T) {
 	stdout := "mise 2024.x installed\ncourier-mise-path=/usr/bin/mise\n" +
 		"courier-mise-version=2024.10.0\ncourier-mise-data-dir=/data/mise\n" +
+		"courier-mise-toolchain=/usr/local/share/courier/mise-data\n" +
+		"courier-mise-offline=true\n" +
 		"courier-unknown=noise\nnot-a-diagnostic\n"
 	want := map[string]string{
-		"courier-mise-path":     "/usr/bin/mise",
-		"courier-mise-version":  "2024.10.0",
-		"courier-mise-data-dir": "/data/mise",
+		"courier-mise-path":      "/usr/bin/mise",
+		"courier-mise-version":   "2024.10.0",
+		"courier-mise-data-dir":  "/data/mise",
+		"courier-mise-toolchain": "/usr/local/share/courier/mise-data",
+		"courier-mise-offline":   "true",
 	}
 	if got := ParseBootstrapDiagnostics(stdout); !reflect.DeepEqual(got, want) {
 		t.Errorf("ParseBootstrapDiagnostics = %v, want %v", got, want)
@@ -509,12 +524,30 @@ func miseStandIn(t *testing.T, dir, envPayload string) string {
 // controls so the EXIT trap's cleanup is observable.
 func runScript(t *testing.T, script, repo, binDir, scratch string) (string, error) {
 	t.Helper()
+	return runScriptEnv(t, script, repo, binDir, scratch)
+}
+
+// runScriptEnv is runScript with extra environment the test controls
+// (deployment-supplied values like COURIER_MISE_TOOLCHAIN_DIR). Mise's own
+// variables are scrubbed from the inherited environment first, so the
+// scripts are exercised against a mise-neutral base whatever environment the
+// coordinator process itself carries.
+func runScriptEnv(t *testing.T, script, repo, binDir, scratch string, extra ...string) (string, error) {
+	t.Helper()
+	base := os.Environ()[:0:0]
+	for _, kv := range os.Environ() {
+		name, _, ok := strings.Cut(kv, "=")
+		if ok && (strings.HasPrefix(name, "MISE_") || name == ToolchainDirEnv) {
+			continue
+		}
+		base = append(base, kv)
+	}
 	cmd := exec.Command("sh", "-c", script)
 	cmd.Dir = repo
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(append(base,
 		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"TMPDIR="+scratch,
-	)
+	), extra...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -527,6 +560,54 @@ func runScript(t *testing.T, script, repo, binDir, scratch string) (string, erro
 		t.Fatalf("sh -c: %v", err)
 	}
 	return stdout.String(), nil
+}
+
+// bakedToolchainDir writes a stand-in for the worker image's baked toolchain
+// contract: a mise data-dir shape with one installed tool, so the hermetic
+// wiring has entries to symlink.
+func bakedToolchainDir(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "mise-data")
+	tool := filepath.Join(dir, "installs", "go", "1.27.3", "bin")
+	if err := os.MkdirAll(tool, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tool, "go"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// offlineEchoStandIn is the mise stand-in for the hermetic-wiring tests: it
+// reports the environment the wiring left for mise to see, and — while the
+// script is still running, because the EXIT trap removes a temp-fallback
+// overlay before the test could inspect it — the entries of the wired data
+// dir with their symlink targets (`overlay=<target>`, or the entry path
+// itself when it is not a symlink).
+func offlineEchoStandIn(t *testing.T, dir string) string {
+	t.Helper()
+	bin := filepath.Join(dir, "mise-bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\n" +
+		"case \"$1\" in\n" +
+		"  --version) printf 'mise 2024.10.29 (stand-in)\\n' ;;\n" +
+		"  run) printf 'offline=%s\\n' \"${MISE_OFFLINE:-unset}\"; printf 'data=%s\\n' \"${MISE_DATA_DIR:-unset}\"; \\\n" +
+		"    if [ -n \"${MISE_DATA_DIR:-}\" ] && [ -d \"$MISE_DATA_DIR\" ]; then \\\n" +
+		"      for entry in \"$MISE_DATA_DIR\"/*; do \\\n" +
+		"        [ -e \"$entry\" ] || continue; \\\n" +
+		"        printf 'overlay=%s\\n' \"$(readlink \"$entry\" || printf '%s' \"$entry\")\"; \\\n" +
+		"      done; \\\n" +
+		"    fi; printf 'bootstrap-ran\\n' ;;\n" +
+		"  x) printf 'MISE_OFFLINE_SEEN=%s\\000MISE_DATA_DIR_SEEN=%s\\000' \"${MISE_OFFLINE:-unset}\" \"${MISE_DATA_DIR:-unset}\" ;;\n" +
+		"  *) printf 'unexpected mise invocation: %s\\n' \"$*\" >&2; exit 64 ;;\n" +
+		"esac\n"
+	path := filepath.Join(bin, "mise")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return bin
 }
 
 // TestScriptsExecuteForReal drives both generated task scripts against a
@@ -592,6 +673,100 @@ func TestScriptsExecuteForReal(t *testing.T) {
 		want := "MISE_STANDIN=active\x00MISE_STANDIN_TWO=2\x00"
 		if stdout != want {
 			t.Errorf("capture stdout = %q, want the NUL record stream %q", stdout, want)
+		}
+	})
+
+	t.Run("baked toolchain wires mise offline", func(t *testing.T) {
+		baked := bakedToolchainDir(t)
+		// The overlay lives on the writable toolchain-cache volume when one
+		// is mounted: clear any stale overlay from an earlier run so this
+		// run's wiring is the one under test (a production pod's emptyDir is
+		// per-pod, so production never sees a reused overlay). Best-effort:
+		// a stale overlay this test cannot remove must not fail the test.
+		_ = os.RemoveAll("/courier-toolchain-cache/mise-data")
+		binDir := offlineEchoStandIn(t, t.TempDir())
+		script, err := BootstrapScript(baseOID)
+		if err != nil {
+			t.Fatalf("BootstrapScript: %v", err)
+		}
+		stdout, runErr := runScriptEnv(t, script, repo, binDir, t.TempDir(),
+			"COURIER_MISE_TOOLCHAIN_DIR="+baked)
+		if runErr != nil {
+			t.Fatalf("bootstrap script failed: %v", runErr)
+		}
+		if !strings.Contains(stdout, "offline=true\n") {
+			t.Errorf("bootstrap stdout missing offline=true: %s", stdout)
+		}
+		// The writable overlay lives outside the baked dir and symlinks
+		// every baked entry, so mise reads the baked installs without the
+		// image layer ever being written. The stand-in reports the overlay's
+		// entries while the script runs — the EXIT trap removes a
+		// temp-fallback overlay before the test could read it from disk.
+		var dataDir string
+		for _, line := range strings.Split(stdout, "\n") {
+			if data, ok := strings.CutPrefix(line, "data="); ok && data != "unset" {
+				dataDir = data
+			}
+		}
+		if dataDir == "" {
+			t.Fatalf("bootstrap stdout missing the wired MISE_DATA_DIR: %s", stdout)
+		}
+		if strings.HasPrefix(dataDir, baked) {
+			t.Errorf("MISE_DATA_DIR = %q, want a writable overlay, not the baked dir itself", dataDir)
+		}
+		symlinked := map[string]bool{}
+		for _, line := range strings.Split(stdout, "\n") {
+			if target, ok := strings.CutPrefix(line, "overlay="); ok {
+				symlinked[target] = true
+			}
+		}
+		if !symlinked[filepath.Join(baked, "installs")] {
+			t.Errorf("wired data dir entries %v do not symlink the baked installs %q", symlinked, filepath.Join(baked, "installs"))
+		}
+		// The trusted diagnostics report the wiring.
+		if !strings.Contains(stdout, "courier-mise-toolchain="+baked+"\n") ||
+			!strings.Contains(stdout, "courier-mise-offline=true\n") {
+			t.Errorf("bootstrap stdout missing the hermetic diagnostics:\n%s", stdout)
+		}
+	})
+
+	t.Run("no baked toolchain keeps networked mise", func(t *testing.T) {
+		// A toolchain path that does not exist: the wiring must export
+		// nothing, so mise sees neither MISE_OFFLINE nor MISE_DATA_DIR.
+		binDir := offlineEchoStandIn(t, t.TempDir())
+		script, err := BootstrapScript(baseOID)
+		if err != nil {
+			t.Fatalf("BootstrapScript: %v", err)
+		}
+		stdout, runErr := runScriptEnv(t, script, repo, binDir, t.TempDir(),
+			"COURIER_MISE_TOOLCHAIN_DIR="+filepath.Join(t.TempDir(), "absent"))
+		if runErr != nil {
+			t.Fatalf("bootstrap script failed: %v", runErr)
+		}
+		if !strings.Contains(stdout, "offline=unset\n") || !strings.Contains(stdout, "data=unset\n") {
+			t.Errorf("without a baked toolchain the wiring must export nothing:\n%s", stdout)
+		}
+		if !strings.Contains(stdout, "courier-mise-offline=false\n") {
+			t.Errorf("bootstrap stdout missing the offline=false diagnostic:\n%s", stdout)
+		}
+	})
+
+	t.Run("env capture sees the same hermetic wiring", func(t *testing.T) {
+		baked := bakedToolchainDir(t)
+		_ = os.RemoveAll("/courier-toolchain-cache/mise-data")
+		binDir := offlineEchoStandIn(t, t.TempDir())
+		script, err := EnvCaptureScript(baseOID)
+		if err != nil {
+			t.Fatalf("EnvCaptureScript: %v", err)
+		}
+		stdout, runErr := runScriptEnv(t, script, repo, binDir, t.TempDir(),
+			"COURIER_MISE_TOOLCHAIN_DIR="+baked)
+		if runErr != nil {
+			t.Fatalf("capture script failed: %v", runErr)
+		}
+		if !strings.Contains(stdout, "MISE_OFFLINE_SEEN=true\x00") ||
+			!strings.Contains(stdout, "MISE_DATA_DIR_SEEN=") {
+			t.Errorf("capture stdout missing the wired environment:\n%q", stdout)
 		}
 	})
 

@@ -2091,12 +2091,13 @@ func (c *Coordinator) bootstrapWorkspace(ctx context.Context, briefID, baseOID s
 		}
 		reason := fmt.Sprintf("%s with exit code %d", bootstrapBlockerReasonPrefix, result.ExitCode)
 		c.recordBootstrapReceipt(BootstrapReceipt{
-			Status:             BootstrapReceiptFailed,
-			Reason:             reason,
-			BootstrapElapsedMs: bootstrapElapsed,
-			BootstrapExitCode:  result.ExitCode,
-			CaptureExitCode:    -1,
-			Diagnostics:        diagnostics,
+			Status:              BootstrapReceiptFailed,
+			Reason:              reason,
+			BootstrapElapsedMs:  bootstrapElapsed,
+			BootstrapExitCode:   result.ExitCode,
+			CaptureExitCode:     -1,
+			Diagnostics:         diagnostics,
+			BootstrapStderrTail: result.StderrTail,
 		})
 		return &bootstrapBlocker{reason: reason}
 	}
@@ -2160,6 +2161,7 @@ func (c *Coordinator) bootstrapWorkspace(ctx context.Context, briefID, baseOID s
 			CaptureElapsedMs:   captureElapsed,
 			CaptureExitCode:    capture.ExitCode,
 			Diagnostics:        diagnostics,
+			CaptureStderrTail:  capture.StderrTail,
 		})
 		return &bootstrapBlocker{reason: reason}
 	}

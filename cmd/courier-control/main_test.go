@@ -586,6 +586,48 @@ func TestModelRequestSinkFailedAttemptReportsAbsence(t *testing.T) {
 	}
 }
 
+// TestBootstrapReceiptSinkCarriesStderrTails pins the failed receipt's
+// diagnostic evidence (#797): the workspace.bootstrap event's detail carries
+// the bounded stderr tails a failed task returned, so the exact download or
+// pin that refused is recoverable from the run log, while the durable reason
+// stays fixed-text.
+func TestBootstrapReceiptSinkCarriesStderrTails(t *testing.T) {
+	var stdout bytes.Buffer
+	sink := bootstrapReceiptSink{
+		emitter: courierlog.NewEmitter(&stdout, courierlog.LevelInfo),
+		stderr:  io.Discard,
+		invocation: executor.Invocation{
+			RunName: "run-1", Repo: "owner/name", Ref: 7, Mode: courierv1alpha1.ModeResolveIssue,
+		},
+	}
+	sink.BootstrapRecorded(harness.BootstrapReceipt{
+		Status:              harness.BootstrapReceiptFailed,
+		Reason:              "the approved bootstrap contract failed with exit code 1",
+		BootstrapExitCode:   1,
+		CaptureExitCode:     -1,
+		BootstrapStderrTail: "mise: go@1.27.3 download failed",
+		CaptureStderrTail:   "",
+	})
+	var event map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout.String())), &event); err != nil {
+		t.Fatalf("emitted line is not JSON: %v: %q", err, stdout.String())
+	}
+	detail, ok := event["detail"].(map[string]any)
+	if !ok {
+		t.Fatalf("detail = %v, want the receipt fields at info level", event["detail"])
+	}
+	if detail["bootstrap_stderr"] != "mise: go@1.27.3 download failed" {
+		t.Fatalf("detail[bootstrap_stderr] = %v, want the task's bounded tail", detail["bootstrap_stderr"])
+	}
+	if _, present := detail["capture_stderr"]; present {
+		t.Fatalf("detail[capture_stderr] = %v, want absent when the capture never ran", detail["capture_stderr"])
+	}
+	// The durable reason stays the fixed-text prefix, not the tail.
+	if detail["reason"] != "the approved bootstrap contract failed with exit code 1" {
+		t.Fatalf("detail[reason] = %v, want the fixed-text reason", detail["reason"])
+	}
+}
+
 // TestEmitModelTelemetry pins #738's per-run summary contract: one
 // model.telemetry line carrying the request tallies by class, the per
 // role/model table, the usage split, the token sums (present only when some
