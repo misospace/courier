@@ -180,11 +180,33 @@ func validOID(s string) bool {
 	return err == nil
 }
 
+// observerEnv is the hostile-repository base environment every observer git
+// command runs under: no system or global config trust, no terminal prompts,
+// no hooks, and external transport helpers disabled. The observer only ever
+// fetches from the operator-trusted remote, so the file protocol stays
+// allowed and the config count stays fixed.
+func observerEnv() []string {
+	return []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + os.DevNull,
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=" + os.DevNull,
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_CONFIG_COUNT=6",
+		"GIT_CONFIG_KEY_0=core.hooksPath", "GIT_CONFIG_VALUE_0=/dev/null",
+		"GIT_CONFIG_KEY_1=core.fsmonitor", "GIT_CONFIG_VALUE_1=false",
+		"GIT_CONFIG_KEY_2=core.replaceRefs", "GIT_CONFIG_VALUE_2=false",
+		"GIT_CONFIG_KEY_3=protocol.ext.allow", "GIT_CONFIG_VALUE_3=never",
+		"GIT_CONFIG_KEY_4=protocol.file.allow", "GIT_CONFIG_VALUE_4=always",
+		"GIT_CONFIG_KEY_5=core.pager", "GIT_CONFIG_VALUE_5=cat",
+	}
+}
+
 func runGit(ctx context.Context, dir string, extra []string, args ...string) error {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.WaitDelay = 2 * time.Second
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.DevNull, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + os.DevNull, "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0", "GIT_CONFIG_COUNT=6", "GIT_CONFIG_KEY_0=core.hooksPath", "GIT_CONFIG_VALUE_0=/dev/null", "GIT_CONFIG_KEY_1=core.fsmonitor", "GIT_CONFIG_VALUE_1=false", "GIT_CONFIG_KEY_2=core.replaceRefs", "GIT_CONFIG_VALUE_2=false", "GIT_CONFIG_KEY_3=protocol.ext.allow", "GIT_CONFIG_VALUE_3=never", "GIT_CONFIG_KEY_4=protocol.file.allow", "GIT_CONFIG_VALUE_4=always", "GIT_CONFIG_KEY_5=core.pager", "GIT_CONFIG_VALUE_5=cat"}
+	cmd.Env = append(observerEnv(), "GIT_OPTIONAL_LOCKS=0")
 	cmd.Env = append(cmd.Env, extra...)
 	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
 	return cmd.Run()
@@ -196,7 +218,7 @@ func remoteBranchExists(ctx context.Context, repo, url, branch string, auth []st
 	cmd := exec.CommandContext(ctx, "git", "ls-remote", "--heads", url, "refs/heads/"+branch)
 	cmd.Dir = repo
 	cmd.WaitDelay = 2 * time.Second
-	cmd.Env = append([]string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.DevNull, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + os.DevNull, "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_COUNT=6", "GIT_CONFIG_KEY_0=core.hooksPath", "GIT_CONFIG_VALUE_0=/dev/null", "GIT_CONFIG_KEY_1=core.fsmonitor", "GIT_CONFIG_VALUE_1=false", "GIT_CONFIG_KEY_2=core.replaceRefs", "GIT_CONFIG_VALUE_2=false", "GIT_CONFIG_KEY_3=protocol.ext.allow", "GIT_CONFIG_VALUE_3=never", "GIT_CONFIG_KEY_4=protocol.file.allow", "GIT_CONFIG_VALUE_4=always", "GIT_CONFIG_KEY_5=core.pager", "GIT_CONFIG_VALUE_5=cat"}, auth...)
+	cmd.Env = append(observerEnv(), auth...)
 	out, err := cmd.Output()
 	if err != nil {
 		return false, err
@@ -219,7 +241,7 @@ func execGitOutput(ctx context.Context, dir string, args ...string) ([]byte, err
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.WaitDelay = 2 * time.Second
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.DevNull, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + os.DevNull, "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_COUNT=6", "GIT_CONFIG_KEY_0=core.hooksPath", "GIT_CONFIG_VALUE_0=/dev/null", "GIT_CONFIG_KEY_1=core.fsmonitor", "GIT_CONFIG_VALUE_1=false", "GIT_CONFIG_KEY_2=core.replaceRefs", "GIT_CONFIG_VALUE_2=false", "GIT_CONFIG_KEY_3=protocol.ext.allow", "GIT_CONFIG_VALUE_3=never", "GIT_CONFIG_KEY_4=protocol.file.allow", "GIT_CONFIG_VALUE_4=always", "GIT_CONFIG_KEY_5=core.pager", "GIT_CONFIG_VALUE_5=cat"}
+	cmd.Env = observerEnv()
 	return cmd.Output()
 }
 
