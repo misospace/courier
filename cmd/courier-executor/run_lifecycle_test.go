@@ -91,6 +91,27 @@ func TestRunStartupGuardsShortCircuitOnFirstTerminal(t *testing.T) {
 	}
 }
 
+func TestRunStartupGuardsStopBeatsZeroExitCode(t *testing.T) {
+	// guardAdoption terminates successfully with (exitSuccess, true): the
+	// runner must short-circuit on stop even when the code is zero, and a
+	// wrapper that keyed stop off code != 0 would run later guards after an
+	// already-emitted Verifying handoff.
+	var calls []string
+	mk := func(name string, code int, stop bool) launchGuard {
+		return func(context.Context) (int, bool) {
+			calls = append(calls, name)
+			return code, stop
+		}
+	}
+	guards := []launchGuard{mk("adoption", exitSuccess, true), mk("head", 1, true)}
+	if code, stop := runStartupGuards(context.Background(), guards); !stop || code != exitSuccess {
+		t.Fatalf("runStartupGuards() = (%d, %v), want (%d, true) when the terminal verdict carries exit code 0", code, stop, exitSuccess)
+	}
+	if want := []string{"adoption"}; !reflect.DeepEqual(calls, want) {
+		t.Fatalf("guards after a zero-code stop ran: %v, want %v", calls, want)
+	}
+}
+
 func TestOrderedLaunchGuardsPassForANeutralRun(t *testing.T) {
 	report := newReporter(io.Discard, io.Discard, config{RunID: "run-1", Repo: "o/r"})
 	guards := orderedLaunchGuards(report)
