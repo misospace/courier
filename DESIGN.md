@@ -3758,7 +3758,18 @@ as an attempt to be reissued, advancing the issued generation and incrementing
 at the cap — exactly the human park the new phase is designed to avoid. The
 Dispatch adapter therefore publishes a dedicated `outcome:"waiting-external"`
 task report and, for queue-backed follow-ups, a generation-fenced
-`status:"WAITING_EXTERNAL"` queue mark. Dispatch is expected to treat both as
+`status:"WAITING_EXTERNAL"` queue mark. Both writers present Dispatch's
+structured `externalWait` dependency (misospace/dispatch#1250, shipped in
+dispatch#1273): the `cooldown_recheck` predicate over an `external_service`
+ref naming the attempt receipt, because Courier's wait has no
+forge-verifiable dependency — a mark or report without the contract fails
+closed to a `PARKED`/`invalid_wait` park nothing re-offers (#786). The shared
+receipt-fenced decline release behind rebase and ownership refusals presents
+the same contract, so a decline re-offers on the queue's bounded recheck
+deadline rather than parking; on a pre-#1250 Dispatch that refuses the
+unknown field, the release surfaces as refused and the documented bounded
+recovery path (the per-generation decline latch and the stale-handout
+reclaimer) applies unchanged. Dispatch is expected to treat both as
 no-ops for fix-attempt accounting: do not advance generation, do not increment
 `fixAttempts`, do not surface as a human block, and keep the item discoverable
 so a future discovery cycle can reactivate the work. Recovery requires a fresh

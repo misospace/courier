@@ -185,6 +185,14 @@ func TestRebaseDiscoveryDeclinesUnnegotiatedRebaseWork(t *testing.T) {
 	if marks[0]["status"] != "WAITING_EXTERNAL" || marks[0]["repo"] != "acme/widgets" || marks[0]["pr"] != float64(42) || marks[0]["generation"] != float64(3) {
 		t.Fatalf("release mark = %#v, want the exact receipt", marks[0])
 	}
+	// #786: the release must present Dispatch's #1250 structured
+	// cooldown-recheck dependency — a mark without it parks the item
+	// PARKED/invalid_wait and nothing re-offers it.
+	if marks[0]["externalWait"] == nil {
+		t.Fatalf("release externalWait = nil, want the structured cooldown-recheck contract")
+	}
+	wantCooldownExternalWait(t, marks[0]["externalWait"], workDescriptor{Type: "followup-pr", PRFixID: "fix-1", Generation: 3},
+		"Courier declined a rebase task it cannot safely execute: rebase capability is not negotiated for this connector; the item stays discoverable for a compatible rebase executor")
 }
 
 // A rebase offer whose receipt is malformed fails discovery without

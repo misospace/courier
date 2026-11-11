@@ -788,6 +788,14 @@ func TestHTTPClientReportBlockedExternalIsWaitingExternal(t *testing.T) {
 		if item := report["prFixItem"].(map[string]any); item["handoutToken"] != "fence-token" {
 			t.Fatalf("prFixItem handoutToken = %#v, want the issued token echoed on every outcome so Dispatch fences the hand-out release to the exact issuance", item["handoutToken"])
 		}
+		// #786: the waiting-external report settles the issued attempt, so it
+		// must carry the structured cooldown-recheck contract — a report
+		// without a valid dependency parks the item fail-closed on modern
+		// Dispatch (#1250).
+		if report["externalWait"] == nil {
+			t.Fatalf("report externalWait = nil, want the structured cooldown-recheck contract")
+		}
+		wantCooldownExternalWait(t, report["externalWait"], workDescriptor{Type: "followup-pr", PRFixID: "item-1", Generation: 3}, "missing prerequisite: secrets/prod")
 		if len(marks) != 1 {
 			t.Fatalf("marks = %#v, want exactly one WAITING_EXTERNAL queue mark", marks)
 		}
@@ -804,6 +812,14 @@ func TestHTTPClientReportBlockedExternalIsWaitingExternal(t *testing.T) {
 		if mark["note"] != "missing prerequisite: secrets/prod" {
 			t.Fatalf("mark note = %v, want the missing prerequisite reason", mark["note"])
 		}
+		// The mark presents the same structured contract as the report: one
+		// wait identity (ref names the attempt receipt), so a repeated
+		// same-generation mark is Dispatch's #1231 idempotent replay, never a
+		// new wait or a deadline reset (#786).
+		if mark["externalWait"] == nil {
+			t.Fatalf("mark externalWait = nil, want the structured cooldown-recheck contract")
+		}
+		wantCooldownExternalWait(t, mark["externalWait"], workDescriptor{Type: "followup-pr", PRFixID: "item-1", Generation: 3}, "missing prerequisite: secrets/prod")
 	})
 
 	t.Run("implement", func(t *testing.T) {
@@ -839,6 +855,12 @@ func TestHTTPClientReportBlockedExternalIsWaitingExternal(t *testing.T) {
 		}
 		if len(paths) != 1 || paths[0] != "/api/agents/worker/tasks/report" {
 			t.Fatalf("paths = %#v, want only the task report (no queue mark for an implement task)", paths)
+		}
+		// A report with no queue receipt never settles the queue (Dispatch's
+		// resolver requires the attempt token), so the structured contract is
+		// queue-scoped: pinned absent here so the scoping stays deliberate.
+		if _, present := reports[0]["externalWait"]; present {
+			t.Fatalf("implement waiting-external report carries externalWait; the contract is scoped to queue-backed attempts")
 		}
 	})
 }
