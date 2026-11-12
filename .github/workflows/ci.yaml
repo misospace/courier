@@ -495,7 +495,7 @@ jobs:
           go-version: "1.27.4"
           cache: true
 
-      - uses: azure/setup-helm@v5.0.1
+      - uses: azure/setup-helm@v5.1.0
 
       - name: Configure chart repository
         run: helm repo add bjw-s-labs https://bjw-s-labs.github.io/helm-charts
