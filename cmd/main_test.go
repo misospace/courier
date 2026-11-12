@@ -321,6 +321,171 @@ func TestDispatchBindingLane(t *testing.T) {
 	}
 }
 
+// TestResolveRebaseExecutors pins the resolution of the rebase-executor
+// designation (#796). The two silent failure modes are opposite: a
+// designation that matches no binding leaves the rebase-only intake contract
+// undeclared, so REBASE work runs as ordinary work, and one that matches
+// several arms every one of them, so Dispatch refuses ordinary work for the
+// whole queue lane. Both must fail startup instead of guessing.
+func TestResolveRebaseExecutors(t *testing.T) {
+	bindings := []dispatchBinding{
+		{queueLane: "queue-a", laneProfile: "lane-a", agentName: "courier-queue-a"},
+		{queueLane: "queue-b", laneProfile: "lane-b", agentName: "courier-queue-b"},
+		{queueLane: "queue-b", laneProfile: "lane-c", agentName: "courier-queue-b-2"},
+	}
+	tests := []struct {
+		name      string
+		lanes     []string
+		executors []string
+		want      map[string]bool
+		wantErr   string // substring required in the error; empty means no error
+	}{
+		{
+			name: "no designation selects nothing",
+			want: map[string]bool{},
+		},
+		{
+			name:  "lane resolves to exactly one binding",
+			lanes: []string{"queue-a"},
+			want:  map[string]bool{"courier-queue-a": true},
+		},
+		{
+			name:    "lane matches no binding",
+			lanes:   []string{"queue-missing"},
+			wantErr: `--dispatch-rebase-lane "queue-missing" matches no configured binding`,
+		},
+		{
+			name:    "lane matches two bindings",
+			lanes:   []string{"queue-b"},
+			wantErr: `--dispatch-rebase-lane "queue-b" matches 2 configured bindings (courier-queue-b, courier-queue-b-2)`,
+		},
+		{
+			name:      "executor names a configured binding agent",
+			executors: []string{"courier-queue-b-2"},
+			want:      map[string]bool{"courier-queue-b-2": true},
+		},
+		{
+			name:      "executor names an unknown agent",
+			executors: []string{"courier-missing"},
+			wantErr:   `--dispatch-rebase-executor "courier-missing" matches no configured binding agent`,
+		},
+		{
+			name:      "lane and executor cannot be combined",
+			lanes:     []string{"queue-a"},
+			executors: []string{"courier-queue-b"},
+			wantErr:   "--dispatch-rebase-lane and --dispatch-rebase-executor cannot be combined",
+		},
+		{
+			name:  "duplicate lanes collapse to one executor",
+			lanes: []string{"queue-a", "queue-a"},
+			want:  map[string]bool{"courier-queue-a": true},
+		},
+		{
+			name:      "duplicate executors collapse to one executor",
+			executors: []string{"courier-queue-a", "courier-queue-a"},
+			want:      map[string]bool{"courier-queue-a": true},
+		},
+		{
+			name:  "lane value is trimmed before it is resolved",
+			lanes: []string{" queue-a "},
+			want:  map[string]bool{"courier-queue-a": true},
+		},
+		{
+			name:      "executor value is trimmed before it is resolved",
+			executors: []string{" courier-queue-a "},
+			want:      map[string]bool{"courier-queue-a": true},
+		},
+		{
+			name:    "empty lane value matches no binding",
+			lanes:   []string{"  "},
+			wantErr: `--dispatch-rebase-lane "" matches no configured binding`,
+		},
+		{
+			name:      "empty executor value matches no binding agent",
+			executors: []string{""},
+			wantErr:   `--dispatch-rebase-executor "" matches no configured binding agent`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := resolveRebaseExecutors(bindings, test.lanes, test.executors)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("resolveRebaseExecutors() error = %v, want it to contain %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveRebaseExecutors() error = %v", err)
+			}
+			if got == nil {
+				t.Fatalf("resolveRebaseExecutors() = nil, want an empty map")
+			}
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("resolveRebaseExecutors() = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+// TestDeclaresRebaseCapability pins the one answer both Dispatch connectors
+// read (#796). The bare connector and the binding that owns its identity poll
+// the same agent, so an agent that is a rebase executor must declare the
+// rebase-only scope on both polls.
+func TestDeclaresRebaseCapability(t *testing.T) {
+	executors := map[string]bool{"courier-rebase": true}
+	tests := []struct {
+		name      string
+		agentName string
+		want      bool
+	}{
+		{name: "the rebase executor declares the scope", agentName: "courier-rebase", want: true},
+		{name: "the bare connector of the rebase executor declares the scope", agentName: " courier-rebase ", want: true},
+		{name: "an ordinary agent declares nothing", agentName: "courier-local", want: false},
+		{name: "an empty agent name declares nothing", agentName: "", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := declaresRebaseCapability(executors, test.agentName); got != test.want {
+				t.Fatalf("declaresRebaseCapability(%q) = %v, want %v", test.agentName, got, test.want)
+			}
+		})
+	}
+}
+
+// TestLooksLikeRebaseExecutor pins the drift heuristic that warns about a
+// binding that reads like a rebase executor but was not declared as one
+// (#796). The heuristic reads whole segments only: a lane or agent whose name
+// merely contains "rebase" as part of a longer word is ordinary work.
+func TestLooksLikeRebaseExecutor(t *testing.T) {
+	tests := []struct {
+		name  string
+		names []string
+		want  bool
+	}{
+		{name: "hyphenated suffix", names: []string{"courier-rebase"}, want: true},
+		{name: "bare name", names: []string{"rebase"}, want: true},
+		{name: "numbered suffix", names: []string{"courier-rebase-2"}, want: true},
+		{name: "dotted name", names: []string{"courier.rebase"}, want: true},
+		{name: "underscored name", names: []string{"courier_rebase"}, want: true},
+		{name: "spaced name", names: []string{"courier rebase"}, want: true},
+		{name: "uppercase name", names: []string{"REBASE-LANE"}, want: true},
+		{name: "ordinary name", names: []string{"courier"}, want: false},
+		{name: "longer word", names: []string{"rebasement"}, want: false},
+		{name: "prefixed word", names: []string{"rebasex"}, want: false},
+		{name: "suffixed word", names: []string{"courier-rebaseish"}, want: false},
+		{name: "one of several names matches", names: []string{"courier", "courier-rebase"}, want: true},
+		{name: "no names", names: nil, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := looksLikeRebaseExecutor(test.names...); got != test.want {
+				t.Fatalf("looksLikeRebaseExecutor(%v) = %v, want %v", test.names, got, test.want)
+			}
+		})
+	}
+}
+
 // TestBuildSecureControlRejectsTaintedCredential covers the whole
 // pod-exposed Secret set: every flag that injects a Secret into a
 // model-controlled coordinator pod taints a registration that references it,

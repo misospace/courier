@@ -78,8 +78,8 @@ startup, so an optional rebase lane can never become a general dependency.
 Courier implements the wire contract Dispatch shipped in misospace/dispatch#1533
 (the versioned intake handshake of misospace/dispatch#1532).
 
-A binding configured with `--dispatch-rebase-lane <queueLane>` declares the
-intake contract on every `next-task` call:
+A binding configured as a rebase executor declares the intake contract on
+every `next-task` call:
 
 ```
 GET /api/agents/<agent>/next-task?...&work_scope=rebase-only&work_scope_version=1&capabilities=rebase-executor:1
@@ -171,8 +171,9 @@ agent allowlist, the serialized concurrency-one gate, and rebase-only intake):
 1. Add a Dispatch binding for a dedicated agent (e.g. `courier-rebase`) with
    its own queue lane:
    `--dispatch-lane-binding rebase-lane:courier-rebase:courier-rebase`
-2. Declare it a rebase executor:
-   `--dispatch-rebase-lane rebase-lane`
+2. Declare it a rebase executor. The flag names the agent identity of the
+   binding, not its queue lane:
+   `--dispatch-rebase-executor courier-rebase`
 3. Create the LaneProfile the binding names — the planned shape is a local
    lane with concurrency 1 and a single coordinator role, no delegation:
 
@@ -191,6 +192,59 @@ agent allowlist, the serialized concurrency-one gate, and rebase-only intake):
    rebase execution itself is the trusted deterministic path.
 4. Keep the DISPATCH_REBASE_AGENTS allowlist on the Dispatch side in step with
    #1327/#1532 so the server grants rebase tasks only to this agent.
+
+The Helm chart renders the same declaration from the lane binding. Set
+`rebaseExecutor: true` on the lane entry and give that entry an explicit
+`agentName`:
+
+```yaml
+dispatch:
+  lanes:
+    - queueLane: rebase-lane
+      laneProfile: courier-rebase
+      agentName: courier-rebase
+      rebaseExecutor: true
+```
+
+The chart refuses a lane entry that sets `rebaseExecutor: true` without an
+explicit `agentName`. The rebase executor is named by its agent identity, so
+that identity must not change when the queue lane changes. The chart also
+refuses a lane entry that sets `rebaseExecutor: true` when `dispatch.enabled`
+is false, and it refuses one that combines `rebaseExecutor: true` with
+operator-supplied `--dispatch-lane-binding` args in
+`controllers.main.containers.main.args`. Declare the rebase executor with an
+operator-supplied `--dispatch-rebase-executor` arg in that case.
+
+## Startup validation
+
+The manager settles the rebase executor when it starts. The manager never
+guesses which binding the operator meant, and it never starts with a
+designation it cannot resolve to exactly one configured binding.
+
+The manager stops with an error in these cases:
+
+- `--dispatch-rebase-executor` names an agent identity that no configured
+  binding uses. The rebase-only intake contract would stay undeclared, and
+  REBASE work would run as ordinary work.
+- `--dispatch-rebase-lane` names a queue lane that no configured binding uses.
+  This is the same drift under the deprecated name.
+- `--dispatch-rebase-lane` names a queue lane that carries more than one
+  binding. Every one of those bindings would declare the rebase-only intake
+  contract. Dispatch refuses ordinary work for an agent outside its rebase
+  worker pool, so the whole queue lane would idle.
+- The operator sets `--dispatch-rebase-executor` and `--dispatch-rebase-lane`
+  together. One designation must have one reading.
+- The operator names a rebase executor while Dispatch discovery is disabled.
+  No binding exists, so the designation names nothing.
+
+The manager logs a warning when a configured binding reads like a rebase
+executor but is not declared as one. A binding whose queue lane, agent
+identity, or lane profile name carries the word `rebase` reads like one.
+REBASE work offered to that binding is declined, so the lane looks idle.
+
+`--dispatch-rebase-lane` is deprecated. It names a queue lane, and one queue
+lane can carry several bindings. Use `--dispatch-rebase-executor` with the agent
+identity of the binding.
 
 ### Model-assisted conflict resolution (#732)
 
