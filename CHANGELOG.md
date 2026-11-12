@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.25](https://github.com/misospace/courier/compare/v0.1.24...v0.1.25) (2026-11-12)
+
+
+### Bug Fixes
+
+* **deps:** update dependency astro (7.4.10 → 7.4.11) ([#809](https://github.com/misospace/courier/issues/809)) ([ecaaff6](https://github.com/misospace/courier/commit/ecaaff6d1bc049f4aba22e56f1162cbaf6417a6b))
+* **deps:** update dependency astro (7.4.9 → 7.4.10) ([#798](https://github.com/misospace/courier/issues/798)) ([9a4451a](https://github.com/misospace/courier/commit/9a4451a094dd4fc9d42fe6999c3c6913c1dc1cbe))
+* **deps:** update dependency go (1.27.3 → 1.27.4) ([#793](https://github.com/misospace/courier/issues/793)) ([54ce031](https://github.com/misospace/courier/commit/54ce0313cb45694c7f45091bf5f83c731c5a1e6a))
+* **devenv:** make the approved bootstrap contract hermetic against the secure worker's network contract ([#801](https://github.com/misospace/courier/issues/801)) ([88e7172](https://github.com/misospace/courier/commit/88e7172e59da453cae141377c66cae7e378e7902))
+* **dispatch:** present the structured externalWait contract on waiting-external writes ([#800](https://github.com/misospace/courier/issues/800)) ([6a80a13](https://github.com/misospace/courier/commit/6a80a13e34acbd6a0970be1b3b26891cc70a37a0))
+
+
+### Refactors
+
+* **executor:** decompose main.go run() into phase-scoped, testable units ([#807](https://github.com/misospace/courier/issues/807)) ([eaf5d62](https://github.com/misospace/courier/commit/eaf5d6246ec2bbe441e90b84f8f0e48adc58ff4b))
+
 ## [0.1.24](https://github.com/misospace/courier/compare/v0.1.23...v0.1.24) (2026-11-10)
 
 
