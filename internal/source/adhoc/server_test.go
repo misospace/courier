@@ -164,7 +164,7 @@ func TestRouteRejectsWrongMethodAndPath(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	assertError(t, rec, http.StatusMethodNotAllowed, "contribution admission accepts POST only")
 
-	for _, path := range []string{"/v1/other", "/v1/contributions/", "/v1/contributions/x", "/"} {
+	for _, path := range []string{"/v1/other", "/v1/contributions/", "/"} {
 		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader("{}"))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+testToken)
@@ -175,6 +175,15 @@ func TestRouteRejectsWrongMethodAndPath(t *testing.T) {
 		}
 		assertNoTokenSweep(t, rec)
 	}
+
+	// A run path is a real route (the #819 status read), so POSTing to
+	// it is a method mistake, not a miss.
+	req = httptest.NewRequest(http.MethodPost, "/v1/contributions/courier-abc", strings.NewReader("{}"))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	assertError(t, rec, http.StatusMethodNotAllowed, "contribution status reads accept GET only")
 }
 
 func TestAuthRejectsWithOneConstantMessage(t *testing.T) {

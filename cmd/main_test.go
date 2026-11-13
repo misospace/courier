@@ -1419,7 +1419,7 @@ func TestStartupReadsSurfaceDeadlineErrors(t *testing.T) {
 	t.Run("contribution admission token read", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 		defer cancel()
-		_, err := loadAdmissionToken(ctx, reader, "courier-system", "courier-admission-token", "token")
+		_, err := loadAdmissionToken(ctx, reader, "courier-system", "contribution admission", "courier-admission-token", "token")
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("loadAdmissionToken() error = %v, want a deadline-exceeded error", err)
 		}
@@ -1639,7 +1639,7 @@ func TestLoadAdmissionToken(t *testing.T) {
 			}
 			fakeClient := builder.Build()
 
-			got, err := loadAdmissionToken(context.Background(), fakeClient, test.namespace, test.secretName, test.secretKey)
+			got, err := loadAdmissionToken(context.Background(), fakeClient, test.namespace, "contribution admission", test.secretName, test.secretKey)
 			if test.wantErr != "" {
 				if err == nil {
 					t.Fatalf("loadAdmissionToken() error = nil, want error mentioning %q", test.wantErr)

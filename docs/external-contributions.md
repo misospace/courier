@@ -288,6 +288,74 @@ human merge, exactly as for resolve-issue runs:
   no second contribution state machine. The chart renders its Service under
   the `contributeAPI:` values. UI/MCP/Dispatch frontends likewise stay thin.
 
+### Status reads (#819)
+
+The same listener answers a read-only lifecycle endpoint for the identity
+admission returns: `GET /v1/contributions/<run>`, where `<run>` is the run
+name from the admission response and the namespace travels as
+`?namespace=` (the operator namespace by default). The CoderRun the
+controller reconciles is the only source of truth. The endpoint stores no
+parallel status, makes no forge call, and writes nothing.
+
+Read authorization is separate from write admission. A second bearer token
+(`--contribute-read-key-secret`; chart `contributeAPI.readKeySecret`)
+authenticates reads: the admission token never reads and the read token
+never admits. With no read token configured, the endpoint answers the
+route miss. Reads respect the same deployment-ownership boundary as
+admission, and only runs whose `spec.source` is `adhoc` are served — a
+foreign run and a miss share one 404, and there is no list route, so the
+endpoint is never a proxy for arbitrary CR lookups.
+
+The response is a fixed allowlist projection of controller status. No goal
+text, issue text, credential, source receipt, checkpoint, or unbounded CRD
+content appears in it.
+
+| Field | Meaning |
+| --- | --- |
+| `run`, `namespace`, `workItemId` | The identity admission returned. |
+| `lane`, `baseRepo`, `workRepo` | The admitted targets. |
+| `phase` | The controller's recorded phase verbatim: `Pending` (admission accepted, waiting), `Claimed`/`Running` (execution), `Verifying` (published, under CI), `AwaitingReview`, `HandedOff`, `NeedsHuman`, `Done`, `AlreadyDone`, `Failed`, `BlockedExternal`. The projection value `unknown` appears only before the controller stamps a phase. Clients must treat any unrecognized value as unknown. |
+| `ciParked` | The run waits on a durable CI park (`status.cipark`). |
+| `publication` | What the controller recorded as published: `branch`, `headRepo`, `headSha`, `pr`. |
+| `cause` | A recorded terminal diagnostic, as its bounded `category` and declared `outcome`. |
+| `admittedAt`, `startedAt`, `phaseEnteredAt`, `finishedAt` | The controller's recorded lifecycle timestamps. |
+
+Reads are bounded the way writes are: constant-time token comparison, one
+run name per request validated before any cluster contact, a concurrency
+cap that answers 503 with `Retry-After: 1` when saturated, and a 10-second
+cluster deadline. API versioning is the `/v1` path prefix: an incompatible
+change to either surface arrives as a new prefix, not a silent reshape.
+
+Example round trip:
+
+```text
+POST /v1/contributions                          Authorization: Bearer <admission token>
+{"lane":"local","baseRepo":"acme/project","baseRef":"main",
+ "workRepo":"bot/project","goal":"fix the login flow"}
+
+201 Created
+{"run":"courier-3f2a…","namespace":"courier","workItemId":"adhoc-9c1b…","resumed":false}
+
+GET /v1/contributions/courier-3f2a…             Authorization: Bearer <read token>
+
+200 OK
+{"run":"courier-3f2a…","namespace":"courier","workItemId":"adhoc-9c1b…",
+ "lane":"local","baseRepo":"acme/project","workRepo":"bot/project",
+ "phase":"Verifying","ciParked":true,
+ "publication":{"branch":"courier/acme/project/goal-9c1b",
+                "headRepo":"bot/project","headSha":"ab12cd34…",
+                "pr":"https://github.com/acme/project/pull/42"},
+ "admittedAt":"2026-11-13T12:00:00Z","startedAt":"2026-11-13T12:00:41Z",
+ "phaseEnteredAt":"2026-11-13T12:21:07Z"}
+```
+
+Polling guidance: phases move over minutes, not seconds. Poll no more than
+once every 15 to 30 seconds while the run is moving, and slow down or stop
+at a recorded ending (`AwaitingReview`, `HandedOff`, `NeedsHuman`, `Done`,
+`AlreadyDone`, `Failed`, `BlockedExternal`). A human merge can later move
+`AwaitingReview` to `Done`; a frontend that cares about that outcome can
+keep a slow poll. On a 503, honor `Retry-After` and widen the interval.
+
 ## Failure cases covered by tests
 
 The test matrix uses a fake forge/git fixture with independently observable

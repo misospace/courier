@@ -291,6 +291,13 @@ Enable it with two settings on the operator:
   startup, so a rotation takes effect when the operator restarts. The
   operator fails closed at startup when this is configured and the Secret or
   its `token` entry is missing.
+- `--contribute-read-key-secret` (optional, chart `contributeAPI.readKeySecret`):
+  name of a Secret in the operator namespace whose `token` entry holds a
+  second bearer token for the read-only status endpoint
+  (`GET /v1/contributions/<run>`, #819). When it is set, the same listener
+  answers status reads for callers presenting that token. The admission
+  token never authenticates a read, and the read token never admits work.
+  Leave it unset to keep status reads off.
 
 The endpoint performs no authority decisions. The approved base repository,
 the pinned base ref, the approved fork, and the lane are validated
@@ -300,7 +307,11 @@ names a namespace outside the deployment's ownership boundary is refused
 before the operator touches the cluster. A repeated request with the same
 idempotency key resumes the existing run: it never creates a second CoderRun,
 branch, or pull request. Responses carry run identity only, never the goal,
-the issue text, the token, or any credential.
+the issue text, the token, or any credential. Status reads project the
+controller's recorded CoderRun status onto a fixed allowlist: phase, CI
+park, publication identity, bounded terminal cause, and timestamps — never
+goal text, issue text, or credentials. See
+docs/external-contributions.md, "Status reads".
 
 To enable native Dispatch discovery, configure the chart's `dispatch` values and
 create the referenced Secret with the `DISPATCH_AGENT_TOKEN` value under the
