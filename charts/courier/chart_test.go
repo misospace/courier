@@ -2569,3 +2569,224 @@ func TestChartRejectsDependencyCacheReplicaScaling(t *testing.T) {
 		t.Fatalf("expected an invalid dependency-cache replica count to fail with secure mode disabled, err = %v:\n%s", err, out)
 	}
 }
+
+// operatorConsoleRenderArgs returns the helm template arguments that render
+// a token-mode operator console, extended with the caller's own --set
+// arguments.
+func operatorConsoleRenderArgs(extra ...string) []string {
+	args := []string{"template", "courier", ".",
+		"--set", "operatorConsole.enabled=true",
+		"--set", "operatorConsole.auth.sessionKeySecret=courier-console-session",
+		"--set", "operatorConsole.auth.operatorTokensSecret=courier-console-tokens",
+	}
+	return append(args, extra...)
+}
+
+// TestChartOperatorConsoleDefaultDisabled covers #821's posture: the console
+// is disabled by default, so the default render contains no console
+// Deployment or Service and never any Ingress.
+func TestChartOperatorConsoleDefaultDisabled(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	disabled := runHelm(t, chartDir, "template", "courier", ".")
+	for _, unwanted := range []string{
+		"courier-console",
+		"--auth-mode",
+		"--session-key-file",
+		"--operator-tokens-file",
+		"--trusted-header",
+	} {
+		if strings.Contains(disabled, unwanted) {
+			t.Fatalf("console-disabled chart output unexpectedly contains %q", unwanted)
+		}
+	}
+	if strings.Contains(disabled, "kind: Ingress") {
+		t.Fatal("console-disabled chart output unexpectedly contains an Ingress")
+	}
+}
+
+// TestChartOperatorConsoleEnabled covers the enabled token-mode render: a
+// second controller Deployment running the courier-console binary, a
+// ClusterIP-only Service in front of it, the session and token Secrets
+// mounted read-only, and no Ingress anywhere.
+func TestChartOperatorConsoleEnabled(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	enabled := runHelm(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.backendURL=http://read-api.default.svc",
+	)...)
+	for _, want := range []string{
+		"--auth-mode=token",
+		"--session-key-file=/etc/courier/console/session-key",
+		"--operator-tokens-file=/etc/courier/console/tokens",
+		"--backend-url=http://read-api.default.svc",
+		"--bind=:8084",
+		"/usr/local/bin/courier-console",
+		"secretName: courier-console-session",
+		"secretName: courier-console-tokens",
+		"readOnly: true",
+	} {
+		if !strings.Contains(enabled, want) {
+			t.Fatalf("console-enabled chart output is missing %q", want)
+		}
+	}
+
+	// The console Deployment and its ClusterIP Service exist under the
+	// documented names.
+	consoleDeployment := findDocument(t, enabled, "kind: Deployment", "name: courier-console")
+	if !strings.Contains(consoleDeployment, "runAsNonRoot: true") {
+		t.Fatal("console Deployment does not carry the runAsNonRoot pod posture")
+	}
+	service := findDocument(t, enabled, "kind: Service", "name: courier-console")
+	for _, want := range []string{"type: ClusterIP", "port: 80", "targetPort: 8084"} {
+		if !strings.Contains(service, want) {
+			t.Fatalf("console Service is missing %q:\n%s", want, service)
+		}
+	}
+
+	// The manager Deployment keeps the name a one-controller release
+	// renders, so enabling the console does not recreate it.
+	findDocument(t, enabled, "kind: Deployment", "name: courier")
+
+	// No Ingress anywhere: exposure is a deployment concern.
+	if strings.Contains(enabled, "kind: Ingress") {
+		t.Fatal("console-enabled chart output unexpectedly contains an Ingress")
+	}
+
+	// Header mode: the trusted header arg replaces the secret-file args and
+	// no console Secret volumes are rendered.
+	header := runHelm(t, chartDir, "template", "courier", ".",
+		"--set", "operatorConsole.enabled=true",
+		"--set", "operatorConsole.auth.mode=header",
+		"--set", "operatorConsole.auth.trustedHeader=X-Forwarded-User",
+	)
+	for _, want := range []string{
+		"--auth-mode=header",
+		"--trusted-header=X-Forwarded-User",
+	} {
+		if !strings.Contains(header, want) {
+			t.Fatalf("console header-mode chart output is missing %q", want)
+		}
+	}
+	for _, unwanted := range []string{
+		"--session-key-file",
+		"--operator-tokens-file",
+		"secretName: courier-console-session",
+		"secretName: courier-console-tokens",
+	} {
+		if strings.Contains(header, unwanted) {
+			t.Fatalf("console header-mode chart output unexpectedly contains %q", unwanted)
+		}
+	}
+}
+
+// TestChartOperatorConsoleRejectsIncompleteConfiguration covers the
+// render-time guards: an enabled console without the required secret
+// references for its chosen auth mode fails the render naming the missing
+// value, so the misconfiguration surfaces at upgrade time.
+func TestChartOperatorConsoleRejectsIncompleteConfiguration(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "token mode without the session key secret",
+			args: []string{
+				"--set", "operatorConsole.enabled=true",
+				"--set", "operatorConsole.auth.operatorTokensSecret=courier-console-tokens",
+			},
+			want: "operatorConsole.enabled requires operatorConsole.auth.sessionKeySecret",
+		},
+		{
+			name: "token mode without the operator tokens secret",
+			args: []string{
+				"--set", "operatorConsole.enabled=true",
+				"--set", "operatorConsole.auth.sessionKeySecret=courier-console-session",
+			},
+			want: "operatorConsole.enabled requires operatorConsole.auth.operatorTokensSecret",
+		},
+		{
+			name: "header mode without the trusted header",
+			args: []string{
+				"--set", "operatorConsole.enabled=true",
+				"--set", "operatorConsole.auth.mode=header",
+			},
+			want: "operatorConsole.enabled requires operatorConsole.auth.trustedHeader",
+		},
+		{
+			name: "unknown auth mode",
+			args: []string{
+				"--set", "operatorConsole.enabled=true",
+				"--set", "operatorConsole.auth.mode=cookie",
+				"--set", "operatorConsole.auth.sessionKeySecret=courier-console-session",
+				"--set", "operatorConsole.auth.operatorTokensSecret=courier-console-tokens",
+			},
+			want: "must be token or header",
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			fullArgs := append([]string{"template", "courier", "."}, testCase.args...)
+			out, err := runHelmOutput(t, chartDir, fullArgs...)
+			if err == nil {
+				t.Fatalf("expected helm template to fail, but it succeeded:\n%s", out)
+			}
+			if !strings.Contains(out, testCase.want) {
+				t.Fatalf("helm template failed without the expected message %q:\n%s", testCase.want, out)
+			}
+		})
+	}
+}
+
+// TestChartOperatorConsolePortOverride pins the console's port coherence:
+// an operatorConsole.port override moves --bind, the liveness probe, and the
+// Service targetPort together, so an override can never render a console
+// whose probe or Service points at a port the container does not listen on.
+func TestChartOperatorConsolePortOverride(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	out := runHelm(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.port=9090",
+	)...)
+	if !strings.Contains(out, "--bind=:9090") {
+		t.Fatalf("console port override is missing from the --bind arg:\n%s", out)
+	}
+	service := findDocument(t, out, "kind: Service", "name: courier-console")
+	if !strings.Contains(service, "targetPort: 9090") {
+		t.Fatalf("console Service did not follow the port override:\n%s", service)
+	}
+	if strings.Contains(service, "targetPort: 8084") {
+		t.Fatalf("console Service still targets the default port after an override:\n%s", service)
+	}
+	deployment := findDocument(t, out, "kind: Deployment", "name: courier-console")
+	if !strings.Contains(deployment, "port: 9090") {
+		t.Fatalf("console liveness probe did not follow the port override:\n%s", deployment)
+	}
+}

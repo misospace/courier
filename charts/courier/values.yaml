@@ -324,6 +324,38 @@ contributeAPI:
   #    the rendered Service routes port 80 to it.
   port: 8083
 
+# -- Operator console scaffold (#821). Disabled by default: enabling it
+#    renders a second controller running the standalone courier-console
+#    binary behind a ClusterIP-only Service. It renders placeholder pages
+#    only — no read API, no tables, no mutating controls — and never talks
+#    to the Kubernetes API. No Ingress is rendered; exposing it is a
+#    deployment concern (docs/operator-console.md).
+operatorConsole:
+  enabled: false
+  # -- Port the console listener binds to inside the console container; the
+  #    rendered Service routes port 80 to it.
+  port: 8084
+  auth:
+    # -- Authentication mode: token (shared operator tokens exchanged for a
+    #    signed session cookie) or header (the upstream proxy's identity
+    #    header). The console must only be reachable from the trusted proxy
+    #    in header mode.
+    mode: token
+    # -- Name of a Secret in the release namespace whose "sessionKeySecretKey"
+    #    entry holds the HMAC session-signing key. Required in token mode.
+    sessionKeySecret: ""
+    sessionKeySecretKey: key
+    # -- Name of a Secret in the release namespace whose
+    #    "operatorTokensSecretKey" entry holds newline-separated accepted
+    #    operator tokens. Required in token mode.
+    operatorTokensSecret: ""
+    operatorTokensSecretKey: tokens
+    # -- Trusted upstream identity header. Required in header mode.
+    trustedHeader: ""
+  # -- Base URL of the (future) operator read API; empty renders the
+  #    backend-unavailable empty states.
+  backendURL: ""
+
 retention:
   # -- Terminal CoderRun retention (#287). The controller deletes terminal runs
   #    after these windows and always keeps the most recent `auditKeep` terminal
@@ -451,6 +483,63 @@ controllers:
           capabilities:
             drop:
               - ALL
+
+  console:
+    # -- The console controller is rendered only when operatorConsole.enabled
+    #    is true; common.yaml.tpl flips this at render time.
+    enabled: false
+    replicas: 1
+    pod:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+    containers:
+      console:
+        image:
+          repository: ghcr.io/misospace/courier
+          tag: ""
+          digest: ""
+          pullPolicy: IfNotPresent
+        command:
+          - /usr/local/bin/courier-console
+        args: []
+        probes:
+          liveness:
+            enabled: true
+            custom: true
+            spec:
+              httpGet:
+                path: /healthz
+                port: 8084
+              initialDelaySeconds: 5
+              periodSeconds: 20
+        resources:
+          requests:
+            cpu: 10m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+
+service:
+  console:
+    # -- The console Service is rendered only when operatorConsole.enabled is
+    #    true; common.yaml.tpl flips this at render time.
+    enabled: false
+    controller: console
+    suffix: console
+    type: ClusterIP
+    ports:
+      http:
+        port: 80
+        targetPort: 8084
 
 serviceAccount:
   main: {}

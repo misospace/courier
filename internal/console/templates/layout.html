@@ -1,0 +1,27 @@
+{{define "layout"}}<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}} — Courier console</title>
+<link rel="stylesheet" href="/static/main.css">
+</head>
+<body>
+<nav>
+  <span class="brand">Courier console</span>
+  <a href="/"{{if eq .Active "overview"}} class="active"{{end}}>Overview</a>
+  <a href="/runs"{{if eq .Active "runs"}} class="active"{{end}}>Runs</a>
+  {{if .Authenticated}}
+  <form method="post" action="/logout" class="signout">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <button type="submit">Sign out</button>
+  </form>
+  {{end}}
+</nav>
+<main>
+{{template "content" .}}
+</main>
+<footer>Courier operator console — placeholder scaffold. The operator read API is not available yet.</footer>
+</body>
+</html>
+{{end}}
