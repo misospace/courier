@@ -116,6 +116,11 @@ type SourceHealth struct {
 }
 
 // RunSummary is one run's projected row for GET runs (paginated list).
+// Spec-side source-owned opaque identifiers — workItemID, sourceContext,
+// sourceReceipt — are never projected: spec.workItemID doubles as a
+// client-supplied contribution idempotency key (#510), so it can carry
+// secret-shaped material and must never cross this surface. The run's name
+// is the server-side correlation identity.
 type RunSummary struct {
 	Name           string       `json:"name"`
 	Namespace      string       `json:"namespace"`
@@ -126,7 +131,6 @@ type RunSummary struct {
 	PhaseEnteredAt *metav1.Time `json:"phaseEnteredAt,omitempty"`
 	Source         string       `json:"source"`
 	Lane           string       `json:"lane"`
-	WorkItemID     string       `json:"workItemID"`
 	// PRNumber is the parsed pull-request number; nil when Status.PR carries
 	// no parseable number (e.g. a URL the projector cannot resolve). Absence
 	// is explicit, never a silent zero.

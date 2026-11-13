@@ -230,7 +230,6 @@ func ProjectRunSummary(run *courierv1alpha1.CoderRun, opts Options) RunSummary {
 		PhaseEnteredAt: run.Status.PhaseEnteredAt.DeepCopy(),
 		Source:         bound(run.Spec.Source),
 		Lane:           bound(run.Spec.Lane),
-		WorkItemID:     bound(run.Spec.WorkItemID),
 		PRNumber:       parsePRNumber(run.Status.PR),
 		Branch:         bound(run.Status.Branch),
 		HeadSHA:        bound(run.Status.HeadSHA),

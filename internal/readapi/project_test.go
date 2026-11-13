@@ -139,7 +139,7 @@ func TestProjectRunSummaryFieldDerivation(t *testing.T) {
 			if summary.Terminal {
 				t.Error("Running run must not be terminal")
 			}
-			if summary.Source != "github-label" || summary.Lane != "local" || summary.WorkItemID != "issue-run" {
+			if summary.Source != "github-label" || summary.Lane != "local" {
 				t.Errorf("spec identity not carried: %+v", summary)
 			}
 		})
@@ -147,6 +147,40 @@ func TestProjectRunSummaryFieldDerivation(t *testing.T) {
 }
 
 func intp(n int) *int { return &n }
+
+// TestWorkItemIDNeverProjected is the redaction regression (#510):
+// spec.workItemID doubles as a client-supplied contribution idempotency
+// key, so it can carry secret-shaped material. No projection of a run may
+// echo the raw value — or the field name — anywhere in its serialized form.
+func TestWorkItemIDNeverProjected(t *testing.T) {
+	secret := "sk-live-9f8e7d6c5b4a3210feedface"
+	run := runFixture("run", "adhoc", "local", courierv1alpha1.PhaseRunning, testNow.Add(-time.Minute))
+	run.Spec.WorkItemID = secret
+	run.Spec.SourceContext = `{"token":"` + secret + `"}`
+
+	summary := ProjectRunSummary(&run, testOptions())
+	detail := ProjectRunDetail(&run, testOptions())
+	list := ProjectRunSummaries([]courierv1alpha1.CoderRun{run}, 1, DefaultPageSize, testOptions())
+	overview := ProjectOverview("courier", []courierv1alpha1.CoderRun{run}, nil, testOptions())
+
+	for name, payload := range map[string]any{
+		"summary":  summary,
+		"detail":   detail,
+		"list":     list,
+		"overview": overview,
+	} {
+		blob, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("%s: marshal: %v", name, err)
+		}
+		if strings.Contains(string(blob), secret) {
+			t.Errorf("%s: serialized projection leaks the raw work-item identity", name)
+		}
+		if strings.Contains(string(blob), "workItemID") {
+			t.Errorf("%s: serialized projection carries a workItemID field", name)
+		}
+	}
+}
 
 // TestLaneSourceScenarios is the table-driven core: six fixtures, asserting the
 // projected lane, source, and overview states.
