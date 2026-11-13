@@ -299,7 +299,6 @@ func TestStatusHappyResponse(t *testing.T) {
 	reader := &fakeStatusReader{status: ContributionStatus{
 		Run:         "courier-abc",
 		Namespace:   "courier",
-		WorkItemID:  "k1",
 		Lane:        "local",
 		BaseRepo:    "upstream/project",
 		WorkRepo:    "contributor/project",
@@ -307,6 +306,7 @@ func TestStatusHappyResponse(t *testing.T) {
 		CIParked:    true,
 		Publication: &ContributionPublication{Branch: "b", HeadRepo: "contributor/project", HeadSHA: "sha", PR: "42"},
 		AdmittedAt:  &now,
+		ObservedAt:  now,
 	}}
 	handler := statusServer(t, reader).Handler()
 
@@ -324,6 +324,39 @@ func TestStatusHappyResponse(t *testing.T) {
 	}
 	if got.Phase != "Verifying" || !got.CIParked || got.Publication == nil || got.Publication.PR != "42" {
 		t.Fatalf("status = %#v, want the reader's projection carried through", got)
+	}
+	if got.ObservedAt.IsZero() {
+		t.Fatal("response carries no observation timestamp")
+	}
+	if strings.Contains(rec.Body.String(), "workItemId") {
+		t.Fatalf("response carries the untrusted work item id: %s", rec.Body.String())
+	}
+}
+
+// TestStatusFixedShapeResponse pins the fixed-shape claim: the scalar
+// fields are always present, at zero values when the run carries none,
+// so consumers never branch on key presence.
+func TestStatusFixedShapeResponse(t *testing.T) {
+	reader := &fakeStatusReader{status: ContributionStatus{
+		Run:       "courier-abc",
+		Namespace: "courier",
+		Lane:      "local",
+		BaseRepo:  "upstream/project",
+		Phase:     "Pending",
+	}}
+	handler := statusServer(t, reader).Handler()
+	rec := get(handler, "/v1/contributions/courier-abc", "Bearer "+testReadToken)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &fields); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	for _, key := range []string{"run", "namespace", "lane", "baseRepo", "workRepo", "phase", "ciParked", "observedAt"} {
+		if _, ok := fields[key]; !ok {
+			t.Fatalf("fixed-shape field %q absent from %s", key, rec.Body.String())
+		}
 	}
 }
 
@@ -419,6 +452,18 @@ func TestStatusAdapterProjection(t *testing.T) {
 			r.Status.CIPark = &courierv1alpha1.CIParkState{}
 			r.Status.PR = "https://github.com/upstream/project/pull/42"
 		}),
+		// HandedOff straight out of a CI park: finishCIPark ends the run
+		// while retaining the park record as the attempt's durable
+		// account, so the read must report the run as no longer parked.
+		contribution("run-handed-off", func(r *courierv1alpha1.CoderRun) {
+			r.Status.Phase = courierv1alpha1.PhaseHandedOff
+			r.Status.CIPark = &courierv1alpha1.CIParkState{
+				Head:        "0123456789abcdef",
+				LastOutcome: courierv1alpha1.CIParkOutcomeExhausted,
+			}
+			r.Status.PR = "https://github.com/upstream/project/pull/42"
+			r.Status.FinishedAt = &now
+		}),
 		// Failed with a recorded terminal diagnostic.
 		contribution("run-failed", func(r *courierv1alpha1.CoderRun) {
 			r.Status.Phase = courierv1alpha1.PhaseFailed
@@ -470,9 +515,17 @@ func TestStatusAdapterProjection(t *testing.T) {
 		if strings.Contains(rec.Body.String(), "provider returned a refusal") {
 			t.Fatalf("GET %s: diagnostic prose leaked into the response", name)
 		}
+		// The idempotency key is untrusted caller text that admission
+		// already returned: no read response ever re-serves it.
+		if strings.Contains(rec.Body.String(), "workItemId") {
+			t.Fatalf("GET %s: untrusted work item id re-served: %s", name, rec.Body.String())
+		}
 		var status ContributionStatus
 		if err := json.Unmarshal(rec.Body.Bytes(), &status); err != nil {
 			t.Fatalf("decode %s: %v", name, err)
+		}
+		if status.ObservedAt.IsZero() {
+			t.Fatalf("GET %s: no observation timestamp", name)
 		}
 		return status
 	}
@@ -481,7 +534,7 @@ func TestStatusAdapterProjection(t *testing.T) {
 	if admitted.Phase != PhaseUnknown || admitted.CIParked || admitted.Publication != nil || admitted.Cause != nil {
 		t.Fatalf("admitted projection = %#v, want unknown phase and nothing published", admitted)
 	}
-	if admitted.WorkItemID != "k-run-admitted" || admitted.BaseRepo != "upstream/project" || admitted.Lane != "local" {
+	if admitted.BaseRepo != "upstream/project" || admitted.WorkRepo != "contributor/project" || admitted.Lane != "local" {
 		t.Fatalf("admitted projection = %#v, want the admitted identity echoed", admitted)
 	}
 	if admitted.AdmittedAt != nil {
@@ -501,6 +554,13 @@ func TestStatusAdapterProjection(t *testing.T) {
 		t.Fatalf("parked projection = %#v", parked)
 	}
 
+	// The retained park account of a finished run is history, not a
+	// live park: ciParked stays false at a recorded ending.
+	handedOff := fetch("run-handed-off")
+	if handedOff.Phase != "HandedOff" || handedOff.CIParked || handedOff.FinishedAt == nil {
+		t.Fatalf("handed-off projection = %#v, want no live park", handedOff)
+	}
+
 	failed := fetch("run-failed")
 	if failed.Phase != "Failed" || failed.FinishedAt == nil ||
 		failed.Cause == nil || failed.Cause.Category != "executor-crash" || failed.Cause.Outcome != "blocked_external" {
@@ -509,11 +569,9 @@ func TestStatusAdapterProjection(t *testing.T) {
 
 	// Oversized values are dropped whole: no truncated identity is ever
 	// presented as a complete one, and the rest of the projection rides
-	// on unaffected.
+	// on unaffected. The oversized idempotency key in the fixture is
+	// never re-served at all (pinned in fetch).
 	oversized := fetch("run-oversized")
-	if oversized.WorkItemID != "" {
-		t.Fatalf("oversized work item id survived the cap: %q", oversized.WorkItemID)
-	}
 	if oversized.Publication == nil ||
 		oversized.Publication.Branch != "courier/upstream/project/goal-abc" ||
 		oversized.Publication.PR != "" {
@@ -525,6 +583,52 @@ func TestStatusAdapterProjection(t *testing.T) {
 	for _, name := range []string{"run-foreign", "run-missing"} {
 		rec := get(handler, "/v1/contributions/"+name, "Bearer "+testReadToken)
 		assertError(t, rec, http.StatusNotFound, "contribution run not found")
+	}
+}
+
+// TestStatusReadsViaAPIReaderNotCacheClient pins the read consistency of
+// the status path: it resolves the run through the direct API-server
+// reader, like the admission path's create-vs-resume lookups, so a
+// lagging informer cache can never serve a poller a state the controller
+// has already moved past.
+func TestStatusReadsViaAPIReaderNotCacheClient(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := courierv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add courier scheme: %v", err)
+	}
+	run := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run-live", Namespace: "courier"},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode:       courierv1alpha1.ModeContribute,
+			Source:     SourceName,
+			WorkItemID: "k-live",
+			Repo:       "upstream/project",
+			WorkRepo:   "contributor/project",
+			Lane:       "local",
+		},
+		Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseRunning},
+	}
+	// The cache client knows nothing; the API reader has the run. A
+	// cache-backed read would answer NotFound (and the handler a 404).
+	laggingCache := fake.NewClientBuilder().WithScheme(scheme).Build()
+	apiReader := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(run).Build()
+
+	adapter := New(laggingCache, apiReader)
+	got, err := adapter.Status(context.Background(), "courier", "run-live")
+	if err != nil {
+		t.Fatalf("status via api reader: %v", err)
+	}
+	if got.Run != "run-live" || got.Phase != "Running" {
+		t.Fatalf("projection = %#v, want the api reader's run", got)
+	}
+
+	// The nil-reader fallback still serves through the client, and a nil
+	// client still fails closed at the call site.
+	if _, err := New(apiReader, nil).Status(context.Background(), "courier", "run-live"); err != nil {
+		t.Fatalf("nil-reader fallback: %v", err)
+	}
+	if _, err := (Adapter{}).Status(context.Background(), "courier", "run-live"); !errors.Is(err, ErrClientRequired) {
+		t.Fatalf("nil client: err = %v, want ErrClientRequired", err)
 	}
 }
 

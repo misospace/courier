@@ -308,17 +308,26 @@ endpoint is never a proxy for arbitrary CR lookups.
 
 The response is a fixed allowlist projection of controller status. No goal
 text, issue text, credential, source receipt, checkpoint, or unbounded CRD
-content appears in it.
+content appears in it. The idempotency key (`spec.workItemID`) is never
+re-served: it is untrusted caller text, and the frontend that admitted the
+run already holds it. Scalar fields are always present; the nested
+`publication`, `cause`, and timestamp fields appear once the controller
+has recorded them.
+
+Reads go to the API server directly, never the informer cache, so a
+response is never a state the controller has already moved past; each one
+is current as of its `observedAt`.
 
 | Field | Meaning |
 | --- | --- |
-| `run`, `namespace`, `workItemId` | The identity admission returned. |
+| `run`, `namespace` | The identity admission returned. |
 | `lane`, `baseRepo`, `workRepo` | The admitted targets. |
 | `phase` | The controller's recorded phase verbatim: `Pending` (admission accepted, waiting), `Claimed`/`Running` (execution), `Verifying` (published, under CI), `AwaitingReview`, `HandedOff`, `NeedsHuman`, `Done`, `AlreadyDone`, `Failed`, `BlockedExternal`. The projection value `unknown` appears only before the controller stamps a phase. Clients must treat any unrecognized value as unknown. |
-| `ciParked` | The run waits on a durable CI park (`status.cipark`). |
+| `ciParked` | The run waits on a durable CI park (`status.cipark`). The controller retains the park record as the attempt's durable account after the park ends, so a run at a recorded ending never reports `ciParked`. |
 | `publication` | What the controller recorded as published: `branch`, `headRepo`, `headSha`, `pr`. |
 | `cause` | A recorded terminal diagnostic, as its bounded `category` and declared `outcome`. |
 | `admittedAt`, `startedAt`, `phaseEnteredAt`, `finishedAt` | The controller's recorded lifecycle timestamps. |
+| `observedAt` | When this read answered from the API server; the state above is current as of this instant. |
 
 Reads are bounded the way writes are: constant-time token comparison, one
 run name per request validated before any cluster contact, a concurrency
@@ -339,14 +348,14 @@ POST /v1/contributions                          Authorization: Bearer <admission
 GET /v1/contributions/courier-3f2a…             Authorization: Bearer <read token>
 
 200 OK
-{"run":"courier-3f2a…","namespace":"courier","workItemId":"adhoc-9c1b…",
+{"run":"courier-3f2a…","namespace":"courier",
  "lane":"local","baseRepo":"acme/project","workRepo":"bot/project",
  "phase":"Verifying","ciParked":true,
  "publication":{"branch":"courier/acme/project/goal-9c1b",
                 "headRepo":"bot/project","headSha":"ab12cd34…",
                 "pr":"https://github.com/acme/project/pull/42"},
  "admittedAt":"2026-11-13T12:00:00Z","startedAt":"2026-11-13T12:00:41Z",
- "phaseEnteredAt":"2026-11-13T12:21:07Z"}
+ "phaseEnteredAt":"2026-11-13T12:21:07Z","observedAt":"2026-11-13T12:21:09Z"}
 ```
 
 Polling guidance: phases move over minutes, not seconds. Poll no more than

@@ -308,9 +308,10 @@ before the operator touches the cluster. A repeated request with the same
 idempotency key resumes the existing run: it never creates a second CoderRun,
 branch, or pull request. Responses carry run identity only, never the goal,
 the issue text, the token, or any credential. Status reads project the
-controller's recorded CoderRun status onto a fixed allowlist: phase, CI
-park, publication identity, bounded terminal cause, and timestamps — never
-goal text, issue text, or credentials. See
+controller's recorded CoderRun status onto a fixed allowlist: phase, live
+CI park, publication identity, bounded terminal cause, lifecycle
+timestamps, and an observation timestamp — never goal text, issue text,
+the idempotency key, or credentials. See
 docs/external-contributions.md, "Status reads".
 
 To enable native Dispatch discovery, configure the chart's `dispatch` values and

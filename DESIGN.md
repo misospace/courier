@@ -3374,17 +3374,21 @@ in the chart), so a frontend can hold read authority without admission
 authority, and with no read token configured the endpoint answers the
 route miss. The controller's CoderRun status is the only source: the read
 stores no parallel state, makes no forge call, and writes nothing. It
-serves runs whose `spec.source` is `adhoc` only — a foreign run and a miss
-share one 404, and there is no list route, so the endpoint is never a
-proxy for arbitrary CR lookups — under the same ownership boundary, with
-constant-time token comparison, a concurrency cap answering 503 with a
-`Retry-After` hint, and a tighter cluster deadline than admission. The
-response is a fixed allowlist projection of recorded controller state:
-phase verbatim (the projection value `unknown` only before the first
-stamp), the CI-park flag, publication identity (branch, head repository,
-head SHA, PR), the bounded terminal cause, and lifecycle timestamps —
-never goal text, issue text, credentials, source receipts, checkpoints, or
-unbounded CRD content. The `/v1` path prefix is the contract version for
+resolves through the direct API-server reader, never the informer cache,
+and each response is current as of its `observedAt`. It serves runs whose
+`spec.source` is `adhoc` only — a foreign run and a miss share one 404,
+and there is no list route, so the endpoint is never a proxy for arbitrary
+CR lookups — under the same ownership boundary, with constant-time token
+comparison, a concurrency cap answering 503 with a `Retry-After` hint, and
+a tighter cluster deadline than admission. The response is a fixed
+allowlist projection of recorded controller state: phase verbatim (the
+projection value `unknown` only before the first stamp), the live CI-park
+flag (a park record the controller retains after the run reached a
+recorded ending does not report it), publication identity (branch, head
+repository, head SHA, PR), the bounded terminal cause, lifecycle
+timestamps, and the observation timestamp — never goal text, issue text,
+credentials, source receipts, checkpoints, the untrusted idempotency key,
+or unbounded CRD content. The `/v1` path prefix is the contract version for
 both surfaces, so an incompatible change arrives as a new prefix. The
 frontend contract is documented in
 [docs/external-contributions.md](./docs/external-contributions.md),

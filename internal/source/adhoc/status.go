@@ -93,14 +93,14 @@ type ContributionStatus struct {
 	// admitted to — the same identity the admission response returned.
 	Run       string `json:"run"`
 	Namespace string `json:"namespace"`
-	// WorkItemID is the contribution's durable idempotency key
-	// (spec.workItemID).
-	WorkItemID string `json:"workItemId"`
 	// Lane, BaseRepo, and WorkRepo echo the admitted contribution's
-	// approved targets (spec.lane, spec.repo, spec.workRepo).
+	// approved targets (spec.lane, spec.repo, spec.workRepo). The
+	// idempotency key (spec.workItemID) is deliberately not projected:
+	// it is caller-supplied, untrusted text (#819), and the frontend
+	// that admitted the run already holds it.
 	Lane     string `json:"lane"`
 	BaseRepo string `json:"baseRepo"`
-	WorkRepo string `json:"workRepo,omitempty"`
+	WorkRepo string `json:"workRepo"`
 	// Phase is the controller's recorded lifecycle phase verbatim
 	// (status.phase): Pending is admission accepted and waiting;
 	// Claimed and Running are execution; Verifying is publication under
@@ -112,7 +112,10 @@ type ContributionStatus struct {
 	Phase string `json:"phase"`
 	// CIParked is true while the run waits on CI in a durable park
 	// (status.cipark). Verifying without a park is active verification.
-	CIParked bool `json:"ciParked,omitempty"`
+	// The controller retains the park record as the attempt's durable
+	// account after the park ends, so a run at a recorded ending is not
+	// parked: presence alone does not set this flag.
+	CIParked bool `json:"ciParked"`
 	// Publication records what the controller has observed published:
 	// branch, head repository and SHA, and the pull request. Nil until
 	// the controller records any part of it.
@@ -129,6 +132,11 @@ type ContributionStatus struct {
 	StartedAt      *metav1.Time `json:"startedAt,omitempty"`
 	PhaseEnteredAt *metav1.Time `json:"phaseEnteredAt,omitempty"`
 	FinishedAt     *metav1.Time `json:"finishedAt,omitempty"`
+	// ObservedAt is when this read answered from the API server, not a
+	// controller-recorded field. It is always present and bounds the
+	// projection's freshness: the state above is the cluster's as of
+	// this instant.
+	ObservedAt metav1.Time `json:"observedAt"`
 }
 
 // ContributionPublication is the recorded publication identity of a
@@ -150,16 +158,18 @@ type ContributionCause struct {
 
 // Status implements StatusReader against the operator's own cluster state:
 // the CoderRun the controller reconciles is the only source of truth, and
-// the read performs no forge call and no state transition. It serves from
-// the manager's cached client, which a status poller can hit repeatedly at
-// negligible cluster cost; watch freshness is the right staleness bound
-// for polling.
+// the read performs no forge call and no state transition. It reads
+// through the same direct API-server reader the admission path's
+// create-vs-resume lookups use, never the informer cache: a poller must
+// never be served a state the controller has already moved past, and the
+// response's ObservedAt honestly names the read time. The concurrency cap
+// and read deadline bound the direct reads' cluster cost.
 func (a Adapter) Status(ctx context.Context, namespace, name string) (ContributionStatus, error) {
 	if a.client == nil {
 		return ContributionStatus{}, ErrClientRequired
 	}
 	run := &courierv1alpha1.CoderRun{}
-	if err := a.client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, run); err != nil {
+	if err := a.reader().Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, run); err != nil {
 		if apierrors.IsNotFound(err) {
 			return ContributionStatus{}, ErrContributionNotFound
 		}
@@ -171,7 +181,9 @@ func (a Adapter) Status(ctx context.Context, namespace, name string) (Contributi
 	if run.Spec.Source != SourceName {
 		return ContributionStatus{}, ErrContributionNotFound
 	}
-	return projectContribution(run), nil
+	out := projectContribution(run)
+	out.ObservedAt = metav1.NewTime(time.Now().UTC())
+	return out, nil
 }
 
 var _ StatusReader = Adapter{}
@@ -181,18 +193,17 @@ var _ StatusReader = Adapter{}
 // is a contract change to the read API, not an implementation detail.
 func projectContribution(run *courierv1alpha1.CoderRun) ContributionStatus {
 	out := ContributionStatus{
-		Run:        boundedField(run.Name),
-		Namespace:  boundedField(run.Namespace),
-		WorkItemID: boundedField(run.Spec.WorkItemID),
-		Lane:       boundedField(run.Spec.Lane),
-		BaseRepo:   boundedField(run.Spec.Repo),
-		WorkRepo:   boundedField(run.Spec.WorkRepo),
-		Phase:      string(run.Status.Phase),
+		Run:       boundedField(run.Name),
+		Namespace: boundedField(run.Namespace),
+		Lane:      boundedField(run.Spec.Lane),
+		BaseRepo:  boundedField(run.Spec.Repo),
+		WorkRepo:  boundedField(run.Spec.WorkRepo),
+		Phase:     string(run.Status.Phase),
 	}
 	if out.Phase == "" {
 		out.Phase = PhaseUnknown
 	}
-	out.CIParked = run.Status.CIPark != nil
+	out.CIParked = ciparkActive(run)
 	pub := ContributionPublication{
 		Branch:   boundedField(run.Status.Branch),
 		HeadRepo: boundedField(run.Status.HeadRepo),
@@ -213,6 +224,30 @@ func projectContribution(run *courierv1alpha1.CoderRun) ContributionStatus {
 	out.PhaseEnteredAt = run.Status.PhaseEnteredAt
 	out.FinishedAt = run.Status.FinishedAt
 	return out
+}
+
+// ciparkActive reports whether the run currently waits inside the
+// controller's durable CI park. The controller ends a park by recording
+// the outcome on the park record and moving the run to a recorded ending,
+// retaining the record as the attempt's durable account; only the abandon
+// paths clear it outright. Presence alone therefore over-reports a
+// finished run as waiting: the flag tracks the live park, and the
+// recorded endings below are the phases no live park can outlive.
+func ciparkActive(run *courierv1alpha1.CoderRun) bool {
+	if run.Status.CIPark == nil {
+		return false
+	}
+	switch run.Status.Phase {
+	case courierv1alpha1.PhaseAwaitingReview,
+		courierv1alpha1.PhaseHandedOff,
+		courierv1alpha1.PhaseNeedsHuman,
+		courierv1alpha1.PhaseDone,
+		courierv1alpha1.PhaseAlreadyDone,
+		courierv1alpha1.PhaseFailed,
+		courierv1alpha1.PhaseBlockedExternal:
+		return false
+	}
+	return true
 }
 
 // boundedField returns s when it fits the projection cap and the empty

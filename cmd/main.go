@@ -460,6 +460,12 @@ func main() {
 	if admissionSecretSet && !admissionBindSet {
 		setupLog.Info("contribution admission listener disabled: --contribute-admission-bind is empty, admission POSTs will be refused", "secret", strings.TrimSpace(contributeAdmissionKeySecret))
 	}
+	if readSecretSet := strings.TrimSpace(contributeReadKeySecret) != ""; readSecretSet && !admissionBindSet {
+		// The read credential rides the admission listener (#819): with no
+		// bind there is no listener for it to ride, so say plainly that the
+		// configured read Secret serves nothing.
+		setupLog.Info("contribution status reads disabled: --contribute-admission-bind is empty, GET /v1/contributions/<run> will not be served", "secret", strings.TrimSpace(contributeReadKeySecret))
+	}
 	if admissionBind := strings.TrimSpace(contributeAdmissionBind); admissionBind != "" {
 		podNamespace := strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
 		if podNamespace == "" {
