@@ -70,7 +70,7 @@ implementation evidence. They never count as live proof.
 | 3 | Meaningful checkpoint and resume. | HARNESS.md section 7 | Checkpoint types and ordering tests (`api/v1alpha1/coderun_types.go`, `native_termination_test.go`). | Restart and resume of a real interrupted run is unobserved in production. | No-go for live proof. |
 | 4 | Publication `lastCommit`. Only a broker-confirmed remote OID is recorded. | #102, HARNESS.md section 7 | Publication verification tests. | A native run that publishes to a real pull request with confirmed `status.lastCommit` is unobserved. | No-go for live proof. |
 | 5 | Current-head CI and PR handoff after publication. | #102 | Tests cover the `Verifying` handoff contract. | No native run carried a published branch through CI to merge. | No-go for live proof. |
-| 6 | Trusted status and credential boundary. The broker can patch only one named run status subresource. | HARNESS.md section 4 | `TestNativeCanaryDoesNotMutateForeignNamespaceRun` and the cross-direction isolation tests in `internal/controller/native_canary_isolation_test.go`. | No side-by-side production deployment has run the boundary. | No-go for live proof. Isolation is the strongest tested area. |
+| 6 | Trusted status and credential boundary. The broker can patch only one named run status subresource. | HARNESS.md section 4 | `TestNativeCanaryDoesNotMutateForeignNamespaceRun` and the cross-direction isolation tests in `internal/controller/native_canary_isolation_test.go`. | Native canaries have run in production beside v1, but no deployment carries a complete acceptance record for the boundary. | No-go for live proof. Isolation is the strongest tested area. |
 
 Rule for reading this table: a criterion moves to go when #731 or #102 records
 live observations from a deployed run, with the deployed run version named.
@@ -188,8 +188,12 @@ the native release:
 - Retry and capacity state (`courier.misospace.dev/retry`,
   `courier.misospace.dev/soft-stop` annotations, `CapacityRecovery`
   condition).
-- Checkpoints (`status.checkpoint`), so a resumed run can reuse completed
-  briefs.
+- Checkpoints (`status.checkpoint`) on the retained run objects, for audit
+  and for a later native resume. They are not v1-resumable state: the legacy
+  OpenCode executor cannot replay native harness brief and checkpoint
+  progress. What v1 can pick up is what lives in the world — branches,
+  commits, and fenced source attempts. A partially completed run re-admitted
+  on v1 still requires the explicit human decision described below.
 
 Ambiguous work, for example a pushed branch with no confirmed publication or a
 run stuck between `Verifying` and `NeedsHuman`, requires an explicit human
@@ -208,9 +212,15 @@ chat.
   File new defects narrowly.
 - Do not treat a dry-run or a single-node exercise as production proof. Only
   live observations from deployed runs count for the go/no-go table.
-- Native model-role configuration must use the harness OpenAI-compatible model
-  bindings. Do not copy OpenCode provider or model strings into a LaneProfile
-  (#632).
+- The model wire format is an explicit lane setting, never inferred from a
+  model name: `LaneProfileSpec.Transport` is `openai` (the LiteLLM-compatible
+  surface, the default when empty) or `anthropic` (the native Anthropic
+  Messages surface) (#716). Choose `anthropic` when the backend requires
+  native Messages — for example thinking-block-sensitive models — and keep
+  model-role values at the gateway-visible model id on the configured route.
+  Neither copying OpenCode provider or model strings into a LaneProfile nor
+  forcing every native lane onto the OpenAI surface is valid (#632). The
+  control binary fails closed on an unknown transport value.
 
 ## Limitations
 
