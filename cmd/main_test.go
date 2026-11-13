@@ -1559,6 +1559,51 @@ func TestValidateContributeAdmissionFlags(t *testing.T) {
 	}
 }
 
+func TestValidateContributeReadFlags(t *testing.T) {
+	tests := []struct {
+		name            string
+		admissionSecret string
+		admissionKey    string
+		readSecret      string
+		readKey         string
+		wantErr         string
+	}{
+		{name: "no read credential disables the check", readSecret: ""},
+		{
+			name:            "separate secrets",
+			admissionSecret: "courier-admission-token", readSecret: "courier-read-token",
+		},
+		{
+			name:            "same secret different key",
+			admissionSecret: "courier-api-token", admissionKey: "admit",
+			readSecret: "courier-api-token", readKey: "read",
+		},
+		{
+			name:            "aliased entry authenticates both surfaces",
+			admissionSecret: "courier-api-token", admissionKey: "token",
+			readSecret: " courier-api-token ", readKey: "token ",
+			wantErr: "must not name the same Secret entry",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateContributeReadFlags(test.admissionSecret, test.admissionKey, test.readSecret, test.readKey)
+			if test.wantErr != "" {
+				if err == nil {
+					t.Fatalf("validateContributeReadFlags() error = nil, want error mentioning %q", test.wantErr)
+				}
+				if !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("validateContributeReadFlags() error = %q, want it to mention %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validateContributeReadFlags() error = %v, want none", err)
+			}
+		})
+	}
+}
+
 func TestLoadAdmissionToken(t *testing.T) {
 	const tokenValue = "a-test-bearer-token-of-some-length"
 

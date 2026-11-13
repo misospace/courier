@@ -36,10 +36,14 @@ const (
 	// maps to a 503 instead of holding the connection open forever.
 	admissionTimeout = 30 * time.Second
 
-	// routeNotFoundMessage is the single miss answer: it names the
-	// collection route and stays accurate now that per-run status reads
-	// hang off the same prefix.
-	routeNotFoundMessage = "contribution API serves " + PathContributions +
+	// routeNotFoundMessage answers a miss on a server whose only surface
+	// is admission; a server without a read token must not announce the
+	// status route it will never serve.
+	routeNotFoundMessage = "contribution admission serves " + PathContributions + " only"
+
+	// routeNotFoundMessageWithReads answers a miss when status reads are
+	// configured and therefore genuinely part of the surface.
+	routeNotFoundMessageWithReads = "contribution API serves " + PathContributions +
 		" and GET " + statusReadPrefix + "<run> only"
 
 	// httpStatus constants for the fixed messages below.
@@ -209,10 +213,12 @@ func (s *AdmissionServer) Handler() http.Handler {
 //   - POST /v1/contributions                    admission (#708)
 //   - GET  /v1/contributions/<run>  status read (#819)
 //
-// Every other path is the one miss answer, and a right path with the
-// wrong method gets its own honest 405: a collection GET (a listing would
-// be the arbitrary-CR-search proxy the read contract forbids) and a POST
-// to a run path are different mistakes and say so.
+// A right path with the wrong method gets its own honest 405: a collection
+// GET (a listing would be the arbitrary-CR-search proxy the read contract
+// forbids) and a POST to a run path are different mistakes and say so.
+// With no read token configured, the run path is not a route at all: the
+// server never announces, method-maps, or serves a status surface it will
+// not answer, and the miss message says so too.
 func (s *AdmissionServer) handle(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == PathContributions {
 		if r.Method != http.MethodPost {
@@ -222,12 +228,16 @@ func (s *AdmissionServer) handle(w http.ResponseWriter, r *http.Request) {
 		s.handleAdmission(w, r)
 		return
 	}
-	if run, ok := statusRoute(r.URL.Path); ok {
+	if run, ok := statusRoute(r.URL.Path); ok && s.readToken != "" {
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, statusMethodMessage)
 			return
 		}
 		s.handleStatus(w, r, run)
+		return
+	}
+	if s.readToken != "" {
+		writeError(w, http.StatusNotFound, routeNotFoundMessageWithReads)
 		return
 	}
 	writeError(w, http.StatusNotFound, routeNotFoundMessage)

@@ -117,15 +117,60 @@ func assertNoSecrets(t *testing.T, rec *httptest.ResponseRecorder) {
 
 func TestStatusReadsDisabledWithoutReader(t *testing.T) {
 	// newTestServer wires no reader and no read token: the read surface
-	// must not exist at all — a miss, not a 401 or 501 that would
-	// announce a disabled capability.
+	// must not exist at all. Every method on a run path is a route miss
+	// with the admission-only miss message — no 405 method map and no
+	// message naming a route the server will never serve.
 	handler := newTestServer(t, &fakeAdmitter{}).Handler()
 	for _, auth := range []string{"", "Bearer " + testToken, "Bearer " + testReadToken} {
-		rec := get(handler, "/v1/contributions/courier-abc", auth)
-		assertNoSecrets(t, rec)
-		if rec.Code != http.StatusNotFound {
-			t.Fatalf("status = %d, want 404 (body: %s)", rec.Code, rec.Body.String())
+		for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
+			req := httptest.NewRequest(method, "/v1/contributions/courier-abc", nil)
+			if auth != "" {
+				req.Header.Set("Authorization", auth)
+			}
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			assertNoSecrets(t, rec)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("%s: status = %d, want 404 (body: %s)", method, rec.Code, rec.Body.String())
+			}
+			if strings.Contains(rec.Body.String(), "status") {
+				t.Fatalf("%s: miss response announces the status surface: %s", method, rec.Body.String())
+			}
 		}
+	}
+}
+
+// TestAdmissionRejectsReadToken pins the other half of credential
+// separation: on a server wired with both tokens, the read bearer is not
+// an admission credential.
+func TestAdmissionRejectsReadToken(t *testing.T) {
+	admitter := &fakeAdmitter{result: Admitted{RunName: "run-1", WorkItemID: "k"}}
+	srv, err := NewAdmissionServer(AdmissionServerConfig{
+		Admitter:         admitter,
+		Token:            testToken,
+		Bind:             ":0",
+		DefaultNamespace: "courier",
+		Status:           &fakeStatusReader{},
+		ReadToken:        testReadToken,
+	})
+	if err != nil {
+		t.Fatalf("construct admission server: %v", err)
+	}
+	handler := srv.Handler()
+
+	body, err := json.Marshal(validRequestBody())
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	rec := post(handler, body, "application/json", "Bearer "+testReadToken)
+	assertError(t, rec, http.StatusUnauthorized, "contribution admission requires a valid bearer token")
+	if admitter.calls() != 0 {
+		t.Fatal("read token reached the admitter")
+	}
+
+	// The admission token still admits, unchanged by the read wiring.
+	if rec := postJSON(t, handler, validRequestBody()); rec.Code != http.StatusCreated {
+		t.Fatalf("admission with its own token: status = %d, want 201 (body: %s)", rec.Code, rec.Body.String())
 	}
 }
 
@@ -389,6 +434,15 @@ func TestStatusAdapterProjection(t *testing.T) {
 			r.Spec.Source = "dispatch"
 			r.Status.Phase = courierv1alpha1.PhaseRunning
 		}),
+		// A run carrying fields beyond the projection cap (admission
+		// never produces these; the cap is the defense-in-depth answer
+		// to CRD fields that are not themselves length-bounded).
+		contribution("run-oversized", func(r *courierv1alpha1.CoderRun) {
+			r.Spec.WorkItemID = strings.Repeat("w", maxStatusFieldBytes+1)
+			r.Status.Phase = courierv1alpha1.PhaseVerifying
+			r.Status.Branch = "courier/upstream/project/goal-abc"
+			r.Status.PR = strings.Repeat("x", maxStatusFieldBytes+1)
+		}),
 	}
 
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objects...).Build()
@@ -453,11 +507,36 @@ func TestStatusAdapterProjection(t *testing.T) {
 		t.Fatalf("failed projection = %#v", failed)
 	}
 
+	// Oversized values are dropped whole: no truncated identity is ever
+	// presented as a complete one, and the rest of the projection rides
+	// on unaffected.
+	oversized := fetch("run-oversized")
+	if oversized.WorkItemID != "" {
+		t.Fatalf("oversized work item id survived the cap: %q", oversized.WorkItemID)
+	}
+	if oversized.Publication == nil ||
+		oversized.Publication.Branch != "courier/upstream/project/goal-abc" ||
+		oversized.Publication.PR != "" {
+		t.Fatalf("oversized projection = %#v", oversized)
+	}
+
 	// The foreign run and a miss are indistinguishable 404s with the
 	// same message: the endpoint never confirms foreign objects exist.
 	for _, name := range []string{"run-foreign", "run-missing"} {
 		rec := get(handler, "/v1/contributions/"+name, "Bearer "+testReadToken)
 		assertError(t, rec, http.StatusNotFound, "contribution run not found")
+	}
+}
+
+// TestBoundedFieldDropsOversized pins the cap boundary: a value at the cap
+// survives, one byte past it is dropped whole, never truncated.
+func TestBoundedFieldDropsOversized(t *testing.T) {
+	atCap := strings.Repeat("a", maxStatusFieldBytes)
+	if got := boundedField(atCap); got != atCap {
+		t.Fatal("a value at the cap must survive")
+	}
+	if got := boundedField(atCap + "x"); got != "" {
+		t.Fatalf("a value past the cap must be dropped, got %q", got[:min(len(got), 32)])
 	}
 }
 

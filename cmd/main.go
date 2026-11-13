@@ -453,6 +453,10 @@ func main() {
 		setupLog.Error(err, "unable to configure contribution admission")
 		os.Exit(1)
 	}
+	if err := validateContributeReadFlags(contributeAdmissionKeySecret, contributeAdmissionKey, contributeReadKeySecret, contributeReadKey); err != nil {
+		setupLog.Error(err, "unable to configure contribution status reads")
+		os.Exit(1)
+	}
 	if admissionSecretSet && !admissionBindSet {
 		setupLog.Info("contribution admission listener disabled: --contribute-admission-bind is empty, admission POSTs will be refused", "secret", strings.TrimSpace(contributeAdmissionKeySecret))
 	}
@@ -1065,6 +1069,23 @@ func validateContributeAdmissionFlags(bind, keySecret string) error {
 	secretSet := strings.TrimSpace(keySecret) != ""
 	if bindSet && !secretSet {
 		return fmt.Errorf("--contribute-admission-bind requires --contribute-admission-key-secret")
+	}
+	return nil
+}
+
+// validateContributeReadFlags reports the one read-credential wiring
+// mistake that voids the read/write split silently (#819): naming the
+// exact same Secret and key as the admission credential, which hands the
+// admission bearer status-read authority while looking like two
+// credentials. Two different Secrets may hold any values; identical
+// pairs are a configuration error, not a deployment.
+func validateContributeReadFlags(admissionSecret, admissionKey, readSecret, readKey string) error {
+	if strings.TrimSpace(readSecret) == "" {
+		return nil
+	}
+	if strings.TrimSpace(readSecret) == strings.TrimSpace(admissionSecret) &&
+		strings.TrimSpace(readKey) == strings.TrimSpace(admissionKey) {
+		return fmt.Errorf("--contribute-read-key-secret with --contribute-read-key must not name the same Secret entry as --contribute-admission-key-secret with --contribute-admission-key; one shared bearer is one credential, and it would authenticate both reads and admissions")
 	}
 	return nil
 }

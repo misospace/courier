@@ -204,7 +204,7 @@ func projectContribution(run *courierv1alpha1.CoderRun) ContributionStatus {
 	}
 	if diag := run.Status.TerminalDiagnostic; diag != nil {
 		out.Cause = &ContributionCause{
-			Category: string(diag.Category),
+			Category: boundedField(string(diag.Category)),
 			Outcome:  boundedField(diag.Outcome),
 		}
 	}
@@ -238,27 +238,20 @@ func statusRoute(path string) (string, bool) {
 // handleStatus runs the read pipeline in the same stage discipline as the
 // admission path — cheap structural checks first, cluster contact last:
 //
-//  1. availability  reads exist only when configured (404)
-//  2. auth          read-token bearer, constant time        (401)
-//  3. run shape     object-name pattern before any lookup   (404)
-//  4. ownership     owned-namespace boundary                (403)
-//  5. capacity      bounded in-flight reads                 (503 + Retry-After)
-//  6. read          adapter Status under a deadline         (200/404/503/500)
+//  1. auth        read-token bearer, constant time        (401)
+//  2. run shape   object-name pattern before any lookup   (404)
+//  3. ownership   owned-namespace boundary                (403)
+//  4. capacity    bounded in-flight reads                 (503 + Retry-After)
+//  5. read        adapter Status under a deadline         (200/404/503/500)
 //
-// Stage 1 answers a route miss rather than announcing a disabled
-// capability. Stage 2 compares only against the read token: the
-// admission credential never authenticates a read, so handing a frontend
-// a read token grants the read and nothing else. Stage 6's errors map to
-// fixed messages; the run name is validated input, so 404 never needs to
-// carry cluster error text.
+// The router admits requests here only when a read token is configured,
+// so an unconfigured server never reaches this code. Stage 1 compares
+// only against the read token: the admission credential never
+// authenticates a read, so handing a frontend a read token grants the
+// read and nothing else. Stage 5's errors map to fixed messages; the run
+// name is validated input, so 404 never needs to carry cluster error text.
 func (s *AdmissionServer) handleStatus(w http.ResponseWriter, r *http.Request, run string) {
-	// Stage 1.
-	if s.readToken == "" {
-		writeError(w, http.StatusNotFound, routeNotFoundMessage)
-		return
-	}
-
-	// Stage 2. One constant message for every credential failure, as on
+	// Stage 1. One constant message for every credential failure, as on
 	// the write path; the read token is never logged or echoed.
 	token, ok := bearerToken(r)
 	if !ok || subtle.ConstantTimeCompare([]byte(token), []byte(s.readToken)) != 1 {
@@ -266,14 +259,14 @@ func (s *AdmissionServer) handleStatus(w http.ResponseWriter, r *http.Request, r
 		return
 	}
 
-	// Stage 3. Malformed names cannot address any object; they are
+	// Stage 2. Malformed names cannot address any object; they are
 	// indistinguishable from misses, so they map to the same 404.
 	if len(run) > maxStatusRunNameBytes || !statusRunNamePattern.MatchString(run) {
 		writeError(w, http.StatusNotFound, statusNotFoundMessage)
 		return
 	}
 
-	// Stage 4. The same ownership boundary that scopes admission: this
+	// Stage 3. The same ownership boundary that scopes admission: this
 	// release never reads runs outside the namespaces it owns.
 	namespace := strings.TrimSpace(r.URL.Query().Get("namespace"))
 	if namespace == "" {
@@ -284,7 +277,7 @@ func (s *AdmissionServer) handleStatus(w http.ResponseWriter, r *http.Request, r
 		return
 	}
 
-	// Stage 5. Non-blocking slot take: a poller learns to back off
+	// Stage 4. Non-blocking slot take: a poller learns to back off
 	// immediately instead of queueing behind a stalled cluster.
 	select {
 	case s.statusSlots <- struct{}{}:
@@ -295,7 +288,7 @@ func (s *AdmissionServer) handleStatus(w http.ResponseWriter, r *http.Request, r
 		return
 	}
 
-	// Stage 6.
+	// Stage 5.
 	readCtx, cancel := context.WithTimeout(r.Context(), statusReadTimeout)
 	defer cancel()
 	status, err := s.statusReader.Status(readCtx, namespace, run)
