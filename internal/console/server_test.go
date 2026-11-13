@@ -487,6 +487,64 @@ func TestSessionCookieFlags(t *testing.T) {
 	}
 }
 
+// TestSessionCookieFlagsOverPlaintext pins the plaintext half of the Secure
+// expression: neither the session cookie nor the logout clearing cookie is
+// Secure without TLS, and the clearing cookie still mirrors the session
+// cookie's attributes.
+func TestSessionCookieFlagsOverPlaintext(t *testing.T) {
+	secrets := newTestSecrets(t)
+	_, base := newTestServer(t, secrets, "")
+	resp, err := noFollowClient().PostForm(base+"/login", url.Values{"token": {secrets.token}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("POST /login status = %d, want 303", resp.StatusCode)
+	}
+	session := resp.Cookies()
+	if len(session) != 1 {
+		t.Fatalf("login set %d cookies, want 1", len(session))
+	}
+	if session[0].Secure {
+		t.Fatal("session cookie over plaintext is Secure")
+	}
+	client := &http.Client{
+		Jar:           &singleCookieJar{cookie: session[0]},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	_, body := get(t, client, base+"/")
+	csrf := findCSRFToken(t, body)
+	if csrf == "" {
+		t.Fatal("authenticated page does not carry the CSRF token")
+	}
+	request, err := http.NewRequest(http.MethodPost, base+"/logout", strings.NewReader("csrf="+csrf))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	applyCookie(t, client, request)
+	logoutResp, err := noFollowClient().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logoutResp.Body.Close()
+	if logoutResp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("logout status = %d, want 303", logoutResp.StatusCode)
+	}
+	cleared := logoutResp.Cookies()
+	if len(cleared) != 1 {
+		t.Fatalf("logout set %d cookies, want 1", len(cleared))
+	}
+	if cleared[0].Secure {
+		t.Fatal("logout clearing cookie over plaintext is Secure")
+	}
+	if cleared[0].HttpOnly != session[0].HttpOnly || cleared[0].SameSite != session[0].SameSite {
+		t.Fatalf("logout clearing cookie flags (%v, %v) do not mirror the session cookie (%v, %v)",
+			cleared[0].HttpOnly, cleared[0].SameSite, session[0].HttpOnly, session[0].SameSite)
+	}
+}
+
 // TestResponsesNeverLeakSecretMaterial covers (i): the operator token bytes
 // and the session key bytes never appear in any response body, on any route,
 // before or after login.
