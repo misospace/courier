@@ -264,6 +264,32 @@ type CommentRequest struct {
 	Body string `json:"body"`
 }
 
+// IssueComment is one entry of GitHub's issue-comments conversation listing,
+// which also serves pull requests. The reviewer's sticky comment lives here;
+// inline review comments (the pull-request review-comments listing) are a
+// different body and are never read by this client.
+type IssueComment struct {
+	ID      int64  `json:"id"`
+	Body    string `json:"body"`
+	HTMLURL string `json:"html_url"`
+	User    struct {
+		Login string `json:"login"`
+	} `json:"user"`
+}
+
+// PullRequestReview is one entry of GitHub's native pull-request reviews
+// listing. The managed review body lives here.
+type PullRequestReview struct {
+	ID          int64  `json:"id"`
+	Body        string `json:"body"`
+	HTMLURL     string `json:"html_url"`
+	State       string `json:"state"`
+	SubmittedAt string `json:"submitted_at"`
+	User        struct {
+		Login string `json:"login"`
+	} `json:"user"`
+}
+
 // CheckRun is a single CI check reported by GitHub.
 type CheckRun struct {
 	ID         int64  `json:"id"`
@@ -431,6 +457,44 @@ func (c *Client) AddComment(ctx context.Context, owner, repo string, number int,
 func (c *Client) CreateComment(ctx context.Context, owner, repo string, number int, body string) error {
 	_, err := c.AddComment(ctx, owner, repo, number, body)
 	return err
+}
+
+// ListIssueComments lists the conversation comments on an issue or pull
+// request, paginating every page. The issue-comments endpoint is where the
+// reviewer's sticky comment lives; the pull-request review-comments endpoint
+// serves inline diff comments and must never be read through this call.
+func (c *Client) ListIssueComments(ctx context.Context, owner, repo string, number int) ([]IssueComment, error) {
+	endpoint := repoEndpoint(owner, repo, "issues", strconv.Itoa(number), "comments")
+	var out []IssueComment
+	for page := 1; ; page++ {
+		var current []IssueComment
+		err := c.doJSONQuery(ctx, http.MethodGet, endpoint, pageQuery(page), nil, &current)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, current...)
+		if len(current) < 100 {
+			return out, nil
+		}
+	}
+}
+
+// ListPullRequestReviews lists the native reviews on a pull request,
+// paginating every page. The managed review body lives in this listing.
+func (c *Client) ListPullRequestReviews(ctx context.Context, owner, repo string, number int) ([]PullRequestReview, error) {
+	endpoint := repoEndpoint(owner, repo, "pulls", strconv.Itoa(number), "reviews")
+	var out []PullRequestReview
+	for page := 1; ; page++ {
+		var current []PullRequestReview
+		err := c.doJSONQuery(ctx, http.MethodGet, endpoint, pageQuery(page), nil, &current)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, current...)
+		if len(current) < 100 {
+			return out, nil
+		}
+	}
 }
 
 // GetPullRequest reads the current pull request from GitHub.

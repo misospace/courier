@@ -131,6 +131,7 @@ func main() {
 	var terminalAuditKeep int
 	var secureMode bool
 	var forgeProvidersFile string
+	var prReviewerIdentity string
 	var runNamespace string
 	var ownedNamespaces stringSliceValue
 	var leaderElectionID string
@@ -172,6 +173,7 @@ func main() {
 	flag.StringVar(&metricsMCPURL, "metrics-mcp-url", "", "Optional remote MCP endpoint for metrics; absence is harmless.")
 	flag.BoolVar(&secureMode, "secure-mode", false, "Route runs through the isolated control/broker/worker topology; legacy stays the default and remains explicitly insecure.")
 	flag.StringVar(&forgeProvidersFile, "forge-providers-file", "", "Secure mode: provider registry file carrying references only.")
+	flag.StringVar(&prReviewerIdentity, "pr-reviewer-identity", "", "Secure mode: forge login the pull-request reviewer posts its managed comment and review under; when set, a fix-pr launch reads that reviewer's machine-readable remediation handoff for the pinned head and feeds it to the coordinator as structured fix input (#755). Empty disables the read.")
 	flag.StringVar(&runNamespace, "run-namespace", "", "Secure mode: the namespace dedicated to run workloads.")
 	flag.Var(&ownedNamespaces, "owned-namespace", "Repeatable run namespace this deployment owns (#632); a run outside the owned set is a strict no-op. Empty keeps the single-controller default: secure mode owns --run-namespace, legacy mode owns every namespace.")
 	flag.StringVar(&leaderElectionID, "leader-election-id", defaultLeaderElectionID, "Lease name for leader election. Two releases sharing an operator namespace need distinct IDs; separate operator namespaces do not (#632).")
@@ -872,6 +874,7 @@ func main() {
 			gatewayPort:       modelGatewayPort,
 			observer:          githubObserver,
 			observerSecret:    observerCredentialSecret,
+			reviewerIdentity:  prReviewerIdentity,
 			legacyGitSecret:   gitCredentialSecret,
 			legacyAPISecret:   githubCredentialSecret,
 			executorEnvSecret: executorEnvironmentSecret,
@@ -1518,21 +1521,25 @@ func loadAdmissionToken(ctx context.Context, reader client.Reader, namespace, se
 
 // secureConfig carries the parsed secure-mode flags into buildSecureControl.
 type secureConfig struct {
-	providersFile     string
-	registry          *forge.Registry
-	runNamespace      string
-	harnessImage      string
-	laneRuntimeImage  string
-	probeImage        string
-	cacheService      string
-	cachePort         int
-	gatewayURL        string
-	gatewayKeySecret  string
-	gatewayKeyName    string
-	gatewayCIDR       string
-	gatewayPort       int
-	observer          controller.WorldObserver
-	observerSecret    string
+	providersFile    string
+	registry         *forge.Registry
+	runNamespace     string
+	harnessImage     string
+	laneRuntimeImage string
+	probeImage       string
+	cacheService     string
+	cachePort        int
+	gatewayURL       string
+	gatewayKeySecret string
+	gatewayKeyName   string
+	gatewayCIDR      string
+	gatewayPort      int
+	observer         controller.WorldObserver
+	observerSecret   string
+	// reviewerIdentity is the forge login the pull-request reviewer posts
+	// under; see --pr-reviewer-identity and SecureConfig.ReviewerIdentity
+	// (#755).
+	reviewerIdentity  string
 	legacyGitSecret   string
 	legacyAPISecret   string
 	executorEnvSecret string
@@ -1681,6 +1688,7 @@ func buildSecureControl(config secureConfig) (*controller.SecureControl, error) 
 			GatewayKeyName:         strings.TrimSpace(config.gatewayKeyName),
 			TokenReviewClusterRole: strings.TrimSpace(config.tokenReviewRole),
 			Skills:                 config.skillRegistry,
+			ReviewerIdentity:       strings.TrimSpace(config.reviewerIdentity),
 			LiveProbes:             true,
 			Kubernetes:             clientset,
 			OperatorNamespace:      strings.TrimSpace(config.operatorNS),
@@ -1702,5 +1710,9 @@ func buildSecureControl(config secureConfig) (*controller.SecureControl, error) 
 				return controller.AdmissionProvider{Provider: provider, Policy: provider, HeadLister: provider}, nil
 			},
 		},
+		// The reviewer's remediation handoff (#755) is read through the same
+		// registry-routed forge observer every other operator-side PR read
+		// uses; an empty ReviewerIdentity keeps this read dark.
+		ReviewHandoffs: observer,
 	}, nil
 }

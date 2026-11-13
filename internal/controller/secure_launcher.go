@@ -17,6 +17,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	courier "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/executor"
@@ -299,7 +300,38 @@ func (s *SecureControl) controlInvocation(ctx context.Context, run *courier.Code
 	// for what it launches. If secure mode gains rebase support, this call
 	// must become assist-aware — the executor pod builder is the
 	// assist-aware path today.
-	invocation, err := executor.NewInvocationWithContribution(run, lane, topology.ControlWorkspacePath, contribution)
+	//
+	// A fix-pr run launched with a configured reviewer identity first reads
+	// that reviewer's machine-readable remediation handoff for the head the
+	// run is pinned to (#755). The read goes through the configured forge
+	// capability; the payload arrives only after the resolver has matched the
+	// forge-reported author and the reviewed head and validated the published
+	// contract. No handoff — unset identity, no resolver, no reviewed handoff
+	// for this head, or a failed read — degrades to the goal the run rendered
+	// before the handoff existed: structured fix input is an improvement on
+	// the coordinator's own feedback inspection, never a launch precondition.
+	reviewHandoff := ""
+	if run.Spec.Mode == courier.ModeFixPR && strings.TrimSpace(s.Config.ReviewerIdentity) != "" && s.ReviewHandoffs != nil {
+		policy, err := VerifyPersistedPolicy(run)
+		if err != nil {
+			return executor.Invocation{}, err
+		}
+		head := strings.TrimSpace(run.Status.HeadSHA)
+		if head == "" {
+			head = strings.TrimSpace(policy.HeadAnchorOID)
+		}
+		if head != "" {
+			handoff, found, err := s.ReviewHandoffs.ReviewHandoff(ctx, run.Spec.Repo, run.Spec.Ref, s.Config.ReviewerIdentity, head)
+			switch {
+			case err != nil:
+				log.FromContext(ctx).V(1).Info("review handoff read failed; launching without structured fix input",
+					"repo", run.Spec.Repo, "pr", run.Spec.Ref, "error", err.Error())
+			case found:
+				reviewHandoff = handoff
+			}
+		}
+	}
+	invocation, err := executor.NewInvocationWithReviewHandoff(run, lane, topology.ControlWorkspacePath, contribution, reviewHandoff)
 	if err != nil {
 		return executor.Invocation{}, err
 	}
