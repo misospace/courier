@@ -153,6 +153,23 @@ requires resolving the reported conflict or truthfully reporting that it
 remains unresolved; a review approval does not complete a conflict-repair
 task.
 
+A secure fix-pr launch additionally consumes the pull-request reviewer's
+machine-readable remediation handoff (`review-handoff/v1`, #755) when the
+deployment configures the reviewer's forge login (`--pr-reviewer-identity`).
+The operator reads the PR's conversation comments and native review bodies
+through the configured forge capability — the GitHub adapter's `list-comments`
+and `list-reviews` reads, which the harness fix-pr terminal contract already
+required — and trusts a body only when the forge reports its author as the
+configured reviewer identity (the managed marker alone is forgeable) and the
+payload validates against the published upstream contract for the head the run
+is pinned to. The validated payload rides the goal verbatim, bounded, framed as
+untrusted task data: the coordinator resolves every blocker and major finding,
+handles minor findings per repository policy, and re-verifies each finding
+against the current head. No trusted handoff — unset identity, no reviewer
+body for this head, or a failed read — launches the pre-handoff goal unchanged:
+structured fix input improves the coordinator's own feedback inspection and is
+never a launch precondition.
+
 Goals stay short — a goal plus tools — but each carries one non-negotiable
 contract: delegation covers bounded work, never the coordinator's ownership
 of completion and forge publication. The publication hint names the run branch
