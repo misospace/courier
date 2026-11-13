@@ -324,6 +324,20 @@ contributeAPI:
   #    the rendered Service routes port 80 to it.
   port: 8083
 
+readAPI:
+  # -- Authenticated read-only projection API (issue #820). Disabled by
+  #    default. When enabled the manager serves the namespace-scoped read API
+  #    on its bind port and the chart renders the ClusterIP Service consumers
+  #    GET projections from. The bearer token lives in a Secret you create;
+  #    it is never rendered into the pod spec or logged.
+  enabled: false
+  # -- Name of the Secret (in the release namespace) whose "token" entry
+  #    holds the bearer token the read API requires. Required when enabled.
+  keySecret: ""
+  # -- Port the read API listener binds to inside the manager container;
+  #    the rendered Service routes port 80 to it.
+  port: 8084
+
 retention:
   # -- Terminal CoderRun retention (#287). The controller deletes terminal runs
   #    after these windows and always keeps the most recent `auditKeep` terminal
