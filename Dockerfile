@@ -199,7 +199,7 @@ USER 65532:65532
 # dependency cache server (courier-dependency-cache) — the deployment-level
 # trusted infrastructure binaries. Kept last so a bare `docker build .`
 # produces the operator image; build paths still pass --target explicitly.
-FROM gcr.io/distroless/static:nonroot@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329 AS manager
+FROM gcr.io/distroless/static:nonroot@sha256:aafe993665bf6200db38a02c11a9351e782a84b6a45e7f33b6695638c88e3931 AS manager
 WORKDIR /
 COPY --from=binaries /workspace/manager .
 COPY --from=binaries /workspace/courier-dependency-cache /usr/local/bin/courier-dependency-cache
