@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -147,5 +148,81 @@ func TestObserverReviewHandoffDisabledWithoutIdentityOrHead(t *testing.T) {
 	}
 	if _, found, err := observer.ReviewHandoff(context.Background(), "acme/widgets", 7, "pr-reviewer", ""); found || err != nil {
 		t.Fatalf("empty head must disable the read: found=%v err=%v", found, err)
+	}
+}
+
+func TestObserverReviewHandoffRoutesToRegistrationEndpoint(t *testing.T) {
+	// The handoff read must follow the registry-selected endpoint like every
+	// other observer read: a GitHub Enterprise registration's listings never
+	// leave for the public API host.
+	transport := &recordingListTransport{}
+	client, err := New("token", transport)
+	if err != nil {
+		t.Fatalf("build client: %v", err)
+	}
+	observer := Observer{Client: client, Registrations: testForgeRegistry(t, "https://ghes.example.test/api/v3")}
+	if _, found, err := observer.ReviewHandoff(context.Background(), "acme/demo", 7, "pr-reviewer", "cafe"); err != nil || found {
+		t.Fatalf("ReviewHandoff = (found %v, %v), want a routed empty read", found, err)
+	}
+	if len(transport.requests) != 2 {
+		t.Fatalf("recorded %d requests, want the comment and review listings", len(transport.requests))
+	}
+	for _, req := range transport.requests {
+		if req.URL.Host != "ghes.example.test" {
+			t.Fatalf("handoff read for %s went to %q, want the registration host", req.URL.Path, req.URL.Host)
+		}
+		if !strings.HasPrefix(req.URL.Path, "/api/v3/repos/acme/demo") {
+			t.Fatalf("handoff read path = %q, want the registration API prefix", req.URL.Path)
+		}
+	}
+}
+
+// recordingListTransport answers every request with an empty JSON array and
+// records where each went.
+type recordingListTransport struct {
+	requests []*http.Request
+}
+
+func (t *recordingListTransport) Do(req *http.Request) (*http.Response, error) {
+	t.requests = append(t.requests, req.Clone(context.Background()))
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader("[]")),
+	}, nil
+}
+
+func TestConversationListPageCapBoundsScan(t *testing.T) {
+	// An inflated conversation must not turn one launch into an unbounded
+	// paged read: the scan stops at the cap and the oversized listing simply
+	// yields no handoff rather than a runaway read.
+	pages := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/repos/acme/widgets/issues/7/comments" {
+			pages++
+			// Every page is full, so an unbounded scan would never stop.
+			items := make([]string, 100)
+			for i := range items {
+				items[i] = `{"id":1,"user":{"login":"bot"},"body":"x"}`
+			}
+			fmt.Fprintf(w, "[%s]", strings.Join(items, ","))
+			return
+		}
+		fmt.Fprint(w, `[]`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "token")
+	if err != nil {
+		t.Fatalf("build client: %v", err)
+	}
+	comments, err := client.ListIssueComments(context.Background(), "acme", "widgets", 7)
+	if err != nil {
+		t.Fatalf("ListIssueComments: %v", err)
+	}
+	if pages != conversationListPageCap {
+		t.Fatalf("pages fetched = %d, want the cap %d", pages, conversationListPageCap)
+	}
+	if len(comments) != conversationListPageCap*100 {
+		t.Fatalf("listed %d comments, want cap*100", len(comments))
 	}
 }

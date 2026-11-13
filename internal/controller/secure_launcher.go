@@ -22,6 +22,7 @@ import (
 	courier "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/forge"
+	"github.com/misospace/courier/internal/reviewhandoff"
 	"github.com/misospace/courier/internal/topology"
 )
 
@@ -324,8 +325,17 @@ func (s *SecureControl) controlInvocation(ctx context.Context, run *courier.Code
 			handoff, found, err := s.ReviewHandoffs.ReviewHandoff(ctx, run.Spec.Repo, run.Spec.Ref, s.Config.ReviewerIdentity, head)
 			switch {
 			case err != nil:
-				log.FromContext(ctx).V(1).Info("review handoff read failed; launching without structured fix input",
-					"repo", run.Spec.Repo, "pr", run.Spec.Ref, "error", err.Error())
+				// A body the reviewer itself published that fails the
+				// published contract is a real defect at the reviewer, not
+				// a quiet absence: record it at default verbosity. A failed
+				// read is ordinary infrastructure noise and stays verbose.
+				if reviewhandoff.IsValidationFailure(err) {
+					log.FromContext(ctx).Info("reviewer handoff body failed validation; launching without structured fix input",
+						"repo", run.Spec.Repo, "pr", run.Spec.Ref, "error", err.Error())
+				} else {
+					log.FromContext(ctx).V(1).Info("review handoff read failed; launching without structured fix input",
+						"repo", run.Spec.Repo, "pr", run.Spec.Ref, "error", err.Error())
+				}
 			case found:
 				reviewHandoff = handoff
 			}

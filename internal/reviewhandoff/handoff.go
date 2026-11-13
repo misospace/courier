@@ -40,6 +40,18 @@ var (
 	ErrShape     = errors.New("reviewhandoff: payload violates shape constraints")
 )
 
+// IsValidationFailure reports whether err is a failure of the handoff
+// payload itself — fence, schema, size, or shape — rather than a failure of
+// the read that carried it. A reviewer's own body that fails validation is a
+// defect at the producer and deserves visibility; a transport failure is
+// ordinary infrastructure noise.
+func IsValidationFailure(err error) bool {
+	return errors.Is(err, ErrMalformed) ||
+		errors.Is(err, ErrSchema) ||
+		errors.Is(err, ErrOversized) ||
+		errors.Is(err, ErrShape)
+}
+
 // Item is one remediation item in the handoff envelope.
 type Item struct {
 	ID          string `json:"id,omitempty"`

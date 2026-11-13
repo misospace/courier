@@ -459,14 +459,24 @@ func (c *Client) CreateComment(ctx context.Context, owner, repo string, number i
 	return err
 }
 
+// conversationListPageCap bounds the conversation and review listings.
+// Bodies on an attacker-visible pull request can be inflated, and the
+// reviewer's handoff rides one managed body, so an unbounded paged read of
+// full bodies is a memory and API-quota lever on whoever lists it. A capped
+// scan returns what it listed; a consumer looking for one managed body
+// treats "not in the listed pages" exactly as absence, so the cap can never
+// accept a wrong body — it can only decline to find the right one.
+const conversationListPageCap = 20
+
 // ListIssueComments lists the conversation comments on an issue or pull
-// request, paginating every page. The issue-comments endpoint is where the
-// reviewer's sticky comment lives; the pull-request review-comments endpoint
-// serves inline diff comments and must never be read through this call.
+// request, paginating up to conversationListPageCap pages. The
+// issue-comments endpoint is where the reviewer's sticky comment lives; the
+// pull-request review-comments endpoint serves inline diff comments and must
+// never be read through this call.
 func (c *Client) ListIssueComments(ctx context.Context, owner, repo string, number int) ([]IssueComment, error) {
 	endpoint := repoEndpoint(owner, repo, "issues", strconv.Itoa(number), "comments")
 	var out []IssueComment
-	for page := 1; ; page++ {
+	for page := 1; page <= conversationListPageCap; page++ {
 		var current []IssueComment
 		err := c.doJSONQuery(ctx, http.MethodGet, endpoint, pageQuery(page), nil, &current)
 		if err != nil {
@@ -477,14 +487,16 @@ func (c *Client) ListIssueComments(ctx context.Context, owner, repo string, numb
 			return out, nil
 		}
 	}
+	return out, nil
 }
 
 // ListPullRequestReviews lists the native reviews on a pull request,
-// paginating every page. The managed review body lives in this listing.
+// paginating up to conversationListPageCap pages. The managed review body
+// lives in this listing.
 func (c *Client) ListPullRequestReviews(ctx context.Context, owner, repo string, number int) ([]PullRequestReview, error) {
 	endpoint := repoEndpoint(owner, repo, "pulls", strconv.Itoa(number), "reviews")
 	var out []PullRequestReview
-	for page := 1; ; page++ {
+	for page := 1; page <= conversationListPageCap; page++ {
 		var current []PullRequestReview
 		err := c.doJSONQuery(ctx, http.MethodGet, endpoint, pageQuery(page), nil, &current)
 		if err != nil {
@@ -495,6 +507,7 @@ func (c *Client) ListPullRequestReviews(ctx context.Context, owner, repo string,
 			return out, nil
 		}
 	}
+	return out, nil
 }
 
 // GetPullRequest reads the current pull request from GitHub.
