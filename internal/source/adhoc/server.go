@@ -16,9 +16,10 @@ import (
 	"time"
 )
 
-// PathContributions is the single route the admission server serves. It is
-// the HTTP twin of the courierctl contribute subcommand: the same adapter,
-// the same server-side validation, a thinner frontend
+// PathContributions is the admission route the server serves; per-run
+// status reads hang off the same prefix (status.go). It is the HTTP twin
+// of the courierctl contribute subcommand: the same adapter, the same
+// server-side validation, a thinner frontend
 // (#708, docs/external-contributions.md, "Admission surface").
 const PathContributions = "/v1/contributions"
 
@@ -34,6 +35,16 @@ const (
 	// stalled API server that accepts the connection but never answers
 	// maps to a 503 instead of holding the connection open forever.
 	admissionTimeout = 30 * time.Second
+
+	// routeNotFoundMessage answers a miss on a server whose only surface
+	// is admission; a server without a read token must not announce the
+	// status route it will never serve.
+	routeNotFoundMessage = "contribution admission serves " + PathContributions + " only"
+
+	// routeNotFoundMessageWithReads answers a miss when status reads are
+	// configured and therefore genuinely part of the surface.
+	routeNotFoundMessageWithReads = "contribution API serves " + PathContributions +
+		" and GET " + statusReadPrefix + "<run> only"
 
 	// httpStatus constants for the fixed messages below.
 	unauthorizedMessage  = "contribution admission requires a valid bearer token"
@@ -73,8 +84,16 @@ type AdmissionServerConfig struct {
 	// OwnedNamespaces is the deployment-ownership boundary (#632): the
 	// namespaces this release may admit runs into. Non-empty restricts
 	// admission to exactly these namespaces; empty means every namespace,
-	// the single-controller default.
+	// the single-controller default. It scopes status reads too.
 	OwnedNamespaces []string
+	// Status and ReadToken wire the read-only lifecycle surface (#819).
+	// They come as a pair: a reader without its own credential would
+	// invite a later wiring mistake that authenticates reads with the
+	// admission token, and a token without a reader serves nothing. Set
+	// both to serve GET /v1/contributions/<run>; leave both empty to
+	// leave reads off.
+	Status    StatusReader
+	ReadToken string
 }
 
 // AdmissionServer serves the HTTP admission API for ad-hoc contributions
@@ -84,19 +103,29 @@ type AdmissionServerConfig struct {
 // own, because the adapter and the controller admission path own all of it
 // (docs/external-contributions.md, "Admission surface"). The response
 // carries run identity only; the goal, issue text, and token never appear
-// in it.
+// in it. When a read token and reader are configured, the same listener
+// also serves the read-only contribution status endpoint (#819) under an
+// independent credential; see status.go.
 type AdmissionServer struct {
 	admitter         Admitter
 	token            string
 	bind             string
 	defaultNamespace string
 	ownedNamespaces  []string
+	statusReader     StatusReader
+	readToken        string
+	// statusSlots is the counting semaphore behind the status read
+	// concurrency bound: a token per in-flight read, sized at
+	// construction so the handler never allocates per request.
+	statusSlots chan struct{}
 }
 
 // NewAdmissionServer builds the server, failing closed when a required
 // input is missing: a server without an admitter, a token, or a bind
 // address would either do nothing or authenticate nothing, and that must
-// be a startup error rather than a runtime surprise.
+// be a startup error rather than a runtime surprise. The status reader and
+// its read token are optional, but only together: a half-configured read
+// surface is the same class of wiring mistake.
 func NewAdmissionServer(config AdmissionServerConfig) (*AdmissionServer, error) {
 	switch {
 	case config.Admitter == nil:
@@ -105,6 +134,10 @@ func NewAdmissionServer(config AdmissionServerConfig) (*AdmissionServer, error) 
 		return nil, errors.New("adhoc: admission server requires a bearer token")
 	case config.Bind == "":
 		return nil, errors.New("adhoc: admission server requires a bind address")
+	case (config.Status == nil) != (config.ReadToken == ""):
+		return nil, errors.New("adhoc: admission server status reads require both a status reader and a read token")
+	case config.ReadToken == config.Token:
+		return nil, errors.New("adhoc: admission server read token must be a distinct bearer from the admission token; one shared bearer is one credential, and it would authenticate both reads and admissions")
 	}
 	return &AdmissionServer{
 		admitter:         config.Admitter,
@@ -112,6 +145,9 @@ func NewAdmissionServer(config AdmissionServerConfig) (*AdmissionServer, error) 
 		bind:             config.Bind,
 		defaultNamespace: config.DefaultNamespace,
 		ownedNamespaces:  config.OwnedNamespaces,
+		statusReader:     config.Status,
+		readToken:        config.ReadToken,
+		statusSlots:      make(chan struct{}, maxConcurrentStatusReads),
 	}, nil
 }
 
@@ -168,10 +204,45 @@ func (s *AdmissionServer) Start(ctx context.Context) error {
 }
 
 // Handler returns the server's HTTP handler: the single entry point for
-// every POST, with all authentication, negotiation, bounding, and error
-// mapping inside it.
+// every request, with all authentication, negotiation, bounding, and
+// error mapping inside it.
 func (s *AdmissionServer) Handler() http.Handler {
 	return http.HandlerFunc(s.handle)
+}
+
+// handle routes the two surfaces before any request touches a pipeline:
+//
+//   - POST /v1/contributions                    admission (#708)
+//   - GET  /v1/contributions/<run>  status read (#819)
+//
+// A right path with the wrong method gets its own honest 405: a collection
+// GET (a listing would be the arbitrary-CR-search proxy the read contract
+// forbids) and a POST to a run path are different mistakes and say so.
+// With no read token configured, the run path is not a route at all: the
+// server never announces, method-maps, or serves a status surface it will
+// not answer, and the miss message says so too.
+func (s *AdmissionServer) handle(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == PathContributions {
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "contribution admission accepts POST only")
+			return
+		}
+		s.handleAdmission(w, r)
+		return
+	}
+	if run, ok := statusRoute(r.URL.Path); ok && s.readToken != "" {
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, statusMethodMessage)
+			return
+		}
+		s.handleStatus(w, r, run)
+		return
+	}
+	if s.readToken != "" {
+		writeError(w, http.StatusNotFound, routeNotFoundMessageWithReads)
+		return
+	}
+	writeError(w, http.StatusNotFound, routeNotFoundMessage)
 }
 
 // AdmissionRequest is the JSON body of one admission POST. Field names are
@@ -213,38 +284,27 @@ type AdmissionResult struct {
 	Resumed bool `json:"resumed"`
 }
 
-// handle runs the admission pipeline in a fixed order, mirroring the
-// intake's stage discipline: each stage either proceeds or rejects with a
-// mapped status code, cheap structural checks run before expensive ones,
-// and every cluster contact happens last, after the request is fully
-// shaped:
+// handleAdmission runs the admission pipeline in a fixed order, mirroring
+// the intake's stage discipline: each stage either proceeds or rejects
+// with a mapped status code, cheap structural checks run before expensive
+// ones, and every cluster contact happens last, after the request is
+// fully shaped:
 //
-//  1. route       exactly POST /v1/contributions   (404/405)
-//  2. auth        static bearer token             (401)
-//  3. media type  application/json                (415)
-//  4. body bound  ContentLength + MaxBytesReader  (413)
-//  5. decode      strict single JSON object       (400)
-//  6. shape       fresh vs. explicit key          (400)
-//  7. ownership   owned-namespace boundary        (403)
-//  8. admission   adapter Admit under a deadline  (400/409/503/500)
+//  1. auth        static bearer token             (401)
+//  2. media type  application/json                (415)
+//  3. body bound  ContentLength + MaxBytesReader  (413)
+//  4. decode      strict single JSON object       (400)
+//  5. shape       fresh vs. explicit key          (400)
+//  6. ownership   owned-namespace boundary        (403)
+//  7. admission   adapter Admit under a deadline  (400/409/503/500)
 //
-// Stage 2 uses one constant rejection message for missing, malformed, and
+// Stage 1 uses one constant rejection message for missing, malformed, and
 // wrong tokens alike, so an unauthenticated caller learns nothing about
 // which part failed; the token itself is never logged or echoed anywhere.
-// Stages 6 and 7 run before any cluster contact, so a contradictory or
+// Stages 5 and 6 run before any cluster contact, so a contradictory or
 // out-of-bounds request leaves the cluster untouched.
-func (s *AdmissionServer) handle(w http.ResponseWriter, r *http.Request) {
-	// Stage 1. Exactly one route, POST only.
-	if r.URL.Path != PathContributions {
-		writeError(w, http.StatusNotFound, "contribution admission serves "+PathContributions+" only")
-		return
-	}
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "contribution admission accepts POST only")
-		return
-	}
-
-	// Stage 2. Static bearer token, compared in constant time. One
+func (s *AdmissionServer) handleAdmission(w http.ResponseWriter, r *http.Request) {
+	// Stage 1. Static bearer token, compared in constant time. One
 	// constant message covers missing, malformed, and wrong tokens: the
 	// response must not tell an unauthenticated caller which part of the
 	// credential failed. The token is never written to any response.
@@ -254,7 +314,7 @@ func (s *AdmissionServer) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Stage 3. The API consumes application/json only; a form POST or a
+	// Stage 2. The API consumes application/json only; a form POST or a
 	// raw body is a client bug. Parameters (charset and the like) are
 	// ignored, and the comparison is case-insensitive.
 	if contentType(r) != "application/json" {
@@ -262,7 +322,7 @@ func (s *AdmissionServer) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Stage 4. Bound the body before parsing so an oversized upload cannot
+	// Stage 3. Bound the body before parsing so an oversized upload cannot
 	// exhaust memory. ContentLength is only a claim: a chunked upload
 	// reports -1, so the read itself is capped too and every byte that
 	// enters the handler is bounded, not just the declared ones.
@@ -272,7 +332,7 @@ func (s *AdmissionServer) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxAdmissionBodyBytes)
 
-	// Stage 5. One strict JSON object: malformed JSON, a non-object shape,
+	// Stage 4. One strict JSON object: malformed JSON, a non-object shape,
 	// an unknown field, or trailing garbage is a 400 — a silent typo must
 	// never become a silently ignored input.
 	req, err := decodeAdmissionRequest(r)
@@ -285,7 +345,7 @@ func (s *AdmissionServer) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Stage 6. The fresh/explicit-key contradiction is rejected here, on
+	// Stage 5. The fresh/explicit-key contradiction is rejected here, on
 	// the raw key, before any cluster contact — the same rule the CLI
 	// applies at parse time. Letting one silently win would hide the
 	// caller's mistake about which idempotency strategy they meant.
@@ -294,7 +354,7 @@ func (s *AdmissionServer) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Stage 7. Ownership boundary (#632), before any cluster contact: this
+	// Stage 6. Ownership boundary (#632), before any cluster contact: this
 	// release never admits a run into a namespace its reconciler refuses
 	// to own. The namespace is trimmed here so what the server records is
 	// exactly what the adapter validates and persists, which trims its own
@@ -308,7 +368,7 @@ func (s *AdmissionServer) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Stage 8. Admission under a deadline, so a stalled API server maps to
+	// Stage 7. Admission under a deadline, so a stalled API server maps to
 	// a 503 instead of holding the connection open. Fields are handed to
 	// the adapter untrimmed: the adapter trims and validates its own
 	// inputs, and the server adding a second trimming rule would risk the
