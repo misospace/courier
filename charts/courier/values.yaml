@@ -417,6 +417,14 @@ controllers:
         #                               attribution needs an account-associated
         #                               email; authorship is separate from
         #                               authentication and commit signing.
+        #   --pr-reviewer-identity      Secure mode: forge login the
+        #                               pull-request reviewer posts its managed
+        #                               comment and review under. When set, a
+        #                               fix-pr launch reads that reviewer's
+        #                               machine-readable remediation handoff
+        #                               for the pinned head and feeds it to the
+        #                               coordinator as structured fix input
+        #                               (#755). Empty disables the read.
         args:
           - --leader-elect
           - --git-remote-template=https://github.com/%s.git
