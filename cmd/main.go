@@ -491,6 +491,10 @@ func main() {
 				setupLog.Error(err, "unable to configure contribution status reads")
 				os.Exit(1)
 			}
+			if err := validateContributeReadTokens(token, readToken); err != nil {
+				setupLog.Error(err, "unable to configure contribution status reads")
+				os.Exit(1)
+			}
 		}
 		server, err := adhoc.NewAdmissionServer(contributeServerConfig(adapter, token, admissionBind, podNamespace, ownedRunNamespaces, readToken))
 		if err != nil {
@@ -1078,8 +1082,8 @@ func validateContributeAdmissionFlags(bind, keySecret string) error {
 // mistake that voids the read/write split silently (#819): naming the
 // exact same Secret and key as the admission credential, which hands the
 // admission bearer status-read authority while looking like two
-// credentials. Two different Secrets may hold any values; identical
-// pairs are a configuration error, not a deployment.
+// credentials. Flag validation cannot see Secret values, so a byte-level
+// check runs once both tokens are loaded (validateContributeReadTokens).
 func validateContributeReadFlags(admissionSecret, admissionKey, readSecret, readKey string) error {
 	if strings.TrimSpace(readSecret) == "" {
 		return nil
@@ -1087,6 +1091,17 @@ func validateContributeReadFlags(admissionSecret, admissionKey, readSecret, read
 	if strings.TrimSpace(readSecret) == strings.TrimSpace(admissionSecret) &&
 		strings.TrimSpace(readKey) == strings.TrimSpace(admissionKey) {
 		return fmt.Errorf("--contribute-read-key-secret with --contribute-read-key must not name the same Secret entry as --contribute-admission-key-secret with --contribute-admission-key; one shared bearer is one credential, and it would authenticate both reads and admissions")
+	}
+	return nil
+}
+
+// validateContributeReadTokens rejects equal credential values at startup
+// (#819): name-distinct Secrets — or two keys in one Secret — holding the
+// same bearer bytes hand the read token write admission authority, the
+// same split the name check above exists to keep.
+func validateContributeReadTokens(admissionToken, readToken string) error {
+	if readToken != "" && readToken == admissionToken {
+		return fmt.Errorf("the contribution read credential is byte-identical to the admission token; one shared bearer is one credential, and it would authenticate both reads and admissions")
 	}
 	return nil
 }

@@ -300,7 +300,10 @@ parallel status, makes no forge call, and writes nothing.
 Read authorization is separate from write admission. A second bearer token
 (`--contribute-read-key-secret`; chart `contributeAPI.readKeySecret`)
 authenticates reads: the admission token never reads and the read token
-never admits. With no read token configured, the endpoint answers the
+never admits. The two credentials must be distinct bearers, not just
+distinct Secret entries — startup fails if the read token is byte-identical
+to the admission token, since one shared bearer authenticates both surfaces.
+With no read token configured, the endpoint answers the
 route miss. Reads respect the same deployment-ownership boundary as
 admission, and only runs whose `spec.source` is `adhoc` are served — a
 foreign run and a miss share one 404, and there is no list route, so the

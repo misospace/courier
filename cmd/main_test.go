@@ -1605,6 +1605,40 @@ func TestValidateContributeReadFlags(t *testing.T) {
 	}
 }
 
+func TestValidateContributeReadTokens(t *testing.T) {
+	tests := []struct {
+		name           string
+		admissionToken string
+		readToken      string
+		wantErr        string
+	}{
+		{name: "no read token disables the check", admissionToken: "write-bearer", readToken: ""},
+		{name: "distinct bearers", admissionToken: "write-bearer", readToken: "read-bearer"},
+		{
+			name:           "equal bearers authenticate both surfaces",
+			admissionToken: "same-bearer", readToken: "same-bearer",
+			wantErr: "byte-identical to the admission token",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateContributeReadTokens(test.admissionToken, test.readToken)
+			if test.wantErr != "" {
+				if err == nil {
+					t.Fatalf("validateContributeReadTokens() error = nil, want error mentioning %q", test.wantErr)
+				}
+				if !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("validateContributeReadTokens() error = %q, want it to mention %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validateContributeReadTokens() error = %v", err)
+			}
+		})
+	}
+}
+
 // TestContributeServerConfig pins the manager's own read wiring (#819):
 // the status reader travels only with its read token, and the config the
 // manager builds is accepted by NewAdmissionServer in both shapes. An

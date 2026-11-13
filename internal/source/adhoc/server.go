@@ -136,6 +136,8 @@ func NewAdmissionServer(config AdmissionServerConfig) (*AdmissionServer, error) 
 		return nil, errors.New("adhoc: admission server requires a bind address")
 	case (config.Status == nil) != (config.ReadToken == ""):
 		return nil, errors.New("adhoc: admission server status reads require both a status reader and a read token")
+	case config.ReadToken == config.Token:
+		return nil, errors.New("adhoc: admission server read token must be a distinct bearer from the admission token; one shared bearer is one credential, and it would authenticate both reads and admissions")
 	}
 	return &AdmissionServer{
 		admitter:         config.Admitter,

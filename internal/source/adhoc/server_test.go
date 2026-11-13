@@ -451,7 +451,9 @@ func TestAdmissionCarriesDeadline(t *testing.T) {
 
 // TestConstructorFailsClosed pins that NewAdmissionServer rejects a wiring
 // mistake at construction: a server without an admitter, a token, or a bind
-// address would do nothing or authenticate nothing.
+// address would do nothing or authenticate nothing, and a read token
+// byte-identical to the admission token would let the read bearer admit
+// (#819).
 func TestConstructorFailsClosed(t *testing.T) {
 	valid := AdmissionServerConfig{
 		Admitter: &fakeAdmitter{},
@@ -471,6 +473,16 @@ func TestConstructorFailsClosed(t *testing.T) {
 		if _, err := NewAdmissionServer(cfg); err == nil {
 			t.Fatalf("%s: construction accepted a required missing input", name)
 		}
+	}
+	shared := AdmissionServerConfig{
+		Admitter:  &fakeAdmitter{},
+		Token:     testToken,
+		Bind:      ":0",
+		Status:    &fakeStatusReader{},
+		ReadToken: testToken,
+	}
+	if _, err := NewAdmissionServer(shared); err == nil {
+		t.Fatal("construction accepted a read token byte-identical to the admission token")
 	}
 }
 
