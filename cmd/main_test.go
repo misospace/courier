@@ -22,6 +22,7 @@ import (
 	"github.com/misospace/courier/internal/forge"
 	couriergithub "github.com/misospace/courier/internal/github"
 	"github.com/misospace/courier/internal/skills"
+	"github.com/misospace/courier/internal/source/adhoc"
 	"github.com/misospace/courier/internal/source/cron"
 	"github.com/misospace/courier/internal/source/dispatch"
 	corev1 "k8s.io/api/core/v1"
@@ -1598,7 +1599,38 @@ func TestValidateContributeReadFlags(t *testing.T) {
 				return
 			}
 			if err != nil {
-				t.Fatalf("validateContributeReadFlags() error = %v, want none", err)
+				t.Fatalf("validateContributeReadFlags() error = %v", err)
+			}
+		})
+	}
+}
+
+// TestContributeServerConfig pins the manager's own read wiring (#819):
+// the status reader travels only with its read token, and the config the
+// manager builds is accepted by NewAdmissionServer in both shapes. An
+// admission-only deployment — an admission Secret and no read Secret —
+// must start, not crash on the reader/token pair rule.
+func TestContributeServerConfig(t *testing.T) {
+	adapter := adhoc.New(nil, nil)
+	tests := []struct {
+		name       string
+		readToken  string
+		wantStatus bool
+	}{
+		{name: "admission-only leaves the reader unwired", readToken: "", wantStatus: false},
+		{name: "a read token brings the reader", readToken: "a-read-bearer-token-of-some-length", wantStatus: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := contributeServerConfig(adapter, "an-admission-bearer-token-of-some-length", ":8083", "courier-system", []string{"courier-system"}, test.readToken)
+			if (config.Status != nil) != test.wantStatus {
+				t.Fatalf("status reader wired = %v, want %v", config.Status != nil, test.wantStatus)
+			}
+			if config.ReadToken != test.readToken {
+				t.Fatalf("read token = %q, want %q", config.ReadToken, test.readToken)
+			}
+			if _, err := adhoc.NewAdmissionServer(config); err != nil {
+				t.Fatalf("NewAdmissionServer() rejected the manager's own config: %v", err)
 			}
 		})
 	}

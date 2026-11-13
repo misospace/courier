@@ -269,16 +269,17 @@ func TestStatusNamespaceDefaultingAndBoundary(t *testing.T) {
 
 func TestStatusErrorMapping(t *testing.T) {
 	cases := []struct {
-		name string
-		err  error
-		code int
-		msg  string
+		name       string
+		err        error
+		code       int
+		msg        string
+		retryAfter string
 	}{
-		{"not found", ErrContributionNotFound, http.StatusNotFound, "contribution run not found"},
-		{"wrapped not found", fmt.Errorf("lookup: %w", ErrContributionNotFound), http.StatusNotFound, "contribution run not found"},
-		{"deadline", context.DeadlineExceeded, http.StatusServiceUnavailable, "contribution status read timed out before the cluster answered"},
-		{"wrapped deadline", fmt.Errorf("get coder run: %w", context.DeadlineExceeded), http.StatusServiceUnavailable, "contribution status read timed out before the cluster answered"},
-		{"generic", errors.New("get coder run: connection refused from etcd"), http.StatusInternalServerError, "contribution status read failed"},
+		{"not found", ErrContributionNotFound, http.StatusNotFound, "contribution run not found", ""},
+		{"wrapped not found", fmt.Errorf("lookup: %w", ErrContributionNotFound), http.StatusNotFound, "contribution run not found", ""},
+		{"deadline", context.DeadlineExceeded, http.StatusServiceUnavailable, "contribution status read timed out before the cluster answered", "1"},
+		{"wrapped deadline", fmt.Errorf("get coder run: %w", context.DeadlineExceeded), http.StatusServiceUnavailable, "contribution status read timed out before the cluster answered", "1"},
+		{"generic", errors.New("get coder run: connection refused from etcd"), http.StatusInternalServerError, "contribution status read failed", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -289,6 +290,11 @@ func TestStatusErrorMapping(t *testing.T) {
 			assertError(t, rec, tc.code, tc.msg)
 			if strings.Contains(rec.Body.String(), "etcd") {
 				t.Fatal("cluster error text leaked into the response")
+			}
+			// Every read-surface 503 names when to come back; the other
+			// statuses carry no such hint.
+			if got := rec.Header().Get("Retry-After"); got != tc.retryAfter {
+				t.Fatalf("Retry-After = %q, want %q", got, tc.retryAfter)
 			}
 		})
 	}

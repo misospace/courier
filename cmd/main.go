@@ -490,15 +490,7 @@ func main() {
 				os.Exit(1)
 			}
 		}
-		server, err := adhoc.NewAdmissionServer(adhoc.AdmissionServerConfig{
-			Admitter:         adapter,
-			Token:            token,
-			Bind:             admissionBind,
-			DefaultNamespace: podNamespace,
-			OwnedNamespaces:  ownedRunNamespaces,
-			Status:           adapter,
-			ReadToken:        readToken,
-		})
+		server, err := adhoc.NewAdmissionServer(contributeServerConfig(adapter, token, admissionBind, podNamespace, ownedRunNamespaces, readToken))
 		if err != nil {
 			setupLog.Error(err, "unable to configure contribution admission")
 			os.Exit(1)
@@ -1094,6 +1086,27 @@ func validateContributeReadFlags(admissionSecret, admissionKey, readSecret, read
 		return fmt.Errorf("--contribute-read-key-secret with --contribute-read-key must not name the same Secret entry as --contribute-admission-key-secret with --contribute-admission-key; one shared bearer is one credential, and it would authenticate both reads and admissions")
 	}
 	return nil
+}
+
+// contributeServerConfig wires the admission listener's server config
+// (#708, #819). The status reader rides only with its own credential:
+// NewAdmissionServer rejects a reader without a read token, so an
+// admission-only deployment — a configured admission Secret and no read
+// Secret — would crash at startup if the reader were passed
+// unconditionally.
+func contributeServerConfig(adapter adhoc.Adapter, token, bind, defaultNamespace string, ownedNamespaces []string, readToken string) adhoc.AdmissionServerConfig {
+	config := adhoc.AdmissionServerConfig{
+		Admitter:         adapter,
+		Token:            token,
+		Bind:             bind,
+		DefaultNamespace: defaultNamespace,
+		OwnedNamespaces:  ownedNamespaces,
+		ReadToken:        readToken,
+	}
+	if readToken != "" {
+		config.Status = adapter
+	}
+	return config
 }
 
 // dispatchBinding pairs one Dispatch queue lane with one Courier LaneProfile.

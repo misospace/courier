@@ -277,7 +277,7 @@ func statusRoute(path string) (string, bool) {
 //  2. run shape   object-name pattern before any lookup   (404)
 //  3. ownership   owned-namespace boundary                (403)
 //  4. capacity    bounded in-flight reads                 (503 + Retry-After)
-//  5. read        adapter Status under a deadline         (200/404/503/500)
+//  5. read        adapter Status under a deadline         (200/404/503 + Retry-After/500)
 //
 // The router admits requests here only when a read token is configured,
 // so an unconfigured server never reaches this code. Stage 1 compares
@@ -332,6 +332,11 @@ func (s *AdmissionServer) handleStatus(w http.ResponseWriter, r *http.Request, r
 		case errors.Is(err, ErrContributionNotFound):
 			writeError(w, http.StatusNotFound, statusNotFoundMessage)
 		case errors.Is(err, context.DeadlineExceeded):
+			// The same hint as the capacity 503: the polling contract is
+			// one rule — every 503 from the read surface names when to
+			// come back, so a stalled cluster sends pollers away on the
+			// documented interval instead of a silent guess.
+			w.Header().Set("Retry-After", "1")
 			writeError(w, http.StatusServiceUnavailable, statusTimeoutMessage)
 		default:
 			// Arbitrary cluster error text stays out of the response,

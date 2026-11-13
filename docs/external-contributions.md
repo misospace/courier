@@ -306,6 +306,14 @@ admission, and only runs whose `spec.source` is `adhoc` are served — a
 foreign run and a miss share one 404, and there is no list route, so the
 endpoint is never a proxy for arbitrary CR lookups.
 
+Terminal runs outlive their record, not their object: the reaper
+(`internal/controller/reap.go`) deletes a run once its terminal retention
+window passes (by default a five-minute inspection window for `Done` and
+`AlreadyDone`, a week for `Failed` and `NeedsHuman`). After that the read
+answers the same 404 as a miss — a reaped run and a run that never existed
+are indistinguishable — so a frontend that must keep a run's final state
+records it before its window closes.
+
 The response is a fixed allowlist projection of controller status. No goal
 text, issue text, credential, source receipt, checkpoint, or unbounded CRD
 content appears in it. The idempotency key (`spec.workItemID`) is never
@@ -332,8 +340,9 @@ is current as of its `observedAt`.
 Reads are bounded the way writes are: constant-time token comparison, one
 run name per request validated before any cluster contact, a concurrency
 cap that answers 503 with `Retry-After: 1` when saturated, and a 10-second
-cluster deadline. API versioning is the `/v1` path prefix: an incompatible
-change to either surface arrives as a new prefix, not a silent reshape.
+cluster deadline whose 503 carries the same hint. API versioning is the
+`/v1` path prefix: an incompatible change to either surface arrives as a
+new prefix, not a silent reshape.
 
 Example round trip:
 
