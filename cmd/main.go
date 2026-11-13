@@ -5,11 +5,11 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -47,8 +47,23 @@ import (
 
 var (
 	scheme   = runtime.NewScheme()
-	setupLog = ctrl.Log.WithName("setup")
+	setupLog = setupLogger{Logger: ctrl.Log.WithName("setup")}
 )
+
+// setupLogger adds a warning level to the setup logger. The logr logger API
+// has none, so a startup warning is recorded as an info line that names
+// itself: the operator's log stream has to show that a rebase designation
+// was not applied, without the operator failing to start over a drift it
+// reports (#796).
+type setupLogger struct {
+	logr.Logger
+}
+
+// Warn records a startup warning. It is not an error: the operator keeps
+// running, and the message names the drift the operator has to fix.
+func (l setupLogger) Warn(msg string, keysAndValues ...any) {
+	l.Info("warning: "+msg, keysAndValues...)
+}
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
@@ -98,6 +113,7 @@ func main() {
 	var dispatchLane string
 	var dispatchLaneBindings stringSliceValue
 	var dispatchRebaseLanes stringSliceValue
+	var dispatchRebaseExecutors stringSliceValue
 	var dispatchPollInterval time.Duration
 	var dispatchHTTPTimeout time.Duration
 	var cronSchedulesFile string
@@ -187,7 +203,8 @@ func main() {
 	flag.StringVar(&dispatchQueueLane, "dispatch-queue-lane", "", "Dispatch queue lane sent to next-task.")
 	flag.StringVar(&dispatchLane, "dispatch-lane", "", "LaneProfile assigned to discovered Dispatch work.")
 	flag.Var(&dispatchLaneBindings, "dispatch-lane-binding", "Repeatable Dispatch binding <queueLane>:<laneProfile>[:<agentName>]; one discovery runner per binding.")
-	flag.Var(&dispatchRebaseLanes, "dispatch-rebase-lane", "Repeatable queue-lane name whose Dispatch binding requests the versioned rebase capability contract (#715). A rebase binding accepts REBASE work only on an affirmative, version-matched capability response and declines everything else; ordinary bindings negotiate nothing and stay compatible with older Dispatch deployments.")
+	flag.Var(&dispatchRebaseLanes, "dispatch-rebase-lane", "Deprecated alias for --dispatch-rebase-executor: repeatable queue-lane name whose Dispatch binding requests the versioned rebase capability contract (#715). The lane must resolve to exactly one configured binding; prefer naming the rebase executor agent identity directly.")
+	flag.Var(&dispatchRebaseExecutors, "dispatch-rebase-executor", "Repeatable Dispatch agent identity of the binding that is the rebase executor; the named binding declares the versioned rebase-only intake contract (#796). A rebase executor accepts REBASE work only on an affirmative, version-matched capability response and declines everything else.")
 	flag.DurationVar(&dispatchPollInterval, "dispatch-poll-interval", 30*time.Second, "Dispatch discovery poll interval.")
 	flag.DurationVar(&dispatchHTTPTimeout, "dispatch-http-timeout", 30*time.Second, "Dispatch HTTP request timeout.")
 	var labelSourceEnabled bool
@@ -560,6 +577,16 @@ func main() {
 	// decoding the context itself (#624). The registry is shared by pointer, so
 	// adapters registered below are visible to every consumer.
 	launcher.Sources = sources
+	if !dispatchEnabled && (len(dispatchRebaseLanes) > 0 || len(dispatchRebaseExecutors) > 0) {
+		// A rebase designation without Dispatch discovery configures
+		// nothing: no binding exists, so the rebase-only intake contract
+		// would never be declared and REBASE work would never reach the
+		// rebase lane. The operator named a rebase executor, so the manager
+		// stops here instead of starting with a designation it cannot
+		// apply (#796).
+		setupLog.Error(fmt.Errorf("dispatch: a rebase executor is declared but Dispatch discovery is disabled"), "unable to configure Dispatch source", "rebaseLanes", dispatchRebaseLanes.String(), "rebaseExecutors", dispatchRebaseExecutors.String())
+		os.Exit(1)
+	}
 	if dispatchEnabled {
 		if strings.TrimSpace(dispatchBaseURL) == "" || strings.TrimSpace(dispatchAgentName) == "" {
 			setupLog.Error(fmt.Errorf("dispatch requires base URL and agent name"), "unable to configure Dispatch source")
@@ -573,6 +600,27 @@ func main() {
 		if len(bindings) == 0 {
 			setupLog.Error(fmt.Errorf("dispatch requires base URL, agent name, and at least one queue-lane/LaneProfile binding"), "unable to configure Dispatch source")
 			os.Exit(1)
+		}
+		// The rebase designation is settled before any Dispatch client
+		// exists: an ambiguous or stale designation must fail startup while
+		// nothing has polled yet, not after a lane silently armed the wrong
+		// binding (#796).
+		rebaseExecutors, err := resolveRebaseExecutors(bindings, dispatchRebaseLanes, dispatchRebaseExecutors)
+		if err != nil {
+			setupLog.Error(err, "unable to configure Dispatch source")
+			os.Exit(1)
+		}
+		for _, binding := range bindings {
+			if declaresRebaseCapability(rebaseExecutors, binding.agentName) {
+				continue
+			}
+			// Inverse drift: a binding that reads like a rebase executor
+			// but was not declared as one declines every REBASE handout,
+			// which reads as a rebase lane that idles (#796).
+			if !looksLikeRebaseExecutor(binding.queueLane, binding.agentName, binding.laneProfile) {
+				continue
+			}
+			setupLog.Warn("Dispatch binding looks like a rebase executor but is not declared as one; REBASE work offered to this binding will be declined", "queueLane", binding.queueLane, "laneProfile", binding.laneProfile, "agentName", binding.agentName)
 		}
 		namespace := strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
 		if namespace == "" {
@@ -609,6 +657,16 @@ func main() {
 		}
 		legacyClient.WithPullRequestStateChecker(checker)
 		legacyClient.WithOwnershipBindings(ownershipBindings)
+		// The bare connector polls the same Dispatch agent as the binding
+		// that owns that identity, so a rebase executor must carry the
+		// rebase-only scope on both clients: an agent that polls once with
+		// the scope and once without it takes ordinary work on the unscoped
+		// poll, which is exactly the failure the rebase lane exists to
+		// prevent (#796).
+		if declaresRebaseCapability(rebaseExecutors, dispatchAgentName) {
+			legacyClient.WithRebaseCapability(true)
+			setupLog.Info("Dispatch bare connector requests the rebase capability contract", "agentName", strings.TrimSpace(dispatchAgentName))
+		}
 		if dispatchPRFixExclusions {
 			legacyClient.WithPRFixExclusions(true)
 		}
@@ -624,14 +682,17 @@ func main() {
 			if dispatchPRFixExclusions {
 				bindingClient.WithPRFixExclusions(true)
 			}
-			// A rebase lane is an explicit per-binding operator choice (#715):
-			// the binding sends the versioned rebase capability request and
-			// fail-closes on every negotiation refusal. Every other binding
-			// negotiates nothing, which is what keeps ordinary lanes
-			// operational with Dispatch deployments that predate the contract.
-			if slices.Contains(dispatchRebaseLanes, binding.queueLane) {
+			// A rebase executor is an explicit per-binding operator choice
+			// (#715): the binding sends the versioned rebase capability
+			// request and fail-closes on every negotiation refusal. Every
+			// other binding negotiates nothing, which is what keeps ordinary
+			// lanes operational with Dispatch deployments that predate the
+			// contract. The designation is resolved to agent identities
+			// before any client exists, so a stale or ambiguous lane cannot
+			// arm the wrong binding here (#796).
+			if declaresRebaseCapability(rebaseExecutors, binding.agentName) {
 				bindingClient.WithRebaseCapability(true)
-				setupLog.Info("Dispatch binding requests the rebase capability contract", "queueLane", binding.queueLane, "laneProfile", binding.laneProfile)
+				setupLog.Info("Dispatch binding requests the rebase capability contract", "queueLane", binding.queueLane, "laneProfile", binding.laneProfile, "agentName", binding.agentName)
 			}
 			opts := []dispatch.Option{dispatch.WithConnectorDiagnostics(diagnostics)}
 			if binding.sourceAgent != "" {
@@ -1083,6 +1144,105 @@ func validDispatchAgentName(name string) bool {
 		}
 	}
 	return true
+}
+
+// resolveRebaseExecutors settles which configured Dispatch bindings are the
+// rebase executors (#796). The designation must resolve to exactly one
+// binding, because the two failure modes are silent and opposite: a stale
+// name that matches nothing leaves the rebase-only intake contract
+// undeclared, so the rebase lane executes ordinary issue work, while an
+// ambiguous name arms every binding that shares it, so Dispatch refuses
+// ordinary work for the whole queue lane. Startup fails on both rather than
+// guessing which the deployment meant.
+//
+// --dispatch-rebase-lane names the queue lane of the binding and stays as a
+// deprecated alias; --dispatch-rebase-executor names the binding's Dispatch
+// agent identity directly and is the only form that stays unambiguous when
+// one queue lane carries several bindings. The two forms cannot be combined:
+// one designation must have one reading.
+func resolveRebaseExecutors(bindings []dispatchBinding, lanes, executors []string) (map[string]bool, error) {
+	if len(lanes) > 0 && len(executors) > 0 {
+		return nil, fmt.Errorf("dispatch: --dispatch-rebase-lane and --dispatch-rebase-executor cannot be combined; name every rebase executor agent with --dispatch-rebase-executor")
+	}
+	resolved := make(map[string]bool, len(lanes)+len(executors))
+	for _, lane := range lanes {
+		value := strings.TrimSpace(lane)
+		matched := make([]dispatchBinding, 0, 1)
+		for _, binding := range bindings {
+			if binding.queueLane == value {
+				matched = append(matched, binding)
+			}
+		}
+		switch len(matched) {
+		case 0:
+			return nil, fmt.Errorf("dispatch: --dispatch-rebase-lane %q matches no configured binding; the rebase-only intake contract is not declared and REBASE work runs as ordinary work", value)
+		case 1:
+			resolved[matched[0].agentName] = true
+		default:
+			return nil, fmt.Errorf("dispatch: --dispatch-rebase-lane %q matches %d configured bindings (%s); every one of them would declare the rebase-only intake contract, so Dispatch refuses ordinary work for the whole queue lane; name the rebase executor agents with --dispatch-rebase-executor", value, len(matched), dispatchBindingAgentNames(matched))
+		}
+	}
+	for _, executor := range executors {
+		value := strings.TrimSpace(executor)
+		matched := make([]dispatchBinding, 0, 1)
+		for _, binding := range bindings {
+			if binding.agentName == value {
+				matched = append(matched, binding)
+			}
+		}
+		switch len(matched) {
+		case 0:
+			return nil, fmt.Errorf("dispatch: --dispatch-rebase-executor %q matches no configured binding agent; the rebase-only intake contract is not declared and REBASE work runs as ordinary work", value)
+		case 1:
+			resolved[matched[0].agentName] = true
+		default:
+			// resolveDispatchBindings already rejects duplicate agent
+			// identities, so the configured bindings can never reach this
+			// branch; it keeps the resolution honest for any caller that
+			// assembles bindings of its own.
+			return nil, fmt.Errorf("dispatch: --dispatch-rebase-executor %q matches %d configured bindings (%s); the rebase executor must name exactly one agent identity", value, len(matched), dispatchBindingAgentNames(matched))
+		}
+	}
+	return resolved, nil
+}
+
+// declaresRebaseCapability reports whether the Dispatch agent identity must
+// declare the rebase-only intake contract (#796). The bare connector and the
+// binding that owns its identity poll the same agent, so both read this one
+// answer: an agent that is a rebase executor must never poll once with the
+// scope and once without it.
+func declaresRebaseCapability(executors map[string]bool, agentName string) bool {
+	return executors[strings.TrimSpace(agentName)]
+}
+
+// dispatchBindingAgentNames renders the agent identities of the given
+// bindings as a comma-separated list, for the startup errors that have to
+// name every binding a designation would have armed.
+func dispatchBindingAgentNames(bindings []dispatchBinding) string {
+	names := make([]string, 0, len(bindings))
+	for _, binding := range bindings {
+		names = append(names, binding.agentName)
+	}
+	return strings.Join(names, ", ")
+}
+
+// looksLikeRebaseExecutor reports whether any of the given names reads like
+// the identity of a rebase executor (#796). It is a drift heuristic, not a
+// decision: a binding that looks like a rebase executor but was not declared
+// as one silently declines every REBASE handout, which reads as a rebase
+// lane that idles. Startup warns about the drift instead of arming a binding
+// the operator never designated.
+func looksLikeRebaseExecutor(names ...string) bool {
+	for _, name := range names {
+		for _, segment := range strings.FieldsFunc(name, func(r rune) bool {
+			return r == '-' || r == '.' || r == '_' || r == ' '
+		}) {
+			if strings.EqualFold(segment, "rebase") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ownershipInput carries the startup configuration the deployment-ownership

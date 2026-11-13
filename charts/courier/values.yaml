@@ -50,6 +50,10 @@ dispatch:
   # -- Optional list of lane bindings; each entry pairs a Dispatch queueLane
   #    with a Courier laneProfile and optional stable agentName. Repeated queue
   #    lanes need distinct explicit agentName values.
+  #    An entry with rebaseExecutor: true names the rebase executor binding.
+  #    That entry needs an explicit agentName, because the rebase executor is
+  #    named by its agent identity and must not change when the queue lane
+  #    changes.
   lanes: []
   pollInterval: 30s
   httpTimeout: 30s

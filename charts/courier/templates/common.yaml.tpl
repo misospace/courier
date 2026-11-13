@@ -24,6 +24,8 @@
 {{- $hasDispatchQueueLane := false }}
 {{- $hasDispatchLane := false }}
 {{- $hasDispatchLaneBinding := false }}
+{{- $hasDispatchRebaseExecutor := false }}
+{{- $hasDispatchRebaseLane := false }}
 {{- $hasDispatchPollInterval := false }}
 {{- $hasDispatchHTTPTimeout := false }}
 {{- $hasLabelSourceEnabled := false }}
@@ -65,6 +67,12 @@
 {{- end }}
 {{- if hasPrefix "--dispatch-lane-binding=" $arg }}
 {{- $hasDispatchLaneBinding = true }}
+{{- end }}
+{{- if hasPrefix "--dispatch-rebase-executor=" $arg }}
+{{- $hasDispatchRebaseExecutor = true }}
+{{- end }}
+{{- if hasPrefix "--dispatch-rebase-lane=" $arg }}
+{{- $hasDispatchRebaseLane = true }}
 {{- end }}
 {{- if hasPrefix "--dispatch-poll-interval=" $arg }}
 {{- $hasDispatchPollInterval = true }}
@@ -110,6 +118,13 @@
 {{- end }}
 {{- $dispatch := .Values.dispatch }}
 {{- $lanes := $dispatch.lanes | default (list) }}
+{{- $rebaseExecutorLanes := 0 }}
+{{- range $binding := $lanes }}
+{{- if $binding.rebaseExecutor }}{{- $rebaseExecutorLanes = add $rebaseExecutorLanes 1 }}{{- end }}
+{{- end }}
+{{- if and (not $dispatch.enabled) (gt $rebaseExecutorLanes 0) }}
+{{- fail "dispatch.lanes[].rebaseExecutor requires dispatch.enabled" }}
+{{- end }}
 {{- if $dispatch.enabled }}
 {{- if or (not $dispatch.baseURL) (not $dispatch.agentName) (not $dispatch.tokenSecret.name) (not $dispatch.tokenSecret.key) }}
 {{- fail "dispatch.enabled requires baseURL, agentName, tokenSecret.name, and tokenSecret.key" }}
@@ -143,6 +158,12 @@
 {{- if and (gt (index $queueCounts $binding.queueLane) 1) (not $binding.agentName) }}
 {{- fail (printf "repeated queueLane %q requires explicit distinct agentName values" $binding.queueLane) }}
 {{- end }}
+{{- if and $binding.rebaseExecutor (not $binding.agentName) }}
+{{- fail (printf "dispatch.lanes entry with rebaseExecutor true requires an explicit agentName (queueLane %q)" $binding.queueLane) }}
+{{- end }}
+{{- end }}
+{{- if and $hasDispatchLaneBinding (gt $rebaseExecutorLanes 0) }}
+{{- fail "dispatch.lanes[].rebaseExecutor cannot be combined with operator-supplied --dispatch-lane-binding args; declare the rebase executor with an operator-supplied --dispatch-rebase-executor arg" }}
 {{- end }}
 {{- else if or (not $dispatch.queueLane) (not $dispatch.laneProfile) }}
 {{- fail "dispatch.enabled requires dispatch.lanes or both dispatch.queueLane and dispatch.laneProfile" }}
@@ -157,6 +178,9 @@
 {{- $bindingArg := printf "%s:%s" $binding.queueLane $binding.laneProfile }}
 {{- if $binding.agentName }}{{- $bindingArg = printf "%s:%s" $bindingArg $binding.agentName }}{{- end }}
 {{- $args = append $args (printf "--dispatch-lane-binding=%s" $bindingArg) }}
+{{- if and $binding.rebaseExecutor (not $hasDispatchRebaseExecutor) (not $hasDispatchRebaseLane) }}
+{{- $args = append $args (printf "--dispatch-rebase-executor=%s" $binding.agentName) }}
+{{- end }}
 {{- end }}
 {{- end }}
 {{- else }}

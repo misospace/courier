@@ -3368,6 +3368,20 @@ a conflict. The versioned rebase-only intake contract with Dispatch and the
 supported release combinations are documented in
 [docs/rebase-lane.md](./docs/rebase-lane.md).
 
+The rebase executor is a configured binding, not a queue lane. The manager
+settles the designation at startup and stops when the designation does not name
+exactly one configured binding, or when Dispatch discovery is disabled. The two
+failure modes are silent and opposite: a designation that matches nothing
+leaves the rebase-only intake contract undeclared, so the rebase lane executes
+ordinary issue work, and a designation that matches several bindings arms
+every one of them, so Dispatch refuses ordinary work for the whole queue lane.
+The operator names the binding by its Dispatch agent identity
+(`--dispatch-rebase-executor`); the deprecated `--dispatch-rebase-lane` alias
+resolves a queue lane only when that lane carries exactly one binding, and the
+two forms cannot be combined. A binding that reads like a rebase executor but
+was not declared as one produces a startup warning, because it declines every
+REBASE handout and the lane looks idle.
+
 Model-assisted conflict resolution (#732) is an explicit operator-selected
 capability, off by default. When enabled, the engine hands the episode's first
 mechanically-rejected file set to the configured coordinator model for exactly
