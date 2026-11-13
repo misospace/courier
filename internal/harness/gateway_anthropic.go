@@ -114,7 +114,7 @@ func (a *AnthropicTransport) StreamChat(ctx context.Context, req ChatRequest) ([
 		// The same bounded-read redaction contract as every transport: the
 		// provider body is classified, never retained or echoed.
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxProviderErrorBody))
-		return []Event{{Kind: KindError, Err: gatewayStatusError(resp.StatusCode, resp.Header, body, a.signals())}}, nil
+		return []Event{{Kind: KindError, Err: gatewayStatusErrorForModel(resp.StatusCode, resp.Header, body, a.signals(), gatewayModelID(req.Model))}}, nil
 	}
 	return normalizeAnthropicStream(resp.Body, a.signals())
 }
@@ -131,7 +131,10 @@ func (a *AnthropicTransport) StreamChat(ctx context.Context, req ChatRequest) ([
 // text and tool_use blocks built from the normalized fields.
 func anthropicWireRequest(req ChatRequest) ([]byte, error) {
 	wire := anthropicWireRequestShape{
-		Model:     req.Model,
+		// The gateway sees the model half of the bound provider/model name,
+		// exactly as on the OpenAI-compatible transport: the provider half is
+		// Courier-side routing and never gateway-visible (#812).
+		Model:     gatewayModelID(req.Model),
 		MaxTokens: req.MaxTokens,
 		Stream:    true,
 		// The Messages API requires a non-null messages array (#724): a
