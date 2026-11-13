@@ -140,8 +140,12 @@ type ToolDef struct {
 }
 
 // ChatRequest is one model turn. Model is the role-bound model identifier
-// from the LaneProfile, passed through to the gateway verbatim: the gateway
-// owns provider routing and Courier stays model-agnostic.
+// from the LaneProfile in Courier's provider/model convention. The provider
+// half names the client-side provider — the routing segment a caller such as
+// opencode resolves locally — and is never gateway-visible: every native
+// transport sends the model half (see gatewayModelID) on the wire, so a
+// gateway that lists bare model names serves the same binding the OpenCode
+// transport resolves locally.
 type ChatRequest struct {
 	Model    string
 	Messages []Message
@@ -152,6 +156,21 @@ type ChatRequest struct {
 	// API — send it; formats that treat it as optional, like the OpenAI
 	// chat-completions request, ignore it exactly as today.
 	MaxTokens int
+}
+
+// gatewayModelID derives the gateway-visible model identifier from a bound
+// model name. Courier names a role's model "provider/model": the provider
+// half is client-side routing — the OpenCode transport resolves it locally,
+// and it never reaches any gateway — while the model half is the id an
+// OpenAI-compatible gateway is served under. A binding without a provider
+// prefix (or with an empty half on either side) is sent unchanged, so
+// bare-name deployments keep working verbatim.
+func gatewayModelID(model string) string {
+	provider, rest, ok := strings.Cut(model, "/")
+	if !ok || provider == "" || rest == "" {
+		return model
+	}
+	return rest
 }
 
 // wireStreamOptions is the streaming option the OpenAI-compatible request
@@ -234,7 +253,7 @@ func (g *Gateway) StreamChat(ctx context.Context, req ChatRequest) ([]Event, err
 			defer resp.Body.Close()
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				body, _ := io.ReadAll(io.LimitReader(resp.Body, maxProviderErrorBody))
-				return []Event{{Kind: KindError, Err: gatewayStatusError(resp.StatusCode, resp.Header, body, g.signals()), RejectedRequests: 1}}, nil
+				return []Event{{Kind: KindError, Err: gatewayStatusErrorForModel(resp.StatusCode, resp.Header, body, g.signals(), gatewayModelID(req.Model)), RejectedRequests: 1}}, nil
 			}
 			events, err := normalizeStream(resp.Body, g.signals())
 			// The request the provider rejected is a provider request the
@@ -247,7 +266,7 @@ func (g *Gateway) StreamChat(ctx context.Context, req ChatRequest) ([]Event, err
 			}
 			return events, err
 		}
-		return []Event{{Kind: KindError, Err: gatewayStatusError(resp.StatusCode, resp.Header, body, g.signals())}}, nil
+		return []Event{{Kind: KindError, Err: gatewayStatusErrorForModel(resp.StatusCode, resp.Header, body, g.signals(), gatewayModelID(req.Model))}}, nil
 	}
 	return normalizeStream(resp.Body, g.signals())
 }
@@ -260,7 +279,7 @@ func (g *Gateway) StreamChat(ctx context.Context, req ChatRequest) ([]Event, err
 // sent=true with a GatewayTransportError.
 func (g *Gateway) post(ctx context.Context, req ChatRequest, includeUsage bool) (*http.Response, bool, error) {
 	body, err := json.Marshal(wireRequest{
-		Model:    req.Model,
+		Model:    gatewayModelID(req.Model),
 		Messages: toWireMessages(req.Messages),
 		Tools:    toolsToWire(req.Tools),
 		Stream:   true,
@@ -381,7 +400,7 @@ func modelInfoInputLimit(ctx context.Context, client *http.Client, baseURL, apiK
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxProviderErrorBody))
-		return 0, gatewayStatusError(resp.StatusCode, resp.Header, body, signals)
+		return 0, gatewayStatusErrorForModel(resp.StatusCode, resp.Header, body, signals, gatewayModelID(model))
 	}
 	var report wireModelInfo
 	decoder := json.NewDecoder(io.LimitReader(resp.Body, maxModelInfoBody))
@@ -395,12 +414,24 @@ func modelInfoInputLimit(ctx context.Context, client *http.Client, baseURL, apiK
 		return 0, errors.New("harness: gateway model info is undecodable")
 	}
 	limit, named := 0, false
+	// The request wire carries the model half, so an entry under the
+	// gateway-visible id decides the verified limit; the configured binding's
+	// own spelling is the fallback for a gateway that lists only it. Without
+	// this preference the gateway's response order would decide which of two
+	// differently-sized deployments a declared budget gets verified against.
+	wireID := gatewayModelID(model)
+	wireLimit, wireNamed := 0, false
 	for _, entry := range report.Data {
-		if entry.ModelName != model && entry.ID != model {
-			continue
+		if entry.ModelName == wireID || entry.ID == wireID {
+			wireLimit, wireNamed = entry.inputLimit(), true
+			break
 		}
-		limit, named = entry.inputLimit(), true
-		break
+		if !named && (entry.ModelName == model || entry.ID == model) {
+			limit, named = entry.inputLimit(), true
+		}
+	}
+	if wireNamed {
+		limit, named = wireLimit, true
 	}
 	if !named {
 		return 0, fmt.Errorf("harness: gateway model info names no entry for model %q", model)
@@ -422,6 +453,16 @@ func gatewayStatusError(status int, header http.Header, body []byte, signals Exh
 		RetryAfter:   classification.RetryAfter,
 		Retryable:    classification.Retryable,
 	}
+}
+
+// gatewayStatusErrorForModel names the gateway-visible model id the failed
+// request carried, so a rejection reason identifies the exact model id the
+// gateway answered for — the id is harness configuration, never provider
+// body text, and the redaction contract is unchanged.
+func gatewayStatusErrorForModel(status int, header http.Header, body []byte, signals ExhaustionSignals, model string) *GatewayError {
+	err := gatewayStatusError(status, header, body, signals)
+	err.Model = model
+	return err
 }
 
 // GatewayTransportError is a transport-class gateway failure: dial, reset,
@@ -453,13 +494,24 @@ type GatewayError struct {
 	// Retryable reports whether an immediate in-process retry can succeed.
 	// Only meaningful when Availability is set.
 	Retryable bool
+	// Model is the gateway-visible model id the failed request carried, empty
+	// when the failure carries no HTTP status to report it against — a
+	// mid-stream provider error terminalizes with the stream's own
+	// classification alone. When set, it names the exact id the gateway
+	// rejected so a termination reason identifies the configuration layer at
+	// fault.
+	Model string
 }
 
 func (e *GatewayError) Error() string {
 	if e.Status == 0 && e.Availability != "" {
 		return fmt.Sprintf("harness: gateway reported a stream error (%s)", e.Availability)
 	}
-	return fmt.Sprintf("harness: gateway returned status %d (%s)", e.Status, httpStatusCategory(e.Status))
+	reason := fmt.Sprintf("harness: gateway returned status %d (%s)", e.Status, httpStatusCategory(e.Status))
+	if e.Model != "" {
+		reason += fmt.Sprintf(" for model %q", e.Model)
+	}
+	return reason
 }
 
 // classification returns the error's classification, defaulting to a

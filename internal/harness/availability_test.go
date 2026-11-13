@@ -513,7 +513,9 @@ func TestCoordinatorEndsBlockedExternalOnDelegatedExhaustion(t *testing.T) {
 	// coordinator must not re-delegate or burn the binding further.
 	coderRequests := 0
 	for _, call := range mocker.calls {
-		if call.model == "test/coder" {
+		// The gateway sees the model half of the bound "test/coder" name: the
+		// provider half is Courier-side routing, never gateway-visible (#812).
+		if call.model == "coder" {
 			coderRequests++
 		}
 	}

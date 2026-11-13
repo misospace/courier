@@ -927,8 +927,8 @@ func TestContextBudgetFailedReadIsCachedPerModel(t *testing.T) {
 	if coordinator.State != StateUnavailable || !coordinator.Retryable {
 		t.Fatalf("coordinator = %+v, want a retryable unavailability", coordinator)
 	}
-	if coordinator.Detail != coder.Detail || coordinator.Detail != "harness: gateway returned status 503 (gateway unavailable)" {
-		t.Fatalf("shared read reason = %q / %q, want the same classified 503 reason", coordinator.Detail, coder.Detail)
+	if coordinator.Detail != coder.Detail || coordinator.Detail != `harness: gateway returned status 503 (gateway unavailable) for model "shared"` {
+		t.Fatalf("shared read reason = %q / %q, want the same classified 503 reason naming the gateway model", coordinator.Detail, coder.Detail)
 	}
 	if coordinator.Availability != ProviderUnavailable || coder.Availability != ProviderUnavailable {
 		t.Fatalf("availability = %q / %q, want %q", coordinator.Availability, coder.Availability, ProviderUnavailable)

@@ -1817,7 +1817,18 @@ boundary (#716). LiteLLM's OpenAI translation is not semantics-preserving for
 provider-native reasoning, so a model whose thinking survives only its own
 protocol is served by its own transport, with thinking blocks carried as
 opaque provider continuation data and never flattened into assistant text.
-The harness-owned default client behind both transports carries a first-byte
+A role binding is Courier's `provider/model` pair, and the provider half is
+client-side routing: it names the provider the caller resolves the model
+through, exactly as the OpenCode transport resolves it locally, and is never
+gateway-visible. Both native transports therefore send the model half on the
+wire and read the model-metadata entry for the gateway-visible id, falling
+back to the binding's own spelling only when the gateway lists no such entry,
+so a gateway that lists bare model names serves a prefixed binding; the
+binding identity in telemetry, capability names, and the run's pinned model
+surface stays the configured pair. A gateway status failure names the
+gateway-visible id the request carried, so a rejected startup probe reports
+which id was refused rather than only that authorization failed. The
+harness-owned default client behind both transports carries a first-byte
 stall bound (#754): a gateway that accepts the connection and never produces a
 response header fails the turn as a transport error instead of holding the run
 until termination — a transport resource bound that never caps model

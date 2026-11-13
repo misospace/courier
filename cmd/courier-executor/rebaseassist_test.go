@@ -118,12 +118,17 @@ func TestGatewayResolverResolvesFiles(t *testing.T) {
 	if resolution.Model != "litellm/qwen3.8-27b" {
 		t.Fatalf("model = %q, want the configured coordinator model", resolution.Model)
 	}
-	// The request the adapter sent: the configured model, one user message
-	// carrying the engine's prompt, and the gateway key in the header alone.
+	// The request the adapter sent: the gateway half of the configured model
+	// (the provider half is Courier-side routing and never reaches the
+	// gateway, #812), one user message carrying the engine's prompt, and the
+	// gateway key in the header alone.
 	sse.mu.Lock()
 	defer sse.mu.Unlock()
-	if !strings.Contains(sse.last, `"model":"litellm/qwen3.8-27b"`) {
-		t.Fatalf("request model missing: %s", sse.last)
+	if !strings.Contains(sse.last, `"model":"qwen3.8-27b"`) {
+		t.Fatalf("request model = %s, want the gateway half of the configured model", sse.last)
+	}
+	if strings.Contains(sse.last, "litellm/") {
+		t.Fatalf("request leaked the provider half of the binding: %s", sse.last)
 	}
 	if !strings.Contains(sse.last, "x := 3") || !strings.Contains(sse.last, "refusal") {
 		t.Fatalf("request prompt missing the conflict evidence: %s", sse.last)
@@ -212,6 +217,30 @@ func TestGatewayResolverOverCapIsRefusal(t *testing.T) {
 	}
 	if !strings.Contains(resolution.Refusal, "exceeded") || len(resolution.Files) != 0 {
 		t.Fatalf("resolution = %#v, want the over-bound refusal and no files", resolution)
+	}
+}
+
+// A gateway rejection on the assist turn names the exact gateway model id it
+// was answered for — the resolution-unavailable reason a run ends with has to
+// identify which id the gateway refused (#812) — while the provider's own body
+// stays redacted.
+func TestGatewayResolverRejectionNamesGatewayModel(t *testing.T) {
+	sse := &sseGateway{status: http.StatusForbidden}
+	server := newAssistGateway(t, sse)
+	resolver, _ := newRebaseAssistResolver(testConfig(server.URL))
+	_, err := resolver.Resolve(context.Background(), assistRequest())
+	if err == nil {
+		t.Fatal("Resolve succeeded on a 403")
+	}
+	var gatewayErr *harness.GatewayError
+	if !errors.As(err, &gatewayErr) {
+		t.Fatalf("err = %v, want a classified gateway error", err)
+	}
+	if gatewayErr.Model != "qwen3.8-27b" {
+		t.Fatalf("error model = %q, want the gateway half of the binding", gatewayErr.Model)
+	}
+	if !strings.Contains(err.Error(), `for model "qwen3.8-27b"`) {
+		t.Fatalf("err = %v, want the rejected gateway model named", err)
 	}
 }
 
