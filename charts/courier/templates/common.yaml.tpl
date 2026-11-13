@@ -527,6 +527,20 @@
 {{- if not $hasAdmissionBind }}{{- $args = append $args (printf "--contribute-admission-bind=:%d" (int $contributeAPI.port)) }}{{- end }}
 {{- if and $contributeAPI.readKeySecret (not $hasReadKeySecret) }}{{- $args = append $args (printf "--contribute-read-key-secret=%s" $contributeAPI.readKeySecret) }}{{- end }}
 {{- end }}
+{{- $readAPI := .Values.readAPI }}
+{{- if $readAPI.enabled }}
+{{- if not $readAPI.keySecret }}
+{{- fail "readAPI.enabled requires readAPI.keySecret" }}
+{{- end }}
+{{- $hasReadAPITokenSecret := false }}
+{{- $hasReadAPIBind := false }}
+{{- range $arg := $args }}
+{{- if hasPrefix "--readapi-token-secret=" $arg }}{{- $hasReadAPITokenSecret = true }}{{- end }}
+{{- if hasPrefix "--readapi-bind=" $arg }}{{- $hasReadAPIBind = true }}{{- end }}
+{{- end }}
+{{- if not $hasReadAPITokenSecret }}{{- $args = append $args (printf "--readapi-token-secret=%s" $readAPI.keySecret) }}{{- end }}
+{{- if not $hasReadAPIBind }}{{- $args = append $args (printf "--readapi-bind=:%d" (int $readAPI.port)) }}{{- end }}
+{{- end }}
 {{- $retention := .Values.retention }}
 {{- if $retention }}
 {{- $hasDoneRetention := false }}

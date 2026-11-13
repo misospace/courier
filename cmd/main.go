@@ -34,6 +34,7 @@ import (
 	"github.com/misospace/courier/internal/forge"
 	couriergithub "github.com/misospace/courier/internal/github"
 	courierlog "github.com/misospace/courier/internal/log"
+	"github.com/misospace/courier/internal/readapi"
 	"github.com/misospace/courier/internal/skills"
 	"github.com/misospace/courier/internal/source"
 	"github.com/misospace/courier/internal/source/adhoc"
@@ -124,6 +125,9 @@ func main() {
 	var contributeAdmissionBind string
 	var contributeAdmissionKeySecret string
 	var contributeAdmissionKey string
+	var readAPIBind string
+	var readAPITokenSecret string
+	var readAPITokenKey string
 	var contributeReadKeySecret string
 	var contributeReadKey string
 	var doneRetention time.Duration
@@ -231,6 +235,9 @@ func main() {
 	flag.StringVar(&contributeAdmissionBind, "contribute-admission-bind", "", "Address the operator's own contribution-admission API binds to in-process (for example :8083); frontends POST ad-hoc contributions to it (#708). Empty leaves the API off, and a non-empty value requires --contribute-admission-key-secret.")
 	flag.StringVar(&contributeAdmissionKeySecret, "contribute-admission-key-secret", "", "Name of the Secret in the operator namespace holding the contribution-admission API bearer token; required with --contribute-admission-bind.")
 	flag.StringVar(&contributeAdmissionKey, "contribute-admission-key", "token", "Key within the contribution-admission key Secret.")
+	flag.StringVar(&readAPIBind, "readapi-bind", "", "Address the operator's own read-only HTTP API binds to in-process (for example :8084); it serves namespace-scoped projections of CoderRun and LaneProfile state behind a bearer token. Empty leaves the API off, and a non-empty value requires --readapi-token-secret.")
+	flag.StringVar(&readAPITokenSecret, "readapi-token-secret", "", "Name of the Secret in the operator namespace holding the read API bearer token; required with --readapi-bind.")
+	flag.StringVar(&readAPITokenKey, "readapi-token-key", "token", "Key within the read API token Secret.")
 	flag.StringVar(&contributeReadKeySecret, "contribute-read-key-secret", "", "Name of the Secret in the operator namespace holding the contribution status-read bearer token (#819). The same admission listener answers GET /v1/contributions/<run> with it; the admission token never authenticates a read. Empty leaves status reads off.")
 	flag.StringVar(&contributeReadKey, "contribute-read-key", "token", "Key within the contribution read key Secret.")
 	flag.DurationVar(&doneRetention, "done-retention", 5*time.Minute, "How long a resolved Done CoderRun is kept before the retention reaper deletes it.")
@@ -511,6 +518,46 @@ func main() {
 		} else {
 			setupLog.Info("contribution status reads disabled: --contribute-read-key-secret is empty, GET /v1/contributions/<run> will not be served")
 		}
+	}
+
+	// The read-only HTTP API is the operator's own in-process projection of
+	// CoderRun and LaneProfile state for non-kubectl consumers: redacted,
+	// namespace-scoped, GET-only, and bearer-token authenticated. It is
+	// disabled by default; an empty --readapi-bind wires nothing. It serves
+	// one namespace — the deployment's first owned run namespace when an
+	// ownership boundary is configured, the operator namespace otherwise —
+	// and takes no leader election, like the other listeners.
+	if readBind := strings.TrimSpace(readAPIBind); readBind != "" {
+		namespace := podNamespaceOrEmpty(ownedRunNamespaces)
+		if namespace == "" {
+			setupLog.Error(fmt.Errorf("POD_NAMESPACE is empty"), "unable to configure the read API")
+			os.Exit(1)
+		}
+		if strings.TrimSpace(readAPITokenSecret) == "" {
+			err := fmt.Errorf("--readapi-token-secret is required with --readapi-bind")
+			setupLog.Error(err, "unable to configure the read API")
+			os.Exit(1)
+		}
+		token, err := loadBearerToken(startupCtx, mgr.GetAPIReader(), namespace, readAPITokenSecret, readAPITokenKey, "read API")
+		if err != nil {
+			setupLog.Error(err, "unable to configure the read API")
+			os.Exit(1)
+		}
+		server, err := readapi.NewServer(readapi.ServerConfig{
+			Reader:    mgr.GetClient(),
+			Token:     token,
+			Bind:      readBind,
+			Namespace: namespace,
+		})
+		if err != nil {
+			setupLog.Error(err, "unable to configure the read API")
+			os.Exit(1)
+		}
+		if err := mgr.Add(server); err != nil {
+			setupLog.Error(err, "unable to add the read API server")
+			os.Exit(1)
+		}
+		setupLog.Info("read API enabled", "bind", readBind, "namespace", namespace)
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -1078,6 +1125,17 @@ func validateContributeAdmissionFlags(bind, keySecret string) error {
 	return nil
 }
 
+// podNamespaceOrEmpty resolves the single namespace the read API serves:
+// the deployment's first owned run namespace when an ownership boundary is
+// configured, the operator's own namespace otherwise. Empty means neither
+// is known and the read API cannot be scoped.
+func podNamespaceOrEmpty(owned []string) string {
+	if len(owned) > 0 {
+		return owned[0]
+	}
+	return strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
+}
+
 // validateContributeReadFlags reports the one read-credential wiring
 // mistake that voids the read/write split silently (#819): naming the
 // exact same Secret and key as the admission credential, which hands the
@@ -1569,14 +1627,20 @@ func loadEvidenceKey(ctx context.Context, reader client.Reader, namespace, name 
 // loadAdmissionToken reads one contribution-API bearer token from the
 // named Secret in the operator namespace (#708, read token #819). label
 // names which credential is being loaded so a startup error points at the
-// flag the operator actually set. It fails closed like loadEvidenceKey:
-// the listener must agree with the deployment on one token, so a missing
-// or empty key is a startup error rather than an API that authenticates
-// nothing. The token value never appears in any error.
+// flag the operator actually set.
 func loadAdmissionToken(ctx context.Context, reader client.Reader, namespace, label, secretName, secretKey string) (string, error) {
+	return loadBearerToken(ctx, reader, namespace, secretName, secretKey, label)
+}
+
+// loadBearerToken reads a listener's bearer token from the named Secret in
+// the operator namespace. It fails closed like loadEvidenceKey: the listener
+// must agree with the deployment on one token, so a missing or empty key is
+// a startup error rather than an API that authenticates nothing. The token
+// value never appears in any error.
+func loadBearerToken(ctx context.Context, reader client.Reader, namespace, secretName, secretKey, purpose string) (string, error) {
 	secretName = strings.TrimSpace(secretName)
 	if secretName == "" {
-		return "", fmt.Errorf("%s key Secret name is required", label)
+		return "", fmt.Errorf("%s key Secret name is required", purpose)
 	}
 	secretKey = strings.TrimSpace(secretKey)
 	if secretKey == "" {
@@ -1584,18 +1648,18 @@ func loadAdmissionToken(ctx context.Context, reader client.Reader, namespace, la
 	}
 	namespace = strings.TrimSpace(namespace)
 	if namespace == "" {
-		return "", fmt.Errorf("POD_NAMESPACE is required when a %s key Secret is configured", label)
+		return "", fmt.Errorf("POD_NAMESPACE is required when a %s key Secret is configured", purpose)
 	}
 	var secret corev1.Secret
 	if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretName}, &secret); err != nil {
 		if apierrors.IsNotFound(err) {
-			return "", fmt.Errorf("%s key Secret %s/%s not found: %w", label, namespace, secretName, err)
+			return "", fmt.Errorf("%s key Secret %s/%s not found: %w", purpose, namespace, secretName, err)
 		}
-		return "", fmt.Errorf("read %s key Secret %s/%s: %w", label, namespace, secretName, err)
+		return "", fmt.Errorf("read %s key Secret %s/%s: %w", purpose, namespace, secretName, err)
 	}
 	token, ok := secret.Data[secretKey]
 	if !ok || strings.TrimSpace(string(token)) == "" {
-		return "", fmt.Errorf("%s key Secret %s/%s has no non-empty %q entry", label, namespace, secretName, secretKey)
+		return "", fmt.Errorf("%s key Secret %s/%s has no non-empty %q entry", purpose, namespace, secretName, secretKey)
 	}
 	return string(token), nil
 }
