@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.1.26](https://github.com/misospace/courier/compare/v0.1.25...v0.1.26) (2026-11-13)
+
+
+### Features
+
+* **api:** authenticated read-only Courier run and contribution lifecycle contract ([#836](https://github.com/misospace/courier/issues/836)) ([4ab7899](https://github.com/misospace/courier/commit/4ab7899bd8c1f97bf272b45805bf1a719849c935))
+* consume the PR Reviewer remediation handoff for fix-pr work ([#833](https://github.com/misospace/courier/issues/833)) ([0df6e59](https://github.com/misospace/courier/commit/0df6e59aa2a7b3233ee859f79cbf32a75cd8b083))
+* **deps:** update module github.com/prometheus/common (v0.73.1 → v0.74.0) ([#810](https://github.com/misospace/courier/issues/810)) ([ab1c02f](https://github.com/misospace/courier/commit/ab1c02f410ce680221854847037413d0181aaa7d))
+
+
+### Bug Fixes
+
+* **deps:** update dependency astro (7.4.11 → 7.4.12) ([#835](https://github.com/misospace/courier/issues/835)) ([cf5dc74](https://github.com/misospace/courier/commit/cf5dc74e011e19fba95819afffe5803eda516b9d))
+* **dispatch:** resolve the rebase executor to one binding at startup ([#796](https://github.com/misospace/courier/issues/796)) ([#813](https://github.com/misospace/courier/issues/813)) ([9db8b13](https://github.com/misospace/courier/commit/9db8b13e489b397efa0a8be9f2e49d52091b03cf))
+* **github-release:** update release helm (4.3.1 → 4.3.2) ([#816](https://github.com/misospace/courier/issues/816)) ([797dfad](https://github.com/misospace/courier/commit/797dfadc428cabfef2365dc10b937325774d9439))
+* **harness:** send the model half of provider/model bindings to the gateway ([#817](https://github.com/misospace/courier/issues/817)) ([244644e](https://github.com/misospace/courier/commit/244644ef5c724688dcb8c0eb4c7583b77966f095))
+
+
+### Chores
+
+* **container:** update image gcr.io/distroless/static (25ac8f0 → aafe993) ([#814](https://github.com/misospace/courier/issues/814)) ([48f9733](https://github.com/misospace/courier/commit/48f97334837ed028276a268277592d8b8a0d721b))
+
 ## [0.1.25](https://github.com/misospace/courier/compare/v0.1.24...v0.1.25) (2026-11-12)
 
 
