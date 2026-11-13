@@ -178,15 +178,25 @@ func (a *Authenticator) Login(token string, r *http.Request) (*http.Cookie, bool
 		return nil, false
 	}
 	a.sessions.put(id, a.now())
+	cookie := a.sessionCookie(r)
+	cookie.Value = id + "." + a.sign(id)
+	cookie.Expires = a.now().Add(sessionTTL)
+	return cookie, true
+}
+
+// sessionCookie returns a fresh session cookie carrying the shared posture:
+// HttpOnly, SameSite=Lax, and Secure keyed off TLS terminating on the pod
+// (docs/operator-console.md). Login and its clearing counterpart must agree
+// on these attributes: a browser is not guaranteed to remove a cookie whose
+// attributes differ from the cookie a Set-Cookie replaces.
+func (a *Authenticator) sessionCookie(r *http.Request) *http.Cookie {
 	return &http.Cookie{
 		Name:     sessionCookieName,
-		Value:    id + "." + a.sign(id),
 		Path:     "/",
-		Expires:  a.now().Add(sessionTTL),
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 		Secure:   r != nil && r.TLS != nil,
-	}, true
+	}
 }
 
 // SessionFromRequest validates the request's session cookie: the signature
@@ -218,17 +228,13 @@ func (a *Authenticator) Logout(sessionID string) {
 	a.sessions.delete(sessionID)
 }
 
-// expiredCookie returns the clearing cookie sent on logout.
-func (a *Authenticator) expiredCookie() *http.Cookie {
-	return &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    "",
-		Path:     "/",
-		Expires:  a.now().Add(-time.Hour),
-		MaxAge:   -1,
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-	}
+// expiredCookie returns the clearing cookie sent on logout. It mirrors the
+// session cookie's attributes so the browser removes the cookie it replaces.
+func (a *Authenticator) expiredCookie(r *http.Request) *http.Cookie {
+	cookie := a.sessionCookie(r)
+	cookie.Expires = a.now().Add(-time.Hour)
+	cookie.MaxAge = -1
+	return cookie
 }
 
 // sign returns the hex HMAC-SHA256 of the session id under the session key.

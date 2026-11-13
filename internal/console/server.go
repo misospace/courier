@@ -241,7 +241,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.auth.Logout(sessionID)
-	http.SetCookie(w, s.auth.expiredCookie())
+	http.SetCookie(w, s.auth.expiredCookie(r))
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 

@@ -373,7 +373,9 @@ func findCSRFToken(t *testing.T, body string) string {
 }
 
 // TestSessionCookieFlags covers (h): the session cookie is HttpOnly and
-// SameSite=Lax, and Secure under TLS.
+// SameSite=Lax, and Secure under TLS; and the logout clearing cookie mirrors
+// those attributes, because a Set-Cookie whose attributes differ from the
+// cookie it replaces is not guaranteed to remove it.
 func TestSessionCookieFlags(t *testing.T) {
 	secrets := newTestSecrets(t)
 	server, err := NewServer(Config{
@@ -423,6 +425,65 @@ func TestSessionCookieFlags(t *testing.T) {
 	}
 	if cookie.Expires.IsZero() || time.Until(cookie.Expires) > 12*time.Hour {
 		t.Fatalf("session cookie expiry %v is not within 12h", cookie.Expires)
+	}
+
+	// Log out over the same TLS server: the clearing cookie must mirror the
+	// login cookie's attributes. The CSRF token comes from an authenticated
+	// page; this client carries no jar, so the cookie rides manually.
+	overviewReq, err := http.NewRequest(http.MethodGet, tlsServer.URL+"/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	overviewReq.AddCookie(cookie)
+	overviewResp, err := client.Do(overviewReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	overviewBody := readAll(t, overviewResp)
+	overviewResp.Body.Close()
+	csrf := findCSRFToken(t, overviewBody)
+	if csrf == "" {
+		t.Fatal("authenticated page over TLS does not carry the CSRF token")
+	}
+	logoutReq, err := http.NewRequest(http.MethodPost, tlsServer.URL+"/logout",
+		strings.NewReader("csrf="+csrf))
+	if err != nil {
+		t.Fatal(err)
+	}
+	logoutReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	logoutReq.AddCookie(cookie)
+	logoutResp, err := client.Do(logoutReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logoutResp.Body.Close()
+	if logoutResp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("logout status = %d, want 303", logoutResp.StatusCode)
+	}
+	clearing := logoutResp.Cookies()
+	if len(clearing) != 1 {
+		t.Fatalf("logout set %d cookies, want 1", len(clearing))
+	}
+	cleared := clearing[0]
+	if cleared.Name != cookie.Name || cleared.Value != "" {
+		t.Fatalf("logout cookie = %q with value %q, want the session cookie name cleared",
+			cleared.Name, cleared.Value)
+	}
+	if cleared.Path != cookie.Path {
+		t.Fatalf("logout cookie path = %q, want %q", cleared.Path, cookie.Path)
+	}
+	if !cleared.HttpOnly {
+		t.Fatal("logout clearing cookie is not HttpOnly")
+	}
+	if cleared.SameSite != cookie.SameSite {
+		t.Fatalf("logout clearing cookie SameSite = %v, want %v", cleared.SameSite, cookie.SameSite)
+	}
+	if cleared.Secure != cookie.Secure {
+		t.Fatalf("logout clearing cookie Secure = %v, want the login cookie's %v",
+			cleared.Secure, cookie.Secure)
+	}
+	if !cleared.Expires.Before(time.Now()) {
+		t.Fatalf("logout clearing cookie expiry %v is not in the past", cleared.Expires)
 	}
 }
 
