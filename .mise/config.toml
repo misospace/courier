@@ -2,7 +2,7 @@ min_version = "2026.10.17"
 
 [tools]
 go = "1.27.4"
-helm = "4.3.1"
+helm = "4.3.2"
 
 [tasks.bootstrap]
 description = "Install the pinned toolchain, controller-gen, setup-envtest, and envtest assets (idempotent; no codegen, no tests, no formatting)"
