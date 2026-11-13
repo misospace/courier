@@ -524,6 +524,96 @@
 {{- if not $hasAdmissionKeySecret }}{{- $args = append $args (printf "--contribute-admission-key-secret=%s" $contributeAPI.keySecret) }}{{- end }}
 {{- if not $hasAdmissionBind }}{{- $args = append $args (printf "--contribute-admission-bind=:%d" (int $contributeAPI.port)) }}{{- end }}
 {{- end }}
+{{- $operatorConsole := .Values.operatorConsole }}
+{{- if $operatorConsole.enabled }}
+{{- /* The console is the chart's second controller. Its image and its
+  operator-supplied args follow the same has* guard pattern as the manager
+  blocks above; the secret files are single-file subPath mounts so the two
+  Secret volumes never share a mount path. With two controllers the library
+  appends every controller identifier to its object names, so both are
+  force-renamed to the names a one-controller release already rendered —
+  the manager Deployment keeps its name across the flip. */}}
+{{- $fullname := include "bjw-s.common.lib.chart.names.fullname" . }}
+{{- $console := index .Values.controllers "console" }}
+{{- if not (hasKey $console "forceRename") }}{{- $_ := set $console "forceRename" (printf "%s-console" $fullname) }}{{- end }}
+{{- $mainController := index .Values.controllers "main" }}
+{{- if not (hasKey $mainController "forceRename") }}{{- $_ := set $mainController "forceRename" $fullname }}{{- end }}
+{{- $consoleContainer := $console.containers.console }}
+{{- $consoleImage := $consoleContainer.image }}
+{{- if and (not $consoleImage.tag) (not $consoleImage.digest) }}
+{{- $_ := set $consoleImage "tag" .Chart.AppVersion }}
+{{- end }}
+{{- $consoleAuthMode := $operatorConsole.auth.mode }}
+{{- if and (ne $consoleAuthMode "token") (ne $consoleAuthMode "header") }}
+{{- fail (printf "operatorConsole.auth.mode %q must be token or header" $consoleAuthMode) }}
+{{- end }}
+{{- if eq $consoleAuthMode "token" }}
+{{- if not $operatorConsole.auth.sessionKeySecret }}
+{{- fail "operatorConsole.enabled requires operatorConsole.auth.sessionKeySecret" }}
+{{- end }}
+{{- if not $operatorConsole.auth.operatorTokensSecret }}
+{{- fail "operatorConsole.enabled requires operatorConsole.auth.operatorTokensSecret" }}
+{{- end }}
+{{- else if not $operatorConsole.auth.trustedHeader }}
+{{- fail "operatorConsole.enabled requires operatorConsole.auth.trustedHeader" }}
+{{- end }}
+{{- $consoleArgs := concat (list) ($consoleContainer.args | default (list)) }}
+{{- $hasConsoleAuthMode := false }}
+{{- $hasConsoleSessionKeyFile := false }}
+{{- $hasConsoleTokensFile := false }}
+{{- $hasConsoleTrustedHeader := false }}
+{{- $hasConsoleBackendURL := false }}
+{{- $hasConsoleBind := false }}
+{{- range $arg := $consoleArgs }}
+{{- if hasPrefix "--auth-mode=" $arg }}{{- $hasConsoleAuthMode = true }}{{- end }}
+{{- if hasPrefix "--session-key-file=" $arg }}{{- $hasConsoleSessionKeyFile = true }}{{- end }}
+{{- if hasPrefix "--operator-tokens-file=" $arg }}{{- $hasConsoleTokensFile = true }}{{- end }}
+{{- if hasPrefix "--trusted-header=" $arg }}{{- $hasConsoleTrustedHeader = true }}{{- end }}
+{{- if hasPrefix "--backend-url=" $arg }}{{- $hasConsoleBackendURL = true }}{{- end }}
+{{- if hasPrefix "--bind=" $arg }}{{- $hasConsoleBind = true }}{{- end }}
+{{- end }}
+{{- if not $hasConsoleAuthMode }}{{- $consoleArgs = append $consoleArgs (printf "--auth-mode=%s" $consoleAuthMode) }}{{- end }}
+{{- if eq $consoleAuthMode "token" }}
+{{- if not $hasConsoleSessionKeyFile }}{{- $consoleArgs = append $consoleArgs "--session-key-file=/etc/courier/console/session-key" }}{{- end }}
+{{- if not $hasConsoleTokensFile }}{{- $consoleArgs = append $consoleArgs "--operator-tokens-file=/etc/courier/console/tokens" }}{{- end }}
+{{- else if not $hasConsoleTrustedHeader }}
+{{- $consoleArgs = append $consoleArgs (printf "--trusted-header=%s" $operatorConsole.auth.trustedHeader) }}
+{{- end }}
+{{- if and $operatorConsole.backendURL (not $hasConsoleBackendURL) }}
+{{- $consoleArgs = append $consoleArgs (printf "--backend-url=%s" $operatorConsole.backendURL) }}
+{{- end }}
+{{- if not $hasConsoleBind }}{{- $consoleArgs = append $consoleArgs (printf "--bind=:%d" (int $operatorConsole.port)) }}{{- end }}
+{{- $_ := set $consoleContainer "args" $consoleArgs }}
+{{- /* The console's probe and Service follow the configured port, so an
+  operatorConsole.port override moves the whole console, not just --bind. */}}
+{{- $consoleProbes := $consoleContainer.probes | default (dict) }}
+{{- range $probeName, $probe := $consoleProbes }}
+{{- if $probe.spec.httpGet }}{{- $_ := set $probe.spec.httpGet "port" (int $operatorConsole.port) }}{{- end }}
+{{- end }}
+{{- $_ := set $consoleContainer "probes" $consoleProbes }}
+{{- if eq $consoleAuthMode "token" }}
+{{- $persistence := deepCopy (.Values.persistence | default dict) }}
+{{- $_ := set $persistence "console-session-key" (dict
+  "type" "secret"
+  "name" $operatorConsole.auth.sessionKeySecret
+  "items" (list (dict "key" $operatorConsole.auth.sessionKeySecretKey "path" "session-key"))
+  "advancedMounts" (dict "console" (dict "console" (list (dict "path" "/etc/courier/console/session-key" "subPath" "session-key" "readOnly" true))))) }}
+{{- $_ := set $persistence "console-tokens" (dict
+  "type" "secret"
+  "name" $operatorConsole.auth.operatorTokensSecret
+  "items" (list (dict "key" $operatorConsole.auth.operatorTokensSecretKey "path" "tokens"))
+  "advancedMounts" (dict "console" (dict "console" (list (dict "path" "/etc/courier/console/tokens" "subPath" "tokens" "readOnly" true))))) }}
+{{- $_ := set .Values "persistence" $persistence }}
+{{- end }}
+{{- $_ := set $console "enabled" true }}
+{{- $consoleServices := deepCopy (.Values.service | default dict) }}
+{{- if hasKey $consoleServices "console" }}
+{{- $consoleService := index $consoleServices "console" }}
+{{- $_ := set $consoleService "enabled" true }}
+{{- if $consoleService.ports }}{{- range $portName, $port := $consoleService.ports }}{{- $_ := set $port "targetPort" (int $operatorConsole.port) }}{{- end }}{{- end }}
+{{- end }}
+{{- $_ := set .Values "service" $consoleServices }}
+{{- end }}
 {{- $retention := .Values.retention }}
 {{- if $retention }}
 {{- $hasDoneRetention := false }}
