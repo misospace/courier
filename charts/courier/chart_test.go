@@ -513,6 +513,52 @@ func TestChartRendersEvidenceIntake(t *testing.T) {
 	}
 }
 
+// TestChartRendersContributeAPIStatusReads checks the #819 read token:
+// the manager flag is rendered only when contributeAPI.readKeySecret is
+// set, and never on its own — reads ride the admission listener.
+func TestChartRendersContributeAPIStatusReads(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	// Off by default: no contribute flags at all.
+	disabled := runHelm(t, chartDir, "template", "courier", ".")
+	if strings.Contains(disabled, "--contribute-") {
+		t.Fatal("default chart output unexpectedly renders contribute flags")
+	}
+
+	// Admission without a read token: reads stay off.
+	admissionOnly := runHelm(t, chartDir, "template", "courier", ".",
+		"--set", "contributeAPI.enabled=true",
+		"--set", "contributeAPI.keySecret=admission-key",
+	)
+	for _, want := range []string{
+		"--contribute-admission-key-secret=admission-key",
+		"--contribute-admission-bind=:8083",
+	} {
+		if !strings.Contains(admissionOnly, want) {
+			t.Fatalf("contribute-enabled chart output is missing %q", want)
+		}
+	}
+	if strings.Contains(admissionOnly, "--contribute-read-key-secret") {
+		t.Fatal("chart rendered a read token flag without contributeAPI.readKeySecret")
+	}
+
+	// With a read token: the read flag rides the same listener.
+	enabled := runHelm(t, chartDir, "template", "courier", ".",
+		"--set", "contributeAPI.enabled=true",
+		"--set", "contributeAPI.keySecret=admission-key",
+		"--set", "contributeAPI.readKeySecret=read-key",
+	)
+	if !strings.Contains(enabled, "--contribute-read-key-secret=read-key") {
+		t.Fatal("chart output is missing --contribute-read-key-secret=read-key")
+	}
+}
+
 // TestChartRendersRetentionConfiguration checks the #287 retention block is
 // rendered as the matching manager flags, and that an explicit args override
 // wins over the value.

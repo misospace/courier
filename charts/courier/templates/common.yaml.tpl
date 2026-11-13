@@ -517,12 +517,15 @@
 {{- end }}
 {{- $hasAdmissionKeySecret := false }}
 {{- $hasAdmissionBind := false }}
+{{- $hasReadKeySecret := false }}
 {{- range $arg := $args }}
 {{- if hasPrefix "--contribute-admission-key-secret=" $arg }}{{- $hasAdmissionKeySecret = true }}{{- end }}
 {{- if hasPrefix "--contribute-admission-bind=" $arg }}{{- $hasAdmissionBind = true }}{{- end }}
+{{- if hasPrefix "--contribute-read-key-secret=" $arg }}{{- $hasReadKeySecret = true }}{{- end }}
 {{- end }}
 {{- if not $hasAdmissionKeySecret }}{{- $args = append $args (printf "--contribute-admission-key-secret=%s" $contributeAPI.keySecret) }}{{- end }}
 {{- if not $hasAdmissionBind }}{{- $args = append $args (printf "--contribute-admission-bind=:%d" (int $contributeAPI.port)) }}{{- end }}
+{{- if and $contributeAPI.readKeySecret (not $hasReadKeySecret) }}{{- $args = append $args (printf "--contribute-read-key-secret=%s" $contributeAPI.readKeySecret) }}{{- end }}
 {{- end }}
 {{- $readAPI := .Values.readAPI }}
 {{- if $readAPI.enabled }}
