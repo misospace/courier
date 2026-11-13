@@ -26,8 +26,10 @@ func TestProviderImplementsContract(t *testing.T) {
 	if got := p.Capabilities().Available(forge.CapabilityCommentWorkItem); !got.Available {
 		t.Fatalf("CapabilityCommentWorkItem availability = %#v, want available", got)
 	}
-	if got := p.Capabilities().Available(forge.CapabilityListReviews); got.Available {
-		t.Fatalf("CapabilityListReviews availability = %#v, want unavailable", got)
+	for _, capability := range []forge.Capability{forge.CapabilityListReviews, forge.CapabilityListComments} {
+		if got := p.Capabilities().Available(capability); !got.Available {
+			t.Fatalf("capability %q availability = %#v, want available", capability, got)
+		}
 	}
 	for _, capability := range []forge.Capability{forge.CapabilityListWorkItemsByLabel, forge.CapabilityRemoveWorkItemLabel} {
 		if got := p.Capabilities().Available(capability); !got.Available {
@@ -408,14 +410,55 @@ func TestProviderProtectionEstablishesUnprotectedOnlyFromBothAPIs(t *testing.T) 
 	}
 }
 
-func TestProviderUnsupportedOperations(t *testing.T) {
-	p := NewProvider(forge.ProviderConfig{Name: "gh"}, nil)
-	ctx := context.Background()
-	if _, err := p.ListReviews(ctx, forge.PullRequestRef{Repo: "acme/demo", Number: 7}); !errors.Is(err, forge.ErrUnsupported) {
-		t.Fatalf("ListReviews() error = %v, want ErrUnsupported", err)
+// ListReviews and ListComments are covered reads: the provider maps GitHub's
+// native review records and issue-conversation comment records to the
+// forge-neutral shapes with decimal string IDs, and each read must hit its
+// own endpoint — comments through issues/{n}/comments (where the reviewer's
+// sticky comment lives) and reviews through pulls/{n}/reviews, never through
+// the pulls/{n}/comments inline-review endpoint.
+func TestProviderListReviewsAndComments(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/acme/demo/issues/7/comments":
+			_, _ = io.WriteString(w, `[{"id":81,"body":"handoff body","html_url":"https://github.com/acme/demo/pull/7#issuecomment-81","user":{"login":"courier-reviewer"}}]`)
+		case "/repos/acme/demo/pulls/7/reviews":
+			_, _ = io.WriteString(w, `[{"id":91,"state":"CHANGES_REQUESTED","body":"manage the lane","submitted_at":"2026-02-03T04:05:06Z","user":{"login":"octocat"}}]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, "token")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := p.ListComments(ctx, forge.PullRequestRef{Repo: "acme/demo", Number: 7}); !errors.Is(err, forge.ErrUnsupported) {
-		t.Fatalf("ListComments() error = %v, want ErrUnsupported", err)
+	p := NewProvider(forge.ProviderConfig{Name: "gh", Endpoint: server.URL, CredentialRef: "secret/gh"}, client)
+	ctx := context.Background()
+	ref := forge.PullRequestRef{Repo: "acme/demo", Number: 7}
+
+	reviews, err := p.ListReviews(ctx, ref)
+	if err != nil {
+		t.Fatalf("ListReviews() error = %v", err)
+	}
+	if len(reviews) != 1 || reviews[0].ID != "91" || reviews[0].Author != "octocat" || reviews[0].State != "CHANGES_REQUESTED" || reviews[0].Body != "manage the lane" || reviews[0].SubmittedAt != "2026-02-03T04:05:06Z" {
+		t.Fatalf("ListReviews() = %#v, want the mapped review record", reviews)
+	}
+
+	comments, err := p.ListComments(ctx, ref)
+	if err != nil {
+		t.Fatalf("ListComments() error = %v", err)
+	}
+	if len(comments) != 1 || comments[0].ID != "81" || comments[0].Author != "courier-reviewer" || comments[0].Body != "handoff body" || comments[0].URL != "https://github.com/acme/demo/pull/7#issuecomment-81" {
+		t.Fatalf("ListComments() = %#v, want the mapped comment record", comments)
+	}
+
+	want := "/repos/acme/demo/pulls/7/reviews,/repos/acme/demo/issues/7/comments"
+	if got := strings.Join(paths, ","); got != want {
+		t.Fatalf("request paths = %q, want %q", got, want)
 	}
 }
 
