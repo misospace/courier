@@ -41,7 +41,7 @@ The table maps what ships today. Chart values live in
 | Ownership boundary | Default `owns()` claims every namespace when `ownership.namespaces` is empty. | Controller reconciles only owned namespaces. A foreign run is a strict no-op before any read or write. | `ownership.namespaces`, `--owned-namespace`; `owns()` in `internal/controller/coderun_controller.go` |
 | Model access | Model credentials in the coordinator pod. | Model gateway in trusted control only. Empty gateway makes the harness fail closed. | `secure.modelGateway`, `--model-gateway-*` |
 | Admission sources | Shared registry: `manual`, `adhoc`, `dispatch`, `label`, `cron`. | Same registry. Sources are not mode-specific. | `internal/source/`, `internal/controller/admission.go` |
-| Status writes | Coordinator writes status. | Broker writes status through a trusted gRPC boundary on port 8444. TokenReview uses the chart ClusterRole. | HARNESS.md section 6, `secure.brokerTokenReviewClusterRole` |
+| Status writes | Coordinator writes status. | Broker writes status through a trusted gRPC boundary on port 8444. TokenReview uses the chart ClusterRole. | HARNESS.md section 4, `secure.brokerTokenReviewClusterRole` |
 | Terminal result | Operator verifies world state. | Trusted `NativeResult` classification supplements operator verification. Publication only moves a run to `Verifying`. | `NativeResult` in `api/v1alpha1/coderun_types.go` |
 | Retention | `retention.done: 5m`, `retention.failed: 168h`, `retention.needsHuman: 168h`, `retention.auditKeep: 5`. | Same flags. | `--done-retention`, `--failed-retention`, `--needs-human-retention`, `--terminal-audit-keep` |
 | CRD management | Release renders CRDs with `helm.sh/resource-policy: keep`. | Disable `crds.enabled` on the canary so one release owns CRDs out of band. | `crds.enabled` |
@@ -70,7 +70,7 @@ implementation evidence. They never count as live proof.
 | 3 | Meaningful checkpoint and resume. | HARNESS.md section 7 | Checkpoint types and ordering tests (`api/v1alpha1/coderun_types.go`, `native_termination_test.go`). | Restart and resume of a real interrupted run is unobserved in production. | No-go for live proof. |
 | 4 | Publication `lastCommit`. Only a broker-confirmed remote OID is recorded. | #102, HARNESS.md section 7 | Publication verification tests. | A native run that publishes to a real pull request with confirmed `status.lastCommit` is unobserved. | No-go for live proof. |
 | 5 | Current-head CI and PR handoff after publication. | #102 | Tests cover the `Verifying` handoff contract. | No native run carried a published branch through CI to merge. | No-go for live proof. |
-| 6 | Trusted status and credential boundary. The broker can patch only one named run status subresource. | HARNESS.md section 6 | `TestNativeCanaryDoesNotMutateForeignNamespaceRun` and the cross-direction isolation tests in `internal/controller/native_canary_isolation_test.go`. | No side-by-side production deployment has run the boundary. | No-go for live proof. Isolation is the strongest tested area. |
+| 6 | Trusted status and credential boundary. The broker can patch only one named run status subresource. | HARNESS.md section 4 | `TestNativeCanaryDoesNotMutateForeignNamespaceRun` and the cross-direction isolation tests in `internal/controller/native_canary_isolation_test.go`. | No side-by-side production deployment has run the boundary. | No-go for live proof. Isolation is the strongest tested area. |
 
 Rule for reading this table: a criterion moves to go when #731 or #102 records
 live observations from a deployed run, with the deployed run version named.
@@ -121,20 +121,27 @@ the canary.
    with an empty `ownership.namespaces` claims every namespace and will fight
    the canary.
 2. Deploy the canary release with `secure.enabled: true`,
-   `secure.runNamespace` set to a dedicated namespace,
-   `ownership.namespaces` equal to that namespace only, `crds.enabled: false`,
+   `secure.runNamespace` set to a dedicated namespace, `crds.enabled: false`,
    and a distinct `ownership.leaderElectionID` and
    `secure.brokerTokenReviewClusterRole` if both releases share an operator
-   namespace.
+   namespace. Set `ownership.namespaces` to the run namespace, plus the
+   canary release's own namespace if the canary runs a discovery source
+   (step 5): the chart render and the operator's `resolveOwnership` startup
+   check both fail when a discovery-enabled release's namespace sits outside
+   the boundary (`charts/courier/templates/common.yaml.tpl`, `cmd/main.go`).
 3. Make sure that the canary release fails the render when the ownership
    boundary is wrong. The chart cross-validation in
    `charts/courier/templates/common.yaml.tpl` must pass.
 4. Run the ownership isolation tests against the deployed version:
    `go test ./internal/controller -run 'Foreign|Owned' -count=1`. This is
    a check on the artifact, not live proof.
-5. Admit canary runs on the chosen slice only. Point one lane profile or one
-   dispatch lane at the native release. Keep `concurrency: 1` for the first
-   slice.
+5. Admit canary runs on the chosen slice only. Prefer a lane-profile-only
+   slice. A dispatch lane requires `dispatch.enabled` on the canary release,
+   which enables discovery and forces the canary release's own namespace
+   into `ownership.namespaces` (step 2). Two releases that share one
+   operator namespace cannot both run discovery sources there: both
+   boundaries would own the runs discovery materializes in that namespace.
+   Keep `concurrency: 1` for the first slice.
 6. Observe per run: `status.heartbeat.at` advancing at the 15 second cadence
    during a long tool episode, `status.activeOperations` populated,
    `status.checkpoint` populated, `status.lastCommit` confirmed at
@@ -157,8 +164,11 @@ If the canary fails a go/no-go criterion, stop intake first and decide second.
    decision per run. The safe default is to leave the run in place with its
    history and let a human re-admit it on v1. Never bulk-unclaim source
    receipts.
-4. Remove the canary slice from v1 admission blacklisting, or re-point the
-   slice's lane profile at v1, and confirm v1 claims the slice again.
+4. Restore the slice on v1. The canary held the slice by admitting it only on
+   the canary release; bind the slice's lane on the v1 release again
+   (`dispatch.lanes` in chart values, or the repeatable
+   `--dispatch-lane-binding` flag), or re-enable the slice's admission source
+   on v1 if the canary disabled it, and confirm v1 claims the slice again.
 5. Keep the native release installed but scaled to no new admissions, or
    uninstall it after its retention windows pass
    (`retention.needsHuman: 168h`). Keep the run namespace until you no longer
