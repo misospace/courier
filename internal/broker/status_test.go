@@ -790,3 +790,46 @@ func TestStatusWriterRejectsMalformedPullRequestIdentity(t *testing.T) {
 		t.Fatalf("status.pr = %q, want the refused writes to have recorded nothing", run.Status.PR)
 	}
 }
+
+// TestStatusWriterPullRequestFenceComparesNumerically proves the fence
+// survives non-canonical identities the operator may already have recorded:
+// a recorded " 845 " still matches a write of 845 and normalizes, while an
+// identity that is not a number (a hand-recorded URL) is refused rather than
+// laundered into a canonical number (#844).
+func TestStatusWriterPullRequestFenceComparesNumerically(t *testing.T) {
+	w, c, identity := statusFixture(t)
+	seed := func(value string) {
+		var run courier.CoderRun
+		if err := c.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: testRunName}, &run); err != nil {
+			t.Fatal(err)
+		}
+		run.Status.PR = value
+		if err := c.Status().Update(context.Background(), &run); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed(" 845 ")
+	if err := w.Write(context.Background(), identity, HarnessPatch{PullRequest: &PullRequestRecord{Number: 845}}, nil); err != nil {
+		t.Fatalf("write matching a whitespace-recorded number: %v", err)
+	}
+	var run courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: testRunName}, &run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Status.PR != "845" {
+		t.Fatalf("status.pr = %q, want the canonical number", run.Status.PR)
+	}
+	seed("https://github.com/owner/repo/pull/845")
+	if err := w.Write(context.Background(), identity, HarnessPatch{PullRequest: &PullRequestRecord{Number: 845}}, nil); err == nil {
+		t.Fatal("a non-numeric recorded identity was rewritten without proof it names the same pull request")
+	}
+	if err := w.Write(context.Background(), identity, HarnessPatch{PullRequest: &PullRequestRecord{Number: 846}}, nil); err == nil {
+		t.Fatal("a different number than the recorded identity was accepted")
+	}
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: testRunName}, &run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Status.PR != "https://github.com/owner/repo/pull/845" {
+		t.Fatalf("status.pr = %q, want the refused writes to have left the recorded identity standing", run.Status.PR)
+	}
+}

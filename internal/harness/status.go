@@ -350,6 +350,14 @@ func (r *StatusReporter) ModelSurface(ctx context.Context, schemaVersion int, di
 	}})
 }
 
+// durable reports whether this reporter can carry a load-bearing status
+// write (#844). Telemetry writes tolerate an unconfigured path; an identity
+// write does not, and callers gate on this before taking side effects whose
+// record they can never make durable.
+func (r *StatusReporter) durable() bool {
+	return r != nil && r.transport != nil
+}
+
 // PullRequestOpened records the pull request the run's broker created
 // through its pull-request creation route (#844), through the broker's
 // trusted status path, before the finish honors the published result. The
@@ -362,8 +370,11 @@ func (r *StatusReporter) ModelSurface(ctx context.Context, schemaVersion int, di
 // adopts and re-records, never a claim of a pull request the status path
 // never persisted.
 func (r *StatusReporter) PullRequestOpened(ctx context.Context, number int) error {
-	if r == nil || r.transport == nil {
-		return nil
+	if r == nil {
+		return errors.New("harness: pull-request identity has no status path")
+	}
+	if r.transport == nil {
+		return errors.New("harness: pull-request identity has no configured status path")
 	}
 	if number <= 0 {
 		return errors.New("harness: pull-request identity is malformed")

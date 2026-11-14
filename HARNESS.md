@@ -4,8 +4,9 @@ The trust and execution contract for the resumable coordinator harness (#8),
 consuming the forge capability boundary (#80) and credential/process isolation
 problem (#104). The topology it settles has landed and is available as the
 opt-in deployment-level secure mode (`--secure-mode`); §11 records what is
-still unwired, chiefly the native path's forge reads and PR creation (#127) and
-the Go dependency cache (#136). The OpenCode bootstrap remains the default,
+still unwired, chiefly the native path's forge reads and pull-request update
+(PR creation itself landed via #843/#844) and the Go dependency cache (#136).
+The OpenCode bootstrap remains the default,
 explicitly insecure legacy mode until a safe replacement is proven.
 
 DESIGN.md remains authoritative. In particular: inform, don't constrain model
@@ -1165,7 +1166,11 @@ stop new briefs, let in-flight briefs reach terminal and integrate and publish,
 end the model loop, reconcile status debt, flush active operations, derive the
 outcome, and exit. The soft-stop finish derives `changes`, `no_change_needed`,
 or `blocked_external` from the work-ref snapshot beyond the admission anchor
-via the existing broker snapshot, not from a model declaration. `ctx`
+via the existing broker snapshot, not from a model declaration. For a run
+whose goal opens its pull request, a derived changes ending never claims
+published: the pull-request body is the model's declaration and the latch has
+none to substitute, so the run parks `NeedsHuman` with the branch published
+and a relaunch or human opens the pull request (#844). `ctx`
 cancellation (SIGTERM) remains a separate path and is never conflated with
 soft-stop; the boundary preserves per-brief publication and never deletes the
 pod (#238).

@@ -2030,6 +2030,7 @@ func TestSubagentShellRoutesThroughWorkerAndOnlyControlPublishes(t *testing.T) {
 		Snapshot:  snapshotProvider("snap-tip"),
 		Publisher: publisher,
 		Activity:  activity,
+		Status:    NewStatusReporter(&recordingStatusTransport{}, testControlUID, testWorkerUID, 0),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2629,6 +2630,7 @@ func TestBriefResultRetention(t *testing.T) {
 		Worker:    delegator,
 		Snapshot:  snapshotProvider("snap-tip"),
 		Publisher: publisher,
+		Status:    NewStatusReporter(&recordingStatusTransport{}, testControlUID, testWorkerUID, 0),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2690,6 +2692,7 @@ func TestCoordinatorShellRefreshesPublishedIntegrationSnapshot(t *testing.T) {
 		Transport: gateway, Bindings: testBindings(), Worker: delegator,
 		Snapshot:  sequenceSnapshotProvider("brief-base", "published-head", "published-head"),
 		Publisher: publisher,
+		Status:    NewStatusReporter(&recordingStatusTransport{}, testControlUID, testWorkerUID, 0),
 	})
 	if err != nil {
 		t.Fatal(err)

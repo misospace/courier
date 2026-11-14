@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
@@ -323,10 +324,22 @@ func (w *StatusWriter) Write(ctx context.Context, identity StatusIdentity, patch
 			// different number after one is recorded is refused — the
 			// create route can never legitimately open a second pull
 			// request at the pinned head, so a mismatch is a forgery or a
-			// confused caller, never recovery (#844).
+			// confused caller, never recovery (#844). The fence compares
+			// numerically when the recorded identity parses as a number —
+			// the consumers already read it that way — and an identity
+			// that is neither a matching number nor matching text
+			// (a hand-recorded URL, say) is refused rather than silently
+			// rewritten: no one may launder an unverifiable identity into
+			// a canonical one.
 			recorded := strconv.Itoa(patch.PullRequest.Number)
-			if existing := run.Status.PR; existing != "" && existing != recorded {
-				return fmt.Errorf("a different pull request is already recorded for this run")
+			if existing := strings.TrimSpace(run.Status.PR); existing != "" {
+				if existingNumber, convErr := strconv.Atoi(existing); convErr == nil {
+					if existingNumber != patch.PullRequest.Number {
+						return fmt.Errorf("a different pull request is already recorded for this run")
+					}
+				} else if existing != recorded {
+					return fmt.Errorf("a different pull request is already recorded for this run")
+				}
 			}
 			run.Status.PR = recorded
 		}

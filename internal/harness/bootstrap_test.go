@@ -323,6 +323,7 @@ func TestCoordinatorBootstrapsApprovedContractAndAttachesEnv(t *testing.T) {
 		Bindings:  testBindings(),
 		Worker:    delegator,
 		Snapshot:  contractSnapshotProvider("snap-tip", devenv.StateApproved),
+		Status:    NewStatusReporter(&recordingStatusTransport{}, testControlUID, testWorkerUID, 0),
 		Publisher: &mockPublisher{},
 	})
 	if err != nil {
@@ -503,6 +504,7 @@ func TestCoordinatorSkipsBootstrapWithoutAnApprovedContract(t *testing.T) {
 				Bindings:  testBindings(),
 				Worker:    delegator,
 				Snapshot:  contractSnapshotProvider("snap-tip", state),
+				Status:    NewStatusReporter(&recordingStatusTransport{}, testControlUID, testWorkerUID, 0),
 				Publisher: &mockPublisher{},
 			})
 			if err != nil {

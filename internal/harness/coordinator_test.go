@@ -382,3 +382,26 @@ func TestCriteriaEnvelopeIsPinnedIntoTheCoordinatorSession(t *testing.T) {
 		t.Fatalf("sections = %+v, want a criteria.envelope section", decoded.Sections)
 	}
 }
+
+// TestFinishOpensNoPullRequestWithoutAStatusPath proves ordering: the
+// identity write is load-bearing, so a build that cannot make the identity
+// durable must refuse the side effect, not open a pull request it can never
+// record (#844).
+func TestFinishOpensNoPullRequestWithoutAStatusPath(t *testing.T) {
+	publisher := &mockPublisher{}
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Transport: &Gateway{BaseURL: "http://gateway.invalid"},
+		Bindings:  testBindings(),
+		Publisher: publisher,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := coordinator.finish(context.Background(), testInvocation(), executor.OutcomeChanges, "done", nil, pullRequestDeclaration)
+	if result.Kind != courierv1alpha1.NativeResultInfrastructureFailed {
+		t.Fatalf("result = %+v, want an infrastructure failure without a status path", result)
+	}
+	if publisher.opens() != 0 {
+		t.Fatalf("pull-request opens = %d, want none without a status path", publisher.opens())
+	}
+}
