@@ -313,7 +313,7 @@ func TestCoordinatorBootstrapsApprovedContractAndAttachesEnv(t *testing.T) {
 		// Coder sub-agent: done.
 		gatewayResponse{body: sse(contentChunk("work done"), finishChunk("stop"))},
 		// Coordinator: declare changes.
-		gatewayResponse{body: sse(contentChunk(`{"outcome":"changes"}`), finishChunk("stop"))},
+		gatewayResponse{body: sse(contentChunk(`{"outcome":"changes","prTitle":"Resolve issue #7","prBody":"Closes #7. Ships the fix."}`), finishChunk("stop"))},
 	)
 	_ = gateway
 	defer cleanup()
@@ -494,7 +494,7 @@ func TestCoordinatorSkipsBootstrapWithoutAnApprovedContract(t *testing.T) {
 					finishChunk("tool_calls"),
 				)},
 				gatewayResponse{body: sse(contentChunk("work done"), finishChunk("stop"))},
-				gatewayResponse{body: sse(contentChunk(`{"outcome":"changes"}`), finishChunk("stop"))},
+				gatewayResponse{body: sse(contentChunk(`{"outcome":"changes","prTitle":"Resolve issue #7","prBody":"Closes #7. Ships the fix."}`), finishChunk("stop"))},
 			)
 			defer cleanup()
 

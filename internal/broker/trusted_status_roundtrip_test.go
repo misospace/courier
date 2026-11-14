@@ -77,6 +77,32 @@ func TestTrustedStatusEndToEndRoundTrip(t *testing.T) {
 	if run.Status.Heartbeat == nil || run.Status.Heartbeat.Kind != "stream" {
 		t.Fatalf("heartbeat = %#v, want the foreign write to have been dropped", run.Status.Heartbeat)
 	}
+
+	// The created pull-request identity (#844) crosses the same wire: the
+	// harness StatusPatch shape must decode into the broker HarnessPatch and
+	// land on status.pr, the identical rewrite must be idempotent, and a
+	// second identity must be refused.
+	if err := control.PostStatus(context.Background(), harness.StatusPatch{
+		PullRequest: &harness.PullRequestRecord{Number: 846},
+	}); err != nil {
+		t.Fatalf("PostStatus(pull request): %v", err)
+	}
+	if err := control.PostStatus(context.Background(), harness.StatusPatch{
+		PullRequest: &harness.PullRequestRecord{Number: 846},
+	}); err != nil {
+		t.Fatalf("idempotent rewrite of the recorded pull-request identity: %v", err)
+	}
+	if err := control.PostStatus(context.Background(), harness.StatusPatch{
+		PullRequest: &harness.PullRequestRecord{Number: 847},
+	}); err == nil {
+		t.Fatal("a second pull-request identity crossed the wire and was accepted")
+	}
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: testRunName}, run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Status.PR != "846" {
+		t.Fatalf("status.pr = %q, want the number the harness reported", run.Status.PR)
+	}
 }
 
 var testNow = time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)

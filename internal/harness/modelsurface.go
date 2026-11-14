@@ -29,8 +29,10 @@ import (
 // contents (including repository-local skill instruction bodies and their
 // workspace-derived descriptions — the pinned bundle pairs are the trusted
 // skill identity), the source-owned goal text, and any text already covered
-// by an existing trusted digest or pin (criterion texts ride their pinned set
-// digest; skill bodies ride the bundle digests).
+// by an existing trusted digest or pin (skill bodies ride the bundle
+// digests; criterion texts ride the pinned set digest, and the criterion
+// envelope reaches the digest only as the pinned section identity Run
+// actually pins, #844).
 //
 // What the digest proves and what it does not is documented in HARNESS.md §5.
 
@@ -218,6 +220,13 @@ func assembleModelSurface(bindings Bindings, coordinatorTools, subagentTools []T
 		{Name: "subagent.framing", Role: "system", Digest: textDigest(subagentFraming)},
 		{Name: "control.turn", Role: "system", Digest: textDigest(controlTurnText)},
 		{Name: "outcome.clarification", Role: "user", Digest: textDigest(outcomeClarification)},
+	}
+	// The pinned acceptance-criteria envelope pins as coordinator system
+	// framing when the run pins a criterion set (#844): Run pins the exact
+	// section this helper renders, so the digest hashes the identical text
+	// and never a second description of it.
+	if section := criteriaEnvelopeSection(inputs.CriteriaJSON); section != "" {
+		sections = append(sections, modelSurfaceSection{Name: "criteria.envelope", Role: "system", Digest: textDigest(section)})
 	}
 	// The lane's framing pins verbatim when it exists: Run pins the raw
 	// text the invocation carries, so the digest hashes the exact bytes and

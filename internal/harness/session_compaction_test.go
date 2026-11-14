@@ -472,8 +472,8 @@ func TestRunFailsClosedWhenCompactionCannotFit(t *testing.T) {
 // tool result is a few dozen tokens — only that combination puts a scripted
 // run's growth across the compact point.
 func TestRunCompactsAcrossItsTurnsAndReportsTelemetry(t *testing.T) {
-	// Effective limit 1600, compact point 1200. The pinned goal plus
-	// harness framing is ~400 tokens and each turn ~215, so the fourth
+	// Effective limit 1750, compact point 1312. The pinned goal plus
+	// harness framing is ~400 tokens and each turn ~215, so an early
 	// boundary crosses the point.
 	turn := strings.Repeat("reasoning about the workspace. ", 25)
 	script := make([]gatewayResponse, 0, 6)
@@ -500,7 +500,7 @@ func TestRunCompactsAcrossItsTurnsAndReportsTelemetry(t *testing.T) {
 		Worker:    delegator,
 		Snapshot:  snapshotProvider("snap-tip"),
 		ContextBudgets: map[string]ContextBudgetInput{
-			RoleCoordinator: {Role: RoleCoordinator, DeclaredMaxInputTokens: 1600, ProbedMaxInputTokens: 1600},
+			RoleCoordinator: {Role: RoleCoordinator, DeclaredMaxInputTokens: 1750, ProbedMaxInputTokens: 1750},
 		},
 		Compactions: sink,
 	})
@@ -743,7 +743,7 @@ func TestRunCompactionNeverOrphansToolResults(t *testing.T) {
 		Worker:    delegator,
 		Snapshot:  snapshotProvider("snap-tip"),
 		ContextBudgets: map[string]ContextBudgetInput{
-			RoleCoordinator: {Role: RoleCoordinator, DeclaredMaxInputTokens: 1600, ProbedMaxInputTokens: 1600},
+			RoleCoordinator: {Role: RoleCoordinator, DeclaredMaxInputTokens: 1750, ProbedMaxInputTokens: 1750},
 		},
 		Compactions: sink,
 	})

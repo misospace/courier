@@ -1820,6 +1820,13 @@ regenerated CRD/deepcopy:
   uses resource-version-conditional status updates (retry conflict after a
   fresh read) so clearing one op cannot drop another op or another
   incarnation's state. Ordinary unconditional merge patches are insufficient.
+- The coordinator reports the pull request it creates at finish (#844)
+  through the same fenced write path: the broker records it as `status.pr`,
+  a decimal number string — the identical rewrite is the idempotent
+  re-record of an adopted pull request, and a second, different number for
+  one run is refused. This is the only identity write the harness makes;
+  the operator's observation still records the identity of any pull request
+  it discovers on its own into the same field.
 
 The broker checks the run UID and current control pod UID on each write, and
 refuses stale incarnations. Its ServiceAccount may `get` and patch only the
@@ -2372,11 +2379,14 @@ and the acceptance tests below are satisfied.
    delegation with cancellation/retry dedupe, and startup capability
    health — and #125's worker-artifact validation, integration, and
    broker-mediated publication have landed (deployment-level secure mode).
-   The native path's forge reads (`ForgeOps`) and pull-request
-   creation/update are not yet wired to the broker's typed API; until they
-   are, a published native run reaches `Verifying` without opening its PR —
-   that wiring belongs to the terminal-result slice (#127), and the model
-   client's forge tool stays unwired in the meantime.
+   Pull-request creation is now wired to the broker's typed API (#843, #844):
+   a resolve-issue or contribute run declares its PR title and body in the
+   outcome JSON, and the finish step opens the PR through the broker after
+   publication and records its identity on the status path before claiming
+   published; the create route is idempotent at the pinned head, so a
+   relaunch adopts the same PR. Forge reads (`ForgeOps`) and pull-request
+   update stay unwired, and the model client's forge tool stays unwired in
+   the meantime.
 3. Settled in §5 and implemented in #125: the worker artifact contract —
    git bundle only, exact base-tip ancestry binding, fixed size/object
    bounds, exact ref-set equality, operator-resolved path scope (none is

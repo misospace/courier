@@ -703,8 +703,17 @@ type mockPublisher struct {
 	publishes  int
 	commits    int
 
-	integrateErr error
-	publishErr   error
+	integrateErr   error
+	publishErr     error
+	pullRequestErr error
+	pullRequests   []pullRequestCall
+}
+
+// pullRequestCall records one OpenPullRequest seam call (#844).
+type pullRequestCall struct {
+	title string
+	body  string
+	draft bool
 }
 
 func (p *mockPublisher) Integrate(_ context.Context, req IntegrationRequest) (Integration, error) {
@@ -726,6 +735,24 @@ func (p *mockPublisher) Publish(_ context.Context) (Publication, error) {
 	}
 	p.publishes++
 	return Publication{OID: fmt.Sprintf("remote-%d", p.publishes)}, nil
+}
+
+// OpenPullRequest implements the PullRequestOpener seam for coordinator
+// finish tests (#844).
+func (p *mockPublisher) OpenPullRequest(_ context.Context, title, body string, draft bool) (PullRequest, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.pullRequestErr != nil {
+		return PullRequest{}, p.pullRequestErr
+	}
+	p.pullRequests = append(p.pullRequests, pullRequestCall{title: title, body: body, draft: draft})
+	return PullRequest{Number: 900 + len(p.pullRequests), State: "open"}, nil
+}
+
+func (p *mockPublisher) opens() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.pullRequests)
 }
 
 func (p *mockPublisher) count() int {
@@ -1990,7 +2017,7 @@ func TestSubagentShellRoutesThroughWorkerAndOnlyControlPublishes(t *testing.T) {
 		// Coder sub-agent: done.
 		gatewayResponse{body: sse(contentChunk("work done"), finishChunk("stop"))},
 		// Coordinator: declare changes.
-		gatewayResponse{body: sse(contentChunk(`{"outcome":"changes"}`), finishChunk("stop"))},
+		gatewayResponse{body: sse(contentChunk(`{"outcome":"changes","prTitle":"Resolve issue #7","prBody":"Closes #7. Ships the fix."}`), finishChunk("stop"))},
 	)
 	defer cleanup()
 
@@ -2590,7 +2617,7 @@ func TestBriefResultRetention(t *testing.T) {
 			finishChunk("tool_calls"),
 		)},
 		gatewayResponse{body: sse(contentChunk("the actual delegate summary"), finishChunk("stop"))},
-		gatewayResponse{body: sse(contentChunk(`{"outcome":"changes"}`), finishChunk("stop"))},
+		gatewayResponse{body: sse(contentChunk(`{"outcome":"changes","prTitle":"Resolve issue #7","prBody":"Closes #7. Ships the fix."}`), finishChunk("stop"))},
 	)
 	defer cleanup()
 	worker.snapshotTip = "snap-tip"
@@ -2655,7 +2682,7 @@ func TestCoordinatorShellRefreshesPublishedIntegrationSnapshot(t *testing.T) {
 			toolCallChunk(0, "validate", toolShell, `{"command":"go test ./..."}`),
 			finishChunk("tool_calls"),
 		)},
-		gatewayResponse{body: sse(contentChunk(`{"outcome":"changes"}`), finishChunk("stop"))},
+		gatewayResponse{body: sse(contentChunk(`{"outcome":"changes","prTitle":"Resolve issue #7","prBody":"Closes #7. Ships the fix."}`), finishChunk("stop"))},
 	)
 	defer cleanup()
 	publisher := &mockPublisher{}

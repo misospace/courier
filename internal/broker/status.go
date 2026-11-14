@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
@@ -62,6 +63,23 @@ type HarnessPatch struct {
 	// authenticated incarnation's UID, one digest final per incarnation,
 	// and a replacement incarnation records its own.
 	ModelSurface *courier.ModelSurfaceProvenance `json:"modelSurface,omitempty"`
+	// PullRequest records the pull request this run's broker created through
+	// the pull-request creation route (#844). The number is the create
+	// route's own re-read identity echoed back by the harness; the writer
+	// records it as the run's pull-request identity (status.pr, the field
+	// the operator's verification already reads as a number) and refuses a
+	// different number once one is recorded, so the identical rewrite — the
+	// relaunch that adopted the discovered pull request — is the idempotent
+	// retry.
+	PullRequest *PullRequestRecord `json:"pullRequest,omitempty"`
+}
+
+// PullRequestRecord carries the created pull request's number. The run's
+// work branch and head identity are already recorded on the run, so the
+// number is the missing half of the identity the operator's Verifying phase
+// verifies through the forge read-pull-request capability.
+type PullRequestRecord struct {
+	Number int `json:"number"`
 }
 
 // OperationAddition carries the operation ID (the map key) and the entry.
@@ -112,7 +130,7 @@ func (w *StatusWriter) Write(ctx context.Context, identity StatusIdentity, patch
 	if patch.Checkpoint == nil && patch.Heartbeat == nil && patch.LastCommit == nil &&
 		patch.AddOperation == nil && patch.ClearOperation == "" && !patch.ReconcileOperations &&
 		patch.ControlRequestAck == nil && patch.TerminalResult == nil && patch.NoChange == nil &&
-		patch.ModelSurface == nil {
+		patch.ModelSurface == nil && patch.PullRequest == nil {
 		return fmt.Errorf("empty harness status patch")
 	}
 	// An acknowledgement names the request it acknowledges and carries its
@@ -158,6 +176,12 @@ func (w *StatusWriter) Write(ctx context.Context, identity StatusIdentity, patch
 		if patch.ModelSurface.CoordinatorPodUID != string(identity.ControlPodUID) {
 			return fmt.Errorf("model-surface provenance UID does not match the authenticated control incarnation")
 		}
+	}
+	// A pull-request record must carry a real number (#844). The
+	// one-identity check against the fresh run runs inside the CAS loop
+	// below.
+	if patch.PullRequest != nil && patch.PullRequest.Number <= 0 {
+		return fmt.Errorf("pull request identity is malformed")
 	}
 	if patch.LastCommit != nil && validate == nil {
 		return fmt.Errorf("lastCommit requires live-world validation")
@@ -291,6 +315,20 @@ func (w *StatusWriter) Write(ctx context.Context, identity StatusIdentity, patch
 				}
 			}
 			run.Status.ModelSurface = patch.ModelSurface.DeepCopy()
+		}
+		if patch.PullRequest != nil {
+			// One pull request per run, fenced by value: the identical
+			// rewrite is the idempotent retry (a re-record after a lost
+			// write or a relaunch that adopted the same pull request), a
+			// different number after one is recorded is refused — the
+			// create route can never legitimately open a second pull
+			// request at the pinned head, so a mismatch is a forgery or a
+			// confused caller, never recovery (#844).
+			recorded := strconv.Itoa(patch.PullRequest.Number)
+			if existing := run.Status.PR; existing != "" && existing != recorded {
+				return fmt.Errorf("a different pull request is already recorded for this run")
+			}
+			run.Status.PR = recorded
 		}
 		if patch.ReconcileOperations {
 			run.Status.ActiveOperations = nil

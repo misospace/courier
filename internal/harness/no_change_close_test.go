@@ -15,7 +15,7 @@ import (
 // for that outcome shape.
 func TestParseOutcomeCarriesGroundedCloseProposal(t *testing.T) {
 	text := `{"outcome":"no_change_needed","evidence":"already implemented upstream","close":{"criteria":[{"criterion":"the flag exists","path":"docs/flags.md","excerpt":"an excerpt of at least twenty-four bytes long"}]}}`
-	outcome, proposal, err := parseOutcome(text)
+	outcome, proposal, _, err := parseOutcome(text, courierv1alpha1.ModeResolveIssue)
 	if err != nil {
 		t.Fatalf("parseOutcome: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestParseOutcomeDropsMalformedCloseKeepsEnding(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			outcome, proposal, err := parseOutcome(tt.text)
+			outcome, proposal, _, err := parseOutcome(tt.text, courierv1alpha1.ModeResolveIssue)
 			if err != nil {
 				t.Fatalf("a malformed close must not cost the ending: %v", err)
 			}
@@ -87,7 +87,7 @@ func TestParseOutcomeDropsMalformedCloseKeepsEnding(t *testing.T) {
 		})
 	}
 
-	if _, _, err := parseOutcome(`{"outcome":"changes","close":{"criteria":[{"criterion":"c","path":"p","excerpt":"an excerpt of at least twenty-four bytes long"}]}}`); err == nil {
+	if _, _, _, err := parseOutcome(`{"outcome":"changes","close":{"criteria":[{"criterion":"c","path":"p","excerpt":"an excerpt of at least twenty-four bytes long"}]}}`, courierv1alpha1.ModeResolveIssue); err == nil {
 		t.Fatal("a changes declaration carrying close must be invalid")
 	}
 }
@@ -105,15 +105,15 @@ func TestFinishCarriesCloseProposalToTheResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, proposal, err := parseOutcome(`{"outcome":"no_change_needed","evidence":"done","close":{"criteria":[{"criterion":"c","path":"p","excerpt":"an excerpt of at least twenty-four bytes long"}]}}`)
+	_, proposal, _, err := parseOutcome(`{"outcome":"no_change_needed","evidence":"done","close":{"criteria":[{"criterion":"c","path":"p","excerpt":"an excerpt of at least twenty-four bytes long"}]}}`, courierv1alpha1.ModeResolveIssue)
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := coordinator.finish(context.Background(), testInvocation(), executor.OutcomeNoChangeNeeded, "done", proposal)
+	result := coordinator.finish(context.Background(), testInvocation(), executor.OutcomeNoChangeNeeded, "done", proposal, nil)
 	if result.Kind != courierv1alpha1.NativeResultNoChange || result.NoChange != proposal {
 		t.Fatalf("result = %#v, want the no-change ending carrying the proposal", result)
 	}
-	plain := coordinator.finish(context.Background(), testInvocation(), executor.OutcomeNoChangeNeeded, "done", nil)
+	plain := coordinator.finish(context.Background(), testInvocation(), executor.OutcomeNoChangeNeeded, "done", nil, nil)
 	if plain.NoChange != nil {
 		t.Fatalf("plain ending carried a proposal: %#v", plain.NoChange)
 	}
