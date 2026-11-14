@@ -1314,18 +1314,21 @@ func TestLaneCollectorScopedReportsOperatorNamespaceLanes(t *testing.T) {
 }
 
 // TestLaneCollectorDedupesLaneProfilesByName pins the shared-name rule: lane
-// labels carry only the name, so one name listed from two consulted namespaces
-// seeds exactly one sample per gauge, and the consult-order-first (run
-// namespace) copy is authoritative — the same copy the lane resolution of a
-// run in that namespace reads.
+// labels carry only the name, so one name listed from several consulted
+// namespaces seeds exactly one sample per gauge, and the consult-order-first
+// copy is authoritative — first the owned run namespaces in scope order, then
+// the operator namespace — the same copies the lane resolutions of runs in
+// those namespaces read.
 func TestLaneCollectorDedupesLaneProfilesByName(t *testing.T) {
 	runSide := admissionLane("shared", 5)
+	secondOwned := admissionLane("shared", 7)
+	secondOwned.Namespace = "runs-b"
 	operatorSide := admissionLane("shared", 9)
 	operatorSide.Namespace = "operator-ns"
 	operatorSide.Annotations = map[string]string{courierv1alpha1.SuspendAnnotation: "true"}
 
-	c := phaseClient(t, runSide, operatorSide)
-	collector := NewLaneCollectorScoped(c, []string{"default"}, []string{"default", "operator-ns"})
+	c := phaseClient(t, runSide, secondOwned, operatorSide)
+	collector := NewLaneCollectorScoped(c, []string{"default", "runs-b"}, []string{"default", "runs-b", "operator-ns"})
 	collector.now = func() time.Time { return timestampClock }
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(collector)
