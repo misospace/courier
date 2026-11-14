@@ -1904,6 +1904,60 @@ func TestResolveOwnership(t *testing.T) {
 	}
 }
 
+// TestLaneProfileMetricNamespaces pins the lane-metric LaneProfile scope:
+// without the bootstrap seam it is exactly the owned run namespaces, and with
+// it the operator namespace joins the consulted set — never duplicated when
+// already owned, never an empty entry, and never widening an empty boundary
+// (the unbounded cluster-wide default stays unscoped). (#837)
+func TestLaneProfileMetricNamespaces(t *testing.T) {
+	tests := []struct {
+		name              string
+		owned             []string
+		operatorNamespace string
+		bootstrapEnabled  bool
+		want              []string
+	}{
+		{
+			name:  "without bootstrap the scope is the owned run namespaces",
+			owned: []string{"runs-a", "runs-b"},
+			want:  []string{"runs-a", "runs-b"},
+		},
+		{
+			name:              "bootstrap adds the operator namespace",
+			owned:             []string{"runs-a"},
+			operatorNamespace: "courier-system",
+			bootstrapEnabled:  true,
+			want:              []string{"runs-a", "courier-system"},
+		},
+		{
+			name:              "an already-owned operator namespace is not duplicated",
+			owned:             []string{"runs-a", "courier-system"},
+			operatorNamespace: "courier-system",
+			bootstrapEnabled:  true,
+			want:              []string{"runs-a", "courier-system"},
+		},
+		{
+			name:             "an empty operator namespace adds nothing",
+			owned:            []string{"runs-a"},
+			bootstrapEnabled: true,
+			want:             []string{"runs-a"},
+		},
+		{
+			name:              "bootstrap keeps an unbounded boundary unscoped",
+			operatorNamespace: "courier-system",
+			bootstrapEnabled:  true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := laneProfileMetricNamespaces(test.owned, test.operatorNamespace, test.bootstrapEnabled)
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("lane namespaces = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestBuildSecureControlCarriesTokenReviewClusterRole(t *testing.T) {
 	registryFile := filepath.Join(t.TempDir(), "providers.json")
 	providers := `{"providers":[{"name":"github","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"forge-creds","key":"token"}},"serves":["*"]}]}`

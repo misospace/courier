@@ -288,11 +288,19 @@ func main() {
 	}
 
 	// Per-lane capacity and suspension gauges are read from the live cluster
-	// at scrape time, so they need only the manager's client. They are scoped
-	// to the owned run namespaces so a side-by-side release never reports
-	// another deployment's lanes (#632); with no boundary they stay
-	// cluster-wide.
-	crmetrics.Registry.MustRegister(controller.NewLaneCollector(mgr.GetClient(), ownedRunNamespaces...))
+	// at scrape time, so they need only the manager's client. Run counts are
+	// scoped to the owned run namespaces so a side-by-side release never
+	// reports another deployment's lanes (#632); with no boundary they stay
+	// cluster-wide. The LaneProfile seed scope adds the operator namespace
+	// when the bootstrap seam is configured: the bootstrap reconciler writes
+	// managed profiles there, and a boundary that keeps it out of the owned
+	// run namespaces would otherwise report those configured lanes as
+	// absent (#837).
+	crmetrics.Registry.MustRegister(controller.NewLaneCollectorScoped(
+		mgr.GetClient(),
+		ownedRunNamespaces,
+		laneProfileMetricNamespaces(ownedRunNamespaces, operatorNamespace, strings.TrimSpace(bootstrapLaneProfilesFile) != ""),
+	))
 	// The oldest retained terminal-run age is likewise read from the live
 	// cluster at scrape time, so the retention reaper's observability half
 	// needs only the manager's client.
@@ -1393,6 +1401,27 @@ func containsNamespace(namespaces []string, namespace string) bool {
 		}
 	}
 	return false
+}
+
+// laneProfileMetricNamespaces settles the LaneProfile scope of the lane
+// metrics: the owned run namespaces, plus the operator namespace when the
+// bootstrap seam is configured (#837). The bootstrap reconciler writes every
+// managed LaneProfile to POD_NAMESPACE, so a lane it manages must be reported
+// even when the ownership boundary keeps the operator namespace out of the
+// owned run namespaces. A name shared across the consulted namespaces is
+// deduped by the collector; an already-owned operator namespace is not
+// duplicated, and an empty operator namespace adds nothing — the bootstrap
+// setup fails closed on it separately. An empty ownership boundary stays
+// unscoped: the cluster-wide list already sees the operator namespace.
+func laneProfileMetricNamespaces(owned []string, operatorNamespace string, bootstrapEnabled bool) []string {
+	if !bootstrapEnabled || len(owned) == 0 {
+		return owned
+	}
+	namespace := strings.TrimSpace(operatorNamespace)
+	if namespace == "" || containsNamespace(owned, namespace) {
+		return owned
+	}
+	return append(append([]string{}, owned...), namespace)
 }
 
 // cronLane pairs one LaneProfile with the schedules targeting it.

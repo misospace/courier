@@ -395,31 +395,61 @@ func nonNegativeSeconds(d time.Duration) float64 {
 }
 
 // LaneCollector reports per-lane CoderRun capacity usage and lane suspension
-// by reading the live cluster at scrape time. Every LaneProfile is reported on
-// both gauges, with drained lanes carrying a zero in-flight count, and a
-// failed List increments the scrape-errors counter instead of silently
-// dropping the scrape. Capacity consumption follows phaseConsumesCapacity:
-// only Claimed and Running runs count, so a Verifying run no longer blocks new
-// admissions. The discovery-side reservation gauges are deliberately broader:
-// source.PhaseReservesDiscovery also counts Pending and empty-phase runs, so a
-// binding does not hoard materialized-but-unadmitted work.
+// by reading the live cluster at scrape time. Every LaneProfile visible in
+// the lane-profile scope is reported on both gauges, with drained lanes
+// carrying a zero in-flight count, and a failed List increments the
+// scrape-errors counter instead of silently dropping the scrape. Capacity
+// consumption follows phaseConsumesCapacity: only Claimed and Running runs
+// count, so a Verifying run no longer blocks new admissions. The discovery-side
+// reservation gauges are deliberately broader: source.PhaseReservesDiscovery
+// also counts Pending and empty-phase runs, so a binding does not hoard
+// materialized-but-unadmitted work.
+//
+// The two namespace scopes are separate (#837): CoderRun lists follow the
+// owned run namespaces, while LaneProfile lists follow the namespaces lane
+// resolution consults, which additionally include the operator namespace
+// where the bootstrap reconciler writes managed profiles. The lane series are
+// keyed by name only, so a profile name listed from more than one consulted
+// namespace seeds exactly one series set: the consult-order-first profile
+// wins, which makes the run-namespace copy authoritative for a lane that also
+// exists in the operator namespace.
 type LaneCollector struct {
-	client       client.Client
-	namespaces   []string
-	now          func() time.Time
-	scrapeErrors prometheus.Counter
+	client         client.Client
+	namespaces     []string
+	laneNamespaces []string
+	now            func() time.Time
+	scrapeErrors   prometheus.Counter
 }
 
-// NewLaneCollector builds a lane collector. The optional namespaces scope
-// the collection to the run namespaces of one deployment (#632): each is
-// listed in turn and the pages accumulate, so a scoped collector observes
-// only the namespaces it owns. With none given the collector lists the
-// whole cluster, the single-controller default.
+// NewLaneCollector builds a lane collector with one namespace scope: the
+// optional namespaces scope both the run lists and the LaneProfile seed lists
+// to the run namespaces of one deployment (#632). Each is listed in turn and
+// the pages accumulate, so a scoped collector observes only the namespaces it
+// owns. With none given the collector lists the whole cluster, the
+// single-controller default. A deployment whose LaneProfiles are consulted in
+// namespaces wider than its run namespaces (a bootstrap-managed deployment,
+// #837) uses NewLaneCollectorScoped.
 func NewLaneCollector(c client.Client, namespaces ...string) *LaneCollector {
+	return NewLaneCollectorScoped(c, namespaces, nil)
+}
+
+// NewLaneCollectorScoped builds a lane collector with separate run and
+// lane-profile scopes. runNamespaces scopes the CoderRun lists;
+// laneNamespaces scopes the LaneProfile lists that seed the per-lane series.
+// Lane profiles live in the namespaces lane resolution consults: a secure
+// deployment authors them in the owned run namespaces, but the bootstrap
+// reconciler writes managed profiles to the operator namespace, which need
+// not be an owned run namespace (#837). An empty laneNamespaces falls back to
+// runNamespaces, the single-scope default.
+func NewLaneCollectorScoped(c client.Client, runNamespaces, laneNamespaces []string) *LaneCollector {
+	if len(laneNamespaces) == 0 {
+		laneNamespaces = runNamespaces
+	}
 	return &LaneCollector{
-		client:     c,
-		now:        time.Now,
-		namespaces: namespaces,
+		client:         c,
+		now:            time.Now,
+		namespaces:     runNamespaces,
+		laneNamespaces: laneNamespaces,
 		scrapeErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "courier_metrics_scrape_errors_total",
 			Help: "List calls that failed while the LaneCollector collected lane metrics.",
@@ -462,8 +492,15 @@ func (c *LaneCollector) Collect(ch chan<- prometheus.Metric) {
 	defer cancel()
 	defer func() { ch <- c.scrapeErrors }()
 
+	// Lane profiles seed the per-lane series from every namespace lane
+	// resolution consults (#837), not only the run namespaces: a
+	// bootstrap-managed deployment writes managed profiles to the operator
+	// namespace, which a side-by-side boundary may keep out of the owned run
+	// namespaces. The lane labels are name-keyed, so a name seen in more
+	// than one consulted namespace seeds once — the consult-order-first
+	// profile wins, keeping the run-namespace copy authoritative.
 	var lanes []courierv1alpha1.LaneProfile
-	if err := listScoped(ctx, c.namespaces, func(opts ...client.ListOption) error {
+	if err := listScoped(ctx, c.laneNamespaces, func(opts ...client.ListOption) error {
 		page := &courierv1alpha1.LaneProfileList{}
 		if err := c.client.List(ctx, page, opts...); err != nil {
 			return err
@@ -477,6 +514,16 @@ func (c *LaneCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 	// Seed every lane at zero so a lane whose runs all drained keeps
 	// reporting 0 instead of disappearing from the series.
+	seen := make(map[string]bool, len(lanes))
+	unique := lanes[:0]
+	for i := range lanes {
+		if seen[lanes[i].Name] {
+			continue
+		}
+		seen[lanes[i].Name] = true
+		unique = append(unique, lanes[i])
+	}
+	lanes = unique
 	inFlight := make(map[string]int, len(lanes))
 	reservations := make(map[string]int, len(lanes))
 	pending := make(map[string]int, len(lanes))

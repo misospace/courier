@@ -1262,6 +1262,142 @@ func TestLaneCollectorScopedToNamespace(t *testing.T) {
 	}
 }
 
+// TestLaneCollectorScopedReportsOperatorNamespaceLanes covers the bootstrap
+// wiring (#837): a LaneProfile consulted in the operator namespace, outside
+// the owned run namespaces, still seeds every lane gauge at zero, so a
+// bootstrap-managed lane is reported instead of looking unscheduled. The run
+// scope stays narrow — the operator namespace's runs are not counted — and a
+// namespace outside the consulted scope stays invisible.
+func TestLaneCollectorScopedReportsOperatorNamespaceLanes(t *testing.T) {
+	local := admissionLane("local", 2)
+	bootstrap := admissionLane("bootstrap", 3)
+	bootstrap.Namespace = "operator-ns"
+	foreign := admissionLane("foreign", 4)
+	foreign.Namespace = "foreign-ns"
+	localRunning := admissionRun("local-running", "local", courierv1alpha1.PhaseRunning)
+	bootstrapRunning := admissionRun("bootstrap-running", "bootstrap", courierv1alpha1.PhaseRunning)
+	bootstrapRunning.Namespace = "operator-ns"
+
+	c := phaseClient(t, local, bootstrap, foreign, localRunning, bootstrapRunning)
+	collector := NewLaneCollectorScoped(c, []string{"default"}, []string{"default", "operator-ns"})
+	collector.now = func() time.Time { return timestampClock }
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(collector)
+
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_lane_concurrency", map[string]string{"lane": "bootstrap"}), "courier_lane_concurrency"); got != 3 {
+		t.Fatalf("concurrency bootstrap = %v, want 3", got)
+	}
+	for name, want := range map[string]float64{
+		"courier_coderuns_in_flight": 0,
+		"courier_lane_suspended":     0,
+		"courier_lane_reservations":  0,
+		"courier_coderuns_pending":   0,
+	} {
+		if got := gaugeValue(t, gatherMetric(t, registry, name, map[string]string{"lane": "bootstrap"}), name); got != want {
+			t.Fatalf("%s bootstrap = %v, want %v (seeded zero for an operator-namespace lane)", name, got, want)
+		}
+	}
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_coderuns_in_flight", map[string]string{"lane": "local"}), "courier_coderuns_in_flight"); got != 1 {
+		t.Fatalf("in-flight local = %v, want 1", got)
+	}
+	// The widened lane scope does not widen the run scope: the run in the
+	// operator namespace is outside the owned run namespaces and uncounted.
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_coderuns_in_flight", map[string]string{"lane": "bootstrap"}), "courier_coderuns_in_flight"); got != 0 {
+		t.Fatalf("in-flight bootstrap = %v, want 0 (runs stay scoped to the owned run namespaces)", got)
+	}
+	// A side-by-side deployment's namespace is in neither scope.
+	for _, name := range []string{"courier_lane_concurrency", "courier_lane_suspended", "courier_coderuns_in_flight"} {
+		if _, present := gaugeValueIfPresent(t, registry, name, map[string]string{"lane": "foreign"}); present {
+			t.Fatalf("%s present for a foreign namespace's lane, want absent", name)
+		}
+	}
+}
+
+// TestLaneCollectorDedupesLaneProfilesByName pins the shared-name rule: lane
+// labels carry only the name, so one name listed from two consulted namespaces
+// seeds exactly one sample per gauge, and the consult-order-first (run
+// namespace) copy is authoritative — the same copy the lane resolution of a
+// run in that namespace reads.
+func TestLaneCollectorDedupesLaneProfilesByName(t *testing.T) {
+	runSide := admissionLane("shared", 5)
+	operatorSide := admissionLane("shared", 9)
+	operatorSide.Namespace = "operator-ns"
+	operatorSide.Annotations = map[string]string{courierv1alpha1.SuspendAnnotation: "true"}
+
+	c := phaseClient(t, runSide, operatorSide)
+	collector := NewLaneCollectorScoped(c, []string{"default"}, []string{"default", "operator-ns"})
+	collector.now = func() time.Time { return timestampClock }
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(collector)
+
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_lane_concurrency", map[string]string{"lane": "shared"}), "courier_lane_concurrency"); got != 5 {
+		t.Fatalf("concurrency shared = %v, want 5 (the run-namespace copy wins)", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_lane_suspended", map[string]string{"lane": "shared"}), "courier_lane_suspended"); got != 0 {
+		t.Fatalf("suspended shared = %v, want 0 (the run-namespace copy wins)", got)
+	}
+
+	count := func(name string) int {
+		families, err := registry.Gather()
+		if err != nil {
+			t.Fatalf("gather: %v", err)
+		}
+		n := 0
+		for _, f := range families {
+			if f.GetName() != name {
+				continue
+			}
+			for _, m := range f.GetMetric() {
+				for _, lp := range m.GetLabel() {
+					if lp.GetName() == "lane" && lp.GetValue() == "shared" {
+						n++
+					}
+				}
+			}
+		}
+		return n
+	}
+	for _, name := range []string{
+		"courier_coderuns_in_flight",
+		"courier_lane_suspended",
+		"courier_lane_concurrency",
+		"courier_lane_reservations",
+		"courier_coderuns_pending",
+	} {
+		if n := count(name); n != 1 {
+			t.Fatalf("%s has %d samples for the shared lane, want exactly 1", name, n)
+		}
+	}
+}
+
+// TestLaneCollectorLaneProfileListFailureScoped keeps the scrape-error
+// posture (#837): a failed LaneProfile read in the widened lane scope
+// increments the dedicated counter instead of dropping the scrape or
+// panicking, while CoderRun reads still succeed.
+func TestLaneCollectorLaneProfileListFailureScoped(t *testing.T) {
+	base := phaseClient(t, admissionRun("local-running", "local", courierv1alpha1.PhaseRunning))
+	withWatch, ok := base.(client.WithWatch)
+	if !ok {
+		t.Fatal("fake client does not implement client.WithWatch")
+	}
+	failing := interceptor.NewClient(withWatch, interceptor.Funcs{
+		List: func(_ context.Context, _ client.WithWatch, list client.ObjectList, _ ...client.ListOption) error {
+			if _, ok := list.(*courierv1alpha1.LaneProfileList); ok {
+				return errors.New("lane profile list failed")
+			}
+			return nil
+		},
+	})
+
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(NewLaneCollectorScoped(failing, []string{"default"}, []string{"default", "operator-ns"}))
+
+	m := gatherMetric(t, registry, "courier_metrics_scrape_errors_total", map[string]string{})
+	if m.GetCounter() == nil || m.GetCounter().GetValue() != 1 {
+		t.Fatalf("courier_metrics_scrape_errors_total = %v, want 1", m.GetCounter())
+	}
+}
+
 // A terminal-age collector scoped to one namespace reports only that
 // namespace's oldest terminal run; the unscoped default sees the whole
 // cluster's oldest.
