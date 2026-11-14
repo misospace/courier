@@ -2348,6 +2348,14 @@ the world. `courier_metrics_scrape_errors_total` counts scrape failures. Scrapin
 is opt-in: the chart's `serviceMonitor.enabled` renders a metrics `Service` and a
 Prometheus Operator `ServiceMonitor`, off by default.
 
+The lane gauges seed their series from the `LaneProfile` objects in the
+namespaces lane resolution consults: the owned run namespaces, plus the operator
+namespace when the bootstrap seam is configured (#837). The operator namespace can
+be shared between side-by-side releases, so its pages are filtered to the profiles
+this deployment's bootstrap provider manages. A release never advertises a
+neighbor's bootstrap lanes. A failed provider read counts as a scrape failure,
+because half a seed list would report a stale lane set.
+
 Alongside those, the operator exports the run-signal set the catalogue in
 [docs/observability-signals-and-health.md](./docs/observability-signals-and-health.md)
 specifies: `courier_coderun_phase_transitions_total{lane,mode,from,to}` and
