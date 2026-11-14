@@ -18,6 +18,7 @@ import (
 	"time"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/bootstrap"
 	"github.com/misospace/courier/internal/controller"
 	"github.com/misospace/courier/internal/forge"
 	couriergithub "github.com/misospace/courier/internal/github"
@@ -1955,6 +1956,46 @@ func TestLaneProfileMetricNamespaces(t *testing.T) {
 				t.Fatalf("lane namespaces = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+// TestBootstrapManagedLanesTracksConfigRotation pins the lane-metric filter
+// wiring (#837): the filter resolves the profile names the bootstrap config
+// actually lists, re-read live from the file so a rotated ConfigMap keeps the
+// filter in step with the reconciler, and a read failure surfaces as an
+// error rather than a stale or empty lane set.
+func TestBootstrapManagedLanesTracksConfigRotation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bootstrap-lanes.yaml")
+	if err := os.WriteFile(path, []byte("profiles:\n  - name: legacy-lane\n    roles:\n      coordinator: test-model\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	provider := &bootstrap.FileProvider{Path: path}
+	resolver := bootstrapManagedLanes(provider)
+
+	names, err := resolver(context.Background())
+	if err != nil {
+		t.Fatalf("resolver: %v", err)
+	}
+	if len(names) != 1 || !names["legacy-lane"] {
+		t.Fatalf("names = %v, want exactly legacy-lane", names)
+	}
+
+	if err := os.WriteFile(path, []byte("profiles:\n  - name: native-lane\n    roles:\n      coordinator: test-model\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	names, err = resolver(context.Background())
+	if err != nil {
+		t.Fatalf("resolver after rotation: %v", err)
+	}
+	if len(names) != 1 || !names["native-lane"] {
+		t.Fatalf("names after rotation = %v, want exactly native-lane", names)
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolver(context.Background()); err == nil {
+		t.Fatal("resolver on a missing config file = nil error, want failure")
 	}
 }
 

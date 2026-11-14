@@ -287,6 +287,37 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The bootstrap seam is configured before the lane collector: the
+	// collector's operator-namespace seed pages are filtered to the profiles
+	// this deployment's bootstrap provider manages (#837), so a shared
+	// operator namespace never leaks a neighbor's bootstrap lanes into this
+	// release's metrics.
+	bootstrapProfilesFile := strings.TrimSpace(bootstrapLaneProfilesFile)
+	var managedLanes func(ctx context.Context) (map[string]bool, error)
+	if bootstrapProfilesFile != "" {
+		podNamespace := strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
+		if podNamespace == "" {
+			setupLog.Error(fmt.Errorf("POD_NAMESPACE is empty"), "unable to configure bootstrap LaneProfiles")
+			os.Exit(1)
+		}
+		provider := &bootstrap.FileProvider{Path: bootstrapProfilesFile}
+		profiles, err := bootstrap.LoadFile(bootstrapProfilesFile)
+		if err != nil {
+			setupLog.Error(err, "unable to load bootstrap LaneProfiles")
+			os.Exit(1)
+		}
+		managedLanes = bootstrapManagedLanes(provider)
+		if err := mgr.Add(&bootstrap.Reconciler{
+			Client:    mgr.GetClient(),
+			Namespace: podNamespace,
+			Provider:  provider,
+		}); err != nil {
+			setupLog.Error(err, "unable to add bootstrap LaneProfile reconciler")
+			os.Exit(1)
+		}
+		setupLog.Info("bootstrap LaneProfiles configured", "profiles", len(profiles), "namespace", podNamespace)
+	}
+
 	// Per-lane capacity and suspension gauges are read from the live cluster
 	// at scrape time, so they need only the manager's client. Run counts are
 	// scoped to the owned run namespaces so a side-by-side release never
@@ -295,11 +326,13 @@ func main() {
 	// when the bootstrap seam is configured: the bootstrap reconciler writes
 	// managed profiles there, and a boundary that keeps it out of the owned
 	// run namespaces would otherwise report those configured lanes as
-	// absent (#837).
-	crmetrics.Registry.MustRegister(controller.NewLaneCollectorScoped(
+	// absent (#837). The extra namespace can be shared between side-by-side
+	// releases, so it is filtered to this release's managed bootstrap lanes.
+	crmetrics.Registry.MustRegister(controller.NewLaneCollectorManaged(
 		mgr.GetClient(),
 		ownedRunNamespaces,
-		laneProfileMetricNamespaces(ownedRunNamespaces, operatorNamespace, strings.TrimSpace(bootstrapLaneProfilesFile) != ""),
+		laneProfileMetricNamespaces(ownedRunNamespaces, operatorNamespace, managedLanes != nil),
+		managedLanes,
 	))
 	// The oldest retained terminal-run age is likewise read from the live
 	// cluster at scrape time, so the retention reaper's observability half
@@ -309,29 +342,6 @@ func main() {
 	// queue they wait on) is likewise read from the live cluster at scrape
 	// time.
 	crmetrics.Registry.MustRegister(controller.NewTerminalBacklogCollector(mgr.GetClient(), ownedRunNamespaces...))
-
-	bootstrapProfilesFile := strings.TrimSpace(bootstrapLaneProfilesFile)
-	if bootstrapProfilesFile != "" {
-		podNamespace := strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
-		if podNamespace == "" {
-			setupLog.Error(fmt.Errorf("POD_NAMESPACE is empty"), "unable to configure bootstrap LaneProfiles")
-			os.Exit(1)
-		}
-		profiles, err := bootstrap.LoadFile(bootstrapProfilesFile)
-		if err != nil {
-			setupLog.Error(err, "unable to load bootstrap LaneProfiles")
-			os.Exit(1)
-		}
-		if err := mgr.Add(&bootstrap.Reconciler{
-			Client:    mgr.GetClient(),
-			Namespace: podNamespace,
-			Provider:  &bootstrap.FileProvider{Path: bootstrapProfilesFile},
-		}); err != nil {
-			setupLog.Error(err, "unable to add bootstrap LaneProfile reconciler")
-			os.Exit(1)
-		}
-		setupLog.Info("bootstrap LaneProfiles configured", "profiles", len(profiles), "namespace", podNamespace)
-	}
 
 	// Deployment-approved skill bundles register once at trusted setup from
 	// a deployment-mounted file; nothing run- or model-controlled ever
@@ -1422,6 +1432,27 @@ func laneProfileMetricNamespaces(owned []string, operatorNamespace string, boots
 		return owned
 	}
 	return append(append([]string{}, owned...), namespace)
+}
+
+// bootstrapManagedLanes adapts the bootstrap provider into the live
+// lane-name filter the lane metrics apply to a shared operator namespace
+// (#837): only the profiles this release's provider actually manages seed
+// the gauges, so a side-by-side release sharing POD_NAMESPACE never
+// advertises a neighbor's bootstrap lanes. The provider re-reads the config
+// file on every call, so a rotated ConfigMap keeps the filter in step with
+// the reconciler's next pass.
+func bootstrapManagedLanes(provider *bootstrap.FileProvider) func(ctx context.Context) (map[string]bool, error) {
+	return func(ctx context.Context) (map[string]bool, error) {
+		profiles, err := provider.Profiles(ctx)
+		if err != nil {
+			return nil, err
+		}
+		names := make(map[string]bool, len(profiles))
+		for i := range profiles {
+			names[profiles[i].Name] = true
+		}
+		return names, nil
+	}
 }
 
 // cronLane pairs one LaneProfile with the schedules targeting it.

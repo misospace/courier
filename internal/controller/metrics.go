@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"time"
 
@@ -408,17 +409,25 @@ func nonNegativeSeconds(d time.Duration) float64 {
 // The two namespace scopes are separate (#837): CoderRun lists follow the
 // owned run namespaces, while LaneProfile lists follow the namespaces lane
 // resolution consults, which additionally include the operator namespace
-// where the bootstrap reconciler writes managed profiles. The lane series are
-// keyed by name only, so a profile name listed from more than one consulted
-// namespace seeds exactly one series set: the consult-order-first profile
-// wins, which makes the run-namespace copy authoritative for a lane that also
-// exists in the operator namespace.
+// where the bootstrap reconciler writes managed profiles. That extra
+// namespace can be shared between side-by-side releases, so its pages are
+// filtered to the profiles this deployment's bootstrap provider actually
+// manages (#837): a release never advertises a neighbor's bootstrap lanes.
+// The lane series are keyed by name only, so a profile name listed from more
+// than one consulted namespace seeds exactly one series set: the
+// consult-order-first profile wins, which makes the run-namespace copy
+// authoritative for a lane that also exists in the operator namespace.
 type LaneCollector struct {
 	client         client.Client
 	namespaces     []string
 	laneNamespaces []string
-	now            func() time.Time
-	scrapeErrors   prometheus.Counter
+	// managedLanes resolves the names of the bootstrap profiles this
+	// deployment manages. LaneProfile pages from namespaces outside the run
+	// scope are filtered to these names; pages from owned run namespaces are
+	// taken whole. nil disables the filter, the single-scope default.
+	managedLanes func(ctx context.Context) (map[string]bool, error)
+	now          func() time.Time
+	scrapeErrors prometheus.Counter
 }
 
 // NewLaneCollector builds a lane collector with one namespace scope: the
@@ -442,14 +451,29 @@ func NewLaneCollector(c client.Client, namespaces ...string) *LaneCollector {
 // not be an owned run namespace (#837). An empty laneNamespaces falls back to
 // runNamespaces, the single-scope default.
 func NewLaneCollectorScoped(c client.Client, runNamespaces, laneNamespaces []string) *LaneCollector {
+	return NewLaneCollectorManaged(c, runNamespaces, laneNamespaces, nil)
+}
+
+// NewLaneCollectorManaged builds a scoped lane collector whose extra
+// lane-profile scope is filtered to the bootstrap profiles this deployment
+// manages (#837). The operator namespace a bootstrap-managed deployment
+// consults can be shared between side-by-side releases, so pages from
+// namespaces the run scope does not own are filtered to the names
+// managedLanes resolves — read live at scrape time, so a rotated bootstrap
+// config stays in step with the reconciler. A managedLanes failure counts as
+// a scrape failure: half a seed list would report a stale lane set. Pages
+// from the owned run namespaces stay unfiltered. managedLanes nil (or an
+// empty extra scope) is NewLaneCollectorScoped.
+func NewLaneCollectorManaged(c client.Client, runNamespaces, laneNamespaces []string, managedLanes func(ctx context.Context) (map[string]bool, error)) *LaneCollector {
 	if len(laneNamespaces) == 0 {
 		laneNamespaces = runNamespaces
 	}
 	return &LaneCollector{
 		client:         c,
-		now:            time.Now,
 		namespaces:     runNamespaces,
 		laneNamespaces: laneNamespaces,
+		managedLanes:   managedLanes,
+		now:            time.Now,
 		scrapeErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "courier_metrics_scrape_errors_total",
 			Help: "List calls that failed while the LaneCollector collected lane metrics.",
@@ -470,6 +494,39 @@ func listScoped(ctx context.Context, namespaces []string, list func(opts ...clie
 	for _, ns := range namespaces {
 		if err := list(client.InNamespace(ns)); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// listLaneProfiles lists the consulted namespaces in turn, mirroring
+// listScoped's fail-fast posture: an empty scope is one cluster-wide List,
+// and a failed page stops the collection. Pages from namespaces the run
+// scope already owns are taken whole; pages from any other consulted
+// namespace (the operator namespace a bootstrap-managed deployment shares,
+// #837) are filtered to the managed bootstrap names, so a side-by-side
+// release never seeds its neighbor's lanes. A nil managed disables the
+// filter.
+func (c *LaneCollector) listLaneProfiles(ctx context.Context, managed map[string]bool, lanes *[]courierv1alpha1.LaneProfile) error {
+	if len(c.laneNamespaces) == 0 {
+		page := &courierv1alpha1.LaneProfileList{}
+		if err := c.client.List(ctx, page); err != nil {
+			return err
+		}
+		*lanes = append(*lanes, page.Items...)
+		return nil
+	}
+	for _, namespace := range c.laneNamespaces {
+		filtered := managed != nil && !slices.Contains(c.namespaces, namespace)
+		page := &courierv1alpha1.LaneProfileList{}
+		if err := c.client.List(ctx, page, client.InNamespace(namespace)); err != nil {
+			return err
+		}
+		for i := range page.Items {
+			if filtered && !managed[page.Items[i].Name] {
+				continue
+			}
+			*lanes = append(*lanes, page.Items[i])
 		}
 	}
 	return nil
@@ -496,18 +553,24 @@ func (c *LaneCollector) Collect(ch chan<- prometheus.Metric) {
 	// resolution consults (#837), not only the run namespaces: a
 	// bootstrap-managed deployment writes managed profiles to the operator
 	// namespace, which a side-by-side boundary may keep out of the owned run
-	// namespaces. The lane labels are name-keyed, so a name seen in more
-	// than one consulted namespace seeds once — the consult-order-first
-	// profile wins, keeping the run-namespace copy authoritative.
-	var lanes []courierv1alpha1.LaneProfile
-	if err := listScoped(ctx, c.laneNamespaces, func(opts ...client.ListOption) error {
-		page := &courierv1alpha1.LaneProfileList{}
-		if err := c.client.List(ctx, page, opts...); err != nil {
-			return err
+	// namespaces. That extra namespace can be shared between releases, so
+	// its pages carry only the profiles this deployment's bootstrap provider
+	// manages (#837) — a neighbor's lanes are never advertised. The lane
+	// labels are name-keyed, so a name seen in more than one consulted
+	// namespace seeds once — the consult-order-first profile wins, keeping
+	// the run-namespace copy authoritative.
+	var managed map[string]bool
+	if c.managedLanes != nil {
+		var err error
+		managed, err = c.managedLanes(ctx)
+		if err != nil {
+			c.scrapeErrors.Inc()
+			crlog.Log.Error(err, "metrics scrape: resolving managed bootstrap lanes failed")
+			return
 		}
-		lanes = append(lanes, page.Items...)
-		return nil
-	}); err != nil {
+	}
+	var lanes []courierv1alpha1.LaneProfile
+	if err := c.listLaneProfiles(ctx, managed, &lanes); err != nil {
 		c.scrapeErrors.Inc()
 		crlog.Log.Error(err, "metrics scrape: listing LaneProfiles failed")
 		return

@@ -1401,6 +1401,87 @@ func TestLaneCollectorLaneProfileListFailureScoped(t *testing.T) {
 	}
 }
 
+// staticManagedLanes returns a managedLanes resolver pinned to one name set,
+// the stand-in for a live bootstrap provider read.
+func staticManagedLanes(names ...string) func(context.Context) (map[string]bool, error) {
+	set := make(map[string]bool, len(names))
+	for _, name := range names {
+		set[name] = true
+	}
+	return func(context.Context) (map[string]bool, error) {
+		return set, nil
+	}
+}
+
+// TestLaneCollectorFiltersSharedOperatorNamespaceToManagedLanes pins the
+// side-by-side rule (#837): two bootstrap-configured releases share
+// POD_NAMESPACE but own disjoint run namespaces and manage distinct bootstrap
+// lanes. Each collector seeds only its own managed lanes from the shared
+// namespace — never its neighbor's — while its owned run-namespace pages
+// stay unfiltered, even for a name the managed set does not list.
+func TestLaneCollectorFiltersSharedOperatorNamespaceToManagedLanes(t *testing.T) {
+	legacy := admissionLane("legacy-lane", 2)
+	legacy.Namespace = "courier-system"
+	native := admissionLane("native-lane", 7)
+	native.Namespace = "courier-system"
+	// An owned run-namespace profile whose name is in neither managed set:
+	// owned pages are never filtered.
+	unmanaged := admissionLane("unmanaged", 4)
+	unmanaged.Namespace = "runs-v1"
+
+	c := phaseClient(t, legacy, native, unmanaged)
+	now := func() time.Time { return timestampClock }
+
+	v1 := NewLaneCollectorManaged(c, []string{"runs-v1"}, []string{"runs-v1", "courier-system"}, staticManagedLanes("legacy-lane"))
+	v1.now = now
+	v1Registry := prometheus.NewRegistry()
+	v1Registry.MustRegister(v1)
+	if got := gaugeValue(t, gatherMetric(t, v1Registry, "courier_lane_concurrency", map[string]string{"lane": "legacy-lane"}), "courier_lane_concurrency"); got != 2 {
+		t.Fatalf("concurrency legacy-lane = %v, want 2", got)
+	}
+	if _, present := gaugeValueIfPresent(t, v1Registry, "courier_lane_concurrency", map[string]string{"lane": "native-lane"}); present {
+		t.Fatal("shared operator namespace leaked the neighbor's native-lane into the v1 release")
+	}
+	if got := gaugeValue(t, gatherMetric(t, v1Registry, "courier_lane_concurrency", map[string]string{"lane": "unmanaged"}), "courier_lane_concurrency"); got != 4 {
+		t.Fatalf("concurrency unmanaged = %v, want 4 (owned run-namespace pages stay unfiltered)", got)
+	}
+
+	nativeRelease := NewLaneCollectorManaged(c, []string{"runs-native"}, []string{"runs-native", "courier-system"}, staticManagedLanes("native-lane"))
+	nativeRelease.now = now
+	nativeRegistry := prometheus.NewRegistry()
+	nativeRegistry.MustRegister(nativeRelease)
+	if got := gaugeValue(t, gatherMetric(t, nativeRegistry, "courier_lane_concurrency", map[string]string{"lane": "native-lane"}), "courier_lane_concurrency"); got != 7 {
+		t.Fatalf("concurrency native-lane = %v, want 7", got)
+	}
+	for _, lane := range []string{"legacy-lane", "unmanaged"} {
+		if _, present := gaugeValueIfPresent(t, nativeRegistry, "courier_lane_concurrency", map[string]string{"lane": lane}); present {
+			t.Fatalf("the native release advertised %s, want absent", lane)
+		}
+	}
+}
+
+// TestLaneCollectorManagedLanesFailure pins the scrape-error posture for the
+// managed-lane filter (#837): a failed provider read counts as a scrape
+// failure instead of emitting a half-truth lane set, and no lane series are
+// seeded from it.
+func TestLaneCollectorManagedLanesFailure(t *testing.T) {
+	c := phaseClient(t, admissionRun("local-running", "local", courierv1alpha1.PhaseRunning))
+	failing := func(context.Context) (map[string]bool, error) {
+		return nil, errors.New("bootstrap provider failed")
+	}
+
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(NewLaneCollectorManaged(c, []string{"default"}, []string{"default", "courier-system"}, failing))
+
+	m := gatherMetric(t, registry, "courier_metrics_scrape_errors_total", map[string]string{})
+	if m.GetCounter() == nil || m.GetCounter().GetValue() != 1 {
+		t.Fatalf("courier_metrics_scrape_errors_total = %v, want 1", m.GetCounter())
+	}
+	if _, present := gaugeValueIfPresent(t, registry, "courier_lane_concurrency", map[string]string{"lane": "local"}); present {
+		t.Fatal("a failed managed-lane read must not seed lane series")
+	}
+}
+
 // A terminal-age collector scoped to one namespace reports only that
 // namespace's oldest terminal run; the unscoped default sees the whole
 // cluster's oldest.
