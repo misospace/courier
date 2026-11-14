@@ -86,6 +86,10 @@ type Authenticator struct {
 	tokens        [][]byte
 	key           []byte
 	sessions      sessionStore
+	// insecureCookies is the explicit opt-out of the Secure cookie
+	// posture (see Config.InsecureCookies). The zero value is the secure
+	// posture.
+	insecureCookies bool
 	// now is the clock; tests pin it.
 	now func() time.Time
 }
@@ -94,11 +98,12 @@ type Authenticator struct {
 // failing closed on an incomplete or unknown mode.
 func newAuthenticator(cfg Config) (*Authenticator, error) {
 	a := &Authenticator{
-		mode:          cfg.Mode,
-		trustedHeader: cfg.TrustedHeader,
-		tokens:        cfg.OperatorTokens,
-		key:           cfg.SessionKey,
-		now:           time.Now,
+		mode:            cfg.Mode,
+		trustedHeader:   cfg.TrustedHeader,
+		tokens:          cfg.OperatorTokens,
+		key:             cfg.SessionKey,
+		insecureCookies: cfg.InsecureCookies,
+		now:             time.Now,
 	}
 	switch cfg.Mode {
 	case AuthModeToken:
@@ -159,7 +164,7 @@ func (a *Authenticator) sessionAndIdentity(r *http.Request) (sessionID string, o
 // Login checks the presented operator token against the accepted set and, on
 // a match, mints a session cookie. The comparison is constant-time per
 // candidate; a wrong token never yields a cookie.
-func (a *Authenticator) Login(token string, r *http.Request) (*http.Cookie, bool) {
+func (a *Authenticator) Login(token string) (*http.Cookie, bool) {
 	if token == "" {
 		return nil, false
 	}
@@ -178,24 +183,27 @@ func (a *Authenticator) Login(token string, r *http.Request) (*http.Cookie, bool
 		return nil, false
 	}
 	a.sessions.put(id, a.now())
-	cookie := a.sessionCookie(r)
+	cookie := a.sessionCookie()
 	cookie.Value = id + "." + a.sign(id)
 	cookie.Expires = a.now().Add(sessionTTL)
 	return cookie, true
 }
 
 // sessionCookie returns a fresh session cookie carrying the shared posture:
-// HttpOnly, SameSite=Lax, and Secure keyed off TLS terminating on the pod
+// HttpOnly, SameSite=Lax, and Secure. Secure is a configured posture, never
+// inferred from r.TLS: every supported deployment terminates TLS at a proxy
+// whose hop to this listener is plaintext HTTP, so inference from the
+// listener would leave the advertised posture permanently off
 // (docs/operator-console.md). Login and its clearing counterpart must agree
 // on these attributes: a browser is not guaranteed to remove a cookie whose
 // attributes differ from the cookie a Set-Cookie replaces.
-func (a *Authenticator) sessionCookie(r *http.Request) *http.Cookie {
+func (a *Authenticator) sessionCookie() *http.Cookie {
 	return &http.Cookie{
 		Name:     sessionCookieName,
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   r != nil && r.TLS != nil,
+		Secure:   !a.insecureCookies,
 	}
 }
 
@@ -230,8 +238,8 @@ func (a *Authenticator) Logout(sessionID string) {
 
 // expiredCookie returns the clearing cookie sent on logout. It mirrors the
 // session cookie's attributes so the browser removes the cookie it replaces.
-func (a *Authenticator) expiredCookie(r *http.Request) *http.Cookie {
-	cookie := a.sessionCookie(r)
+func (a *Authenticator) expiredCookie() *http.Cookie {
+	cookie := a.sessionCookie()
 	cookie.Expires = a.now().Add(-time.Hour)
 	cookie.MaxAge = -1
 	return cookie

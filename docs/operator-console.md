@@ -17,16 +17,22 @@ future per-identity policy would land.
 **Token mode** (default). Operators POST a shared token to `/login`; a token
 that matches one of the accepted operator tokens exchanges for a session
 cookie (a random id, HMAC-signed with the session key, `HttpOnly`,
-`SameSite=Lax`, `Secure` under TLS, 12-hour expiry). Sessions live in the
-console process's memory: a restart signs everyone out. Unauthenticated
-requests to any page are redirected to `/login`.
+`SameSite=Lax`, `Secure`, 12-hour expiry). Sessions live in the console
+process's memory: a restart signs everyone out. Unauthenticated requests to
+any page are redirected to `/login`.
 
 **Header mode**. The console trusts an upstream authenticating proxy and
 takes the operator identity from one configured header
-(`--trusted-header`, e.g. `X-Forwarded-User`). Only the proxy that strips or
-sets that header may reach the console. A client that reaches the console
-directly can forge an identity. A request without the header gets a plain
-403 page.
+(`--trusted-header`, e.g. `X-Forwarded-User`). The mode is safe only when
+the proxy is the only client that can reach the console, so the Helm chart
+enforces that rule instead of documenting it. Header mode requires
+`operatorConsole.auth.headerAllowedPeers`, and the chart renders a
+NetworkPolicy named `courier-console-header-ingress`. That policy selects
+the console pods, declares `policyTypes: [Ingress]`, and admits only the
+peers you configured. A workload elsewhere in the cluster has no route to
+the console, so a forged identity header never reaches it. The render fails
+when the peer list is missing or malformed. A request without the header
+gets a plain 403 page.
 
 CSRF groundwork is in place: each session's CSRF token is derived as
 `HMAC(sessionKey, sessionID + ":csrf")`, embedded in rendered forms, and
@@ -35,11 +41,14 @@ mutating controls must too. The first login POST carries no CSRF token yet,
 because a fresh browser session has none to present. Add login-CSRF
 protection before the console gains state a login can change.
 
-The session cookie's `Secure` flag keys off TLS that terminates on the
-console pod itself. Behind the default plaintext, ClusterIP-only Service
-the flag is not set, so keep the console off any path that crosses an
-untrusted network until TLS terminates on the pod or the proxy model
-covers the transport.
+The session cookie always carries `Secure`. The console does not infer the
+flag from its own listener. In every chart-supported deployment the browser's
+TLS ends at a proxy, and the hop that reaches the console is plaintext HTTP.
+An inference from the listener would leave the flag permanently off, so the
+posture is configuration, not observation. `--cookie-secure=false`
+(`operatorConsole.auth.cookieSecure=false` in the chart) opts out explicitly.
+Do not run the console over a network you do not control without that flag
+set to its default.
 
 Every response carries `Content-Security-Policy: default-src 'self';
 frame-ancestors 'none'; form-action 'self'; base-uri 'self'`,
@@ -52,9 +61,10 @@ reference, and no font download.
 
 The console is disabled by default. Enabling it renders a second controller
 Deployment and a ClusterIP-only Service named `courier-console` (port 80 →
-the console port). No Ingress is rendered. Exposing the console is a
-deployment concern, and the default posture is ClusterIP-only with no public
-ingress.
+the console port). No Ingress is rendered. In header mode the chart also
+renders the `courier-console-header-ingress` NetworkPolicy described above;
+token mode renders no policy. Exposing the console is a deployment concern,
+and the default posture is ClusterIP-only with no public ingress.
 
 ```sh
 kubectl create namespace courier-console-ns  # or let --create-namespace do it
@@ -77,9 +87,22 @@ helm upgrade --install courier charts/courier \
 
 The rendered chart fails closed at upgrade time when the console is enabled
 without the secret references its auth mode requires. In header mode, set
-`operatorConsole.auth.mode=header` and
-`operatorConsole.auth.trustedHeader=X-Forwarded-User` instead; no secret
-volumes are mounted in that mode.
+the mode, the header, and at least one proxy peer instead; no secret volumes
+are mounted in that mode:
+
+```sh
+helm upgrade --install courier charts/courier \
+  --namespace courier-console-ns \
+  --set operatorConsole.enabled=true \
+  --set operatorConsole.auth.mode=header \
+  --set operatorConsole.auth.trustedHeader=X-Forwarded-User \
+  --set-json 'operatorConsole.auth.headerAllowedPeers=[{"namespaceSelector":{"kubernetes.io/metadata.name":"proxy-ns"},"podSelector":{"app.kubernetes.io/name":"oauth2-proxy"}}]'
+```
+
+Point the peer selectors at the namespace and pods of your authenticating
+proxy. A proxy that runs with hostNetwork cannot be a NetworkPolicy peer,
+because NetworkPolicy cannot select node-traffic sources. Run that proxy as
+pods, or add an ipBlock policy beside the chart's.
 
 Secrets are read from files only — the binary takes
 `--session-key-file` and `--operator-tokens-file` paths, never environment

@@ -357,6 +357,19 @@ operatorConsole:
     operatorTokensSecretKey: tokens
     # -- Trusted upstream identity header. Required in header mode.
     trustedHeader: ""
+    # -- Peers allowed to reach the console in header mode. Each entry is a
+    #    NetworkPolicy ingress peer with an optional namespaceSelector and
+    #    podSelector label map, combined with AND when both are present. At
+    #    least one entry is required in header mode: the chart then renders
+    #    a default-deny-ingress NetworkPolicy for the console pods, so no
+    #    other in-cluster workload can forge the identity header.
+    headerAllowedPeers: []
+    # -- Secure attribute posture for the session cookie. true (default)
+    #    sets Secure on every session cookie no matter the transport.
+    #    false is an explicit opt-out for a console reachable only over
+    #    plaintext the operator controls; the token flow is not meant to
+    #    run over untrusted plaintext.
+    cookieSecure: true
   # -- Base URL of the (future) operator read API; empty renders the
   #    backend-unavailable empty states.
   backendURL: ""

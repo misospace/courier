@@ -560,6 +560,16 @@
 {{- else if not $operatorConsole.auth.trustedHeader }}
 {{- fail "operatorConsole.enabled requires operatorConsole.auth.trustedHeader" }}
 {{- end }}
+{{- /* header mode trusts the identity header its source network carries,
+so the boundary must be enforced not documented: the chart pairs header mode
+with a default-deny-ingress NetworkPolicy built from
+operatorConsole.auth.headerAllowedPeers, and a header-mode render without
+peers fails (console-networkpolicy.yaml.tpl owns those guards, so helm's
+concurrent template rendering surfaces one message per failure). */}}
+{{- $consoleCookieSecure := $operatorConsole.auth.cookieSecure }}
+{{- if not (kindIs "bool" $consoleCookieSecure) }}
+{{- fail "operatorConsole.auth.cookieSecure must be a boolean" }}
+{{- end }}
 {{- $consoleArgs := concat (list) ($consoleContainer.args | default (list)) }}
 {{- $hasConsoleAuthMode := false }}
 {{- $hasConsoleSessionKeyFile := false }}
@@ -567,6 +577,7 @@
 {{- $hasConsoleTrustedHeader := false }}
 {{- $hasConsoleBackendURL := false }}
 {{- $hasConsoleBind := false }}
+{{- $hasConsoleCookieSecure := false }}
 {{- range $arg := $consoleArgs }}
 {{- if hasPrefix "--auth-mode=" $arg }}{{- $hasConsoleAuthMode = true }}{{- end }}
 {{- if hasPrefix "--session-key-file=" $arg }}{{- $hasConsoleSessionKeyFile = true }}{{- end }}
@@ -574,6 +585,7 @@
 {{- if hasPrefix "--trusted-header=" $arg }}{{- $hasConsoleTrustedHeader = true }}{{- end }}
 {{- if hasPrefix "--backend-url=" $arg }}{{- $hasConsoleBackendURL = true }}{{- end }}
 {{- if hasPrefix "--bind=" $arg }}{{- $hasConsoleBind = true }}{{- end }}
+{{- if hasPrefix "--cookie-secure=" $arg }}{{- $hasConsoleCookieSecure = true }}{{- end }}
 {{- end }}
 {{- if not $hasConsoleAuthMode }}{{- $consoleArgs = append $consoleArgs (printf "--auth-mode=%s" $consoleAuthMode) }}{{- end }}
 {{- if eq $consoleAuthMode "token" }}
@@ -586,6 +598,9 @@
 {{- $consoleArgs = append $consoleArgs (printf "--backend-url=%s" $operatorConsole.backendURL) }}
 {{- end }}
 {{- if not $hasConsoleBind }}{{- $consoleArgs = append $consoleArgs (printf "--bind=:%d" (int $operatorConsole.port)) }}{{- end }}
+{{- /* cookie posture is explicit in the Deployment, so a reviewer sees the
+Secure-cookie setting without reading defaults. */}}
+{{- if not $hasConsoleCookieSecure }}{{- $consoleArgs = append $consoleArgs (printf "--cookie-secure=%t" $consoleCookieSecure) }}{{- end }}
 {{- $_ := set $consoleContainer "args" $consoleArgs }}
 {{- /* The console's probe and Service follow the configured port, so an
   operatorConsole.port override moves the whole console, not just --bind. */}}

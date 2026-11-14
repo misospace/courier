@@ -31,49 +31,20 @@ func main() {
 	}
 }
 
+// serverTimeouts bound request and connection resources: a public-ish
+// listener without them lets slow or idle clients pin goroutines and file
+// descriptors. ReadTimeout bounds reading a whole request; the console's
+// handlers are small form posts and rendered pages, so 10s is generous.
+const (
+	readHeaderTimeout = 5 * time.Second
+	readTimeout       = 10 * time.Second
+	idleTimeout       = 90 * time.Second
+)
+
 func runArgs(args []string) error {
-	flags := flag.NewFlagSet("courier-console", flag.ContinueOnError)
-	var bind, authMode, sessionKeyFile, operatorTokensFile, trustedHeader, backendURL string
-	var backendTimeout time.Duration
-	flags.StringVar(&bind, "bind", defaultBind, "listen address")
-	flags.StringVar(&authMode, "auth-mode", string(console.AuthModeToken), "authentication mode: token or header")
-	flags.StringVar(&sessionKeyFile, "session-key-file", "", "file holding the HMAC session-signing key (required in token mode)")
-	flags.StringVar(&operatorTokensFile, "operator-tokens-file", "", "file holding newline-separated accepted operator tokens (required in token mode)")
-	flags.StringVar(&trustedHeader, "trusted-header", "", "trusted upstream identity header (required in header mode)")
-	flags.StringVar(&backendURL, "backend-url", "", "base URL of the operator read API; empty renders the backend-unavailable states")
-	flags.DurationVar(&backendTimeout, "backend-timeout", 5*time.Second, "backend probe timeout")
-	if err := flags.Parse(args); err != nil {
+	bind, cfg, err := parseFlags(args)
+	if err != nil {
 		return err
-	}
-	cfg := console.Config{
-		Mode:           console.AuthMode(authMode),
-		TrustedHeader:  trustedHeader,
-		BackendURL:     backendURL,
-		BackendTimeout: backendTimeout,
-	}
-	// Secrets come from files only: each flag names a file the deployment
-	// mounts from a Secret. A missing or unreadable file is fatal.
-	switch cfg.Mode {
-	case console.AuthModeToken:
-		if sessionKeyFile == "" || operatorTokensFile == "" {
-			return errors.New("courier-console token mode requires --session-key-file and --operator-tokens-file")
-		}
-		sessionKey, err := readTrimmedFile(sessionKeyFile)
-		if err != nil {
-			return err
-		}
-		tokens, err := readTokensFile(operatorTokensFile)
-		if err != nil {
-			return err
-		}
-		cfg.SessionKey = sessionKey
-		cfg.OperatorTokens = tokens
-	case console.AuthModeHeader:
-		if trustedHeader == "" {
-			return errors.New("courier-console header mode requires --trusted-header")
-		}
-	default:
-		return fmt.Errorf("courier-console: unknown --auth-mode %q (want token or header)", authMode)
 	}
 	server, err := console.NewServer(cfg)
 	if err != nil {
@@ -81,7 +52,13 @@ func runArgs(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
-	httpServer := &http.Server{Addr: bind, Handler: server.Handler()}
+	httpServer := &http.Server{
+		Addr:              bind,
+		Handler:           server.Handler(),
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		IdleTimeout:       idleTimeout,
+	}
 	errCh := make(chan error, 1)
 	go func() {
 		log.Printf("courier-console listening on %s (auth mode %s)", bind, cfg.Mode)
@@ -101,6 +78,57 @@ func runArgs(args []string) error {
 		}
 		return nil
 	}
+}
+
+// parseFlags builds the server configuration from the command line. Secrets
+// come from files only: each flag names a file the deployment mounts from a
+// Secret. A missing or unreadable file is fatal.
+func parseFlags(args []string) (string, console.Config, error) {
+	flags := flag.NewFlagSet("courier-console", flag.ContinueOnError)
+	var bind, authMode, sessionKeyFile, operatorTokensFile, trustedHeader, backendURL string
+	var backendTimeout time.Duration
+	var cookieSecure bool
+	flags.StringVar(&bind, "bind", defaultBind, "listen address")
+	flags.StringVar(&authMode, "auth-mode", string(console.AuthModeToken), "authentication mode: token or header")
+	flags.StringVar(&sessionKeyFile, "session-key-file", "", "file holding the HMAC session-signing key (required in token mode)")
+	flags.StringVar(&operatorTokensFile, "operator-tokens-file", "", "file holding newline-separated accepted operator tokens (required in token mode)")
+	flags.StringVar(&trustedHeader, "trusted-header", "", "trusted upstream identity header (required in header mode)")
+	flags.StringVar(&backendURL, "backend-url", "", "base URL of the operator read API; empty renders the backend-unavailable states")
+	flags.DurationVar(&backendTimeout, "backend-timeout", 5*time.Second, "backend probe timeout")
+	flags.BoolVar(&cookieSecure, "cookie-secure", true, "set the Secure attribute on session cookies; false is an explicit opt-out for a console reachable only over plaintext the operator controls")
+	if err := flags.Parse(args); err != nil {
+		return "", console.Config{}, err
+	}
+	cfg := console.Config{
+		Mode:            console.AuthMode(authMode),
+		TrustedHeader:   trustedHeader,
+		BackendURL:      backendURL,
+		BackendTimeout:  backendTimeout,
+		InsecureCookies: !cookieSecure,
+	}
+	switch cfg.Mode {
+	case console.AuthModeToken:
+		if sessionKeyFile == "" || operatorTokensFile == "" {
+			return "", console.Config{}, errors.New("courier-console token mode requires --session-key-file and --operator-tokens-file")
+		}
+		sessionKey, err := readTrimmedFile(sessionKeyFile)
+		if err != nil {
+			return "", console.Config{}, err
+		}
+		tokens, err := readTokensFile(operatorTokensFile)
+		if err != nil {
+			return "", console.Config{}, err
+		}
+		cfg.SessionKey = sessionKey
+		cfg.OperatorTokens = tokens
+	case console.AuthModeHeader:
+		if trustedHeader == "" {
+			return "", console.Config{}, errors.New("courier-console header mode requires --trusted-header")
+		}
+	default:
+		return "", console.Config{}, fmt.Errorf("courier-console: unknown --auth-mode %q (want token or header)", authMode)
+	}
+	return bind, cfg, nil
 }
 
 // readTrimmedFile reads the whole file and trims surrounding whitespace, so

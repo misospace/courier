@@ -2647,6 +2647,8 @@ func TestChartOperatorConsoleDefaultDisabled(t *testing.T) {
 		"--session-key-file",
 		"--operator-tokens-file",
 		"--trusted-header",
+		"--cookie-secure",
+		"kind: NetworkPolicy",
 	} {
 		if strings.Contains(disabled, unwanted) {
 			t.Fatalf("console-disabled chart output unexpectedly contains %q", unwanted)
@@ -2679,6 +2681,7 @@ func TestChartOperatorConsoleEnabled(t *testing.T) {
 		"--operator-tokens-file=/etc/courier/console/tokens",
 		"--backend-url=http://read-api.default.svc",
 		"--bind=:8084",
+		"--cookie-secure=true",
 		"/usr/local/bin/courier-console",
 		"secretName: courier-console-session",
 		"secretName: courier-console-tokens",
@@ -2706,18 +2709,63 @@ func TestChartOperatorConsoleEnabled(t *testing.T) {
 	// renders, so enabling the console does not recreate it.
 	findDocument(t, enabled, "kind: Deployment", "name: courier")
 
-	// No Ingress anywhere: exposure is a deployment concern.
+	// No Ingress anywhere: exposure is a deployment concern. Token mode
+	// renders no ingress NetworkPolicy either: it authenticates a shared
+	// token over the wire, not the network position.
 	if strings.Contains(enabled, "kind: Ingress") {
 		t.Fatal("console-enabled chart output unexpectedly contains an Ingress")
 	}
+	if strings.Contains(enabled, "kind: NetworkPolicy") {
+		t.Fatal("token-mode console chart output unexpectedly contains a NetworkPolicy")
+	}
 
-	// Header mode: the trusted header arg replaces the secret-file args and
-	// no console Secret volumes are rendered.
-	header := runHelm(t, chartDir, "template", "courier", ".",
+	// The cookie posture is explicit in the render: the opt-out flips the
+	// Deployment arg and nothing else.
+	optOut := runHelm(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.auth.cookieSecure=false",
+	)...)
+	if !strings.Contains(optOut, "--cookie-secure=false") {
+		t.Fatal("console chart output did not carry the cookieSecure opt-out")
+	}
+	if strings.Contains(optOut, "--cookie-secure=true") {
+		t.Fatal("cookieSecure opt-out render still carries the secure cookie arg")
+	}
+}
+
+// operatorConsoleHeaderRenderArgs returns the helm template arguments that
+// render a header-mode operator console with one proxy peer, extended with
+// the caller's own --set arguments.
+func operatorConsoleHeaderRenderArgs(extra ...string) []string {
+	args := []string{"template", "courier", ".",
 		"--set", "operatorConsole.enabled=true",
 		"--set", "operatorConsole.auth.mode=header",
 		"--set", "operatorConsole.auth.trustedHeader=X-Forwarded-User",
-	)
+		"--set-json", `operatorConsole.auth.headerAllowedPeers=[{"namespaceSelector":{"kubernetes.io/metadata.name":"proxy-ns"},"podSelector":{"app.kubernetes.io/name":"oauth2-proxy"}}]`,
+	}
+	return append(args, extra...)
+}
+
+// TestChartOperatorConsoleHeaderModeNetworkPolicy covers the boundary the
+// CHANGES_REQUESTED review of #821 requires: header mode trusts the identity
+// header its source network carries, so the chart must enforce the
+// proxy-only precondition rather than document it. The render pairs header
+// mode with a default-deny-ingress NetworkPolicy selecting exactly the
+// console pods and allowing exactly the configured peers: an in-cluster
+// client outside those peers gets no route to the console, so a forged
+// trusted header never reaches Identity.
+func TestChartOperatorConsoleHeaderModeNetworkPolicy(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	header := runHelm(t, chartDir, operatorConsoleHeaderRenderArgs()...)
+
+	// The trusted header arg replaces the secret-file args and no console
+	// Secret volumes are rendered.
 	for _, want := range []string{
 		"--auth-mode=header",
 		"--trusted-header=X-Forwarded-User",
@@ -2735,6 +2783,92 @@ func TestChartOperatorConsoleEnabled(t *testing.T) {
 		if strings.Contains(header, unwanted) {
 			t.Fatalf("console header-mode chart output unexpectedly contains %q", unwanted)
 		}
+	}
+
+	policyDoc := findDocument(t, header, "kind: NetworkPolicy", "name: courier-console-header-ingress")
+	var policy struct {
+		Spec struct {
+			PodSelector struct {
+				MatchLabels map[string]string `json:"matchLabels"`
+			} `json:"podSelector"`
+			PolicyTypes []string `json:"policyTypes"`
+			Ingress     []struct {
+				From []struct {
+					NamespaceSelector *struct {
+						MatchLabels map[string]string `json:"matchLabels"`
+					} `json:"namespaceSelector"`
+					PodSelector *struct {
+						MatchLabels map[string]string `json:"matchLabels"`
+					} `json:"podSelector"`
+				} `json:"from"`
+				Ports []struct {
+					Protocol string `json:"protocol"`
+					Port     int64  `json:"port"`
+				} `json:"ports"`
+			} `json:"ingress"`
+		} `json:"spec"`
+	}
+	if err := yaml.Unmarshal([]byte(policyDoc), &policy); err != nil {
+		t.Fatalf("parse console NetworkPolicy: %v\n%s", err, policyDoc)
+	}
+
+	// The policy constrains ingress on the pods the console Deployment
+	// actually runs, so the default-deny covers the workload, not a name.
+	deploymentDoc := findDocument(t, header, "kind: Deployment", "name: courier-console")
+	var deployment struct {
+		Spec struct {
+			Selector struct {
+				MatchLabels map[string]string `json:"matchLabels"`
+			} `json:"selector"`
+		} `json:"spec"`
+	}
+	if err := yaml.Unmarshal([]byte(deploymentDoc), &deployment); err != nil {
+		t.Fatalf("parse console Deployment: %v\n%s", err, deploymentDoc)
+	}
+	if !reflect.DeepEqual(policy.Spec.PodSelector.MatchLabels, deployment.Spec.Selector.MatchLabels) {
+		t.Fatalf("NetworkPolicy podSelector %v does not match the console Deployment selector %v",
+			policy.Spec.PodSelector.MatchLabels, deployment.Spec.Selector.MatchLabels)
+	}
+
+	if !reflect.DeepEqual(policy.Spec.PolicyTypes, []string{"Ingress"}) {
+		t.Fatalf("NetworkPolicy policyTypes = %v, want exactly [Ingress]: the console's egress probe must stay open",
+			policy.Spec.PolicyTypes)
+	}
+
+	// Exactly one rule, allowing exactly the configured peer to exactly the
+	// console port: no empty from (all sources), no extra source, no
+	// ipBlock. A client elsewhere in the cluster has no route that this
+	// policy admits, so it cannot forge the identity header.
+	if len(policy.Spec.Ingress) != 1 {
+		t.Fatalf("NetworkPolicy carries %d ingress rules, want exactly 1", len(policy.Spec.Ingress))
+	}
+	rule := policy.Spec.Ingress[0]
+	if len(rule.From) != 1 {
+		t.Fatalf("ingress rule admits %d sources, want exactly 1", len(rule.From))
+	}
+	if rule.From[0].NamespaceSelector == nil ||
+		!reflect.DeepEqual(rule.From[0].NamespaceSelector.MatchLabels, map[string]string{"kubernetes.io/metadata.name": "proxy-ns"}) {
+		t.Fatalf("ingress rule namespaceSelector = %+v, want the configured proxy namespace", rule.From[0].NamespaceSelector)
+	}
+	if rule.From[0].PodSelector == nil ||
+		!reflect.DeepEqual(rule.From[0].PodSelector.MatchLabels, map[string]string{"app.kubernetes.io/name": "oauth2-proxy"}) {
+		t.Fatalf("ingress rule podSelector = %+v, want the configured proxy pods", rule.From[0].PodSelector)
+	}
+	if len(rule.Ports) != 1 || rule.Ports[0].Protocol != "TCP" || rule.Ports[0].Port != 8084 {
+		t.Fatalf("ingress rule ports = %+v, want exactly TCP/8084", rule.Ports)
+	}
+	if strings.Contains(policyDoc, "ipBlock") {
+		t.Fatal("console header NetworkPolicy admits an ipBlock")
+	}
+
+	// The port override moves the policy's allowed port with the bind,
+	// probe, and Service target.
+	overridden := runHelm(t, chartDir, operatorConsoleHeaderRenderArgs(
+		"--set", "operatorConsole.port=9099",
+	)...)
+	overriddenPolicy := findDocument(t, overridden, "kind: NetworkPolicy", "name: courier-console-header-ingress")
+	if !strings.Contains(overriddenPolicy, "port: 9099") {
+		t.Fatalf("port override did not move the NetworkPolicy's allowed port:\n%s", overriddenPolicy)
 	}
 }
 
@@ -2779,6 +2913,45 @@ func TestChartOperatorConsoleRejectsIncompleteConfiguration(t *testing.T) {
 				"--set", "operatorConsole.auth.mode=header",
 			},
 			want: "operatorConsole.enabled requires operatorConsole.auth.trustedHeader",
+		},
+		{
+			name: "header mode without allowed peers",
+			args: []string{
+				"--set", "operatorConsole.enabled=true",
+				"--set", "operatorConsole.auth.mode=header",
+				"--set", "operatorConsole.auth.trustedHeader=X-Forwarded-User",
+			},
+			want: "operatorConsole.auth.headerAllowedPeers",
+		},
+		{
+			name: "header mode with an unknown peer selector key",
+			args: []string{
+				"--set", "operatorConsole.enabled=true",
+				"--set", "operatorConsole.auth.mode=header",
+				"--set", "operatorConsole.auth.trustedHeader=X-Forwarded-User",
+				"--set-json", `operatorConsole.auth.headerAllowedPeers=[{"podSelectors":{"app.kubernetes.io/name":"proxy"}}]`,
+			},
+			want: `headerAllowedPeers entry key "podSelectors" is not namespaceSelector or podSelector`,
+		},
+		{
+			name: "header mode with an empty peer selector",
+			args: []string{
+				"--set", "operatorConsole.enabled=true",
+				"--set", "operatorConsole.auth.mode=header",
+				"--set", "operatorConsole.auth.trustedHeader=X-Forwarded-User",
+				"--set-json", `operatorConsole.auth.headerAllowedPeers=[{"namespaceSelector":{}}]`,
+			},
+			want: "must carry at least one label",
+		},
+		{
+			name: "non-boolean cookieSecure",
+			args: []string{
+				"--set", "operatorConsole.enabled=true",
+				"--set", "operatorConsole.auth.sessionKeySecret=courier-console-session",
+				"--set", "operatorConsole.auth.operatorTokensSecret=courier-console-tokens",
+				"--set", "operatorConsole.auth.cookieSecure=maybe",
+			},
+			want: "operatorConsole.auth.cookieSecure must be a boolean",
 		},
 		{
 			name: "unknown auth mode",

@@ -54,6 +54,13 @@ type Config struct {
 	BackendURL string
 	// BackendTimeout bounds each backend probe. Defaults to 5s.
 	BackendTimeout time.Duration
+	// InsecureCookies opts out of the Secure session-cookie posture. The
+	// default (false) sets Secure on every session cookie, because the
+	// supported Helm deployment terminates TLS at a proxy and the hop that
+	// reaches this listener is plaintext HTTP; the posture is never
+	// inferred from r.TLS. Set true only for a console reachable solely
+	// over plaintext the operator controls.
+	InsecureCookies bool
 }
 
 // Server is the console's HTTP server. Construct it with NewServer and serve
@@ -212,7 +219,7 @@ func (s *Server) handleLoginSubmit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	cookie, ok := s.auth.Login(r.PostFormValue("token"), r)
+	cookie, ok := s.auth.Login(r.PostFormValue("token"))
 	if !ok {
 		data := s.pageData(r, "Sign in", "")
 		data.LoginError = "That token was not accepted."
@@ -241,7 +248,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.auth.Logout(sessionID)
-	http.SetCookie(w, s.auth.expiredCookie(r))
+	http.SetCookie(w, s.auth.expiredCookie())
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 

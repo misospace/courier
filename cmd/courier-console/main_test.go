@@ -64,3 +64,42 @@ func TestRunArgsFailsClosed(t *testing.T) {
 		})
 	}
 }
+
+// TestParseFlagsCookiePosture pins the binary's cookie posture plumbing:
+// the default mints Secure session cookies, and --cookie-secure=false is
+// the only opt-out. The console listener is plaintext HTTP in every
+// supported deployment, so the posture must not depend on the listener.
+func TestParseFlagsCookiePosture(t *testing.T) {
+	dir := t.TempDir()
+	sessionKeyFile := filepath.Join(dir, "session-key")
+	tokensFile := filepath.Join(dir, "tokens")
+	if err := os.WriteFile(sessionKeyFile, []byte("key-material\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tokensFile, []byte("token-material\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base := []string{"--session-key-file=" + sessionKeyFile, "--operator-tokens-file=" + tokensFile}
+
+	bind, cfg, err := parseFlags(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bind != defaultBind {
+		t.Fatalf("default bind = %q, want %q", bind, defaultBind)
+	}
+	if cfg.InsecureCookies {
+		t.Fatal("default cookie posture is insecure")
+	}
+
+	bind, cfg, err = parseFlags(append(base, "--cookie-secure=false", "--bind=:9099"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bind != ":9099" {
+		t.Fatalf("bind = %q, want :9099", bind)
+	}
+	if !cfg.InsecureCookies {
+		t.Fatal("--cookie-secure=false did not opt out of the Secure posture")
+	}
+}

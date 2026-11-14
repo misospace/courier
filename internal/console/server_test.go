@@ -373,9 +373,9 @@ func findCSRFToken(t *testing.T, body string) string {
 }
 
 // TestSessionCookieFlags covers (h): the session cookie is HttpOnly and
-// SameSite=Lax, and Secure under TLS; and the logout clearing cookie mirrors
-// those attributes, because a Set-Cookie whose attributes differ from the
-// cookie it replaces is not guaranteed to remove it.
+// SameSite=Lax, and Secure at the default posture; and the logout clearing
+// cookie mirrors those attributes, because a Set-Cookie whose attributes
+// differ from the cookie it replaces is not guaranteed to remove it.
 func TestSessionCookieFlags(t *testing.T) {
 	secrets := newTestSecrets(t)
 	server, err := NewServer(Config{
@@ -487,11 +487,14 @@ func TestSessionCookieFlags(t *testing.T) {
 	}
 }
 
-// TestSessionCookieFlagsOverPlaintext pins the plaintext half of the Secure
-// expression: neither the session cookie nor the logout clearing cookie is
-// Secure without TLS, and the clearing cookie still mirrors the session
-// cookie's attributes.
-func TestSessionCookieFlagsOverPlaintext(t *testing.T) {
+// TestSessionCookieFlagsOverProxyHop exercises the flow every supported
+// Helm deployment actually runs: the browser's TLS terminates at a proxy
+// and the hop reaching the console listener is plaintext HTTP. At the
+// default posture the session cookie and the logout clearing cookie are
+// still Secure, because the posture is configured and never inferred from
+// the listener. The clearing cookie still mirrors the session cookie's
+// attributes.
+func TestSessionCookieFlagsOverProxyHop(t *testing.T) {
 	secrets := newTestSecrets(t)
 	_, base := newTestServer(t, secrets, "")
 	resp, err := noFollowClient().PostForm(base+"/login", url.Values{"token": {secrets.token}})
@@ -506,8 +509,8 @@ func TestSessionCookieFlagsOverPlaintext(t *testing.T) {
 	if len(session) != 1 {
 		t.Fatalf("login set %d cookies, want 1", len(session))
 	}
-	if session[0].Secure {
-		t.Fatal("session cookie over plaintext is Secure")
+	if !session[0].Secure {
+		t.Fatal("session cookie at the default posture over a plaintext proxy hop is not Secure")
 	}
 	client := &http.Client{
 		Jar:           &singleCookieJar{cookie: session[0]},
@@ -536,12 +539,80 @@ func TestSessionCookieFlagsOverPlaintext(t *testing.T) {
 	if len(cleared) != 1 {
 		t.Fatalf("logout set %d cookies, want 1", len(cleared))
 	}
-	if cleared[0].Secure {
-		t.Fatal("logout clearing cookie over plaintext is Secure")
+	if !cleared[0].Secure {
+		t.Fatal("logout clearing cookie at the default posture is not Secure")
 	}
 	if cleared[0].HttpOnly != session[0].HttpOnly || cleared[0].SameSite != session[0].SameSite {
 		t.Fatalf("logout clearing cookie flags (%v, %v) do not mirror the session cookie (%v, %v)",
 			cleared[0].HttpOnly, cleared[0].SameSite, session[0].HttpOnly, session[0].SameSite)
+	}
+}
+
+// TestInsecureCookiesOptOut pins the explicit opt-out: with
+// InsecureCookies set, neither the session cookie nor the mirrored clearing
+// cookie carries Secure, and nothing else about the posture moves. This is
+// the only path that may mint a plaintext cookie.
+func TestInsecureCookiesOptOut(t *testing.T) {
+	secrets := newTestSecrets(t)
+	server, err := NewServer(Config{
+		Mode:            AuthModeToken,
+		SessionKey:      []byte(secrets.sessionKey),
+		OperatorTokens:  [][]byte{[]byte(secrets.token)},
+		BackendTimeout:  time.Second,
+		InsecureCookies: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(server.Handler())
+	t.Cleanup(httpServer.Close)
+	resp, err := noFollowClient().PostForm(httpServer.URL+"/login", url.Values{"token": {secrets.token}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("POST /login status = %d, want 303", resp.StatusCode)
+	}
+	session := resp.Cookies()
+	if len(session) != 1 {
+		t.Fatalf("login set %d cookies, want 1", len(session))
+	}
+	if session[0].Secure {
+		t.Fatal("InsecureCookies opt-out still minted a Secure session cookie")
+	}
+	if !session[0].HttpOnly || session[0].SameSite != http.SameSiteLaxMode {
+		t.Fatal("InsecureCookies opt-out moved a posture flag other than Secure")
+	}
+	client := &http.Client{
+		Jar:           &singleCookieJar{cookie: session[0]},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	_, body := get(t, client, httpServer.URL+"/")
+	csrf := findCSRFToken(t, body)
+	if csrf == "" {
+		t.Fatal("authenticated page does not carry the CSRF token")
+	}
+	request, err := http.NewRequest(http.MethodPost, httpServer.URL+"/logout", strings.NewReader("csrf="+csrf))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	applyCookie(t, client, request)
+	logoutResp, err := noFollowClient().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logoutResp.Body.Close()
+	if logoutResp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("logout status = %d, want 303", logoutResp.StatusCode)
+	}
+	cleared := logoutResp.Cookies()
+	if len(cleared) != 1 {
+		t.Fatalf("logout set %d cookies, want 1", len(cleared))
+	}
+	if cleared[0].Secure {
+		t.Fatal("logout clearing cookie mirrors a posture the opt-out turned off")
 	}
 }
 
