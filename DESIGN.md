@@ -153,6 +153,23 @@ requires resolving the reported conflict or truthfully reporting that it
 remains unresolved; a review approval does not complete a conflict-repair
 task.
 
+A secure fix-pr launch additionally consumes the pull-request reviewer's
+machine-readable remediation handoff (`review-handoff/v1`, #755) when the
+deployment configures the reviewer's forge login (`--pr-reviewer-identity`).
+The operator reads the PR's conversation comments and native review bodies
+through the configured forge capability — the GitHub adapter's `list-comments`
+and `list-reviews` reads, which the harness fix-pr terminal contract already
+required — and trusts a body only when the forge reports its author as the
+configured reviewer identity (the managed marker alone is forgeable) and the
+payload validates against the published upstream contract for the head the run
+is pinned to. The validated payload rides the goal verbatim, bounded, framed as
+untrusted task data: the coordinator resolves every blocker and major finding,
+handles minor findings per repository policy, and re-verifies each finding
+against the current head. No trusted handoff — unset identity, no reviewer
+body for this head, or a failed read — launches the pre-handoff goal unchanged:
+structured fix input improves the coordinator's own feedback inspection and is
+never a launch precondition.
+
 Goals stay short — a goal plus tools — but each carries one non-negotiable
 contract: delegation covers bounded work, never the coordinator's ownership
 of completion and forge publication. The publication hint names the run branch
@@ -3365,6 +3382,34 @@ a foreign-name collision is 409, a stalled API server is 503. The goal, the
 issue text, the token, and any credential never appear in a response or a
 log line. Dispatch consumes this API (misospace/dispatch#1349) instead of
 writing CoderRuns directly, and Courier stays fully usable without it.
+
+The same listener answers a read-only lifecycle projection of one
+contribution (#819): `GET /v1/contributions/<run>`, namespace-resolved
+like admission. Read authorization is a separately configured bearer
+token (`--contribute-read-key-secret`, and `contributeAPI.readKeySecret`
+in the chart), so a frontend can hold read authority without admission
+authority, and with no read token configured the endpoint answers the
+route miss. The controller's CoderRun status is the only source: the read
+stores no parallel state, makes no forge call, and writes nothing. It
+resolves through the direct API-server reader, never the informer cache,
+and each response is current as of its `observedAt`. It serves runs whose
+`spec.source` is `adhoc` only — a foreign run and a miss share one 404,
+and there is no list route, so the endpoint is never a proxy for arbitrary
+CR lookups — under the same ownership boundary, with constant-time token
+comparison, a concurrency cap answering 503 with a `Retry-After` hint, and
+a tighter cluster deadline than admission. The response is a fixed
+allowlist projection of recorded controller state: phase verbatim (the
+projection value `unknown` only before the first stamp), the live CI-park
+flag (a park record the controller retains after the run reached a
+recorded ending does not report it), publication identity (branch, head
+repository, head SHA, PR), the bounded terminal cause, lifecycle
+timestamps, and the observation timestamp — never goal text, issue text,
+credentials, source receipts, checkpoints, the untrusted idempotency key,
+or unbounded CRD content. The `/v1` path prefix is the contract version for
+both surfaces, so an incompatible change arrives as a new prefix. The
+frontend contract is documented in
+[docs/external-contributions.md](./docs/external-contributions.md),
+"Status reads".
 
 ### Rebase lane
 

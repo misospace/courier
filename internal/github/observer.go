@@ -9,6 +9,7 @@ import (
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/controller"
 	"github.com/misospace/courier/internal/forge"
+	"github.com/misospace/courier/internal/reviewhandoff"
 )
 
 // Observer reads pull requests and their CI state from GitHub.
@@ -29,6 +30,7 @@ type Observer struct {
 var _ controller.WorldObserver = Observer{}
 var _ controller.ExistingPRHeadResolver = Observer{}
 var _ controller.PullRequestReader = Observer{}
+var _ controller.ReviewHandoffResolver = Observer{}
 
 // registrationFor returns the registration selected for a repository, or nil
 // when no registry is loaded and the observer's own destination is authoritative.
@@ -225,6 +227,48 @@ func (o Observer) ReadPullRequest(ctx context.Context, ref forge.PullRequestRef)
 		return forge.PullRequest{}, err
 	}
 	return provider.ReadPullRequest(ctx, ref)
+}
+
+// ReviewHandoff reads the pull-request reviewer's machine-readable
+// remediation handoff ("review-handoff/v1", #755) through the forge
+// capability of the registration serving the base repository: the conversation
+// comments and the native review bodies are listed through the provider, and
+// the first body carrying a validated block recorded for headSHA under the
+// forge-reported reviewerLogin author wins. A body carrying the managed
+// marker from another author is never parsed — the marker alone is forgeable,
+// so the forge-reported author is the trust anchor. A trusted author's body
+// that fails validation is returned as an error, so a broken handoff surfaces
+// instead of silently degrading; the fix-pr launch treats every failure here
+// as "no structured input" and keeps the unstructured inspection goal.
+func (o Observer) ReviewHandoff(ctx context.Context, repo string, number int, reviewerLogin, headSHA string) (string, bool, error) {
+	if strings.TrimSpace(reviewerLogin) == "" || strings.TrimSpace(headSHA) == "" || number <= 0 {
+		return "", false, nil
+	}
+	provider, err := o.ProviderForRepository(repo)
+	if err != nil {
+		return "", false, err
+	}
+	ref := forge.PullRequestRef{Repo: repo, Number: number}
+	comments, err := provider.ListComments(ctx, ref)
+	if err != nil {
+		return "", false, err
+	}
+	reviews, err := provider.ListReviews(ctx, ref)
+	if err != nil {
+		return "", false, err
+	}
+	bodies := make([]reviewhandoff.Body, 0, len(comments)+len(reviews))
+	for _, comment := range comments {
+		bodies = append(bodies, reviewhandoff.Body{Author: comment.Author, Content: comment.Body})
+	}
+	for _, review := range reviews {
+		bodies = append(bodies, reviewhandoff.Body{Author: review.Author, Content: review.Body})
+	}
+	_, raw, found, err := reviewhandoff.Find(bodies, reviewerLogin, headSHA)
+	if err != nil {
+		return "", false, fmt.Errorf("GitHub observer: reviewer handoff body failed validation: %w", err)
+	}
+	return raw, found, nil
 }
 
 func splitRepository(repository string) (string, string, error) {

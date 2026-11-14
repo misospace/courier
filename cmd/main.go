@@ -124,6 +124,8 @@ func main() {
 	var contributeAdmissionBind string
 	var contributeAdmissionKeySecret string
 	var contributeAdmissionKey string
+	var contributeReadKeySecret string
+	var contributeReadKey string
 	var doneRetention time.Duration
 	var failedRetention time.Duration
 	var needsHumanRetention time.Duration
@@ -131,6 +133,7 @@ func main() {
 	var terminalAuditKeep int
 	var secureMode bool
 	var forgeProvidersFile string
+	var prReviewerIdentity string
 	var runNamespace string
 	var ownedNamespaces stringSliceValue
 	var leaderElectionID string
@@ -172,6 +175,7 @@ func main() {
 	flag.StringVar(&metricsMCPURL, "metrics-mcp-url", "", "Optional remote MCP endpoint for metrics; absence is harmless.")
 	flag.BoolVar(&secureMode, "secure-mode", false, "Route runs through the isolated control/broker/worker topology; legacy stays the default and remains explicitly insecure.")
 	flag.StringVar(&forgeProvidersFile, "forge-providers-file", "", "Secure mode: provider registry file carrying references only.")
+	flag.StringVar(&prReviewerIdentity, "pr-reviewer-identity", "", "Secure mode: forge login the pull-request reviewer posts its managed comment and review under; when set, a fix-pr launch reads that reviewer's machine-readable remediation handoff for the pinned head and feeds it to the coordinator as structured fix input (#755). Empty disables the read.")
 	flag.StringVar(&runNamespace, "run-namespace", "", "Secure mode: the namespace dedicated to run workloads.")
 	flag.Var(&ownedNamespaces, "owned-namespace", "Repeatable run namespace this deployment owns (#632); a run outside the owned set is a strict no-op. Empty keeps the single-controller default: secure mode owns --run-namespace, legacy mode owns every namespace.")
 	flag.StringVar(&leaderElectionID, "leader-election-id", defaultLeaderElectionID, "Lease name for leader election. Two releases sharing an operator namespace need distinct IDs; separate operator namespaces do not (#632).")
@@ -227,6 +231,8 @@ func main() {
 	flag.StringVar(&contributeAdmissionBind, "contribute-admission-bind", "", "Address the operator's own contribution-admission API binds to in-process (for example :8083); frontends POST ad-hoc contributions to it (#708). Empty leaves the API off, and a non-empty value requires --contribute-admission-key-secret.")
 	flag.StringVar(&contributeAdmissionKeySecret, "contribute-admission-key-secret", "", "Name of the Secret in the operator namespace holding the contribution-admission API bearer token; required with --contribute-admission-bind.")
 	flag.StringVar(&contributeAdmissionKey, "contribute-admission-key", "token", "Key within the contribution-admission key Secret.")
+	flag.StringVar(&contributeReadKeySecret, "contribute-read-key-secret", "", "Name of the Secret in the operator namespace holding the contribution status-read bearer token (#819). The same admission listener answers GET /v1/contributions/<run> with it; the admission token never authenticates a read. Empty leaves status reads off.")
+	flag.StringVar(&contributeReadKey, "contribute-read-key", "token", "Key within the contribution read key Secret.")
 	flag.DurationVar(&doneRetention, "done-retention", 5*time.Minute, "How long a resolved Done CoderRun is kept before the retention reaper deletes it.")
 	flag.DurationVar(&failedRetention, "failed-retention", 168*time.Hour, "How long a Failed CoderRun is kept, once its lifecycle report has settled, before the retention reaper deletes it.")
 	flag.DurationVar(&needsHumanRetention, "needs-human-retention", 168*time.Hour, "How long a NeedsHuman CoderRun is kept, once its lifecycle report has settled, before the retention reaper deletes it.")
@@ -449,8 +455,18 @@ func main() {
 		setupLog.Error(err, "unable to configure contribution admission")
 		os.Exit(1)
 	}
+	if err := validateContributeReadFlags(contributeAdmissionKeySecret, contributeAdmissionKey, contributeReadKeySecret, contributeReadKey); err != nil {
+		setupLog.Error(err, "unable to configure contribution status reads")
+		os.Exit(1)
+	}
 	if admissionSecretSet && !admissionBindSet {
 		setupLog.Info("contribution admission listener disabled: --contribute-admission-bind is empty, admission POSTs will be refused", "secret", strings.TrimSpace(contributeAdmissionKeySecret))
+	}
+	if readSecretSet := strings.TrimSpace(contributeReadKeySecret) != ""; readSecretSet && !admissionBindSet {
+		// The read credential rides the admission listener (#819): with no
+		// bind there is no listener for it to ride, so say plainly that the
+		// configured read Secret serves nothing.
+		setupLog.Info("contribution status reads disabled: --contribute-admission-bind is empty, GET /v1/contributions/<run> will not be served", "secret", strings.TrimSpace(contributeReadKeySecret))
 	}
 	if admissionBind := strings.TrimSpace(contributeAdmissionBind); admissionBind != "" {
 		podNamespace := strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
@@ -458,18 +474,29 @@ func main() {
 			setupLog.Error(fmt.Errorf("POD_NAMESPACE is empty"), "unable to configure contribution admission")
 			os.Exit(1)
 		}
-		token, err := loadAdmissionToken(startupCtx, mgr.GetAPIReader(), podNamespace, contributeAdmissionKeySecret, contributeAdmissionKey)
+		token, err := loadAdmissionToken(startupCtx, mgr.GetAPIReader(), podNamespace, "contribution admission", contributeAdmissionKeySecret, contributeAdmissionKey)
 		if err != nil {
 			setupLog.Error(err, "unable to configure contribution admission")
 			os.Exit(1)
 		}
-		server, err := adhoc.NewAdmissionServer(adhoc.AdmissionServerConfig{
-			Admitter:         adhoc.New(mgr.GetClient(), mgr.GetAPIReader()),
-			Token:            token,
-			Bind:             admissionBind,
-			DefaultNamespace: podNamespace,
-			OwnedNamespaces:  ownedRunNamespaces,
-		})
+		// The status read (#819) rides the same listener under its own
+		// credential: a frontend given only the read token can poll
+		// lifecycle state and can never admit. An unset read Secret
+		// leaves the read surface off — GET answers the route miss.
+		adapter := adhoc.New(mgr.GetClient(), mgr.GetAPIReader())
+		var readToken string
+		if readSecret := strings.TrimSpace(contributeReadKeySecret); readSecret != "" {
+			readToken, err = loadAdmissionToken(startupCtx, mgr.GetAPIReader(), podNamespace, "contribution read", readSecret, contributeReadKey)
+			if err != nil {
+				setupLog.Error(err, "unable to configure contribution status reads")
+				os.Exit(1)
+			}
+			if err := validateContributeReadTokens(token, readToken); err != nil {
+				setupLog.Error(err, "unable to configure contribution status reads")
+				os.Exit(1)
+			}
+		}
+		server, err := adhoc.NewAdmissionServer(contributeServerConfig(adapter, token, admissionBind, podNamespace, ownedRunNamespaces, readToken))
 		if err != nil {
 			setupLog.Error(err, "unable to configure contribution admission")
 			os.Exit(1)
@@ -479,6 +506,11 @@ func main() {
 			os.Exit(1)
 		}
 		setupLog.Info("contribution admission API enabled", "bind", admissionBind, "secret", strings.TrimSpace(contributeAdmissionKeySecret))
+		if readSecret := strings.TrimSpace(contributeReadKeySecret); readSecret != "" {
+			setupLog.Info("contribution status reads enabled", "secret", readSecret)
+		} else {
+			setupLog.Info("contribution status reads disabled: --contribute-read-key-secret is empty, GET /v1/contributions/<run> will not be served")
+		}
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -872,6 +904,7 @@ func main() {
 			gatewayPort:       modelGatewayPort,
 			observer:          githubObserver,
 			observerSecret:    observerCredentialSecret,
+			reviewerIdentity:  prReviewerIdentity,
 			legacyGitSecret:   gitCredentialSecret,
 			legacyAPISecret:   githubCredentialSecret,
 			executorEnvSecret: executorEnvironmentSecret,
@@ -1043,6 +1076,55 @@ func validateContributeAdmissionFlags(bind, keySecret string) error {
 		return fmt.Errorf("--contribute-admission-bind requires --contribute-admission-key-secret")
 	}
 	return nil
+}
+
+// validateContributeReadFlags reports the one read-credential wiring
+// mistake that voids the read/write split silently (#819): naming the
+// exact same Secret and key as the admission credential, which hands the
+// admission bearer status-read authority while looking like two
+// credentials. Flag validation cannot see Secret values, so a byte-level
+// check runs once both tokens are loaded (validateContributeReadTokens).
+func validateContributeReadFlags(admissionSecret, admissionKey, readSecret, readKey string) error {
+	if strings.TrimSpace(readSecret) == "" {
+		return nil
+	}
+	if strings.TrimSpace(readSecret) == strings.TrimSpace(admissionSecret) &&
+		strings.TrimSpace(readKey) == strings.TrimSpace(admissionKey) {
+		return fmt.Errorf("--contribute-read-key-secret with --contribute-read-key must not name the same Secret entry as --contribute-admission-key-secret with --contribute-admission-key; one shared bearer is one credential, and it would authenticate both reads and admissions")
+	}
+	return nil
+}
+
+// validateContributeReadTokens rejects equal credential values at startup
+// (#819): name-distinct Secrets — or two keys in one Secret — holding the
+// same bearer bytes hand the read token write admission authority, the
+// same split the name check above exists to keep.
+func validateContributeReadTokens(admissionToken, readToken string) error {
+	if readToken != "" && readToken == admissionToken {
+		return fmt.Errorf("the contribution read credential is byte-identical to the admission token; one shared bearer is one credential, and it would authenticate both reads and admissions")
+	}
+	return nil
+}
+
+// contributeServerConfig wires the admission listener's server config
+// (#708, #819). The status reader rides only with its own credential:
+// NewAdmissionServer rejects a reader without a read token, so an
+// admission-only deployment — a configured admission Secret and no read
+// Secret — would crash at startup if the reader were passed
+// unconditionally.
+func contributeServerConfig(adapter adhoc.Adapter, token, bind, defaultNamespace string, ownedNamespaces []string, readToken string) adhoc.AdmissionServerConfig {
+	config := adhoc.AdmissionServerConfig{
+		Admitter:         adapter,
+		Token:            token,
+		Bind:             bind,
+		DefaultNamespace: defaultNamespace,
+		OwnedNamespaces:  ownedNamespaces,
+		ReadToken:        readToken,
+	}
+	if readToken != "" {
+		config.Status = adapter
+	}
+	return config
 }
 
 // dispatchBinding pairs one Dispatch queue lane with one Courier LaneProfile.
@@ -1484,15 +1566,17 @@ func loadEvidenceKey(ctx context.Context, reader client.Reader, namespace, name 
 	return key, nil
 }
 
-// loadAdmissionToken reads the contribution-admission API's bearer token from
-// the named Secret in the operator namespace (#708). It fails closed like
-// loadEvidenceKey: the listener must agree with the deployment on one token,
-// so a missing or empty key is a startup error rather than an API that
-// authenticates nothing. The token value never appears in any error.
-func loadAdmissionToken(ctx context.Context, reader client.Reader, namespace, secretName, secretKey string) (string, error) {
+// loadAdmissionToken reads one contribution-API bearer token from the
+// named Secret in the operator namespace (#708, read token #819). label
+// names which credential is being loaded so a startup error points at the
+// flag the operator actually set. It fails closed like loadEvidenceKey:
+// the listener must agree with the deployment on one token, so a missing
+// or empty key is a startup error rather than an API that authenticates
+// nothing. The token value never appears in any error.
+func loadAdmissionToken(ctx context.Context, reader client.Reader, namespace, label, secretName, secretKey string) (string, error) {
 	secretName = strings.TrimSpace(secretName)
 	if secretName == "" {
-		return "", fmt.Errorf("contribution admission key Secret name is required")
+		return "", fmt.Errorf("%s key Secret name is required", label)
 	}
 	secretKey = strings.TrimSpace(secretKey)
 	if secretKey == "" {
@@ -1500,39 +1584,43 @@ func loadAdmissionToken(ctx context.Context, reader client.Reader, namespace, se
 	}
 	namespace = strings.TrimSpace(namespace)
 	if namespace == "" {
-		return "", fmt.Errorf("POD_NAMESPACE is required when a contribution admission key Secret is configured")
+		return "", fmt.Errorf("POD_NAMESPACE is required when a %s key Secret is configured", label)
 	}
 	var secret corev1.Secret
 	if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretName}, &secret); err != nil {
 		if apierrors.IsNotFound(err) {
-			return "", fmt.Errorf("contribution admission key Secret %s/%s not found: %w", namespace, secretName, err)
+			return "", fmt.Errorf("%s key Secret %s/%s not found: %w", label, namespace, secretName, err)
 		}
-		return "", fmt.Errorf("read contribution admission key Secret %s/%s: %w", namespace, secretName, err)
+		return "", fmt.Errorf("read %s key Secret %s/%s: %w", label, namespace, secretName, err)
 	}
 	token, ok := secret.Data[secretKey]
 	if !ok || strings.TrimSpace(string(token)) == "" {
-		return "", fmt.Errorf("contribution admission key Secret %s/%s has no non-empty %q entry", namespace, secretName, secretKey)
+		return "", fmt.Errorf("%s key Secret %s/%s has no non-empty %q entry", label, namespace, secretName, secretKey)
 	}
 	return string(token), nil
 }
 
 // secureConfig carries the parsed secure-mode flags into buildSecureControl.
 type secureConfig struct {
-	providersFile     string
-	registry          *forge.Registry
-	runNamespace      string
-	harnessImage      string
-	laneRuntimeImage  string
-	probeImage        string
-	cacheService      string
-	cachePort         int
-	gatewayURL        string
-	gatewayKeySecret  string
-	gatewayKeyName    string
-	gatewayCIDR       string
-	gatewayPort       int
-	observer          controller.WorldObserver
-	observerSecret    string
+	providersFile    string
+	registry         *forge.Registry
+	runNamespace     string
+	harnessImage     string
+	laneRuntimeImage string
+	probeImage       string
+	cacheService     string
+	cachePort        int
+	gatewayURL       string
+	gatewayKeySecret string
+	gatewayKeyName   string
+	gatewayCIDR      string
+	gatewayPort      int
+	observer         controller.WorldObserver
+	observerSecret   string
+	// reviewerIdentity is the forge login the pull-request reviewer posts
+	// under; see --pr-reviewer-identity and SecureConfig.ReviewerIdentity
+	// (#755).
+	reviewerIdentity  string
 	legacyGitSecret   string
 	legacyAPISecret   string
 	executorEnvSecret string
@@ -1681,6 +1769,7 @@ func buildSecureControl(config secureConfig) (*controller.SecureControl, error) 
 			GatewayKeyName:         strings.TrimSpace(config.gatewayKeyName),
 			TokenReviewClusterRole: strings.TrimSpace(config.tokenReviewRole),
 			Skills:                 config.skillRegistry,
+			ReviewerIdentity:       strings.TrimSpace(config.reviewerIdentity),
 			LiveProbes:             true,
 			Kubernetes:             clientset,
 			OperatorNamespace:      strings.TrimSpace(config.operatorNS),
@@ -1702,5 +1791,9 @@ func buildSecureControl(config secureConfig) (*controller.SecureControl, error) 
 				return controller.AdmissionProvider{Provider: provider, Policy: provider, HeadLister: provider}, nil
 			},
 		},
+		// The reviewer's remediation handoff (#755) is read through the same
+		// registry-routed forge observer every other operator-side PR read
+		// uses; an empty ReviewerIdentity keeps this read dark.
+		ReviewHandoffs: observer,
 	}, nil
 }

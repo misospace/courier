@@ -22,6 +22,7 @@ import (
 	"github.com/misospace/courier/internal/forge"
 	couriergithub "github.com/misospace/courier/internal/github"
 	"github.com/misospace/courier/internal/skills"
+	"github.com/misospace/courier/internal/source/adhoc"
 	"github.com/misospace/courier/internal/source/cron"
 	"github.com/misospace/courier/internal/source/dispatch"
 	corev1 "k8s.io/api/core/v1"
@@ -1419,7 +1420,7 @@ func TestStartupReadsSurfaceDeadlineErrors(t *testing.T) {
 	t.Run("contribution admission token read", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 		defer cancel()
-		_, err := loadAdmissionToken(ctx, reader, "courier-system", "courier-admission-token", "token")
+		_, err := loadAdmissionToken(ctx, reader, "courier-system", "contribution admission", "courier-admission-token", "token")
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("loadAdmissionToken() error = %v, want a deadline-exceeded error", err)
 		}
@@ -1559,6 +1560,116 @@ func TestValidateContributeAdmissionFlags(t *testing.T) {
 	}
 }
 
+func TestValidateContributeReadFlags(t *testing.T) {
+	tests := []struct {
+		name            string
+		admissionSecret string
+		admissionKey    string
+		readSecret      string
+		readKey         string
+		wantErr         string
+	}{
+		{name: "no read credential disables the check", readSecret: ""},
+		{
+			name:            "separate secrets",
+			admissionSecret: "courier-admission-token", readSecret: "courier-read-token",
+		},
+		{
+			name:            "same secret different key",
+			admissionSecret: "courier-api-token", admissionKey: "admit",
+			readSecret: "courier-api-token", readKey: "read",
+		},
+		{
+			name:            "aliased entry authenticates both surfaces",
+			admissionSecret: "courier-api-token", admissionKey: "token",
+			readSecret: " courier-api-token ", readKey: "token ",
+			wantErr: "must not name the same Secret entry",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateContributeReadFlags(test.admissionSecret, test.admissionKey, test.readSecret, test.readKey)
+			if test.wantErr != "" {
+				if err == nil {
+					t.Fatalf("validateContributeReadFlags() error = nil, want error mentioning %q", test.wantErr)
+				}
+				if !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("validateContributeReadFlags() error = %q, want it to mention %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validateContributeReadFlags() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateContributeReadTokens(t *testing.T) {
+	tests := []struct {
+		name           string
+		admissionToken string
+		readToken      string
+		wantErr        string
+	}{
+		{name: "no read token disables the check", admissionToken: "write-bearer", readToken: ""},
+		{name: "distinct bearers", admissionToken: "write-bearer", readToken: "read-bearer"},
+		{
+			name:           "equal bearers authenticate both surfaces",
+			admissionToken: "same-bearer", readToken: "same-bearer",
+			wantErr: "byte-identical to the admission token",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateContributeReadTokens(test.admissionToken, test.readToken)
+			if test.wantErr != "" {
+				if err == nil {
+					t.Fatalf("validateContributeReadTokens() error = nil, want error mentioning %q", test.wantErr)
+				}
+				if !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("validateContributeReadTokens() error = %q, want it to mention %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validateContributeReadTokens() error = %v", err)
+			}
+		})
+	}
+}
+
+// TestContributeServerConfig pins the manager's own read wiring (#819):
+// the status reader travels only with its read token, and the config the
+// manager builds is accepted by NewAdmissionServer in both shapes. An
+// admission-only deployment — an admission Secret and no read Secret —
+// must start, not crash on the reader/token pair rule.
+func TestContributeServerConfig(t *testing.T) {
+	adapter := adhoc.New(nil, nil)
+	tests := []struct {
+		name       string
+		readToken  string
+		wantStatus bool
+	}{
+		{name: "admission-only leaves the reader unwired", readToken: "", wantStatus: false},
+		{name: "a read token brings the reader", readToken: "a-read-bearer-token-of-some-length", wantStatus: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := contributeServerConfig(adapter, "an-admission-bearer-token-of-some-length", ":8083", "courier-system", []string{"courier-system"}, test.readToken)
+			if (config.Status != nil) != test.wantStatus {
+				t.Fatalf("status reader wired = %v, want %v", config.Status != nil, test.wantStatus)
+			}
+			if config.ReadToken != test.readToken {
+				t.Fatalf("read token = %q, want %q", config.ReadToken, test.readToken)
+			}
+			if _, err := adhoc.NewAdmissionServer(config); err != nil {
+				t.Fatalf("NewAdmissionServer() rejected the manager's own config: %v", err)
+			}
+		})
+	}
+}
+
 func TestLoadAdmissionToken(t *testing.T) {
 	const tokenValue = "a-test-bearer-token-of-some-length"
 
@@ -1639,7 +1750,7 @@ func TestLoadAdmissionToken(t *testing.T) {
 			}
 			fakeClient := builder.Build()
 
-			got, err := loadAdmissionToken(context.Background(), fakeClient, test.namespace, test.secretName, test.secretKey)
+			got, err := loadAdmissionToken(context.Background(), fakeClient, test.namespace, "contribution admission", test.secretName, test.secretKey)
 			if test.wantErr != "" {
 				if err == nil {
 					t.Fatalf("loadAdmissionToken() error = nil, want error mentioning %q", test.wantErr)

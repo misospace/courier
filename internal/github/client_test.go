@@ -1276,3 +1276,146 @@ func TestRemoveIssueLabel(t *testing.T) {
 		}
 	})
 }
+
+func TestListIssueComments(t *testing.T) {
+	t.Run("paginates every page through the conversation endpoint", func(t *testing.T) {
+		var paths, pages []string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			paths = append(paths, r.URL.Path)
+			pages = append(pages, r.URL.Query().Get("page"))
+			w.Header().Set("Content-Type", "application/json")
+			if r.URL.Query().Get("page") == "1" {
+				comments := make([]IssueComment, 100)
+				for i := range comments {
+					comments[i].ID = int64(i + 1)
+				}
+				_ = json.NewEncoder(w).Encode(comments)
+				return
+			}
+			_, _ = io.WriteString(w, `[{"id":101,"body":"handoff","html_url":"https://github.com/acme/demo/pull/7#issuecomment-101","user":{"login":"courier-reviewer"}}]`)
+		}))
+		defer server.Close()
+		client, err := NewClient(server.URL, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		comments, err := client.ListIssueComments(context.Background(), "acme", "demo", 7)
+		if err != nil || len(comments) != 101 {
+			t.Fatalf("comments = %d, %v; want 101 comments", len(comments), err)
+		}
+		if comments[100].ID != 101 || comments[100].User.Login != "courier-reviewer" || comments[100].HTMLURL == "" {
+			t.Fatalf("last comment = %#v, want the page-2 record mapped", comments[100])
+		}
+		if got := strings.Join(pages, ","); got != "1,2" {
+			t.Fatalf("pages = %q, want 1,2", got)
+		}
+		for _, p := range paths {
+			if p != "/repos/acme/demo/issues/7/comments" {
+				t.Fatalf("request path = %q, want the issue-comments conversation endpoint", p)
+			}
+		}
+	})
+	t.Run("empty conversation lists empty", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `[]`)
+		}))
+		defer server.Close()
+		client, err := NewClient(server.URL, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		comments, err := client.ListIssueComments(context.Background(), "acme", "demo", 7)
+		if err != nil || len(comments) != 0 {
+			t.Fatalf("comments = %d, %v; want an empty list", len(comments), err)
+		}
+	})
+	t.Run("non-200 surfaces an APIError", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"message":"Forbidden"}`)
+		}))
+		defer server.Close()
+		client, err := NewClient(server.URL, "secret")
+		if err != nil {
+			t.Fatal(err)
+		}
+		comments, err := client.ListIssueComments(context.Background(), "acme", "demo", 7)
+		var apiErr *APIError
+		if comments != nil || !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusForbidden {
+			t.Fatalf("comments = %#v, error = %v (%T); want a nil list and a 403 APIError", comments, err, err)
+		}
+	})
+}
+
+func TestListPullRequestReviews(t *testing.T) {
+	t.Run("paginates every page through the reviews endpoint", func(t *testing.T) {
+		var paths, pages []string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			paths = append(paths, r.URL.Path)
+			pages = append(pages, r.URL.Query().Get("page"))
+			w.Header().Set("Content-Type", "application/json")
+			if r.URL.Query().Get("page") == "1" {
+				reviews := make([]PullRequestReview, 100)
+				for i := range reviews {
+					reviews[i].ID = int64(i + 1)
+				}
+				_ = json.NewEncoder(w).Encode(reviews)
+				return
+			}
+			_, _ = io.WriteString(w, `[{"id":101,"state":"CHANGES_REQUESTED","body":"manage the lane","submitted_at":"2026-02-03T04:05:06Z","html_url":"https://github.com/acme/demo/pull/7#pullrequestreview-101","user":{"login":"octocat"}}]`)
+		}))
+		defer server.Close()
+		client, err := NewClient(server.URL, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		reviews, err := client.ListPullRequestReviews(context.Background(), "acme", "demo", 7)
+		if err != nil || len(reviews) != 101 {
+			t.Fatalf("reviews = %d, %v; want 101 reviews", len(reviews), err)
+		}
+		last := reviews[100]
+		if last.ID != 101 || last.State != "CHANGES_REQUESTED" || last.SubmittedAt != "2026-02-03T04:05:06Z" || last.User.Login != "octocat" {
+			t.Fatalf("last review = %#v, want the page-2 record mapped", last)
+		}
+		if got := strings.Join(pages, ","); got != "1,2" {
+			t.Fatalf("pages = %q, want 1,2", got)
+		}
+		for _, p := range paths {
+			if p != "/repos/acme/demo/pulls/7/reviews" {
+				t.Fatalf("request path = %q, want the pull-request reviews endpoint", p)
+			}
+		}
+	})
+	t.Run("no reviews lists empty", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `[]`)
+		}))
+		defer server.Close()
+		client, err := NewClient(server.URL, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		reviews, err := client.ListPullRequestReviews(context.Background(), "acme", "demo", 7)
+		if err != nil || len(reviews) != 0 {
+			t.Fatalf("reviews = %d, %v; want an empty list", len(reviews), err)
+		}
+	})
+	t.Run("non-200 surfaces an APIError", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"message":"Not Found"}`)
+		}))
+		defer server.Close()
+		client, err := NewClient(server.URL, "secret")
+		if err != nil {
+			t.Fatal(err)
+		}
+		reviews, err := client.ListPullRequestReviews(context.Background(), "acme", "demo", 7)
+		var apiErr *APIError
+		if reviews != nil || !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
+			t.Fatalf("reviews = %#v, error = %v (%T); want a nil list and a 404 APIError", reviews, err, err)
+		}
+	})
+}

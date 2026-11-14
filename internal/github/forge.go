@@ -76,6 +76,8 @@ func NewProvider(cfg forge.ProviderConfig, client *Client) *Provider {
 			forge.CapabilityCommentWorkItem,
 			forge.CapabilityListWorkItemsByLabel,
 			forge.CapabilityRemoveWorkItemLabel,
+			forge.CapabilityListReviews,
+			forge.CapabilityListComments,
 		),
 	}
 }
@@ -271,14 +273,55 @@ func (p *Provider) listPullRequestsByHead(ctx context.Context, base forge.PullRe
 	return matches, foreign, nil
 }
 
-// ListReviews is not covered by this client.
+// ListReviews lists the native reviews on a pull request. GitHub serves them
+// from the pull-request reviews endpoint, where the managed review body
+// lives; the review ID crosses the boundary as the decimal GitHub ID.
 func (p *Provider) ListReviews(ctx context.Context, ref forge.PullRequestRef) ([]forge.Review, error) {
-	return nil, forge.ErrUnsupported
+	owner, repo, err := splitRepository(ref.Repo)
+	if err != nil {
+		return nil, err
+	}
+	reviews, err := p.client.ListPullRequestReviews(ctx, owner, repo, ref.Number)
+	if err != nil {
+		return nil, boundaryError(err)
+	}
+	out := make([]forge.Review, 0, len(reviews))
+	for _, review := range reviews {
+		out = append(out, forge.Review{
+			ID:          strconv.FormatInt(review.ID, 10),
+			Author:      review.User.Login,
+			State:       review.State,
+			Body:        review.Body,
+			SubmittedAt: review.SubmittedAt,
+		})
+	}
+	return out, nil
 }
 
-// ListComments is not covered by this client.
+// ListComments lists the conversation comments on a pull request. GitHub
+// serves the conversation — including the reviewer's sticky comment — from
+// the issue-comments endpoint; the pull-request review-comments endpoint
+// serves inline diff comments and is never read. The comment ID crosses the
+// boundary as the decimal GitHub ID and the URL as the HTML URL.
 func (p *Provider) ListComments(ctx context.Context, ref forge.PullRequestRef) ([]forge.Comment, error) {
-	return nil, forge.ErrUnsupported
+	owner, repo, err := splitRepository(ref.Repo)
+	if err != nil {
+		return nil, err
+	}
+	comments, err := p.client.ListIssueComments(ctx, owner, repo, ref.Number)
+	if err != nil {
+		return nil, boundaryError(err)
+	}
+	out := make([]forge.Comment, 0, len(comments))
+	for _, comment := range comments {
+		out = append(out, forge.Comment{
+			ID:     strconv.FormatInt(comment.ID, 10),
+			Author: comment.User.Login,
+			Body:   comment.Body,
+			URL:    comment.HTMLURL,
+		})
+	}
+	return out, nil
 }
 
 // ReadChecks lists the CI checks attached to the given head commit.

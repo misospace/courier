@@ -200,6 +200,14 @@ type SecureConfig struct {
 	// the deployment registers no skill bundles, so any lane selecting
 	// skills fails closed at admission rather than resolving to nothing.
 	Skills *skills.Registry
+	// ReviewerIdentity is the forge login the deployment's pull-request
+	// reviewer posts under (its managed comment and native review author).
+	// A fix-pr launch reads that identity's review-handoff/v1 payload as
+	// structured fix input (#755); only bodies the forge reports from this
+	// exact identity are trusted, and a content marker alone is never
+	// enough. Empty disables the read entirely: fix-pr runs keep the
+	// unstructured feedback inspection they had before.
+	ReviewerIdentity string
 	// Now supports deterministic tests.
 	Now func() time.Time
 }
@@ -233,6 +241,12 @@ type SecureControl struct {
 	// source-neutral goal input (#624). Nil means no contribute run can launch,
 	// which its launch fails closed.
 	Sources *SourceRegistry
+	// ReviewHandoffs reads the pull-request reviewer's machine-readable
+	// remediation handoff for a fix-pr run through the configured forge
+	// capability (#755). Nil, or an empty Config.ReviewerIdentity, means no
+	// handoff is read and the fix-pr goal keeps the unstructured feedback
+	// inspection it renders without one.
+	ReviewHandoffs ReviewHandoffResolver
 }
 
 func (s *SecureControl) now() time.Time {
