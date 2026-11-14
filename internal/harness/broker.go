@@ -340,9 +340,10 @@ func (b *BrokerClient) Publish(ctx context.Context, expectedWorkOID, proposedOID
 // PullRequest is the broker's confirmed pull-request record. The create
 // route re-reads the created pull request from the forge before answering,
 // so these fields are the broker's observed identity, not an echo of the
-// request. Coverage carries the criterion coverage the broker derived while
-// validating the body against the pinned criterion set; it is empty when
-// the policy pins none.
+// request. Coverage carries the criterion coverage claimed in the body's
+// evidence block, which the broker answered only after verifying it agrees
+// with the coverage it derived from the pinned set; it is empty when the
+// policy pins none.
 type PullRequest struct {
 	Number   int
 	State    string
@@ -377,10 +378,11 @@ func (b *BrokerClient) CreatePullRequest(ctx context.Context, oid, title, body s
 	}
 	defer resp.Body.Close()
 	var result PullRequest
-	// The re-read record echoes the PR body back inside the response; the
-	// request side already bounded that body at the broker's one-megabyte
-	// decode limit, and the identity fields carry the rest. The bound is
-	// the request bound plus headroom, not a new contract.
+	// The re-read record carries the pull request's title and body back in
+	// the response — on the adoption path those are the discovered pull
+	// request's, not this call's — so the decode bound is a defensive
+	// bound on the response, not a restatement of the request bound. A
+	// record beyond it decodes as malformed and fails closed.
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&result); err != nil {
 		return PullRequest{}, &BrokerCallError{Category: "pull request response is malformed", Retryable: true}
 	}

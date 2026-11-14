@@ -1165,3 +1165,36 @@ func TestCreatePullRequestClientRefusesForeignHead(t *testing.T) {
 		t.Fatalf("forge creates = %d, want none for a refused head", f.observer.pullCreates)
 	}
 }
+
+// TestCreatePullRequestClientRejectsInconsistentResponse pins the client's
+// own answer guards over the create route: a 200 whose record does not
+// carry the proposed head or carries a non-positive number is the same
+// no-status mismatch a publication answer earns — never a creation — and a
+// truncated record is retryable malformed, never a silent success.
+func TestCreatePullRequestClientRejectsInconsistentResponse(t *testing.T) {
+	const proposed = "1111111111111111111111111111111111111111"
+	cases := []struct {
+		name      string
+		body      string
+		retryable bool
+	}{
+		{"head does not match the proposal", `{"Number":7,"State":"open","HeadRepo":"org/repo","HeadRef":"r","HeadOID":"0000000000000000000000000000000000000000"}`, false},
+		{"provider number is not positive", `{"Number":0,"State":"open","HeadRepo":"org/repo","HeadRef":"r","HeadOID":"` + proposed + `"}`, false},
+		{"record is truncated", `{"Number":7,"State":"open","HeadOID":"` + proposed, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			t.Cleanup(server.Close)
+			client := &BrokerClient{BaseURL: server.URL, TokenSource: NewStaticBrokerTokenSource([]byte("valid-token")), HTTP: server.Client()}
+			_, err := client.CreatePullRequest(context.Background(), proposed, "title", "body", false)
+			var callErr *BrokerCallError
+			if !errors.As(err, &callErr) || callErr.Retryable != tc.retryable {
+				t.Fatalf("create with inconsistent answer = %v, want failure (retryable = %v)", err, tc.retryable)
+			}
+		})
+	}
+}
