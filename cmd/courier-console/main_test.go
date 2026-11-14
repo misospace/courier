@@ -1,10 +1,12 @@
 package main
 
 import (
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestRunArgsFailsClosed covers the binary's flag validation: an incomplete
@@ -62,6 +64,29 @@ func TestRunArgsFailsClosed(t *testing.T) {
 				t.Fatalf("runArgs(%q) error = %v, want it to name %q", testCase.args, err, testCase.want)
 			}
 		})
+	}
+}
+
+// TestHTTPServerTimeouts pins the bounded-listener posture of the console's
+// http.Server: every listener timeout is set, and the write bound outlives
+// the default backend probe a page render may take.
+func TestHTTPServerTimeouts(t *testing.T) {
+	srv := newHTTPServer(defaultBind, http.NewServeMux())
+	for _, tc := range []struct {
+		name    string
+		timeout time.Duration
+	}{
+		{"ReadHeaderTimeout", srv.ReadHeaderTimeout},
+		{"ReadTimeout", srv.ReadTimeout},
+		{"WriteTimeout", srv.WriteTimeout},
+		{"IdleTimeout", srv.IdleTimeout},
+	} {
+		if tc.timeout <= 0 {
+			t.Errorf("%s = %v, want a bounded timeout", tc.name, tc.timeout)
+		}
+	}
+	if srv.WriteTimeout <= defaultBackendTimeout {
+		t.Errorf("WriteTimeout %v must outlive the %v default backend probe", srv.WriteTimeout, defaultBackendTimeout)
 	}
 }
 

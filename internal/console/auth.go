@@ -24,17 +24,12 @@ const sessionTTL = 12 * time.Hour
 // sessionIDBytes is the entropy of a session id.
 const sessionIDBytes = 32
 
-// session is one operator login: an in-memory record keyed by the id the
-// cookie carries. Sessions are deliberately not durable — a console restart
-// signs everyone out, which is the honest behavior for a scaffold with no
-// persistence layer.
-type session struct {
-	expires time.Time
-}
-
-// sessionStore tracks live sessions. Expiry is checked on read, so a session
-// that outlives its TTL is refused and reaped on the next request rather
-// than kept alive by a timer; every put also sweeps the expired remainder.
+// sessionStore tracks live sessions, keyed by the id the cookie carries and
+// valued by expiry. Sessions are deliberately not durable — a console
+// restart signs everyone out, which is the honest behavior for a scaffold
+// with no persistence layer. Expiry is checked on read, so a session that
+// outlives its TTL is refused and reaped on the next request rather than
+// kept alive by a timer; every put also sweeps the expired remainder.
 type sessionStore struct {
 	mu       sync.Mutex
 	sessions map[string]time.Time

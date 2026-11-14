@@ -72,8 +72,6 @@ type Server struct {
 	mux     *http.ServeMux
 }
 
-// templateFS was removed; parsePages takes an fs.FS directly.
-
 // pageTemplates are the rendered pages; each is parsed together with the
 // shared layout so {{define "content"}} stays page-local.
 var pageTemplates = []string{"overview", "runs", "run", "login", "forbidden"}
