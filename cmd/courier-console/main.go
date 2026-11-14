@@ -33,11 +33,14 @@ func main() {
 
 // serverTimeouts bound request and connection resources: a public-ish
 // listener without them lets slow or idle clients pin goroutines and file
-// descriptors. ReadTimeout bounds reading a whole request; the console's
-// handlers are small form posts and rendered pages, so 10s is generous.
+// descriptors. ReadTimeout bounds reading a whole request; WriteTimeout
+// covers the write side and stays generous around the handler's bounded
+// backend probe (backend-timeout defaults to 5s); the console's handlers
+// are small form posts and rendered pages.
 const (
 	readHeaderTimeout = 5 * time.Second
 	readTimeout       = 10 * time.Second
+	writeTimeout      = 30 * time.Second
 	idleTimeout       = 90 * time.Second
 )
 

@@ -27,12 +27,14 @@ takes the operator identity from one configured header
 the proxy is the only client that can reach the console, so the Helm chart
 enforces that rule instead of documenting it. Header mode requires
 `operatorConsole.auth.headerAllowedPeers`, and the chart renders a
-NetworkPolicy named `courier-console-header-ingress`. That policy selects
-the console pods, declares `policyTypes: [Ingress]`, and admits only the
-peers you configured. A workload elsewhere in the cluster has no route to
-the console, so a forged identity header never reaches it. The render fails
-when the peer list is missing or malformed. A request without the header
-gets a plain 403 page.
+NetworkPolicy named `courier-console-header-ingress` under the release's
+fullname prefix. That policy selects the console pods, declares
+`policyTypes: [Ingress]`, and admits only the peers you configured. A
+workload elsewhere in the cluster has no admitted route to the console, so
+a forged identity header never reaches it. NetworkPolicy enforcement needs
+a CNI that enforces NetworkPolicy; verify your cluster enforces it before
+you rely on the boundary. The render fails when the peer list is missing or
+malformed. A request without the header gets a plain 403 page.
 
 CSRF groundwork is in place: each session's CSRF token is derived as
 `HMAC(sessionKey, sessionID + ":csrf")`, embedded in rendered forms, and

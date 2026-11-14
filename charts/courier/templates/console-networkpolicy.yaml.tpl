@@ -24,7 +24,40 @@ Token mode renders no policy: it authenticates a shared token over the
 wire, not the network position.
 */}}
 {{- $operatorConsole := .Values.operatorConsole }}
-{{- if and $operatorConsole.enabled (eq $operatorConsole.auth.mode "header") $operatorConsole.auth.trustedHeader }}
+{{- /* The boundary follows the mode the binary will actually run, not only
+operatorConsole.auth.mode: a raw --auth-mode/--trusted-header override in
+controllers.console args wins (the hasPrefix guards in common.yaml.tpl skip
+the matching injected flag), and controllers.console.enabled without an
+operatorConsole block still starts console pods. The effective mode drives
+the guards and the policy. cookieSecure is type-checked here with the same
+message common.yaml.tpl uses, so a header-mode console can never render
+without the check whichever template fails first. */}}
+{{- $effectiveMode := $operatorConsole.auth.mode }}
+{{- $effectiveTrustedHeader := $operatorConsole.auth.trustedHeader }}
+{{- $consoleController := dict }}
+{{- $controllers := index .Values "controllers" }}
+{{- if $controllers }}
+{{- $named := index $controllers "console" }}
+{{- if $named }}{{- $consoleController = $named }}{{- end }}
+{{- end }}
+{{- $rawArgs := list }}
+{{- $containers := index $consoleController "containers" }}
+{{- if $containers }}
+{{- $namedContainer := index $containers "console" }}
+{{- if $namedContainer }}{{- $rawArgs = default (list) (index $namedContainer "args") }}{{- end }}
+{{- end }}
+{{- range $arg := $rawArgs }}
+{{- if hasPrefix "--auth-mode=" $arg }}{{- $effectiveMode = trimPrefix "--auth-mode=" $arg }}{{- end }}
+{{- if hasPrefix "--trusted-header=" $arg }}{{- $effectiveTrustedHeader = trimPrefix "--trusted-header=" $arg }}{{- end }}
+{{- end }}
+{{- $consoleControllerEnabled := false }}
+{{- $enabledRaw := index $consoleController "enabled" }}
+{{- if eq (toString $enabledRaw) "true" }}{{- $consoleControllerEnabled = true }}{{- end }}
+{{- $consoleLive := or $operatorConsole.enabled $consoleControllerEnabled }}
+{{- if and $consoleLive (eq $effectiveMode "header") $effectiveTrustedHeader }}
+{{- if not (kindIs "bool" $operatorConsole.auth.cookieSecure) }}
+{{- fail "operatorConsole.auth.cookieSecure must be a boolean" }}
+{{- end }}
 {{- $peers := $operatorConsole.auth.headerAllowedPeers }}
 {{- if not $peers }}
 {{- fail "operatorConsole.enabled in header mode requires operatorConsole.auth.headerAllowedPeers: the chart enforces the proxy-only boundary with a default-deny-ingress NetworkPolicy" }}

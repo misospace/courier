@@ -2870,6 +2870,29 @@ func TestChartOperatorConsoleHeaderModeNetworkPolicy(t *testing.T) {
 	if !strings.Contains(overriddenPolicy, "port: 9099") {
 		t.Fatalf("port override did not move the NetworkPolicy's allowed port:\n%s", overriddenPolicy)
 	}
+
+	// A raw --auth-mode override in the controller args cannot slip past the
+	// boundary: the guards and the policy key off the mode the binary
+	// actually runs. An args override to header mode without peers fails the
+	// render even when operatorConsole.auth.mode stays token.
+	overrideArgs := []string{
+		"--set", "controllers.console.containers.console.args[0]=--auth-mode=header",
+		"--set", "controllers.console.containers.console.args[1]=--trusted-header=X-Forwarded-User",
+	}
+	overriddenMode, err := runHelmOutput(t, chartDir, operatorConsoleRenderArgs(overrideArgs...)...)
+	if err == nil || !strings.Contains(overriddenMode, "operatorConsole.auth.headerAllowedPeers") {
+		t.Fatalf("expected an args-override header console without peers to fail on headerAllowedPeers, err = %v:\n%s", err, overriddenMode)
+	}
+
+	// With peers supplied, the same override gets its policy: the boundary
+	// ships with the effective header mode, not only the values block.
+	forced := runHelm(t, chartDir, operatorConsoleRenderArgs(append(overrideArgs,
+		"--set-json", `operatorConsole.auth.headerAllowedPeers=[{"podSelector":{"app.kubernetes.io/name":"oauth2-proxy"}}]`,
+	)...)...)
+	paired := findDocument(t, forced, "kind: NetworkPolicy", "name: courier-console-header-ingress")
+	if !strings.Contains(paired, "app.kubernetes.io/name: oauth2-proxy") {
+		t.Fatalf("args-override header console policy is missing the configured peer:\n%s", paired)
+	}
 }
 
 // TestChartOperatorConsoleRejectsIncompleteConfiguration covers the

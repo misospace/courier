@@ -564,8 +564,10 @@
 so the boundary must be enforced not documented: the chart pairs header mode
 with a default-deny-ingress NetworkPolicy built from
 operatorConsole.auth.headerAllowedPeers, and a header-mode render without
-peers fails (console-networkpolicy.yaml.tpl owns those guards, so helm's
-concurrent template rendering surfaces one message per failure). */}}
+peers fails. console-networkpolicy.yaml.tpl owns the peers guards and drives
+them off the mode the binary actually runs (raw --auth-mode overrides win);
+where both templates can fail for one input they emit identical messages, so
+helm's concurrent template rendering stays deterministic per failure class. */}}
 {{- $consoleCookieSecure := $operatorConsole.auth.cookieSecure }}
 {{- if not (kindIs "bool" $consoleCookieSecure) }}
 {{- fail "operatorConsole.auth.cookieSecure must be a boolean" }}
