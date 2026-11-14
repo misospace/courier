@@ -251,6 +251,30 @@ func (e *PublicationEngine) Publish(ctx context.Context) (Publication, error) {
 	return Publication{}, &PublicationBlockedError{Reason: "the live work ref did not settle across reconciliation rounds; refusing to race it"}
 }
 
+// OpenPullRequest opens the run's pull request through the broker's pull-
+// request creation route (#842). It publishes first: the route pins the pull
+// request head to the exact live work tip, so the head it cites must be a
+// broker-confirmed publication. Publish is idempotent against the world, so
+// this stays correct when the branch was published by an earlier call or an
+// earlier incarnation. The broker then enforces the body contracts and the
+// pinned-head duplicate guard before any forge write and confirms the
+// created pull request by re-read. A create that succeeded but whose
+// response was lost is recovered by the duplicate guard's adoption, so the
+// transport-class retry is safe.
+func (e *PublicationEngine) OpenPullRequest(ctx context.Context, title, body string, draft bool) (PullRequest, error) {
+	pub, err := e.Publish(ctx)
+	if err != nil {
+		return PullRequest{}, err
+	}
+	pr, err := retried(ctx, func(ctx context.Context) (PullRequest, error) {
+		return e.broker.CreatePullRequest(ctx, pub.OID, title, body, draft)
+	})
+	if err != nil {
+		return PullRequest{}, e.classify(err, "the pull request creation")
+	}
+	return pr, nil
+}
+
 // expectedTip derives the expected work tip for this incarnation's first
 // publication attempt: the last broker-confirmed OID when this process has
 // one, the admission anchor when the work ref existed at seed time, and
