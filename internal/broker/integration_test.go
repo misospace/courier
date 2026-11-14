@@ -10,144 +10,21 @@ import (
 	"testing"
 
 	"github.com/misospace/courier/internal/forge"
+	"github.com/misospace/courier/internal/forge/forgetest"
 	couriergit "github.com/misospace/courier/internal/git"
 )
 
 // These tests join the real git broker, pinned transport, forge adapter, and
-// policy engine; only the provider's forge API is simulated.
-type integrationForge struct {
-	cfg       forge.ProviderConfig
-	repos     map[string]forge.Repository
-	paths     map[string]string
-	protected map[string]bool
-	prs       []forge.PullRequest
-	nextPR    int
-	racePR    bool
-}
-
-func (f *integrationForge) Config() forge.ProviderConfig { return f.cfg }
-func (f *integrationForge) Capabilities() forge.Capabilities {
-	return forge.NewCapabilities(forge.CapabilityReadPullRequest, forge.CapabilityCreatePullRequest, forge.CapabilityUpdatePullRequest)
-}
-func (f *integrationForge) ResolveRepository(_ context.Context, name string) (forge.Repository, error) {
-	r, ok := f.repos[name]
-	if !ok {
-		return forge.Repository{}, errors.New("unknown repository")
-	}
-	return r, nil
-}
-func (f *integrationForge) ReadRef(_ context.Context, repo forge.Repository, ref string) (forge.RefState, error) {
-	cmd := exec.Command("git", "--git-dir", f.paths[repo.Canonical], "rev-parse", "--verify", "refs/heads/"+ref)
-	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return forge.RefState{Ref: ref}, nil
-	}
-	return forge.RefState{Ref: ref, OID: strings.TrimSpace(string(out)), Exists: true}, nil
-}
-func (f *integrationForge) ReadEffectiveProtection(_ context.Context, repo forge.Repository, ref string) (forge.Protection, error) {
-	return forge.Protection{Protected: f.protected[repo.Canonical+":"+ref]}, nil
-}
-func (f *integrationForge) CanWriteRepository(context.Context, forge.Repository) (bool, error) {
-	return true, nil
-}
-func (f *integrationForge) ReadWorkItem(context.Context, forge.WorkItemRef) (forge.WorkItem, error) {
-	return forge.WorkItem{}, forge.ErrUnsupported
-}
-func (f *integrationForge) ReadPullRequest(_ context.Context, ref forge.PullRequestRef) (forge.PullRequest, error) {
-	for _, pr := range f.prs {
-		if pr.Number == ref.Number && pr.BaseRepo == ref.Repo {
-			if tip := f.tip(pr.HeadRepo, pr.HeadRef); tip != "" {
-				pr.HeadSHA = tip
-			}
-			return pr, nil
-		}
-	}
-	return forge.PullRequest{}, errors.New("pull request not found")
-}
-func (f *integrationForge) ListReviews(context.Context, forge.PullRequestRef) ([]forge.Review, error) {
-	return nil, forge.ErrUnsupported
-}
-func (f *integrationForge) ListComments(context.Context, forge.PullRequestRef) ([]forge.Comment, error) {
-	return nil, forge.ErrUnsupported
-}
-func (f *integrationForge) ReadChecks(context.Context, forge.PullRequestRef, string) ([]forge.Check, error) {
-	return nil, forge.ErrUnsupported
-}
-func (f *integrationForge) CreatePullRequest(_ context.Context, in forge.CreatePullRequestInput) (forge.PullRequest, error) {
-	if f.racePR {
-		f.nextPR++
-		other := forge.PullRequest{Number: f.nextPR, Repo: in.Repo, BaseRepo: in.Repo, BaseRef: in.Base, BaseSHA: f.tip(in.Repo, in.Base), HeadRepo: in.HeadRepo, HeadRef: in.HeadRef, HeadSHA: f.tip(in.HeadRepo, in.HeadRef), State: "open", Title: "concurrent"}
-		f.prs = append(f.prs, other)
-	}
-	f.nextPR++
-	pr := forge.PullRequest{Number: f.nextPR, Repo: in.Repo, BaseRepo: in.Repo, BaseRef: in.Base, BaseSHA: f.tip(in.Repo, in.Base), HeadRepo: in.HeadRepo, HeadRef: in.HeadRef, HeadSHA: f.tip(in.HeadRepo, in.HeadRef), State: "open", Title: in.Title, Body: in.Body, Draft: in.Draft}
-	f.prs = append(f.prs, pr)
-	return pr, nil
-}
-func (f *integrationForge) UpdatePullRequest(_ context.Context, ref forge.PullRequestRef, in forge.UpdatePullRequestInput) (forge.PullRequest, error) {
-	for i := range f.prs {
-		if f.prs[i].Number == ref.Number {
-			if in.Title != "" {
-				f.prs[i].Title = in.Title
-			}
-			if in.Body != "" {
-				f.prs[i].Body = in.Body
-			}
-			return f.prs[i], nil
-		}
-	}
-	return forge.PullRequest{}, errors.New("pull request not found")
-}
-func (f *integrationForge) CommentPullRequest(context.Context, forge.PullRequestRef, string) (forge.Comment, error) {
-	return forge.Comment{}, forge.ErrUnsupported
-}
-func (f *integrationForge) CommentWorkItem(context.Context, forge.WorkItemRef, string) (forge.Comment, error) {
-	return forge.Comment{}, forge.ErrUnsupported
-}
-func (f *integrationForge) ListPullRequestsByHead(_ context.Context, base forge.PullRequestRef, repo, ref string) ([]forge.PullRequest, error) {
-	var result []forge.PullRequest
-	for _, pr := range f.prs {
-		if pr.BaseRepo == base.Repo && pr.HeadRepo == repo && pr.HeadRef == ref {
-			if tip := f.tip(pr.HeadRepo, pr.HeadRef); tip != "" {
-				pr.HeadSHA = tip
-			}
-			result = append(result, pr)
-		}
-	}
-	return result, nil
-}
-func (f *integrationForge) tip(repo, ref string) string {
-	if f.paths[repo] == "" {
-		return ""
-	}
-	cmd := exec.Command("git", "--git-dir", f.paths[repo], "rev-parse", "--verify", "refs/heads/"+ref)
-	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1")
-	out, err := cmd.Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
-}
-
-func (f *integrationForge) Endpoint(_ context.Context, identity string) (string, error) {
-	path := f.paths[identity]
-	if path == "" {
-		return "", errors.New("unknown endpoint")
-	}
-	return path, nil
-}
-
-var _ forge.Provider = (*integrationForge)(nil)
-var _ forge.RepositoryPolicyProvider = (*integrationForge)(nil)
-var _ forge.PullRequestHeadLister = (*integrationForge)(nil)
-var _ GitEndpointResolver = (*integrationForge)(nil)
+// policy engine; only the provider's forge API is simulated. The provider
+// double is the shared local-git forge in internal/forge/forgetest, so this
+// suite and the end-to-end harness exercise one implementation.
+var _ GitEndpointResolver = (*forgetest.LocalGit)(nil)
 
 type integrationFixture struct {
 	root                                            string
 	baseRepo, workRepo                              forge.Repository
 	base, anchor, proposed, nonFF, workRef, baseRef string
-	provider                                        *integrationForge
+	provider                                        *forgetest.LocalGit
 	engine                                          *PolicyEngine
 }
 
@@ -204,7 +81,19 @@ func newIntegrationFixtureWithCriteria(t *testing.T, mode Mode, criteria Criteri
 		workRepo = forge.Repository{ID: "fork-id", Canonical: "contributor/project", DefaultRef: "main"}
 		workCanonical = workRepo.Canonical
 	}
-	provider := &integrationForge{cfg: forge.ProviderConfig{Name: "test"}, repos: map[string]forge.Repository{baseRepo.Canonical: baseRepo, workRepo.Canonical: workRepo}, paths: map[string]string{baseRepo.Canonical: basePath, workRepo.Canonical: workPath}, protected: map[string]bool{}, nextPR: 10}
+	repositories := map[string]forge.Repository{baseRepo.Canonical: baseRepo}
+	paths := map[string]string{baseRepo.Canonical: basePath}
+	if workCanonical != baseRepo.Canonical {
+		repositories[workCanonical] = workRepo
+	}
+	paths[workCanonical] = workPath
+	provider := forgetest.NewLocalGit(forgetest.LocalGitConfig{
+		Provider:        forge.ProviderConfig{Name: "test"},
+		Repositories:    repositories,
+		Paths:           paths,
+		Protected:       map[string]bool{},
+		NextPullRequest: 10,
+	})
 	policy := Policy{RunUID: "run-uid", Mode: mode, Provider: "test", BaseRepo: baseRepo.Canonical, BaseRef: "main", BaseOID: baseOID, WorkRepo: workCanonical, WorkRef: workRef}
 	if mode == ModeResolveIssue {
 		policy.WorkInitiallyAbsent = true
@@ -215,7 +104,7 @@ func newIntegrationFixtureWithCriteria(t *testing.T, mode Mode, criteria Criteri
 		policy.Criteria = criteria
 	} else {
 		policy.PRNumber, policy.HeadAnchorOID, policy.WorkAnchorOID = 7, anchor, anchor
-		provider.prs = []forge.PullRequest{{Number: 7, Repo: baseRepo.Canonical, BaseRepo: baseRepo.Canonical, BaseRef: "main", BaseSHA: baseOID, HeadRepo: workRepo.Canonical, HeadRef: workRef, HeadSHA: anchor, State: "open", Title: "before", Body: "old"}}
+		provider.SetPullRequests([]forge.PullRequest{{Number: 7, Repo: baseRepo.Canonical, BaseRepo: baseRepo.Canonical, BaseRef: "main", BaseSHA: baseOID, HeadRepo: workRepo.Canonical, HeadRef: workRef, HeadSHA: anchor, State: "open", Title: "before", Body: "old"}})
 	}
 	adapter, err := NewForgeAdapter(policy, provider, provider, baseRepo, workRepo)
 	if err != nil {
@@ -261,7 +150,7 @@ func TestBrokerIntegrationResolvePublishAndCreatePR(t *testing.T) {
 	if pr.Number != 11 || pr.BaseRepo != f.baseRepo.Canonical || pr.BaseRef != f.baseRef || pr.HeadRepo != f.baseRepo.Canonical || pr.HeadRef != f.workRef || pr.HeadOID != f.proposed {
 		t.Fatalf("created/read-back PR = %#v", pr)
 	}
-	if got := f.provider.tip(f.baseRepo.Canonical, f.workRef); got != f.proposed {
+	if got := f.provider.Tip(f.baseRepo.Canonical, f.workRef); got != f.proposed {
 		t.Fatalf("remote work tip = %s", got)
 	}
 }
@@ -269,7 +158,7 @@ func TestBrokerIntegrationResolvePublishAndCreatePR(t *testing.T) {
 func TestBrokerIntegrationFixPRPublishesForkAndUpdatesMetadata(t *testing.T) {
 	f := newIntegrationFixture(t, ModeFixPR)
 	ctx := context.Background()
-	baseCollision := f.provider.tip(f.baseRepo.Canonical, f.workRef)
+	baseCollision := f.provider.Tip(f.baseRepo.Canonical, f.workRef)
 	result, err := f.engine.Publish(ctx, PublicationRequest{RunUID: "run-uid", ExpectedWorkOID: f.anchor, ProposedOID: f.proposed})
 	if err != nil {
 		t.Fatalf("Publish: %v", err)
@@ -277,10 +166,10 @@ func TestBrokerIntegrationFixPRPublishesForkAndUpdatesMetadata(t *testing.T) {
 	if result.OID != f.proposed {
 		t.Fatalf("published OID = %s", result.OID)
 	}
-	if got := f.provider.tip(f.baseRepo.Canonical, f.workRef); got != baseCollision {
+	if got := f.provider.Tip(f.baseRepo.Canonical, f.workRef); got != baseCollision {
 		t.Fatalf("same-named base ref changed: %s -> %s", baseCollision, got)
 	}
-	if got := f.provider.tip(f.workRepo.Canonical, f.workRef); got != f.proposed {
+	if got := f.provider.Tip(f.workRepo.Canonical, f.workRef); got != f.proposed {
 		t.Fatalf("fork head = %s", got)
 	}
 	if err := f.engine.UpdateFixPR(ctx, UpdatePullRequest{Title: "after", Body: "updated"}); err != nil {
@@ -303,16 +192,16 @@ func TestBrokerIntegrationDeniesProtectedAndDefaultWorkRefs(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newIntegrationFixture(t, ModeResolveIssue)
 			if tc.protect {
-				f.provider.protected[f.workRepo.Canonical+":"+f.workRef] = true
+				f.provider.SetProtected(f.workRepo.Canonical, f.workRef, true)
 			}
 			// Make the derived work ref equal the provider's default for the default case.
 			if !tc.protect {
-				f.provider.repos[f.workRepo.Canonical] = forge.Repository{ID: f.workRepo.ID, Canonical: f.workRepo.Canonical, DefaultRef: f.workRef}
+				f.provider.SetRepository(forge.Repository{ID: f.workRepo.ID, Canonical: f.workRepo.Canonical, DefaultRef: f.workRef})
 			}
 			if _, err := f.engine.Publish(context.Background(), PublicationRequest{RunUID: "run-uid", ProposedOID: f.proposed}); err == nil {
 				t.Fatal("publication unexpectedly allowed")
 			}
-			if got := f.provider.tip(f.workRepo.Canonical, f.workRef); got != "" {
+			if got := f.provider.Tip(f.workRepo.Canonical, f.workRef); got != "" {
 				t.Fatalf("denied ref was pushed: %s", got)
 			}
 		})
@@ -324,7 +213,7 @@ func TestBrokerIntegrationDeniesForeignHeadAndNonFastForward(t *testing.T) {
 		f := newIntegrationFixture(t, ModeFixPR)
 		// Move fork and PR together to a commit not admitted or confirmed by this run.
 		foreign := filepath.Join(f.root, "foreign")
-		igGit(t, "", "clone", f.provider.paths[f.workRepo.Canonical], foreign)
+		igGit(t, "", "clone", f.provider.Paths[f.workRepo.Canonical], foreign)
 		igGit(t, foreign, "config", "user.email", "foreign@example.invalid")
 		igGit(t, foreign, "config", "user.name", "foreign")
 		igWrite(t, filepath.Join(foreign, "foreign"), "foreign\n")
@@ -340,7 +229,7 @@ func TestBrokerIntegrationDeniesForeignHeadAndNonFastForward(t *testing.T) {
 		if _, err := f.engine.Publish(context.Background(), PublicationRequest{RunUID: "run-uid", ProposedOID: f.nonFF}); err == nil {
 			t.Fatal("non-fast-forward proposal accepted")
 		}
-		if got := f.provider.tip(f.workRepo.Canonical, f.workRef); got != "" {
+		if got := f.provider.Tip(f.workRepo.Canonical, f.workRef); got != "" {
 			t.Fatalf("non-FF ref was pushed: %s", got)
 		}
 	})
@@ -351,7 +240,7 @@ func TestBrokerIntegrationDeniesConcurrentDuplicatePR(t *testing.T) {
 	if _, err := f.engine.Publish(context.Background(), PublicationRequest{RunUID: "run-uid", ProposedOID: f.proposed}); err != nil {
 		t.Fatal(err)
 	}
-	f.provider.racePR = true
+	f.provider.SetRacePullRequest(true)
 	if _, _, err := f.engine.CreatePullRequest(context.Background(), f.proposed, "title", "Closes acme/project#122.", false); err == nil {
 		t.Fatal("concurrent duplicate PR accepted")
 	}
@@ -396,13 +285,13 @@ func TestBrokerIntegrationCriterionEvidenceBoundary(t *testing.T) {
 	if _, err := f.engine.Publish(ctx, PublicationRequest{RunUID: "run-uid", ProposedOID: f.proposed}); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
-	prsBefore := len(f.provider.prs)
+	prsBefore := len(f.provider.PullRequests)
 	_, _, err = f.engine.CreatePullRequest(ctx, f.proposed, "title", "Closes acme/project#122. Ships the packaging fix.", false)
 	var cerr *CriteriaError
 	if !errors.As(err, &cerr) || !errors.Is(err, ErrCriteriaBlockMissing) {
 		t.Fatalf("missing-block body: want the missing-block refusal, got %v", err)
 	}
-	if len(f.provider.prs) != prsBefore {
+	if len(f.provider.PullRequests) != prsBefore {
 		t.Fatal("the forge recorded a pull request despite the criterion-evidence refusal")
 	}
 	body := "Closes acme/project#122. Ships the packaging fix.\n\n" + honestBlockFor(set)
@@ -422,7 +311,7 @@ func TestBrokerIntegrationCriterionEvidenceBoundary(t *testing.T) {
 	if _, _, err = f.engine.CreatePullRequest(ctx, f.proposed, "issue 122", overstated, false); !errors.As(err, &cerr) || cerr.CoverageClaim != CoverageFull || cerr.CoverageDerived != CoveragePartial {
 		t.Fatalf("overstated body: want the coverage-lie refusal, got %v", err)
 	}
-	if len(f.provider.prs) != prsBefore+1 {
-		t.Fatalf("the overstated body changed forge state: %d pull requests", len(f.provider.prs))
+	if len(f.provider.PullRequests) != prsBefore+1 {
+		t.Fatalf("the overstated body changed forge state: %d pull requests", len(f.provider.PullRequests))
 	}
 }
