@@ -25,6 +25,7 @@ const (
 	brokerPathSnapshot       = "/v1/git/snapshot"
 	brokerPathImport         = "/v1/bundles/import"
 	brokerPathPublish        = "/v1/publication"
+	brokerPathPullRequest    = "/v1/pull-requests"
 	brokerPathStatus         = "/trusted/v1/status"
 	brokerPathControlRequest = "/trusted/v1/control-request"
 )
@@ -37,6 +38,7 @@ const (
 	headerSnapshotAtAnchor = "X-Courier-Snapshot-At-Anchor"
 	headerProposedOID      = "X-Courier-Proposed-OID"
 	headerExpectedTip      = "X-Courier-Expected-Tip"
+	headerCriteriaCoverage = "X-Courier-Criteria-Coverage"
 )
 
 // BrokerCallError classifies one broker call failure. Transport-class and
@@ -332,6 +334,62 @@ func (b *BrokerClient) Publish(ctx context.Context, expectedWorkOID, proposedOID
 	if result.OID != proposedOID {
 		return Publication{}, &BrokerCallError{Category: "publication response does not match the proposal"}
 	}
+	return result, nil
+}
+
+// PullRequest is the broker's confirmed pull-request record. The create
+// route re-reads the created pull request from the forge before answering,
+// so these fields are the broker's observed identity, not an echo of the
+// request. Coverage carries the criterion coverage claimed in the body's
+// evidence block, which the broker answered only after verifying it agrees
+// with the coverage it derived from the pinned set; it is empty when the
+// policy pins none.
+type PullRequest struct {
+	Number   int
+	State    string
+	HeadRepo string
+	HeadRef  string
+	HeadOID  string
+	Coverage string
+}
+
+// CreatePullRequest asks the broker to open the run's pull request at the
+// proposed OID. The route is the only way the control side opens a pull
+// request: it enforces the linkage and criterion body contracts and the
+// pinned-head duplicate guard before any forge write, refuses a head other
+// than the exact live work tip, and confirms the result by re-read; its
+// response, never the transport outcome, decides. A create that succeeded
+// but whose response never arrived is recovered by the duplicate guard: the
+// retry adopts the discovered pull request when its body satisfies the same
+// contracts instead of creating a second one.
+func (b *BrokerClient) CreatePullRequest(ctx context.Context, oid, title, body string, draft bool) (PullRequest, error) {
+	payload, err := json.Marshal(struct {
+		OID   string `json:"oid"`
+		Title string `json:"title"`
+		Body  string `json:"body"`
+		Draft bool   `json:"draft"`
+	}{OID: oid, Title: title, Body: body, Draft: draft})
+	if err != nil {
+		return PullRequest{}, &BrokerCallError{Category: "request is malformed"}
+	}
+	resp, err := b.do(ctx, http.MethodPost, brokerPathPullRequest, map[string]string{"Content-Type": "application/json"}, payload)
+	if err != nil {
+		return PullRequest{}, err
+	}
+	defer resp.Body.Close()
+	var result PullRequest
+	// The re-read record carries the pull request's title and body back in
+	// the response — on the adoption path those are the discovered pull
+	// request's, not this call's — so the decode bound is a defensive
+	// bound on the response, not a restatement of the request bound. A
+	// record beyond it decodes as malformed and fails closed.
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&result); err != nil {
+		return PullRequest{}, &BrokerCallError{Category: "pull request response is malformed", Retryable: true}
+	}
+	if result.Number <= 0 || result.HeadOID != oid {
+		return PullRequest{}, &BrokerCallError{Category: "pull request response does not match the proposal"}
+	}
+	result.Coverage = resp.Header.Get(headerCriteriaCoverage)
 	return result, nil
 }
 
