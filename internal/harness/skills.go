@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/misospace/courier/internal/skills"
 )
@@ -87,7 +86,7 @@ func NewSkillSet(loaded skills.LoadedSkills) (*SkillSet, error) {
 			// document fragments (a mismatched frontmatter name, for
 			// instance); bounding each line keeps untrusted content from
 			// growing the pinned section.
-			b.WriteString("\n- " + rejected.Name + ": " + truncateRunes(rejected.Reason, 200))
+			b.WriteString("\n- " + rejected.Name + ": " + skills.TruncateRunes(rejected.Reason, 200))
 		}
 	}
 	index := b.String()
@@ -220,18 +219,6 @@ func renderAssetListing(skill Skill) string {
 		b.WriteString(noticeSkillAssetsTruncated)
 	}
 	return b.String()
-}
-
-// truncateRunes bounds s to limit bytes without splitting a multi-byte
-// rune; a local copy so this file stays free of the loader's internals.
-func truncateRunes(s string, limit int) string {
-	if len(s) <= limit {
-		return s
-	}
-	for limit > 0 && !utf8.ValidString(s[:limit]) {
-		limit--
-	}
-	return s[:limit]
 }
 
 // visibleNames renders the visible skill names for an error message.

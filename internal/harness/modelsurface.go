@@ -29,8 +29,10 @@ import (
 // contents (including repository-local skill instruction bodies and their
 // workspace-derived descriptions — the pinned bundle pairs are the trusted
 // skill identity), the source-owned goal text, and any text already covered
-// by an existing trusted digest or pin (criterion texts ride their pinned set
-// digest; skill bodies ride the bundle digests).
+// by an existing trusted digest or pin (skill bodies ride the bundle
+// digests; criterion texts ride the pinned set digest, and the criterion
+// envelope reaches the digest only as the pinned section identity Run
+// actually pins, #844).
 //
 // What the digest proves and what it does not is documented in HARNESS.md §5.
 
@@ -144,6 +146,11 @@ type ModelSurfaceInputs struct {
 	// acceptance-criterion envelope (COURIER_CRITERIA), in the broker
 	// criterion-set shape. Empty when no set was pinned.
 	CriteriaJSON string
+	// Mode is the run's mode. It selects the mode-specific changes clause
+	// of the coordinator's framing and outcome-clarification grammar
+	// (#845 review), so the digest records the exact text this run's
+	// session pins: a mode change is a prompt change and moves it.
+	Mode courierv1alpha1.Mode
 }
 
 // ModelSurface is the computed provenance: the digest record that persists on
@@ -214,10 +221,17 @@ func assembleModelSurface(bindings Bindings, coordinatorTools, subagentTools []T
 	// trusted skill identity. The task turn's placement is the TaskTurn
 	// field, not a section.
 	sections := []modelSurfaceSection{
-		{Name: "coordinator.framing", Role: "system", Digest: textDigest(harnessFraming)},
+		{Name: "coordinator.framing", Role: "system", Digest: textDigest(harnessFraming(inputs.Mode))},
 		{Name: "subagent.framing", Role: "system", Digest: textDigest(subagentFraming)},
 		{Name: "control.turn", Role: "system", Digest: textDigest(controlTurnText)},
-		{Name: "outcome.clarification", Role: "user", Digest: textDigest(outcomeClarification)},
+		{Name: "outcome.clarification", Role: "user", Digest: textDigest(outcomeClarification(inputs.Mode))},
+	}
+	// The pinned acceptance-criteria envelope pins as coordinator system
+	// framing when the run pins a criterion set (#844): Run pins the exact
+	// section this helper renders, so the digest hashes the identical text
+	// and never a second description of it.
+	if section := criteriaEnvelopeSection(inputs.CriteriaJSON); section != "" {
+		sections = append(sections, modelSurfaceSection{Name: "criteria.envelope", Role: "system", Digest: textDigest(section)})
 	}
 	// The lane's framing pins verbatim when it exists: Run pins the raw
 	// text the invocation carries, so the digest hashes the exact bytes and

@@ -302,7 +302,8 @@ func (p *Provider) ListReviews(ctx context.Context, ref forge.PullRequestRef) ([
 // serves the conversation — including the reviewer's sticky comment — from
 // the issue-comments endpoint; the pull-request review-comments endpoint
 // serves inline diff comments and is never read. The comment ID crosses the
-// boundary as the decimal GitHub ID and the URL as the HTML URL.
+// boundary as the decimal GitHub ID, the URL as the HTML URL, and the
+// created/updated times as GitHub's own RFC3339 strings.
 func (p *Provider) ListComments(ctx context.Context, ref forge.PullRequestRef) ([]forge.Comment, error) {
 	owner, repo, err := splitRepository(ref.Repo)
 	if err != nil {
@@ -315,10 +316,12 @@ func (p *Provider) ListComments(ctx context.Context, ref forge.PullRequestRef) (
 	out := make([]forge.Comment, 0, len(comments))
 	for _, comment := range comments {
 		out = append(out, forge.Comment{
-			ID:     strconv.FormatInt(comment.ID, 10),
-			Author: comment.User.Login,
-			Body:   comment.Body,
-			URL:    comment.HTMLURL,
+			ID:        strconv.FormatInt(comment.ID, 10),
+			Author:    comment.User.Login,
+			Body:      comment.Body,
+			URL:       comment.HTMLURL,
+			CreatedAt: comment.CreatedAt,
+			UpdatedAt: comment.UpdatedAt,
 		})
 	}
 	return out, nil

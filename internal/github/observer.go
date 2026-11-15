@@ -233,8 +233,11 @@ func (o Observer) ReadPullRequest(ctx context.Context, ref forge.PullRequestRef)
 // remediation handoff ("review-handoff/v1", #755) through the forge
 // capability of the registration serving the base repository: the conversation
 // comments and the native review bodies are listed through the provider, and
-// the first body carrying a validated block recorded for headSHA under the
-// forge-reported reviewerLogin author wins. A body carrying the managed
+// the validated body the forge published most recently for headSHA under the
+// forge-reported reviewerLogin author wins. Publication freshness is the
+// forge-reported container time — a comment's last edit (its republish) or
+// creation, a native review's submission — never container order and never
+// the payload's opaque review_id (#846). A body carrying the managed
 // marker from another author is never parsed — the marker alone is forgeable,
 // so the forge-reported author is the trust anchor. A trusted author's body
 // that fails validation is returned as an error, so a broken handoff surfaces
@@ -259,10 +262,14 @@ func (o Observer) ReviewHandoff(ctx context.Context, repo string, number int, re
 	}
 	bodies := make([]reviewhandoff.Body, 0, len(comments)+len(reviews))
 	for _, comment := range comments {
-		bodies = append(bodies, reviewhandoff.Body{Author: comment.Author, Content: comment.Body})
+		published := comment.CreatedAt
+		if comment.UpdatedAt != "" {
+			published = comment.UpdatedAt
+		}
+		bodies = append(bodies, reviewhandoff.Body{Author: comment.Author, Content: comment.Body, PublishedAt: published})
 	}
 	for _, review := range reviews {
-		bodies = append(bodies, reviewhandoff.Body{Author: review.Author, Content: review.Body})
+		bodies = append(bodies, reviewhandoff.Body{Author: review.Author, Content: review.Body, PublishedAt: review.SubmittedAt})
 	}
 	_, raw, found, err := reviewhandoff.Find(bodies, reviewerLogin, headSHA)
 	if err != nil {

@@ -409,6 +409,7 @@ func prepareModelWork(deps modelWorkDeps) (*modelWork, *gateFailure, error) {
 		ContextPolicy:    deps.invocation.Context,
 		SkillsJSON:       deps.invocation.Skills,
 		CriteriaJSON:     deps.invocation.Criteria,
+		Mode:             deps.invocation.Mode,
 	})
 	if err != nil {
 		emitModelTelemetry(deps.emitter, deps.invocation, deps.tally.Summary(), "")
