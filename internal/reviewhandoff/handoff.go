@@ -163,8 +163,9 @@ func Parse(content string) (*Handoff, string, error) {
 // or absent freshness keeps the earlier-seen body, so selection is
 // deterministic for a given input. A trusted author's body that fails
 // Parse is a real defect in a body the action owns, so it is returned as
-// an error rather than silently skipped; a trusted body whose head_sha
-// differs is only a stale review of another head and is skipped.
+// an error rather than silently skipped, whatever its position relative
+// to other candidates; a trusted body whose head_sha differs is only a
+// stale review of another head and is skipped.
 func Find(bodies []Body, reviewerLogin, expectedHeadSHA string) (*Handoff, string, bool, error) {
 	var (
 		best     *Handoff

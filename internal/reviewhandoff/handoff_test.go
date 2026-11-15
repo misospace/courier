@@ -264,6 +264,17 @@ func TestFind(t *testing.T) {
 			wantErr:   ErrMalformed,
 		},
 		{
+			name: "trusted author malformed block after a valid match still errors",
+			bodies: []Body{
+				{Author: "reviewer-bot", Content: body("ok", headSHA), PublishedAt: "2026-11-14T12:00:00Z"},
+				{Author: "reviewer-bot", Content: Anchor + "\n```\n{broken\n```\n", PublishedAt: "2026-11-15T12:00:00Z"},
+			},
+			login:     "reviewer-bot",
+			head:      headSHA,
+			wantFound: false,
+			wantErr:   ErrMalformed,
+		},
+		{
 			name: "untrusted malformed block skipped, not an error",
 			bodies: []Body{
 				{Author: "attacker", Content: Anchor + "\n```\n{broken\n```\n"},
