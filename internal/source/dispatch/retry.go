@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/misospace/courier/internal/connector"
 	"github.com/misospace/courier/internal/source"
@@ -289,14 +288,7 @@ func (c *HTTPClient) requeueIssueAttempt(ctx context.Context, id string, d workD
 // empty note is forwarded empty: the note is audit context, never required.
 func retryNote(reason string) string {
 	reason = strings.TrimSpace(reason)
-	if len(reason) <= maxRetryNoteLength {
-		return reason
-	}
-	cut := maxRetryNoteLength
-	for cut > 0 && !utf8.RuneStart(reason[cut]) {
-		cut--
-	}
-	return reason[:cut]
+	return boundString(reason, maxRetryNoteLength)
 }
 
 // classifyRetryExchange classifies one failed requeue exchange whose coded

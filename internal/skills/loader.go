@@ -377,7 +377,7 @@ func renderSkillDocument(name string, data []byte) (description, instructions st
 			case "name":
 				frontName = value
 			case "description":
-				description = truncateRunes(value, maxSkillDescriptionBytes)
+				description = TruncateRunes(value, maxSkillDescriptionBytes)
 			}
 		}
 	}
@@ -394,8 +394,8 @@ func renderSkillDocument(name string, data []byte) (description, instructions st
 	return description, instructions, nil
 }
 
-// truncateRunes bounds s to limit bytes without splitting a multi-byte rune.
-func truncateRunes(s string, limit int) string {
+// TruncateRunes bounds s to limit bytes without splitting a multi-byte rune.
+func TruncateRunes(s string, limit int) string {
 	if len(s) <= limit {
 		return s
 	}
