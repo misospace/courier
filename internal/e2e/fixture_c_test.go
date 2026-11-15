@@ -87,7 +87,7 @@ type fixtureC struct {
 // create route adopts the discovered pull request instead of opening a
 // second one.
 func restartResponses() []modelResponse {
-	changes := fmt.Sprintf(`{"outcome":"changes","prTitle":"Add the widget","prBody":"Closes %s/%s#%d."}`, fixtureOwner, fixtureRepo, fixtureIssue)
+	changes := fixtureChangesDeclaration()
 	return []modelResponse{
 		{sse: sse(contentChunk("probe"), finishChunk("stop"))},
 		{sse: sse(toolCallChunk(0, "call-shell", "shell", `{"command":"echo courier"}`), finishChunk("tool_calls"))},
@@ -157,6 +157,12 @@ func (f *fixtureC) runFirstIncarnation(t *testing.T, ctx context.Context) {
 	result := coordinator.Run(ctx, f.invocation(t))
 	if result.Kind != courierv1alpha1.NativeResultPublished {
 		t.Fatalf("harness result = %+v, want a published ending", result)
+	}
+	// The first incarnation recorded the pull-request identity through its
+	// own trusted status path (#844): the settle observer is not wired yet,
+	// so the run's recorded PR can only be the harness's write.
+	if got := f.fetch(t).Status.PR; got != fmt.Sprint(f.firstPublisher.opened.Number) {
+		t.Fatalf("run PR = %q after the first incarnation, want the opened pull request %d recorded through the trusted status path", got, f.firstPublisher.opened.Number)
 	}
 }
 

@@ -217,6 +217,12 @@ func (p *fixturePublisher) Publish(ctx context.Context) (harness.Publication, er
 func (p *fixturePublisher) OpenPullRequest(ctx context.Context, title, body string, draft bool) (harness.PullRequest, error) {
 	pr, report, err := p.engine.CreatePullRequest(ctx, p.proposal, title, body, draft)
 	if err != nil {
+		// The engine's own refusal vocabulary reaches the coordinator as a
+		// publication block, the way the broker's refusal of the HTTP create
+		// route classifies (#844), not as an infrastructure failure.
+		if strings.HasPrefix(err.Error(), "publication denied") {
+			return harness.PullRequest{}, &harness.PublicationBlockedError{Reason: err.Error(), Err: err}
+		}
 		return harness.PullRequest{}, err
 	}
 	p.opened = pr
@@ -293,8 +299,15 @@ func scriptedResponses() []modelResponse {
 	return []modelResponse{
 		{sse: sse(contentChunk("probe"), finishChunk("stop"))},
 		{sse: sse(toolCallChunk(0, "call-shell", "shell", `{"command":"echo courier"}`), finishChunk("tool_calls"))},
-		{sse: sse(contentChunk(fmt.Sprintf(`{"outcome":"changes","prTitle":"Add the widget","prBody":"Closes %s/%s#%d."}`, fixtureOwner, fixtureRepo, fixtureIssue)), finishChunk("stop"))},
+		{sse: sse(contentChunk(fixtureChangesDeclaration()), finishChunk("stop"))},
 	}
+}
+
+// fixtureChangesDeclaration is the changes outcome declaration the scripted
+// coordinator emits on a run that opens its pull request: the title and body
+// the broker's create route validates against the pinned linkage.
+func fixtureChangesDeclaration() string {
+	return fmt.Sprintf(`{"outcome":"changes","prTitle":"Add the widget","prBody":"Closes %s/%s#%d."}`, fixtureOwner, fixtureRepo, fixtureIssue)
 }
 
 // newFixtureWorld builds the parts every fixture shares: the local git
@@ -587,6 +600,14 @@ func (f *fixtureA) runControl(t *testing.T, ctx context.Context) {
 		t.Fatalf("harness result = %+v, want a published ending", f.result)
 	}
 	f.pullRequest = f.publisher.opened
+
+	// The finish recorded the pull-request identity through the trusted
+	// status path (#844) before the published claim stands: the settle
+	// observer that also names the pull request is not wired yet, so this
+	// record can only be the harness's own write.
+	if got := f.fetch(t).Status.PR; got != fmt.Sprint(f.pullRequest.Number) {
+		t.Fatalf("run PR = %q right after the finish, want the opened pull request %d already recorded through the trusted status path", got, f.pullRequest.Number)
+	}
 
 	// The durable status the run's ending rests on: the checkpoint and the
 	// broker-confirmed commit, written through the authenticated path.
