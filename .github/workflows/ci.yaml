@@ -159,9 +159,6 @@ jobs:
       - name: Replay the native control path
         run: go test -race ./internal/e2e/... -count=1 -timeout 20m
 
-  # Keep the required branch-protection context stable while the expensive
-  # race suite fans out onto independent runners. A failed or cancelled matrix
-  # child makes the matrix job non-success, and therefore this aggregator fail.
   test:
     runs-on: ubuntu-latest
     needs: [test-shard, e2e]
