@@ -516,6 +516,28 @@ rewrite is the idempotent retry that resolves a lost acknowledgment, a
 conflicting rewrite is refused, and a replacement incarnation after a
 relaunch records its own over the stale one.
 
+A `published` result on a run whose mode opens its pull request (resolve-issue,
+contribute) is a stronger claim than the branch push alone. Those modes' outcome
+grammar requires the `changes` declaration to carry a model-authored pull-request
+title and body — the coordinator's framing teaches exactly the grammar the parser
+accepts for the run's mode, and the model-surface digest records that
+mode-specific text — and the trusted finish step publishes the branch, creates
+the pull request through the broker's create route (pinned-head duplicate guard,
+linkage and criterion-evidence body contracts), and records the created number as
+`status.pr` through the same fenced status path before claiming published. A
+create refused by the body contracts ends `blocked_external`; a create whose
+identity never lands durably ends `infrastructure_failed`, so relaunch adopts the
+same pull request instead of opening a second one. `status.pr` carries one
+identity per run from the harness side: the broker's fence treats the identical
+rewrite as the idempotent re-record and refuses a different number, comparing
+numerically when the recorded value parses as a number. The operator's own
+observations (`observeVerifying`, `cipark`, terminal PR enrichment) keep writing
+the pull request they discover on the run's branch into the same field — that is
+the intended split: the harness fence is scoped to the run, not the incarnation,
+so it bounds what the harness may claim as this run's pull request across any
+relaunch, while the world stays authoritative about which pull request the
+branch carries.
+
 The durable reason is code-owned per kind (`NativeResultReason`), never
 model-authored prose: the coordinator's declared evidence, question, or
 missing-dependency text keeps its established surfaces — the

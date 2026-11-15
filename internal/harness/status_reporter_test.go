@@ -365,7 +365,7 @@ func TestCompletedBriefCheckpointRecordsConfirmedOID(t *testing.T) {
 			finishChunk("tool_calls"),
 		)},
 		gatewayResponse{body: sse(contentChunk("work done"), finishChunk("stop"))},
-		gatewayResponse{body: sse(contentChunk(`{"outcome":"changes"}`), finishChunk("stop"))},
+		gatewayResponse{body: sse(contentChunk(`{"outcome":"changes","prTitle":"Resolve issue #7","prBody":"Closes #7. Ships the fix."}`), finishChunk("stop"))},
 	)
 	defer cleanup()
 	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
@@ -720,7 +720,7 @@ func delegateChangesScript() []gatewayResponse {
 			finishChunk("tool_calls"),
 		)},
 		{body: sse(contentChunk("work done"), finishChunk("stop"))},
-		{body: sse(contentChunk(`{"outcome":"changes"}`), finishChunk("stop"))},
+		{body: sse(contentChunk(`{"outcome":"changes","prTitle":"Resolve issue #7","prBody":"Closes #7. Ships the fix."}`), finishChunk("stop"))},
 	}
 }
 
@@ -779,6 +779,7 @@ func TestFinishClassifiesTrustedTerminalResults(t *testing.T) {
 		outcome     executor.DeclaredOutcome
 		summary     string
 		publishErr  error
+		pr          *declaredPullRequest
 		wantKind    courierv1alpha1.NativeResultKind
 		wantOutcome executor.DeclaredOutcome
 	}{
@@ -786,6 +787,7 @@ func TestFinishClassifiesTrustedTerminalResults(t *testing.T) {
 			name:        "confirmed publication is a published ending",
 			outcome:     executor.OutcomeChanges,
 			summary:     "declared",
+			pr:          &declaredPullRequest{title: "Resolve issue #7", body: "Closes #7. Ships the fix."},
 			wantKind:    courierv1alpha1.NativeResultPublished,
 			wantOutcome: executor.OutcomeChanges,
 		},
@@ -794,6 +796,7 @@ func TestFinishClassifiesTrustedTerminalResults(t *testing.T) {
 			outcome:     executor.OutcomeChanges,
 			summary:     "declared",
 			publishErr:  &PublicationBlockedError{Reason: "foreign tip"},
+			pr:          &declaredPullRequest{title: "Resolve issue #7", body: "Closes #7. Ships the fix."},
 			wantKind:    courierv1alpha1.NativeResultBlockedExternal,
 			wantOutcome: executor.OutcomeBlockedExternal,
 		},
@@ -802,6 +805,7 @@ func TestFinishClassifiesTrustedTerminalResults(t *testing.T) {
 			outcome:     executor.OutcomeChanges,
 			summary:     "declared",
 			publishErr:  errors.New("broker unreachable"),
+			pr:          &declaredPullRequest{title: "Resolve issue #7", body: "Closes #7. Ships the fix."},
 			wantKind:    courierv1alpha1.NativeResultInfrastructureFailed,
 			wantOutcome: executor.OutcomeChanges,
 		},
@@ -810,6 +814,7 @@ func TestFinishClassifiesTrustedTerminalResults(t *testing.T) {
 			outcome:     executor.OutcomeChanges,
 			summary:     "declared",
 			publishErr:  ErrNothingToPublish,
+			pr:          &declaredPullRequest{title: "Resolve issue #7", body: "Closes #7. Ships the fix."},
 			wantKind:    courierv1alpha1.NativeResultWorkloadFailed,
 			wantOutcome: "",
 		},
@@ -850,7 +855,7 @@ func TestFinishClassifiesTrustedTerminalResults(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			result := coordinator.finish(context.Background(), invocation, tt.outcome, tt.summary, nil)
+			result := coordinator.finish(context.Background(), invocation, tt.outcome, tt.summary, nil, tt.pr)
 			if result.Kind != tt.wantKind {
 				t.Fatalf("kind = %q, want %q (result %+v)", result.Kind, tt.wantKind, result)
 			}

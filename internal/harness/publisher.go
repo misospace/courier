@@ -50,6 +50,17 @@ type Publisher interface {
 	Publish(ctx context.Context) (Publication, error)
 }
 
+// PullRequestOpener is the publication engine's optional pull-request seam
+// (#844): it opens the run's pull request at the broker-confirmed head and
+// returns the broker's re-read identity. The Publisher interface stays the
+// two-method snapshot/publication contract every fixture implements; the
+// finish flow discovers this seam from the engine it already holds, so an
+// absent seam on a run that opens a pull request is a named wiring failure,
+// never a silent skip.
+type PullRequestOpener interface {
+	OpenPullRequest(ctx context.Context, title, body string, draft bool) (PullRequest, error)
+}
+
 // PublicationEngine is the trusted control-side implementation of the
 // snapshot and publication seams: it seeds and renders snapshots from its
 // private integration tree, validates and integrates returned artifacts,

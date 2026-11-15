@@ -248,7 +248,12 @@ func TestSoftStopLatchBlocksNewBriefsOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := coordinator.Run(context.Background(), testInvocation())
+	// A fix-pr run already acts on an existing pull request, so its
+	// world-derived changes ending still publishes (#844 gates only runs
+	// that would have to open one).
+	inv := testInvocation()
+	inv.Mode = courierv1alpha1.ModeFixPR
+	result := coordinator.Run(context.Background(), inv)
 	if result.Outcome != "changes" {
 		t.Fatalf("outcome = %v, want changes from the world-derived finish: %+v", result.Outcome, result)
 	}
@@ -312,7 +317,7 @@ func TestCoordinatorWithoutControlHasNoSoftStopPath(t *testing.T) {
 }
 
 func TestSoftStopFinishDerivesOutcomeFromWorld(t *testing.T) {
-	t.Run("beyond-anchor-publishes-changes", func(t *testing.T) {
+	t.Run("beyond-anchor-opens-mode-parks-without-a-pull-request", func(t *testing.T) {
 		publisher := &stubPublisher{result: Publication{OID: "abc123"}}
 		coordinator, err := NewCoordinator(CoordinatorConfig{
 			Transport: &Gateway{BaseURL: "http://unused.invalid"}, Bindings: testBindings(),
@@ -322,7 +327,27 @@ func TestSoftStopFinishDerivesOutcomeFromWorld(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		result := coordinator.finishSoftStop(context.Background())
+		result := coordinator.finishSoftStop(context.Background(), testInvocation())
+		if result.Err != nil || result.Kind != courierv1alpha1.NativeResultNeedsHuman || result.Outcome != "" {
+			t.Fatalf("result = %+v, want a NeedsHuman park: a resolve-issue soft stop never claims published without its pull request (#844)", result)
+		}
+		if publisher.count() != 1 {
+			t.Fatalf("publishes = %d, want 1: the published branch is kept, only the published claim is withheld", publisher.count())
+		}
+	})
+	t.Run("beyond-anchor-publishes-changes-for-runs-without-a-pull-request-path", func(t *testing.T) {
+		publisher := &stubPublisher{result: Publication{OID: "abc123"}}
+		coordinator, err := NewCoordinator(CoordinatorConfig{
+			Transport: &Gateway{BaseURL: "http://unused.invalid"}, Bindings: testBindings(),
+			Publisher:           publisher,
+			WorkRefBeyondAnchor: func(context.Context) (bool, error) { return true, nil },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		inv := testInvocation()
+		inv.Mode = courierv1alpha1.ModeFixPR
+		result := coordinator.finishSoftStop(context.Background(), inv)
 		if result.Err != nil || result.Outcome != "changes" {
 			t.Fatalf("result = %+v, want changes", result)
 		}
@@ -340,7 +365,7 @@ func TestSoftStopFinishDerivesOutcomeFromWorld(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		result := coordinator.finishSoftStop(context.Background())
+		result := coordinator.finishSoftStop(context.Background(), testInvocation())
 		if result.Err != nil || result.Outcome != "no_change_needed" {
 			t.Fatalf("result = %+v, want no_change_needed", result)
 		}
@@ -358,7 +383,7 @@ func TestSoftStopFinishDerivesOutcomeFromWorld(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		result := coordinator.finishSoftStop(context.Background())
+		result := coordinator.finishSoftStop(context.Background(), testInvocation())
 		if result.Err != nil || result.Outcome != "blocked_external" {
 			t.Fatalf("result = %+v, want blocked_external", result)
 		}
@@ -372,7 +397,7 @@ func TestSoftStopFinishDerivesOutcomeFromWorld(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		result := coordinator.finishSoftStop(context.Background())
+		result := coordinator.finishSoftStop(context.Background(), testInvocation())
 		if result.Err == nil {
 			t.Fatalf("result = %+v, want an infrastructure error", result)
 		}
@@ -388,7 +413,7 @@ func TestSoftStopFinishDerivesOutcomeFromWorld(t *testing.T) {
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		result := coordinator.finishSoftStop(ctx)
+		result := coordinator.finishSoftStop(ctx, testInvocation())
 		if result.Err == nil || result.Outcome != "" {
 			t.Fatalf("result = %+v, want the SIGTERM path to end as an error, never a soft-stop outcome", result)
 		}
@@ -398,9 +423,11 @@ func TestSoftStopFinishDerivesOutcomeFromWorld(t *testing.T) {
 // A soft stop acknowledged at a recovered incarnation's first step boundary
 // arrives before any snapshot, brief, or shell has prepared the publication
 // engine. The finish must still confirm the world's own already-published
-// work and end as changes — never refuse the publish and relaunch. This runs
-// the real engine against the real broker: a stub publisher cannot see the
-// state dependency.
+// work — never refuse the publish and relaunch. For a resolve-issue run the
+// ending parks NeedsHuman because the latch has no declared pull request to
+// open (#844); the publication itself is still re-confirmed exactly once.
+// This runs the real engine against the real broker: a stub publisher cannot
+// see the state dependency.
 func TestSoftStopEarlyFinishConfirmsRecoveredWork(t *testing.T) {
 	ctx := context.Background()
 	f := newBrokerFixture(t)
@@ -438,8 +465,8 @@ func TestSoftStopEarlyFinishConfirmsRecoveredWork(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := coordinator.Run(ctx, testInvocation())
-	if result.Err != nil || result.Outcome != "changes" {
-		t.Fatalf("result = %+v, want changes from the world's confirmed work", result)
+	if result.Err != nil || result.Kind != courierv1alpha1.NativeResultNeedsHuman {
+		t.Fatalf("result = %+v, want the recovered world's work confirmed and the run parked: a resolve-issue soft stop keeps the branch published but never claims published without its pull request (#844)", result)
 	}
 	// The confirmation is idempotent: the remote holds exactly the one
 	// publication, with no duplicate push and no relaunch.
