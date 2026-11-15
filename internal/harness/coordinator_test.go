@@ -311,8 +311,13 @@ func TestHarnessFramingCarriesTheModeGrammar(t *testing.T) {
 			if _, _, pr, err := parseOutcome(prShape, mode); err != nil || pr == nil {
 				t.Fatalf("mode %s: the changes shape the text teaches must parse: pr = %#v, err = %v", mode, pr, err)
 			}
+			// The text claims a bare changes declaration is refused here;
+			// the parser must say the same.
+			if _, _, _, err := parseOutcome(bareShape, mode); err == nil {
+				t.Fatalf("mode %s: the mode text claims a bare changes declaration is refused, but the parser accepted it", mode)
+			}
 		}
-		for _, mode := range []courierv1alpha1.Mode{courierv1alpha1.ModeFixPR, courierv1alpha1.ModeRebase} {
+		for _, mode := range []courierv1alpha1.Mode{courierv1alpha1.ModeFixPR, courierv1alpha1.ModeRebase, courierv1alpha1.Mode("")} {
 			doc := text(mode)
 			if !strings.Contains(doc, bareShape) {
 				t.Fatalf("mode %s: the mode text never teaches the bare changes shape", mode)

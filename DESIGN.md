@@ -528,9 +528,10 @@ rewrite as the idempotent re-record and refuses a different number, comparing
 numerically when the recorded value parses as a number. The operator's own
 observations (`observeVerifying`, `cipark`, terminal PR enrichment) keep writing
 the pull request they discover on the run's branch into the same field — that is
-the intended split: the harness fence bounds what one coordinator incarnation can
-claim, while the world stays authoritative about which pull request the branch
-carries.
+the intended split: the harness fence is scoped to the run, not the incarnation,
+so it bounds what the harness may claim as this run's pull request across any
+relaunch, while the world stays authoritative about which pull request the
+branch carries.
 
 The durable reason is code-owned per kind (`NativeResultReason`), never
 model-authored prose: the coordinator's declared evidence, question, or
