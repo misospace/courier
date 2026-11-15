@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"time"
 )
 
 const (
@@ -93,10 +94,17 @@ type Handoff struct {
 	DerivedObligationState      *string      `json:"derived_obligation_state,omitempty"`
 }
 
-// Body is one pull-request comment or native review body with its author.
+// Body is one pull-request comment or native review body with its author and
+// the forge-reported publication time of the container that carries it.
+// PublishedAt is RFC3339 text as the forge reports it: a native review's
+// submitted_at, or the comment's last-edit time when the forge reports one
+// and its creation time otherwise (a managed sticky comment is edited in
+// place, so its edit is the handoff's republish). An empty or unparseable
+// PublishedAt is a body that makes no freshness claim.
 type Body struct {
-	Author  string
-	Content string
+	Author      string
+	Content     string
+	PublishedAt string
 }
 
 // Parse extracts the FIRST anchored fenced block from content (later anchors
@@ -142,13 +150,29 @@ func Parse(content string) (*Handoff, string, error) {
 	return &h, payload, nil
 }
 
-// Find returns the first body authored by reviewerLogin (case-insensitive)
-// whose payload was produced for expectedHeadSHA (case-insensitive). Bodies
-// without the anchor or from other authors are skipped. A trusted author's
-// body that fails Parse is a real defect in a body the action owns, so it is
-// returned as an error rather than silently skipped; a trusted body whose
-// head_sha differs is only a stale review of another head and is skipped.
+// Find returns the most recently published body authored by reviewerLogin
+// (case-insensitive) whose payload was produced for expectedHeadSHA
+// (case-insensitive). Bodies without the anchor or from other authors are
+// skipped. Among same-head bodies from the configured reviewer the newest
+// forge-reported publication wins: a later PublishedAt beats an earlier
+// one, a parseable PublishedAt beats an empty or unparseable one, and the
+// order the containers arrived in carries no precedence — an older comment
+// never outranks a newer native review and an older review never outranks
+// a newer one. Freshness comes only from the forge-reported publication
+// time; the payload's opaque review_id is never a freshness signal. Equal
+// or absent freshness keeps the earlier-seen body, so selection is
+// deterministic for a given input. A trusted author's body that fails
+// Parse is a real defect in a body the action owns, so it is returned as
+// an error rather than silently skipped; a trusted body whose head_sha
+// differs is only a stale review of another head and is skipped.
 func Find(bodies []Body, reviewerLogin, expectedHeadSHA string) (*Handoff, string, bool, error) {
+	var (
+		best     *Handoff
+		bestRaw  string
+		found    bool
+		bestAt   time.Time
+		bestWarm bool
+	)
 	for _, b := range bodies {
 		if !strings.Contains(b.Content, Anchor) {
 			continue
@@ -163,9 +187,28 @@ func Find(bodies []Body, reviewerLogin, expectedHeadSHA string) (*Handoff, strin
 		if !strings.EqualFold(h.HeadSHA, expectedHeadSHA) {
 			continue
 		}
-		return h, raw, true, nil
+		at, warm := parsePublishedAt(b.PublishedAt)
+		if !found || (warm && (!bestWarm || at.After(bestAt))) {
+			best, bestRaw = h, raw
+			bestAt, bestWarm = at, warm
+			found = true
+		}
 	}
-	return nil, "", false, nil
+	return best, bestRaw, found, nil
+}
+
+// parsePublishedAt interprets a forge-reported publication timestamp. The
+// forge contract is RFC3339 (Go's parser accepts the sub-second form too).
+// An empty or unparseable value reports ok=false: no freshness claim.
+func parsePublishedAt(value string) (time.Time, bool) {
+	if value == "" {
+		return time.Time{}, false
+	}
+	at, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return at, true
 }
 
 // extractPayload returns the single raw JSON line from the fenced block that

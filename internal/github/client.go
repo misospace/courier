@@ -269,10 +269,12 @@ type CommentRequest struct {
 // inline review comments (the pull-request review-comments listing) are a
 // different body and are never read by this client.
 type IssueComment struct {
-	ID      int64  `json:"id"`
-	Body    string `json:"body"`
-	HTMLURL string `json:"html_url"`
-	User    struct {
+	ID        int64  `json:"id"`
+	Body      string `json:"body"`
+	HTMLURL   string `json:"html_url"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+	User      struct {
 		Login string `json:"login"`
 	} `json:"user"`
 }

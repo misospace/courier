@@ -233,6 +233,11 @@ type Comment struct {
 	Author string
 	Body   string
 	URL    string
+	// CreatedAt and UpdatedAt are the forge-reported RFC3339 publication and
+	// last-edit times, when the forge provides them. A body edited in place
+	// was republished at UpdatedAt.
+	CreatedAt string
+	UpdatedAt string
 }
 
 // Check is a provider-neutral CI/check result attached to a commit.
