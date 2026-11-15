@@ -157,7 +157,9 @@ func NewLocalGit(cfg LocalGitConfig) *LocalGit {
 		workItems[name] = item
 	}
 	pulls := make([]forge.PullRequest, len(cfg.PullRequests))
-	copy(pulls, cfg.PullRequests)
+	for i, pr := range cfg.PullRequests {
+		pulls[i] = copyPullRequest(pr)
+	}
 	next := cfg.NextPullRequest
 	if next == 0 {
 		next = 10
@@ -427,12 +429,16 @@ func (g *LocalGit) Path(identity string) string {
 	return g.paths[identity]
 }
 
-// PullRequests returns a copy of the known pull-request set.
+// PullRequests returns a copy of the known pull-request set. The copy shares
+// nothing with the double's own state, so a caller cannot reach the double
+// through the returned records.
 func (g *LocalGit) PullRequests() []forge.PullRequest {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	out := make([]forge.PullRequest, len(g.pullRequests))
-	copy(out, g.pullRequests)
+	for i, pr := range g.pullRequests {
+		out[i] = copyPullRequest(pr)
+	}
 	return out
 }
 
@@ -458,7 +464,9 @@ func (g *LocalGit) SetPullRequests(pulls []forge.PullRequest) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.pullRequests = make([]forge.PullRequest, len(pulls))
-	copy(g.pullRequests, pulls)
+	for i, pr := range pulls {
+		g.pullRequests[i] = copyPullRequest(pr)
+	}
 }
 
 // SetRacePullRequest arms the concurrent-create behavior: the next create
