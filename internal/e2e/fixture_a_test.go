@@ -217,7 +217,7 @@ func (p *fixturePublisher) Publish(ctx context.Context) (harness.Publication, er
 func (p *fixturePublisher) OpenPullRequest(ctx context.Context, title, body string, draft bool) (harness.PullRequest, error) {
 	pr, report, err := p.engine.CreatePullRequest(ctx, p.proposal, title, body, draft)
 	if err != nil {
-		return harness.PullRequest{}, classifyCreateRefusal(err)
+		return harness.PullRequest{}, classifyCreateRefusal(ctx, err)
 	}
 	p.opened = pr
 	opened := harness.PullRequest{
@@ -237,18 +237,24 @@ func (p *fixturePublisher) OpenPullRequest(ctx context.Context, title, body stri
 // into the coordinator's taxonomy, the way the broker's own HTTP route
 // classifies it (internal/broker/server.go): the route answers every error
 // the engine returns with HTTP 422, and the harness reads a non-retryable 4xx
-// as a definite denial — a blocked world, never an infrastructure failure.
+// as a definite denial — a blocked world, never an infrastructure failure. A
+// forge outage inside the engine is a denial here for the same reason it is
+// one in production: the route collapses every engine error into that one
+// status.
 //
 // The fixture classifies the engine's answer instead of matching its error
 // text, so a reworded refusal still reads as a refusal instead of silently
-// becoming a transport failure. Only the transport class stays an
-// infrastructure failure: a cancelled or expired call never reached an
-// answer, exactly as it never reaches one on the wire.
-func classifyCreateRefusal(err error) error {
+// becoming a transport failure.
+//
+// Only the transport class stays an infrastructure failure: a call whose
+// context is done never received an answer, exactly as it never receives one
+// on the wire, and a context error the engine passed through is that same
+// class.
+func classifyCreateRefusal(ctx context.Context, err error) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}
 	return &harness.PublicationBlockedError{Reason: err.Error(), Err: err}
@@ -256,15 +262,16 @@ func classifyCreateRefusal(err error) error {
 
 // TestCreateRefusalClassification pins the classification the coordinator
 // sees when the create route refuses: a refusal the engine states is a
-// blocked world, whatever the engine words it with, and only the transport
-// class is an infrastructure failure.
+// blocked world, whatever the engine words it with, and only a call that
+// never received an answer is an infrastructure failure.
 func TestCreateRefusalClassification(t *testing.T) {
+	live := context.Background()
 	for _, refusal := range []error{
 		errors.New("publication denied: the proposed commit is not the exact live head"),
 		errors.New("publication denied: multiple pull requests claim the pinned head"),
 		errors.New("check existing pull request failed"),
 	} {
-		classified := classifyCreateRefusal(refusal)
+		classified := classifyCreateRefusal(live, refusal)
 		var blocked *harness.PublicationBlockedError
 		if !errors.As(classified, &blocked) {
 			t.Fatalf("classified refusal = %v, want a publication block", classified)
@@ -276,14 +283,27 @@ func TestCreateRefusalClassification(t *testing.T) {
 			t.Fatalf("blocked reason = %q, want the engine's own wording %q", blocked.Reason, refusal.Error())
 		}
 	}
+	// The engine answers a failed call with its own sanitized refusal, so
+	// the transport class is the call's state, not the error's type: an
+	// expired call never received the answer the engine states.
+	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	refusal := errors.New("observe pinned base failed")
+	classified := classifyCreateRefusal(expired, refusal)
+	var blocked *harness.PublicationBlockedError
+	if errors.As(classified, &blocked) {
+		t.Fatalf("classified expired call = %v, want an infrastructure failure", classified)
+	}
+	if classified != refusal {
+		t.Fatalf("classified expired call = %v, want the engine's own answer", classified)
+	}
 	for _, transport := range []error{context.Canceled, context.DeadlineExceeded} {
-		classified := classifyCreateRefusal(transport)
-		var blocked *harness.PublicationBlockedError
+		classified := classifyCreateRefusal(live, transport)
 		if errors.As(classified, &blocked) {
 			t.Fatalf("classified transport failure = %v, want an infrastructure failure", classified)
 		}
 	}
-	if classified := classifyCreateRefusal(nil); classified != nil {
+	if classified := classifyCreateRefusal(live, nil); classified != nil {
 		t.Fatalf("classified absence = %v, want no error", classified)
 	}
 }

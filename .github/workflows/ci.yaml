@@ -122,10 +122,11 @@ jobs:
           printf 'race-test shard %s: %s\n' "$SHARD" "${packages[*]}"
           go test -race "${packages[@]}" -coverprofile "cover-${SHARD}.out"
 
-  # The deterministic native replay: three end-to-end scenarios over the
-  # production packages, replayed against envtest and a local git world. It
-  # runs in its own job so the replay has its own named check and its own
-  # time bound, and so a replay failure names the replay rather than a shard.
+  # The deterministic native replay: the native path's three end-to-end
+  # scenarios plus the non-Dispatch source variant, over the production
+  # packages, replayed against envtest and a local git world. It runs in its
+  # own job so the replay has its own named check and its own time bound, and
+  # so a replay failure names the replay rather than a shard.
   e2e:
     name: test / e2e
     runs-on: ubuntu-latest
