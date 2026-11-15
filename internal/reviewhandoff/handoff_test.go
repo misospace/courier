@@ -264,6 +264,17 @@ func TestFind(t *testing.T) {
 			wantErr:   ErrMalformed,
 		},
 		{
+			name: "trusted author malformed block after a valid match still errors",
+			bodies: []Body{
+				{Author: "reviewer-bot", Content: body("ok", headSHA), PublishedAt: "2026-11-14T12:00:00Z"},
+				{Author: "reviewer-bot", Content: Anchor + "\n```\n{broken\n```\n", PublishedAt: "2026-11-15T12:00:00Z"},
+			},
+			login:     "reviewer-bot",
+			head:      headSHA,
+			wantFound: false,
+			wantErr:   ErrMalformed,
+		},
+		{
 			name: "untrusted malformed block skipped, not an error",
 			bodies: []Body{
 				{Author: "attacker", Content: Anchor + "\n```\n{broken\n```\n"},
@@ -317,6 +328,49 @@ func TestFind(t *testing.T) {
 			}
 			if !strings.Contains(raw, `"review_id":"`+tc.wantReview+`"`) {
 				t.Errorf("raw payload does not contain chosen review_id: %s", raw)
+			}
+		})
+	}
+}
+
+// TestFindSelectsLatestSameHeadPublication pins #846: reruns on an unchanged
+// head each publish a newer body, and the newest forge-reported publication
+// wins regardless of the container order the caller supplied. The obsolete
+// envelopes carry the lexicographically LARGER review_id, so a selection that
+// sorted opaque payload ids would pick them; selection must follow the
+// forge-reported publication time instead.
+func TestFindSelectsLatestSameHeadPublication(t *testing.T) {
+	body := func(reviewID string) string {
+		return block(envelopePayload(t, func(m map[string]any) {
+			m["review_id"] = reviewID
+			m["head_sha"] = headSHA
+		}), "```", "\ntrailing markdown\n")
+	}
+	newer := Body{Author: "reviewer-bot", Content: body("aaa-current"), PublishedAt: "2026-11-14T12:00:00Z"}
+	older := Body{Author: "reviewer-bot", Content: body("zzz-obsolete"), PublishedAt: "2026-11-13T12:00:00Z"}
+	noStamp := Body{Author: "reviewer-bot", Content: body("no-timestamp")}
+	badStamp := Body{Author: "reviewer-bot", Content: body("garbage-stamp"), PublishedAt: "yesterday at tea time"}
+
+	cases := []struct {
+		name       string
+		bodies     []Body
+		wantReview string
+	}{
+		{"newer replaces older, newest seeded first", []Body{newer, older}, "aaa-current"},
+		{"newer replaces older, oldest seeded first", []Body{older, newer}, "aaa-current"},
+		{"parseable stamp beats no claim, claim seeded first", []Body{newer, noStamp}, "aaa-current"},
+		{"parseable stamp beats no claim, claim seeded last", []Body{noStamp, newer}, "aaa-current"},
+		{"parseable stamp beats unparseable stamp", []Body{badStamp, newer}, "aaa-current"},
+		{"no usable stamps keeps earlier-seen deterministically", []Body{noStamp, badStamp}, "no-timestamp"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, _, found, err := Find(tc.bodies, "reviewer-bot", headSHA)
+			if err != nil || !found {
+				t.Fatalf("found = %v, err = %v, want a selection", found, err)
+			}
+			if h.ReviewID != tc.wantReview {
+				t.Fatalf("selected review_id = %q, want %q", h.ReviewID, tc.wantReview)
 			}
 		})
 	}

@@ -412,10 +412,11 @@ func TestProviderProtectionEstablishesUnprotectedOnlyFromBothAPIs(t *testing.T) 
 
 // ListReviews and ListComments are covered reads: the provider maps GitHub's
 // native review records and issue-conversation comment records to the
-// forge-neutral shapes with decimal string IDs, and each read must hit its
-// own endpoint — comments through issues/{n}/comments (where the reviewer's
-// sticky comment lives) and reviews through pulls/{n}/reviews, never through
-// the pulls/{n}/comments inline-review endpoint.
+// forge-neutral shapes with decimal string IDs and RFC3339 publication times,
+// and each read must hit its own endpoint — comments through
+// issues/{n}/comments (where the reviewer's sticky comment lives) and reviews
+// through pulls/{n}/reviews, never through the pulls/{n}/comments inline-review
+// endpoint.
 func TestProviderListReviewsAndComments(t *testing.T) {
 	var paths []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -423,7 +424,7 @@ func TestProviderListReviewsAndComments(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/repos/acme/demo/issues/7/comments":
-			_, _ = io.WriteString(w, `[{"id":81,"body":"handoff body","html_url":"https://github.com/acme/demo/pull/7#issuecomment-81","user":{"login":"courier-reviewer"}}]`)
+			_, _ = io.WriteString(w, `[{"id":81,"body":"handoff body","html_url":"https://github.com/acme/demo/pull/7#issuecomment-81","created_at":"2026-02-01T02:03:04Z","updated_at":"2026-02-03T04:05:06Z","user":{"login":"courier-reviewer"}}]`)
 		case "/repos/acme/demo/pulls/7/reviews":
 			_, _ = io.WriteString(w, `[{"id":91,"state":"CHANGES_REQUESTED","body":"manage the lane","submitted_at":"2026-02-03T04:05:06Z","user":{"login":"octocat"}}]`)
 		default:
@@ -452,7 +453,7 @@ func TestProviderListReviewsAndComments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListComments() error = %v", err)
 	}
-	if len(comments) != 1 || comments[0].ID != "81" || comments[0].Author != "courier-reviewer" || comments[0].Body != "handoff body" || comments[0].URL != "https://github.com/acme/demo/pull/7#issuecomment-81" {
+	if len(comments) != 1 || comments[0].ID != "81" || comments[0].Author != "courier-reviewer" || comments[0].Body != "handoff body" || comments[0].URL != "https://github.com/acme/demo/pull/7#issuecomment-81" || comments[0].CreatedAt != "2026-02-01T02:03:04Z" || comments[0].UpdatedAt != "2026-02-03T04:05:06Z" {
 		t.Fatalf("ListComments() = %#v, want the mapped comment record", comments)
 	}
 

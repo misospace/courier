@@ -162,7 +162,12 @@ and `list-reviews` reads, which the harness fix-pr terminal contract already
 required — and trusts a body only when the forge reports its author as the
 configured reviewer identity (the managed marker alone is forgeable) and the
 payload validates against the published upstream contract for the head the run
-is pinned to. The validated payload rides the goal verbatim, bounded, framed as
+is pinned to. When several such bodies exist for that head — reruns on an
+unchanged head each publish a newer body — the read selects the one the forge
+published most recently: a comment's last edit (its republish) or creation, a
+native review's submission. Container order carries no precedence, and the
+payload's opaque `review_id` is never a freshness signal. The validated payload
+rides the goal verbatim, bounded, framed as
 untrusted task data: the coordinator resolves every blocker and major finding,
 handles minor findings per repository policy, and re-verifies each finding
 against the current head. No trusted handoff — unset identity, no reviewer

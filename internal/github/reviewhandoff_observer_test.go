@@ -18,9 +18,14 @@ import (
 
 func handoffPayloadJSON(t *testing.T, head string) string {
 	t.Helper()
+	return handoffPayloadJSONWithID(t, head, "review-1")
+}
+
+func handoffPayloadJSONWithID(t *testing.T, head, reviewID string) string {
+	t.Helper()
 	envelope := map[string]any{
 		"schema":          "review-handoff/v1",
-		"review_id":       "review-1",
+		"review_id":       reviewID,
 		"head_sha":        head,
 		"verdict":         "request_changes",
 		"review_result":   "issues",
@@ -98,6 +103,89 @@ func TestObserverReviewHandoffSearchesReviewsToo(t *testing.T) {
 	}
 	if _, found, err := (Observer{Client: client}).ReviewHandoff(context.Background(), "acme/widgets", 7, "pr-reviewer[bot]", head); err != nil || !found {
 		t.Fatalf("native review body not consulted: found=%v err=%v", found, err)
+	}
+}
+
+// TestObserverReviewHandoffPrefersNewerReviewOnSameHead pins #846: reruns of
+// the reviewer on an unchanged head each submit a new native review, and the
+// newest submitted_at must replace the older review's remediation items
+// regardless of the order the reviews listing carries them.
+func TestObserverReviewHandoffPrefersNewerReviewOnSameHead(t *testing.T) {
+	const head = "cafe1234cafe1234cafe1234cafe1234cafe1234"
+	older := "<!-- ai-pr-reviewer-handoff:v1 -->\n```json\n" + handoffPayloadJSONWithID(t, head, "old-review") + "\n```"
+	newer := "<!-- ai-pr-reviewer-handoff:v1 -->\n```json\n" + handoffPayloadJSONWithID(t, head, "new-review") + "\n```"
+	olderReview := fmt.Sprintf(`{"id":1,"user":{"login":"pr-reviewer"},"state":"CHANGES_REQUESTED","submitted_at":"2026-11-13T09:00:00Z","body":%s}`, mustJSON(t, older))
+	newerReview := fmt.Sprintf(`{"id":2,"user":{"login":"pr-reviewer"},"state":"CHANGES_REQUESTED","submitted_at":"2026-11-14T09:00:00Z","body":%s}`, mustJSON(t, newer))
+	for _, tc := range []struct{ name, reviews string }{
+		{"newest listed last", "[" + olderReview + "," + newerReview + "]"},
+		{"newest listed first", "[" + newerReview + "," + olderReview + "]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := handoffServer(t, `[]`, tc.reviews)
+			defer server.Close()
+			client, err := NewClient(server.URL, "token")
+			if err != nil {
+				t.Fatalf("build client: %v", err)
+			}
+			raw, found, err := (Observer{Client: client}).ReviewHandoff(context.Background(), "acme/widgets", 7, "pr-reviewer", head)
+			if err != nil || !found {
+				t.Fatalf("found=%v err=%v, want a selection", found, err)
+			}
+			if !strings.Contains(raw, `"review_id":"new-review"`) {
+				t.Fatalf("stale review selected despite a newer same-head review: %s", raw)
+			}
+		})
+	}
+}
+
+// TestObserverReviewHandoffFreshnessBeatsContainerOrder pins the
+// managed-surface precedence contract across surfaces (#846): conversation
+// comments are listed before native reviews, but that container order carries
+// no precedence — the newest forge-reported publication wins in both
+// directions, and an in-place edit of the sticky comment counts as its
+// republish.
+func TestObserverReviewHandoffFreshnessBeatsContainerOrder(t *testing.T) {
+	const head = "beef1234beef1234beef1234beef1234beef1234"
+	commentBody := "<!-- ai-pr-reviewer-handoff:v1 -->\n```json\n" + handoffPayloadJSONWithID(t, head, "sticky-comment") + "\n```"
+	reviewBody := "<!-- ai-pr-reviewer-handoff:v1 -->\n```json\n" + handoffPayloadJSONWithID(t, head, "native-review") + "\n```"
+	comment := func(updated string) string {
+		return fmt.Sprintf(`{"id":1,"user":{"login":"pr-reviewer"},"created_at":"2026-11-12T10:00:00Z","updated_at":%q,"body":%s}`,
+			updated, mustJSON(t, commentBody))
+	}
+	review := func(submitted string) string {
+		return fmt.Sprintf(`{"id":2,"user":{"login":"pr-reviewer"},"state":"CHANGES_REQUESTED","submitted_at":%q,"body":%s}`,
+			submitted, mustJSON(t, reviewBody))
+	}
+	cases := []struct{ name, comments, reviews, wantReviewID string }{
+		{
+			name:         "newer native review outranks older sticky comment listed first",
+			comments:     "[" + comment("2026-11-12T10:00:00Z") + "]",
+			reviews:      "[" + review("2026-11-14T10:00:00Z") + "]",
+			wantReviewID: "native-review",
+		},
+		{
+			name:         "sticky comment republished by edit outranks older native review",
+			comments:     "[" + comment("2026-11-15T10:00:00Z") + "]",
+			reviews:      "[" + review("2026-11-13T10:00:00Z") + "]",
+			wantReviewID: "sticky-comment",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := handoffServer(t, tc.comments, tc.reviews)
+			defer server.Close()
+			client, err := NewClient(server.URL, "token")
+			if err != nil {
+				t.Fatalf("build client: %v", err)
+			}
+			raw, found, err := (Observer{Client: client}).ReviewHandoff(context.Background(), "acme/widgets", 7, "pr-reviewer", head)
+			if err != nil || !found {
+				t.Fatalf("found=%v err=%v, want a selection", found, err)
+			}
+			if !strings.Contains(raw, `"review_id":"`+tc.wantReviewID+`"`) {
+				t.Fatalf("selection = %s, want the %s payload", raw, tc.wantReviewID)
+			}
+		})
 	}
 }
 
