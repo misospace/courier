@@ -217,13 +217,7 @@ func (p *fixturePublisher) Publish(ctx context.Context) (harness.Publication, er
 func (p *fixturePublisher) OpenPullRequest(ctx context.Context, title, body string, draft bool) (harness.PullRequest, error) {
 	pr, report, err := p.engine.CreatePullRequest(ctx, p.proposal, title, body, draft)
 	if err != nil {
-		// The engine's own refusal vocabulary reaches the coordinator as a
-		// publication block, the way the broker's refusal of the HTTP create
-		// route classifies (#844), not as an infrastructure failure.
-		if strings.HasPrefix(err.Error(), "publication denied") {
-			return harness.PullRequest{}, &harness.PublicationBlockedError{Reason: err.Error(), Err: err}
-		}
-		return harness.PullRequest{}, err
+		return harness.PullRequest{}, classifyCreateRefusal(err)
 	}
 	p.opened = pr
 	opened := harness.PullRequest{
@@ -237,6 +231,61 @@ func (p *fixturePublisher) OpenPullRequest(ctx context.Context, title, body stri
 		opened.Coverage = report.Coverage
 	}
 	return opened, nil
+}
+
+// classifyCreateRefusal maps the policy engine's answer to the create route
+// into the coordinator's taxonomy, the way the broker's own HTTP route
+// classifies it (internal/broker/server.go): the route answers every error
+// the engine returns with HTTP 422, and the harness reads a non-retryable 4xx
+// as a definite denial — a blocked world, never an infrastructure failure.
+//
+// The fixture classifies the engine's answer instead of matching its error
+// text, so a reworded refusal still reads as a refusal instead of silently
+// becoming a transport failure. Only the transport class stays an
+// infrastructure failure: a cancelled or expired call never reached an
+// answer, exactly as it never reaches one on the wire.
+func classifyCreateRefusal(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return &harness.PublicationBlockedError{Reason: err.Error(), Err: err}
+}
+
+// TestCreateRefusalClassification pins the classification the coordinator
+// sees when the create route refuses: a refusal the engine states is a
+// blocked world, whatever the engine words it with, and only the transport
+// class is an infrastructure failure.
+func TestCreateRefusalClassification(t *testing.T) {
+	for _, refusal := range []error{
+		errors.New("publication denied: the proposed commit is not the exact live head"),
+		errors.New("publication denied: multiple pull requests claim the pinned head"),
+		errors.New("check existing pull request failed"),
+	} {
+		classified := classifyCreateRefusal(refusal)
+		var blocked *harness.PublicationBlockedError
+		if !errors.As(classified, &blocked) {
+			t.Fatalf("classified refusal = %v, want a publication block", classified)
+		}
+		if blocked.Err != refusal {
+			t.Fatalf("blocked error = %v, want the engine's own answer", blocked.Err)
+		}
+		if blocked.Reason != refusal.Error() {
+			t.Fatalf("blocked reason = %q, want the engine's own wording %q", blocked.Reason, refusal.Error())
+		}
+	}
+	for _, transport := range []error{context.Canceled, context.DeadlineExceeded} {
+		classified := classifyCreateRefusal(transport)
+		var blocked *harness.PublicationBlockedError
+		if errors.As(classified, &blocked) {
+			t.Fatalf("classified transport failure = %v, want an infrastructure failure", classified)
+		}
+	}
+	if classified := classifyCreateRefusal(nil); classified != nil {
+		t.Fatalf("classified absence = %v, want no error", classified)
+	}
 }
 
 // TestFixtureANativeControlPath is the fixture itself.
@@ -1071,18 +1120,26 @@ func (f *fixtureA) fetch(t *testing.T) *courierv1alpha1.CoderRun {
 	return run
 }
 
-// pod reads one provisioned topology pod.
+// pod reads one provisioned topology pod of this run.
+//
+// The lookup is bound to the run's own label: several fixtures share the run
+// namespace, so a component label alone could hand this fixture another
+// run's pod and make its topology claim vacuous.
 func (f *fixtureA) pod(t *testing.T, component string) *corev1.Pod {
 	t.Helper()
 	pods := &corev1.PodList{}
 	if err := envtestClient.List(context.Background(), pods, client.InNamespace(f.namespace)); err != nil {
 		t.Fatal(err)
 	}
+	run := topology.RunLabelValue(f.runName)
 	for i := range pods.Items {
+		if pods.Items[i].Labels[topology.LabelRun] != run {
+			continue
+		}
 		if pods.Items[i].Labels["courier.misospace.dev/component"] == component {
 			return &pods.Items[i]
 		}
 	}
-	t.Fatalf("the secure topology has no %s pod", component)
+	t.Fatalf("the secure topology of run %q has no %s pod", f.runName, component)
 	return nil
 }

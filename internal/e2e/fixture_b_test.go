@@ -55,9 +55,10 @@ type fixtureB struct {
 //
 // The fault is scripted four times because that is the production bound for
 // one failing turn: the harness sends the request once and retries it at most
-// maxStreamRetries times more. A fifth request finds the script exhausted, so
-// the gateway answers with its own refusal and the fixture's count assertion
-// fails with the number it saw.
+// maxStreamRetries times more. The probe's answer plus those four attempts
+// are the whole script, so a sixth request — the one the production bound
+// forbids — finds the script exhausted, the gateway answers with its own
+// refusal, and the fixture's count assertion fails with the number it saw.
 func throttledResponses() []modelResponse {
 	fault := &modelFault{
 		status:  http.StatusTooManyRequests,

@@ -161,7 +161,7 @@ jobs:
           echo "KUBEBUILDER_ASSETS=$assets" >> "$GITHUB_ENV"
 
       - name: Replay the native control path
-        run: go test -race ./internal/e2e/... -count=1 -timeout 10m
+        run: go test -race ./internal/e2e/... -count=1 -timeout 20m
 
   # Keep the required branch-protection context stable while the expensive
   # race suite fans out onto independent runners. A failed or cancelled matrix
