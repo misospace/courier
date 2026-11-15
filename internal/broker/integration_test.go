@@ -213,7 +213,7 @@ func TestBrokerIntegrationDeniesForeignHeadAndNonFastForward(t *testing.T) {
 		f := newIntegrationFixture(t, ModeFixPR)
 		// Move fork and PR together to a commit not admitted or confirmed by this run.
 		foreign := filepath.Join(f.root, "foreign")
-		igGit(t, "", "clone", f.provider.Paths[f.workRepo.Canonical], foreign)
+		igGit(t, "", "clone", f.provider.Path(f.workRepo.Canonical), foreign)
 		igGit(t, foreign, "config", "user.email", "foreign@example.invalid")
 		igGit(t, foreign, "config", "user.name", "foreign")
 		igWrite(t, filepath.Join(foreign, "foreign"), "foreign\n")
@@ -285,13 +285,13 @@ func TestBrokerIntegrationCriterionEvidenceBoundary(t *testing.T) {
 	if _, err := f.engine.Publish(ctx, PublicationRequest{RunUID: "run-uid", ProposedOID: f.proposed}); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
-	prsBefore := len(f.provider.PullRequests)
+	prsBefore := len(f.provider.PullRequests())
 	_, _, err = f.engine.CreatePullRequest(ctx, f.proposed, "title", "Closes acme/project#122. Ships the packaging fix.", false)
 	var cerr *CriteriaError
 	if !errors.As(err, &cerr) || !errors.Is(err, ErrCriteriaBlockMissing) {
 		t.Fatalf("missing-block body: want the missing-block refusal, got %v", err)
 	}
-	if len(f.provider.PullRequests) != prsBefore {
+	if len(f.provider.PullRequests()) != prsBefore {
 		t.Fatal("the forge recorded a pull request despite the criterion-evidence refusal")
 	}
 	body := "Closes acme/project#122. Ships the packaging fix.\n\n" + honestBlockFor(set)
@@ -311,7 +311,7 @@ func TestBrokerIntegrationCriterionEvidenceBoundary(t *testing.T) {
 	if _, _, err = f.engine.CreatePullRequest(ctx, f.proposed, "issue 122", overstated, false); !errors.As(err, &cerr) || cerr.CoverageClaim != CoverageFull || cerr.CoverageDerived != CoveragePartial {
 		t.Fatalf("overstated body: want the coverage-lie refusal, got %v", err)
 	}
-	if len(f.provider.PullRequests) != prsBefore+1 {
-		t.Fatalf("the overstated body changed forge state: %d pull requests", len(f.provider.PullRequests))
+	if len(f.provider.PullRequests()) != prsBefore+1 {
+		t.Fatalf("the overstated body changed forge state: %d pull requests", len(f.provider.PullRequests()))
 	}
 }

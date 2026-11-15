@@ -101,27 +101,31 @@ type LocalGitConfig struct {
 
 // LocalGit is the local-git-backed forge double. All methods are safe for
 // concurrent use.
+//
+// The world's mutable state is private to the double and reachable only
+// through locked accessors, so a caller can never read it without the
+// double's lock.
 type LocalGit struct {
 	mu sync.Mutex
 
 	cfg  forge.ProviderConfig
 	caps forge.Capabilities
 
-	// Repositories maps a canonical identity to its repository identity.
-	Repositories map[string]forge.Repository
-	// Paths maps a canonical identity to its local git directory.
-	Paths map[string]string
-	// Protected maps "repository:ref" to its effective write protection.
-	Protected map[string]bool
-	// WorkItems maps "repository/id" to its work item.
-	WorkItems map[string]forge.WorkItem
-	// PullRequests is the known pull-request set; created requests join it.
-	PullRequests []forge.PullRequest
-	// NextPullRequest is the number the next created request takes.
-	NextPullRequest int
-	// RacePullRequest makes a create record a competing request for the
+	// repositories maps a canonical identity to its repository identity.
+	repositories map[string]forge.Repository
+	// paths maps a canonical identity to its local git directory.
+	paths map[string]string
+	// protected maps "repository:ref" to its effective write protection.
+	protected map[string]bool
+	// workItems maps "repository/id" to its work item.
+	workItems map[string]forge.WorkItem
+	// pullRequests is the known pull-request set; created requests join it.
+	pullRequests []forge.PullRequest
+	// nextPullRequest is the number the next created request takes.
+	nextPullRequest int
+	// racePullRequest makes a create record a competing request for the
 	// same head before the requested one.
-	RacePullRequest bool
+	racePullRequest bool
 
 	ops []LocalGitOp
 }
@@ -171,13 +175,13 @@ func NewLocalGit(cfg LocalGitConfig) *LocalGit {
 			forge.CapabilityComment,
 			forge.CapabilityCommentWorkItem,
 		),
-		Repositories:    repositories,
-		Paths:           paths,
-		Protected:       protected,
-		WorkItems:       workItems,
-		PullRequests:    pulls,
-		NextPullRequest: next,
-		RacePullRequest: cfg.RacePullRequest,
+		repositories:    repositories,
+		paths:           paths,
+		protected:       protected,
+		workItems:       workItems,
+		pullRequests:    pulls,
+		nextPullRequest: next,
+		racePullRequest: cfg.RacePullRequest,
 	}
 }
 
@@ -201,7 +205,7 @@ func (g *LocalGit) ResolveRepository(_ context.Context, name string) (forge.Repo
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.record(LocalGitOp{Kind: LocalGitOpResolveRepository, Repo: name})
-	for _, repo := range g.Repositories {
+	for _, repo := range g.repositories {
 		if repo.ID == name || repo.Canonical == name {
 			return repo, nil
 		}
@@ -227,7 +231,7 @@ func (g *LocalGit) ReadEffectiveProtection(_ context.Context, repo forge.Reposit
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.record(LocalGitOp{Kind: LocalGitOpReadEffectiveProtection, Repo: repo.Canonical, Ref: ref})
-	return forge.Protection{Protected: g.Protected[repo.Canonical+":"+ref]}, nil
+	return forge.Protection{Protected: g.protected[repo.Canonical+":"+ref]}, nil
 }
 
 // CanWriteRepository reports that the double's repositories are writable.
@@ -244,7 +248,7 @@ func (g *LocalGit) ReadWorkItem(_ context.Context, ref forge.WorkItemRef) (forge
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.record(LocalGitOp{Kind: LocalGitOpReadWorkItem, Repo: ref.Repo, WorkItem: ref})
-	item, ok := g.WorkItems[ref.Repo+"/"+ref.ID]
+	item, ok := g.workItems[ref.Repo+"/"+ref.ID]
 	if !ok {
 		return forge.WorkItem{}, forge.ErrUnsupported
 	}
@@ -257,7 +261,7 @@ func (g *LocalGit) ReadPullRequest(_ context.Context, ref forge.PullRequestRef) 
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.record(LocalGitOp{Kind: LocalGitOpReadPullRequest, Repo: ref.Repo, PR: ref})
-	for _, pr := range g.PullRequests {
+	for _, pr := range g.pullRequests {
 		if pr.Number == ref.Number && pr.BaseRepo == ref.Repo {
 			if tip, ok := g.tipLocked(pr.HeadRepo, pr.HeadRef); ok {
 				pr.HeadSHA = tip
@@ -301,11 +305,11 @@ func (g *LocalGit) ReadChecks(context.Context, forge.PullRequestRef, string) ([]
 func (g *LocalGit) CreatePullRequest(_ context.Context, in forge.CreatePullRequestInput) (forge.PullRequest, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.record(LocalGitOp{Kind: LocalGitOpCreatePullRequest, Repo: in.Repo, Number: g.NextPullRequest})
-	if g.RacePullRequest {
-		g.NextPullRequest++
+	g.record(LocalGitOp{Kind: LocalGitOpCreatePullRequest, Repo: in.Repo, Number: g.nextPullRequest})
+	if g.racePullRequest {
+		g.nextPullRequest++
 		other := forge.PullRequest{
-			Number:   g.NextPullRequest,
+			Number:   g.nextPullRequest,
 			Repo:     in.Repo,
 			BaseRepo: in.Repo,
 			BaseRef:  in.Base,
@@ -316,11 +320,11 @@ func (g *LocalGit) CreatePullRequest(_ context.Context, in forge.CreatePullReque
 			State:    "open",
 			Title:    "concurrent",
 		}
-		g.PullRequests = append(g.PullRequests, other)
+		g.pullRequests = append(g.pullRequests, other)
 	}
-	g.NextPullRequest++
+	g.nextPullRequest++
 	pr := forge.PullRequest{
-		Number:   g.NextPullRequest,
+		Number:   g.nextPullRequest,
 		Repo:     in.Repo,
 		BaseRepo: in.Repo,
 		BaseRef:  in.Base,
@@ -333,7 +337,7 @@ func (g *LocalGit) CreatePullRequest(_ context.Context, in forge.CreatePullReque
 		Body:     in.Body,
 		Draft:    in.Draft,
 	}
-	g.PullRequests = append(g.PullRequests, pr)
+	g.pullRequests = append(g.pullRequests, pr)
 	return pr, nil
 }
 
@@ -343,15 +347,15 @@ func (g *LocalGit) UpdatePullRequest(_ context.Context, ref forge.PullRequestRef
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.record(LocalGitOp{Kind: LocalGitOpUpdatePullRequest, Repo: ref.Repo, PR: ref, Number: ref.Number})
-	for i := range g.PullRequests {
-		if g.PullRequests[i].Number == ref.Number {
+	for i := range g.pullRequests {
+		if g.pullRequests[i].Number == ref.Number {
 			if in.Title != "" {
-				g.PullRequests[i].Title = in.Title
+				g.pullRequests[i].Title = in.Title
 			}
 			if in.Body != "" {
-				g.PullRequests[i].Body = in.Body
+				g.pullRequests[i].Body = in.Body
 			}
-			return g.PullRequests[i], nil
+			return g.pullRequests[i], nil
 		}
 	}
 	return forge.PullRequest{}, errors.New("pull request not found")
@@ -381,7 +385,7 @@ func (g *LocalGit) ListPullRequestsByHead(_ context.Context, base forge.PullRequ
 	defer g.mu.Unlock()
 	g.record(LocalGitOp{Kind: LocalGitOpListPullRequestsByHead, Repo: repo, PR: base, HeadRepo: repo, Ref: ref})
 	var out []forge.PullRequest
-	for _, pr := range g.PullRequests {
+	for _, pr := range g.pullRequests {
 		if pr.BaseRepo != base.Repo || pr.HeadRepo != repo || pr.HeadRef != ref {
 			continue
 		}
@@ -400,7 +404,7 @@ func (g *LocalGit) ListPullRequestsByHead(_ context.Context, base forge.PullRequ
 func (g *LocalGit) Endpoint(_ context.Context, identity string) (string, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	path := g.Paths[identity]
+	path := g.paths[identity]
 	if path == "" {
 		return "", errors.New("unknown endpoint")
 	}
@@ -415,12 +419,29 @@ func (g *LocalGit) Tip(repo, ref string) string {
 	return g.tipOrEmpty(repo, ref)
 }
 
+// Path reports the local git directory that holds a canonical repository
+// identity, or an empty string when the double does not know the identity.
+func (g *LocalGit) Path(identity string) string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.paths[identity]
+}
+
+// PullRequests returns a copy of the known pull-request set.
+func (g *LocalGit) PullRequests() []forge.PullRequest {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := make([]forge.PullRequest, len(g.pullRequests))
+	copy(out, g.pullRequests)
+	return out
+}
+
 // SetProtected sets the effective write protection of one ref. It is a world
 // mutation and is not recorded as an op.
 func (g *LocalGit) SetProtected(repo, ref string, protected bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.Protected[repo+":"+ref] = protected
+	g.protected[repo+":"+ref] = protected
 }
 
 // SetRepository replaces a repository's identity. It is a world mutation and
@@ -428,7 +449,7 @@ func (g *LocalGit) SetProtected(repo, ref string, protected bool) {
 func (g *LocalGit) SetRepository(repo forge.Repository) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.Repositories[repo.Canonical] = repo
+	g.repositories[repo.Canonical] = repo
 }
 
 // SetPullRequests replaces the known pull-request set. It is a world
@@ -436,8 +457,8 @@ func (g *LocalGit) SetRepository(repo forge.Repository) {
 func (g *LocalGit) SetPullRequests(pulls []forge.PullRequest) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.PullRequests = make([]forge.PullRequest, len(pulls))
-	copy(g.PullRequests, pulls)
+	g.pullRequests = make([]forge.PullRequest, len(pulls))
+	copy(g.pullRequests, pulls)
 }
 
 // SetRacePullRequest arms the concurrent-create behavior: the next create
@@ -446,7 +467,7 @@ func (g *LocalGit) SetPullRequests(pulls []forge.PullRequest) {
 func (g *LocalGit) SetRacePullRequest(race bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.RacePullRequest = race
+	g.racePullRequest = race
 }
 
 // Ops returns the recorded provider calls in call order.
@@ -481,7 +502,7 @@ func (g *LocalGit) tipOrEmpty(repo, ref string) string {
 // tipLocked reads the live tip of a ref out of the local git directory. The
 // caller's lock is held.
 func (g *LocalGit) tipLocked(repo, ref string) (string, bool) {
-	path := g.Paths[repo]
+	path := g.paths[repo]
 	if path == "" {
 		return "", false
 	}
