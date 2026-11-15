@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 )
 
 // anthropicSSE renders one SSE body from data payloads, one line each, the
@@ -554,7 +556,7 @@ func TestAnthropicRendersTheProductionPinnedShape(t *testing.T) {
 	defer server.Close()
 	transport := &AnthropicTransport{BaseURL: server.URL}
 	transcript := []Message{
-		{Role: "system", Content: harnessFraming},
+		{Role: "system", Content: harnessFraming(courierv1alpha1.ModeResolveIssue)},
 		{Role: "system", Content: "lane framing: production native canary"},
 		{Role: "system", Content: "skills index: shell, git"},
 		{Role: "user", Content: "goal: land the fix"},
@@ -595,7 +597,7 @@ func TestAnthropicRendersTheProductionPinnedShape(t *testing.T) {
 	if block["type"] != "text" || block["text"] != "goal: land the fix" {
 		t.Fatalf("task turn block = %s; want the goal verbatim", blockJSON)
 	}
-	if !strings.Contains(wire.System, "lane framing: production native canary") || !strings.Contains(wire.System, "skills index: shell, git") || !strings.Contains(wire.System, harnessFraming) {
+	if !strings.Contains(wire.System, "lane framing: production native canary") || !strings.Contains(wire.System, "skills index: shell, git") || !strings.Contains(wire.System, harnessFraming(courierv1alpha1.ModeResolveIssue)) {
 		t.Fatalf("system = %q; want the harness framing, the lane framing, and the skills index joined in the system field", wire.System)
 	}
 	if strings.Contains(wire.System, "goal: land the fix") {

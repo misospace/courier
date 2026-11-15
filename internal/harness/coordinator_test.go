@@ -293,6 +293,40 @@ func TestParseOutcomePullRequestDeclaration(t *testing.T) {
 	}
 }
 
+// TestHarnessFramingCarriesTheModeGrammar ties the mode-aware framing and
+// injected clarification to the parser (#845 review): the changes shape each
+// mode's text teaches must parse for that mode, and the text for a run that
+// never opens a pull request never documents the pull-request fields as
+// declarable — the grammar the model reads is exactly the grammar
+// parseOutcome accepts for its run.
+func TestHarnessFramingCarriesTheModeGrammar(t *testing.T) {
+	const prShape = `{"outcome":"changes","prTitle":"...","prBody":"..."}`
+	const bareShape = `{"outcome":"changes"}`
+	for _, text := range []func(courierv1alpha1.Mode) string{harnessFraming, outcomeClarification} {
+		for _, mode := range []courierv1alpha1.Mode{courierv1alpha1.ModeResolveIssue, courierv1alpha1.ModeContribute} {
+			doc := text(mode)
+			if !strings.Contains(doc, prShape) {
+				t.Fatalf("mode %s: the mode text never teaches the required pr-carrying changes shape", mode)
+			}
+			if _, _, pr, err := parseOutcome(prShape, mode); err != nil || pr == nil {
+				t.Fatalf("mode %s: the changes shape the text teaches must parse: pr = %#v, err = %v", mode, pr, err)
+			}
+		}
+		for _, mode := range []courierv1alpha1.Mode{courierv1alpha1.ModeFixPR, courierv1alpha1.ModeRebase} {
+			doc := text(mode)
+			if !strings.Contains(doc, bareShape) {
+				t.Fatalf("mode %s: the mode text never teaches the bare changes shape", mode)
+			}
+			if strings.Contains(doc, `"prTitle"`) {
+				t.Fatalf("mode %s: the mode text documents pull-request fields to a run that never opens one", mode)
+			}
+			if _, _, pr, err := parseOutcome(bareShape, mode); err != nil || pr != nil {
+				t.Fatalf("mode %s: the changes shape the text teaches must parse: pr = %#v, err = %v", mode, pr, err)
+			}
+		}
+	}
+}
+
 // TestStatusReporterRecordsPullRequestIdentity proves the harness side of
 // the durable record: the created number rides a dedicated status patch, and
 // the broker fence — not the reporter — owns one-identity-per-run (#844).
@@ -360,6 +394,7 @@ func TestCriteriaEnvelopeIsPinnedIntoTheCoordinatorSession(t *testing.T) {
 	surface, err := coordinator.ModelSurface(ModelSurfaceInputs{
 		GatewayTransport: "openai",
 		CriteriaJSON:     criteriaJSON,
+		Mode:             inv.Mode,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -380,6 +415,29 @@ func TestCriteriaEnvelopeIsPinnedIntoTheCoordinatorSession(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("sections = %+v, want a criteria.envelope section", decoded.Sections)
+	}
+	// The mode-specific grammar sections must carry the digest of the exact
+	// text this run's mode pins, so the framing the model reads and the
+	// provenance record cannot drift by mode (#845 review).
+	for _, want := range []struct {
+		name, text string
+	}{
+		{"coordinator.framing", harnessFraming(inv.Mode)},
+		{"outcome.clarification", outcomeClarification(inv.Mode)},
+	} {
+		var match bool
+		for _, candidate := range decoded.Sections {
+			if candidate.Name != want.name {
+				continue
+			}
+			match = true
+			if candidate.Digest != textDigest(want.text) {
+				t.Fatalf("section %q digest = %q, want the digest of the mode-specific pinned text", want.name, candidate.Digest)
+			}
+		}
+		if !match {
+			t.Fatalf("sections = %+v, want a %s section", decoded.Sections, want.name)
+		}
 	}
 }
 

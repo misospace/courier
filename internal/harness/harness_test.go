@@ -3491,7 +3491,7 @@ func TestOpenAIRendersTheProductionPinnedShapeVerbatim(t *testing.T) {
 	gateway, mock, close := gatewayFor(gatewayResponse{body: sse(contentChunk("ok"), finishChunk("stop"))})
 	defer close()
 	transcript := []Message{
-		{Role: "system", Content: harnessFraming},
+		{Role: "system", Content: harnessFraming(courier.ModeResolveIssue)},
 		{Role: "system", Content: "lane framing: production native canary"},
 		{Role: "system", Content: "skills index: shell, git"},
 		{Role: "user", Content: "goal: land the fix"},
@@ -3523,7 +3523,7 @@ func TestOpenAIRendersTheProductionPinnedShapeVerbatim(t *testing.T) {
 	if wire.Messages[3].Content != "goal: land the fix" {
 		t.Fatalf("task turn = %q; want the goal verbatim as the user turn", wire.Messages[3].Content)
 	}
-	if wire.Messages[0].Content != harnessFraming {
+	if wire.Messages[0].Content != harnessFraming(courier.ModeResolveIssue) {
 		t.Fatalf("framing message = %q; want the harness framing verbatim as system", wire.Messages[0].Content)
 	}
 }
@@ -3637,7 +3637,7 @@ func TestCoordinatorRunPinsFramingSystemAndGoalUser(t *testing.T) {
 	}
 	messages := decodeFirstRequest(t, mock.calls[0].rawBody)
 	wantRoles := []string{"system", "system", "system", "user"}
-	wantContent := []string{harnessFraming, inv.Framing, skillSet.Section(), inv.Goal}
+	wantContent := []string{harnessFraming(inv.Mode), inv.Framing, skillSet.Section(), inv.Goal}
 	if len(messages) != len(wantRoles) {
 		t.Fatalf("first request carries %d messages; want the pinned shape in full: %+v", len(messages), messages)
 	}

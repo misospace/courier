@@ -198,6 +198,12 @@ func surfaceSuccessfulSkill(t *testing.T, c *Coordinator, name, briefID string) 
 	return result.Content
 }
 
+// surfaceSurfaceMode is the run mode the model-surface digest assembly and
+// the harvested outcome clarification share: the clarification is
+// mode-specific grammar (#845 review), so the harvest and the assembly must
+// read the same mode for the digest pin to bite.
+const surfaceSurfaceMode = courierv1alpha1.ModeResolveIssue
+
 // surfaceCoordinatorSurface collects the coordinator role's surface for one
 // wiring. Sections mirror exactly what Run pins and what the coordinator's
 // own tool paths emit.
@@ -208,8 +214,12 @@ func surfaceCoordinatorSurface(t *testing.T, skillSet *SkillSet) roleSurface {
 		forge = surfaceStubForge{}
 	}
 	c := surfaceCoordinator(t, forge, skillSet, nil)
+	// One framing variant enters the surface scan: a run pins exactly one
+	// mode's framing, and the per-mode grammar tie lives in
+	// TestHarnessFramingCarriesTheModeGrammar rather than by double-counting
+	// both variants against the role's surface budget (#845 review).
 	sections := []surfaceSection{
-		{owner: "coordinator pinned framing (harnessFraming)", text: harnessFraming},
+		{owner: "coordinator pinned framing (harnessFraming)", text: harnessFraming(surfaceSurfaceMode)},
 	}
 	if skillSet != nil {
 		sections = append(sections, surfaceSection{owner: "pinned skills section (SkillSet.Section)", text: skillSet.Section()})
@@ -227,7 +237,7 @@ func surfaceCoordinatorNotices(t *testing.T, c *Coordinator, skillful bool) []su
 	t.Helper()
 	sections := []surfaceSection{
 		{owner: "notice: injected control turn (controlTurnText)", text: controlTurnText},
-		{owner: "notice: outcome clarification (outcomeClarification)", text: outcomeClarification},
+		{owner: "notice: outcome clarification (outcomeClarification)", text: outcomeClarification(surfaceSurfaceMode)},
 		{owner: "notice: step-boundary compaction digest (compactDigest)", text: compactDigest(2, "", []Message{
 			{Role: "user", Content: "earlier directive"},
 			{Role: "tool", Content: "earlier tool output"},
@@ -349,7 +359,7 @@ func TestModelVisibleSurfaceContract(t *testing.T) {
 	// rendered against the same fixture the harvest used. A new literal in
 	// a tool path that never entered the fixed-notice table fails here.
 	t.Run("every fixed notice is pinned in the model-surface digest", func(t *testing.T) {
-		surface, err := AssembleModelSurface(testBindings(), nil, nil, ModelSurfaceInputs{GatewayTransport: "openai"})
+		surface, err := AssembleModelSurface(testBindings(), nil, nil, ModelSurfaceInputs{GatewayTransport: "openai", Mode: surfaceSurfaceMode})
 		if err != nil {
 			t.Fatalf("assemble: %v", err)
 		}

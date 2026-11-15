@@ -1211,7 +1211,10 @@ the schema version itself; the effective wire transport; the resolved
 role→model bindings; the canonical identities (name plus sha256) of the
 pinned prompt sections — the coordinator and sub-agent framings, the
 soft-stop control turn, the outcome clarification, and the lane's declared
-framing when present — each with the transcript role it pins under, plus the
+framing when present (the coordinator framing and the clarification carry
+the run mode's changes-clause grammar, so the digest records the exact
+mode-specific text the session pins) — each with the transcript role it
+pins under, plus the
 task turn's placement (the role the goal, or a delegate's brief, pins as —
 the task text itself is source-owned and never hashed, but which channel
 carries it is part of the contract); the per-role declared tool-schema identities, read
@@ -2384,9 +2387,11 @@ and the acceptance tests below are satisfied.
    delegation with cancellation/retry dedupe, and startup capability
    health — and #125's worker-artifact validation, integration, and
    broker-mediated publication have landed (deployment-level secure mode).
-   Pull-request creation is now wired to the broker's typed API (#843, #844):
-   a resolve-issue or contribute run declares its PR title and body in the
-   outcome JSON, and the finish step opens the PR through the broker after
+    Pull-request creation is now wired to the broker's typed API (#843, #844):
+    a resolve-issue or contribute run declares its PR title and body in the
+    outcome JSON — the outcome grammar is mode-specific: the run's framing and
+    the injected clarification teach exactly the changes shape its mode's
+    parser accepts — and the finish step opens the PR through the broker after
    publication and records its identity on the status path before claiming
    published; the create route is idempotent at the pinned head, so a
    relaunch adopts the same PR. Forge reads (`ForgeOps`) and pull-request

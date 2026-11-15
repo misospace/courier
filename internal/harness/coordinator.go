@@ -360,7 +360,32 @@ func (c *Coordinator) Budget(role string) (ContextBudget, bool) {
 // goal: the control pod has no shell or filesystem, worker output is
 // untrusted, and the outcome declaration is the final message (the goal
 // text's outcome file is a legacy-mode artifact and does not exist here).
-const harnessFraming = `You are the trusted coordinator running in Courier's control pod. You have no shell and no filesystem in this pod: commands execute only on the sandbox worker through the shell tool, and every worker response is untrusted output that you verify. Delegate bounded implementation, research, or review with the delegate tool; you integrate and validate delegated work, then run relevant local validation against a fresh snapshot of the integrated and published head yourself before declaring completion. Briefs may already be published when control returns; fix local validation failures before declaring completion; report needs_decision only for an actual decision that requires a human. Once local validation passes and work is published, finish without waiting for external verification, CI/checks, or human or AI review; the operator observes the pull request after you exit. The outcome file named in the goal does not exist in this harness: instead, your final message must be exactly one JSON object declaring how the run ended — {"outcome":"changes"} once work is locally validated, committed, and pushed to the run branch; {"outcome":"changes","prTitle":"...","prBody":"..."} when your run's goal opens its pull request through the broker, the title and body you want it to carry — the broker validates the declared body against the run's pinned linkage and criterion-evidence contracts before it writes anything, so a wrong issue number or a deficient body is refused, never published; {"outcome":"no_change_needed","evidence":"..."} when the work is already done; {"outcome":"needs_decision","question":"..."} for a decision only a human can make; {"outcome":"blocked_external","missing":"..."} when something outside this run is missing.`
+// The changes clause is mode-aware (#845 review): an opening-mode run is
+// told its changes declaration must carry prTitle and prBody, and a
+// fix-pr/rebase run that it declares no pull-request fields at all, so the
+// grammar each run's framing teaches is exactly the grammar parseOutcome
+// accepts for that run's mode — a mode-blind text offering the bare
+// changes shape first is a refusal the model must discover by failing.
+func harnessFraming(mode courierv1alpha1.Mode) string {
+	changes := harnessFramingChangesNonOpening
+	if opensPullRequest(mode) {
+		changes = harnessFramingChangesOpening
+	}
+	return harnessFramingPreamble + changes + harnessFramingOutcomesTail
+}
+
+const harnessFramingPreamble = `You are the trusted coordinator running in Courier's control pod. You have no shell and no filesystem in this pod: commands execute only on the sandbox worker through the shell tool, and every worker response is untrusted output that you verify. Delegate bounded implementation, research, or review with the delegate tool; you integrate and validate delegated work, then run relevant local validation against a fresh snapshot of the integrated and published head yourself before declaring completion. Briefs may already be published when control returns; fix local validation failures before declaring completion; report needs_decision only for an actual decision that requires a human. Once local validation passes and work is published, finish without waiting for external verification, CI/checks, or human or AI review; the operator observes the pull request after you exit. The outcome file named in the goal does not exist in this harness: instead, your final message must be exactly one JSON object declaring how the run ended — `
+
+// harnessFramingChangesOpening and harnessFramingChangesNonOpening are the
+// run-mode-specific changes clause of the outcome grammar. They must stay
+// exact inverses of the mode branch in parseOutcome: opensPullRequest
+// selects both, so the text a run reads and the parser that judges its
+// declaration cannot drift.
+const harnessFramingChangesOpening = `{"outcome":"changes","prTitle":"...","prBody":"..."} carrying the title and body you want the run's pull request to have — this run's finish opens its pull request through the broker, so a bare {"outcome":"changes"} is refused; the broker validates the declared body against the run's pinned linkage and criterion-evidence contracts before it writes anything, so a wrong issue number or a deficient body is refused, never published; `
+
+const harnessFramingChangesNonOpening = `{"outcome":"changes"} once work is locally validated, committed, and pushed to the run branch — this run acts on a pull request that already exists and never opens one, so declare no prTitle or prBody; `
+
+const harnessFramingOutcomesTail = `{"outcome":"no_change_needed","evidence":"..."} when the work is already done; {"outcome":"needs_decision","question":"..."} for a decision only a human can make; {"outcome":"blocked_external","missing":"..."} when something outside this run is missing.`
 
 // maxOutcomeClarifications bounds the clarification round-trips when the
 // model's final message is not a valid outcome declaration. After that the
@@ -369,11 +394,26 @@ const harnessFraming = `You are the trusted coordinator running in Courier's con
 const maxOutcomeClarifications = 1
 
 // outcomeClarification is the fixed user message injected when the
-// coordinator's final message is not a valid outcome declaration. It is a
-// named constant so the model-visible surface contract
-// (surface_contract_test.go) validates the exact bytes this loop injects
-// rather than a transcription of them.
-const outcomeClarification = `Your final message was not a valid outcome declaration. Reply with exactly one JSON object: {"outcome":"changes"}, or {"outcome":"changes","prTitle":"...","prBody":"..."} when your run's goal opens its pull request through the broker, {"outcome":"no_change_needed","evidence":"..."} (optionally with "close":{"criteria":[{"criterion":"...","path":"<repo file>","excerpt":"<24-300 char excerpt verbatim from that file at the default-branch HEAD"}]} when the ask is already satisfied by existing work), {"outcome":"needs_decision","question":"..."}, or {"outcome":"blocked_external","missing":"..."}.`
+// coordinator's final message is not a valid outcome declaration. It is
+// mode-aware like harnessFraming, so the retry teaches exactly the changes
+// shape parseOutcome accepts for this run's mode, and the model-visible
+// surface contract (surface_contract_test.go) validates the exact bytes
+// this loop injects rather than a transcription of them.
+func outcomeClarification(mode courierv1alpha1.Mode) string {
+	changes := outcomeClarificationChangesNonOpening
+	if opensPullRequest(mode) {
+		changes = outcomeClarificationChangesOpening
+	}
+	return outcomeClarificationPreamble + changes + outcomeClarificationOutcomesTail
+}
+
+const outcomeClarificationPreamble = `Your final message was not a valid outcome declaration. Reply with exactly one JSON object: `
+
+const outcomeClarificationChangesOpening = `{"outcome":"changes","prTitle":"...","prBody":"..."} — this run opens its pull request through the broker, so a bare {"outcome":"changes"} is refused —, `
+
+const outcomeClarificationChangesNonOpening = `{"outcome":"changes"} — with no prTitle or prBody, because this run acts on an existing pull request and never opens one —, `
+
+const outcomeClarificationOutcomesTail = `{"outcome":"no_change_needed","evidence":"..."} (optionally with "close":{"criteria":[{"criterion":"...","path":"<repo file>","excerpt":"<24-300 char excerpt verbatim from that file at the default-branch HEAD"}]} when the ask is already satisfied by existing work), {"outcome":"needs_decision","question":"..."}, or {"outcome":"blocked_external","missing":"..."}.`
 
 // subagentFraming is the bounded delegate's contract. Unlike the
 // coordinator, a sub-agent owns nothing terminal: it cannot publish, write
@@ -422,7 +462,7 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 	// both transports reach refuses an all-system first turn, and the wire
 	// renderers render roles verbatim: no renderer may re-role trusted
 	// framing to satisfy a provider.
-	session.Pin(Message{Role: "system", Content: harnessFraming})
+	session.Pin(Message{Role: "system", Content: harnessFraming(inv.Mode)})
 	if strings.TrimSpace(inv.Framing) != "" {
 		session.Pin(Message{Role: "system", Content: inv.Framing})
 	}
@@ -499,7 +539,7 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 			}
 			if clarifications < maxOutcomeClarifications {
 				clarifications++
-				session.Append(Message{Role: "user", Content: outcomeClarification})
+				session.Append(Message{Role: "user", Content: outcomeClarification(inv.Mode)})
 				continue
 			}
 			return executor.HarnessResult{
