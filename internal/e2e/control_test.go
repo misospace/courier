@@ -264,15 +264,15 @@ func (f *fixtureA) invocation(t *testing.T) executor.Invocation {
 // publisherFor builds the trusted publication seam the coordinator drives.
 // The proposal is the commit this incarnation publishes; expected is the work
 // tip it expects to find, exactly as the production control side derives it
-// from the live world.
-func (f *fixtureA) publisherFor(proposal, expected, title, body string) *fixturePublisher {
+// from the live world. The pull-request title and body are not part of the
+// seam: the coordinator's finish passes the model's declared pair to
+// OpenPullRequest (#844).
+func (f *fixtureA) publisherFor(proposal, expected string) *fixturePublisher {
 	return &fixturePublisher{
 		engine:   f.engine,
 		runUID:   f.runUID,
 		proposal: proposal,
 		expected: expected,
-		title:    title,
-		body:     body,
 	}
 }
 

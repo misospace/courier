@@ -179,8 +179,6 @@ type fixturePublisher struct {
 	// the production control side derives it from the live world: empty for
 	// the run's first commit, the live tip for every later one.
 	expected string
-	title    string
-	body     string
 	// opened is the pull request the publication opened.
 	opened broker.PullRequestState
 	// publications counts the publication attempts this seam made, so a
@@ -189,6 +187,7 @@ type fixturePublisher struct {
 }
 
 var _ harness.Publisher = (*fixturePublisher)(nil)
+var _ harness.PullRequestOpener = (*fixturePublisher)(nil)
 
 // Integrate is unreachable in this fixture: the coordinator integrates only
 // a delegated brief's artifact, and the fixture's model delegates nothing.
@@ -196,20 +195,42 @@ func (p *fixturePublisher) Integrate(context.Context, harness.IntegrationRequest
 	return harness.Integration{}, errors.New("e2e: no brief was delegated, so there is nothing to integrate")
 }
 
-// Publish publishes the proposal through the production broker policy engine
-// and opens the pull request the policy allows.
+// Publish fast-forwards the pinned work ref to the proposal through the
+// production broker policy engine. The pull request is not opened here: the
+// coordinator's finish opens it through OpenPullRequest with the title and
+// body the model declared (#844).
 func (p *fixturePublisher) Publish(ctx context.Context) (harness.Publication, error) {
 	p.publications++
 	result, err := p.engine.Publish(ctx, broker.PublicationRequest{RunUID: p.runUID, ProposedOID: p.proposal, ExpectedWorkOID: p.expected})
 	if err != nil {
 		return harness.Publication{}, err
 	}
-	pr, _, err := p.engine.CreatePullRequest(ctx, p.proposal, p.title, p.body, false)
+	return harness.Publication{OID: result.OID, AlreadyPublished: result.AlreadyPublished}, nil
+}
+
+// OpenPullRequest opens the run's pull request at the proposed head through
+// the production broker policy engine's create route (#844), with the
+// title and body the model declared: the linkage contract and the
+// duplicate-pull-request guard are the engine's decision, so a re-open after
+// a restart adopts the discovered pull request instead of creating a second
+// one.
+func (p *fixturePublisher) OpenPullRequest(ctx context.Context, title, body string, draft bool) (harness.PullRequest, error) {
+	pr, report, err := p.engine.CreatePullRequest(ctx, p.proposal, title, body, draft)
 	if err != nil {
-		return harness.Publication{}, err
+		return harness.PullRequest{}, err
 	}
 	p.opened = pr
-	return harness.Publication{OID: result.OID, AlreadyPublished: result.AlreadyPublished}, nil
+	opened := harness.PullRequest{
+		Number:   pr.Number,
+		State:    pr.State,
+		HeadRepo: pr.HeadRepo,
+		HeadRef:  pr.HeadRef,
+		HeadOID:  pr.HeadOID,
+	}
+	if report != nil {
+		opened.Coverage = report.Coverage
+	}
+	return opened, nil
 }
 
 // TestFixtureANativeControlPath is the fixture itself.
@@ -264,12 +285,15 @@ type fixtureProposal struct {
 
 // scriptedResponses is the fixture world's model script: the capability
 // gate's completion probe, the coordinator's first turn (one worker task),
-// and the coordinator's second turn (the outcome declaration).
+// and the coordinator's second turn (the outcome declaration). The resolve-
+// issue run opens its pull request through the broker's create route, so the
+// changes declaration carries the pull-request title and body (#844) that
+// route validates against the pinned linkage.
 func scriptedResponses() []modelResponse {
 	return []modelResponse{
 		{sse: sse(contentChunk("probe"), finishChunk("stop"))},
 		{sse: sse(toolCallChunk(0, "call-shell", "shell", `{"command":"echo courier"}`), finishChunk("tool_calls"))},
-		{sse: sse(contentChunk(`{"outcome":"changes"}`), finishChunk("stop"))},
+		{sse: sse(contentChunk(fmt.Sprintf(`{"outcome":"changes","prTitle":"Add the widget","prBody":"Closes %s/%s#%d."}`, fixtureOwner, fixtureRepo, fixtureIssue)), finishChunk("stop"))},
 	}
 }
 
@@ -555,9 +579,7 @@ func (f *fixtureA) runControl(t *testing.T, ctx context.Context) {
 	f.capabilityGate(t, ctx, gateway, probe)
 
 	delegator := f.newDelegator(t, f.controlPod, f.workerKey)
-	f.publisher = f.publisherFor(f.proposal, "",
-		"Add the widget",
-		fmt.Sprintf("Closes %s/%s#%d.", fixtureOwner, fixtureRepo, fixtureIssue))
+	f.publisher = f.publisherFor(f.proposal, "")
 	coordinator := f.newCoordinator(t, gateway, delegator, f.publisher, f.reporter)
 
 	f.result = coordinator.Run(ctx, f.invocation(t))

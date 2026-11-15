@@ -118,9 +118,7 @@ func (f *fixtureB) runControl(t *testing.T, ctx context.Context) {
 	f.capabilityGate(t, ctx, gateway, probe)
 
 	delegator := f.newDelegator(t, f.controlPod, f.workerKey)
-	f.publisher = f.publisherFor(f.proposal, "",
-		"Add the widget",
-		fmt.Sprintf("Closes %s/%s#%d.", fixtureOwner, fixtureRepo, fixtureIssue))
+	f.publisher = f.publisherFor(f.proposal, "")
 	coordinator := f.newCoordinator(t, gateway, delegator, f.publisher, f.reporter)
 
 	f.result = coordinator.Run(ctx, f.invocation(t))

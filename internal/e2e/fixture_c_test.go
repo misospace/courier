@@ -81,14 +81,19 @@ type fixtureC struct {
 
 // restartResponses is the model script of the two incarnations: the first
 // incarnation's probe, its tool turn, its outcome declaration, then the
-// replacement incarnation's probe and its own outcome declaration.
+// replacement incarnation's probe and its own outcome declaration. Both
+// outcome declarations carry the pull-request title and body (#844): the
+// mode, not the world, decides the shape, and the second incarnation's
+// create route adopts the discovered pull request instead of opening a
+// second one.
 func restartResponses() []modelResponse {
+	changes := fmt.Sprintf(`{"outcome":"changes","prTitle":"Add the widget","prBody":"Closes %s/%s#%d."}`, fixtureOwner, fixtureRepo, fixtureIssue)
 	return []modelResponse{
 		{sse: sse(contentChunk("probe"), finishChunk("stop"))},
 		{sse: sse(toolCallChunk(0, "call-shell", "shell", `{"command":"echo courier"}`), finishChunk("tool_calls"))},
-		{sse: sse(contentChunk(`{"outcome":"changes"}`), finishChunk("stop"))},
+		{sse: sse(contentChunk(changes), finishChunk("stop"))},
 		{sse: sse(contentChunk("probe"), finishChunk("stop"))},
-		{sse: sse(contentChunk(`{"outcome":"changes"}`), finishChunk("stop"))},
+		{sse: sse(contentChunk(changes), finishChunk("stop"))},
 	}
 }
 
@@ -146,9 +151,7 @@ func (f *fixtureC) runFirstIncarnation(t *testing.T, ctx context.Context) {
 	f.capabilityGate(t, ctx, gateway, probe)
 
 	delegator := f.newDelegator(t, f.controlPod, f.workerKey)
-	f.firstPublisher = f.publisherFor(f.proposals[0], "",
-		"Add the widget",
-		fmt.Sprintf("Closes %s/%s#%d.", fixtureOwner, fixtureRepo, fixtureIssue))
+	f.firstPublisher = f.publisherFor(f.proposals[0], "")
 	coordinator := f.newCoordinator(t, gateway, delegator, f.firstPublisher, f.reporter)
 
 	result := coordinator.Run(ctx, f.invocation(t))
@@ -259,9 +262,7 @@ func (f *fixtureC) runSecondIncarnation(t *testing.T, ctx context.Context) {
 	f.capabilityGate(t, ctx, gateway, probe)
 
 	delegator := f.newDelegator(t, f.replacement, f.workerKey)
-	f.secondPublisher = f.publisherFor(f.proposals[1], f.proposals[0],
-		"Add the widget",
-		fmt.Sprintf("Closes %s/%s#%d.", fixtureOwner, fixtureRepo, fixtureIssue))
+	f.secondPublisher = f.publisherFor(f.proposals[1], f.proposals[0])
 	coordinator := f.newCoordinator(t, gateway, delegator, f.secondPublisher, f.reporter)
 
 	result := coordinator.Run(ctx, f.invocation(t))
