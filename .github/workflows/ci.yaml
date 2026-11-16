@@ -113,7 +113,7 @@ jobs:
           if [ "$PACKAGES" = "__rest__" ]; then
             mapfile -t packages < <(
               go list ./... |
-                grep -v -E '/cmd/courier-executor$|/internal/harness$|/internal/controller$'
+                grep -v -E '/cmd/courier-executor$|/internal/harness$|/internal/controller$|/internal/e2e$'
             )
           else
             packages=("$PACKAGES")
@@ -122,20 +122,59 @@ jobs:
           printf 'race-test shard %s: %s\n' "$SHARD" "${packages[*]}"
           go test -race "${packages[@]}" -coverprofile "cover-${SHARD}.out"
 
-  # Keep the required branch-protection context stable while the expensive
-  # race suite fans out onto independent runners. A failed or cancelled matrix
-  # child makes the matrix job non-success, and therefore this aggregator fail.
+  e2e:
+    name: test / e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version: "1.27.4"
+          cache: true
+
+      - name: Install setup-envtest
+        run: make setup-envtest
+
+      - name: Resolve envtest asset version
+        id: envtest-version
+        run: |
+          k8s=$(sed -n 's/^ENVTEST_K8S_VERSION ?= //p' Makefile)
+          test -n "$k8s"
+          echo "k8s=$k8s" >> "$GITHUB_OUTPUT"
+
+      - name: Cache envtest assets
+        uses: actions/cache@v6.1.0
+        with:
+          path: ~/.local/share/kubebuilder-envtest
+          key: envtest-k8s-${{ steps.envtest-version.outputs.k8s }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Provision envtest assets
+        run: |
+          k8s=$(sed -n 's/^ENVTEST_K8S_VERSION ?= //p' Makefile)
+          assets="$(bin/setup-envtest use -p path "$k8s")"
+          test -n "$assets"
+          echo "KUBEBUILDER_ASSETS=$assets" >> "$GITHUB_ENV"
+
+      - name: Replay the native control path
+        run: go test -race ./internal/e2e/... -count=1 -timeout 20m
+
   test:
     runs-on: ubuntu-latest
-    needs: test-shard
+    needs: [test-shard, e2e]
     if: ${{ !cancelled() }}
     steps:
-      - name: Require race-test shards
+      - name: Require race-test shards and the native replay
         env:
           SHARD_RESULT: ${{ needs.test-shard.result }}
+          E2E_RESULT: ${{ needs.e2e.result }}
         run: |
           if [ "$SHARD_RESULT" != "success" ]; then
             echo "race-test shards finished with: $SHARD_RESULT"
+            exit 1
+          fi
+          if [ "$E2E_RESULT" != "success" ]; then
+            echo "the native replay finished with: $E2E_RESULT"
             exit 1
           fi
 

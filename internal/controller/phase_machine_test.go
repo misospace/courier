@@ -2047,7 +2047,7 @@ func TestBlockedExternalIsRecoverableDependencyBlock(t *testing.T) {
 	}
 	// The phase is terminal, so it no longer consumes lane capacity and a
 	// follow-up reconcile does not re-publish the lifecycle.
-	if phaseConsumesCapacity(updated.Status.Phase) {
+	if PhaseConsumesCapacity(updated.Status.Phase) {
 		t.Fatalf("phase %q must not consume lane capacity", updated.Status.Phase)
 	}
 	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {

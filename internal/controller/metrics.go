@@ -400,7 +400,7 @@ func nonNegativeSeconds(d time.Duration) float64 {
 // the lane-profile scope is reported on both gauges, with drained lanes
 // carrying a zero in-flight count, and a failed List increments the
 // scrape-errors counter instead of silently dropping the scrape. Capacity
-// consumption follows phaseConsumesCapacity: only Claimed and Running runs
+// consumption follows PhaseConsumesCapacity: only Claimed and Running runs
 // count, so a Verifying run no longer blocks new admissions. The discovery-side
 // reservation gauges are deliberately broader: source.PhaseReservesDiscovery
 // also counts Pending and empty-phase runs, so a binding does not hoard
@@ -619,7 +619,7 @@ func (c *LaneCollector) Collect(ch chan<- prometheus.Metric) {
 	oldestReservation := make(map[string]time.Time)
 	for i := range runs {
 		run := &runs[i]
-		if phaseConsumesCapacity(run.Status.Phase) {
+		if PhaseConsumesCapacity(run.Status.Phase) {
 			inFlight[run.Spec.Lane]++
 		}
 		if source.PhaseReservesDiscovery(run.Status.Phase) {
