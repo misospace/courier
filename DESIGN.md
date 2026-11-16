@@ -4198,10 +4198,11 @@ Three scenarios are replayed:
 - **The published path.** The operator admits the run and claims its source
   with a receipt, the capability gate passes, a real role-bound turn produces
   earned tool activity, the authenticated status path persists heartbeat,
-  checkpoint, and lastCommit under the control pod's identity, the broker's
-  policy engine publishes the pinned branch and opens exactly one pull request
-  on the pinned head, and the operator settles the source. The fixture asserts
-  the identity of every published artifact, that the forge contract's
+  checkpoint, and lastCommit under the control pod's identity, and the control
+  side publishes the pinned branch and opens exactly one pull request on the
+  pinned head over the broker's own routes, where the policy engine makes every
+  decision. The operator then settles the source. The fixture asserts the
+  identity of every published artifact, that the forge contract's
   capability vocabulary is closed and the coordinator offers the model no
   merge-shaped tool, and that no heartbeat was written before the activity
   that earned it.
@@ -4222,14 +4223,16 @@ Three scenarios are replayed:
 The replay proves the seams, not the cluster. It never runs a pod (envtest has
 no kubelet, so the harness half is driven in-process), it does not exercise the
 operator's own relaunch path (the restart scenario provisions the replacement
-control pod itself), it drives the broker's policy engine directly rather than
-its HTTP routes, and it supplies the proposal rather than rendering the
-integration tree. The worker's shell is the residual path to a forge merge: the
-worker holds no forge credential and the secure topology denies it network
-access to the forge, but envtest enforces no network policy. Real provider
-behavior, real CI on a published pull request, real cluster RBAC and
-network-policy enforcement, and sustained heartbeat cadence over a long episode
-remain live-only checks. The graduated evidence table in
+control pod itself), it supplies the proposal rather than rendering the
+integration tree, and it reaches the broker over its own HTTP routes — the
+publication route and the pull-request creation route — with the production
+control-side client, so the route's confirmations and refusals are the
+evidence the replay asserts. The worker's shell is the residual path to a
+forge merge: the worker holds no forge credential and the secure topology
+denies it network access to the forge, but envtest enforces no network
+policy. Real provider behavior, real CI on a published pull request, real
+cluster RBAC and network-policy enforcement, and sustained heartbeat cadence
+over a long episode remain live-only checks. The graduated evidence table in
 [docs/native-graduation-runbook.md](./docs/native-graduation-runbook.md)
 keeps the two evidence classes apart; the live acceptance criteria live in
 [#102](https://github.com/misospace/courier/issues/102).

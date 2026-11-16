@@ -91,18 +91,16 @@ third-party pull request.
 
 | Scenario | What it proves | What it cannot prove |
 | --- | --- | --- |
-| Published path (`internal/e2e/fixture_a_test.go`) | Admission, source claim with a receipt, capability gate, a role-bound turn with earned tool activity, authenticated status progress, fenced publication, source settlement, the published identity, exactly one pull request on the pinned head, and the absence of any merge path. | Pod execution: envtest has no kubelet, so the harness half runs in-process. |
+| Published path (`internal/e2e/fixture_a_test.go`) | Admission, source claim with a receipt, capability gate, a role-bound turn with earned tool activity, authenticated status progress, a fenced publication and a pull request created over the broker's own HTTP routes with the production control-side client, source settlement, the published identity, exactly one pull request on the pinned head, and the absence of any merge path. | Pod execution: envtest has no kubelet, so the harness half runs in-process. |
 | Failed path (`internal/e2e/fixture_b_test.go`) | An injected provider throttle produces no heartbeat, a bounded request count, a truthful blocked-external ending with the observed cause, a finished attempt, a released lane, and no publication. | Real provider throttling, and any provider behavior the scripted gateway does not model. |
 | Restarted path (`internal/e2e/fixture_c_test.go`) | A second control incarnation keeps the source identity, has the stale incarnation's status write refused, leaves exactly one pull request on the pinned head, and records the commit actually published. | The operator's own relaunch path: the fixture provisions the replacement control pod, because a test cannot run one. A broker restart is a different case: the broker is its own pod, so a control restart leaves it standing and the successor's publication rides the broker's confirmation. |
 
 What stays live-only, and is tracked in #102 rather than here: sustained
 heartbeat cadence over a long tool or subagent episode, a real published pull
-request with real CI, the operator's relaunch of a real interrupted run, the
-broker's HTTP publication and pull-request routes as the native control side
-calls them, cluster RBAC and network-policy enforcement, and the worker's
-residual shell path to a forge (the worker holds no forge credential and the
-secure topology denies it network access, but envtest enforces no network
-policy).
+request with real CI, the operator's relaunch of a real interrupted run,
+cluster RBAC and network-policy enforcement, and the worker's residual shell
+path to a forge (the worker holds no forge credential and the secure topology
+denies it network access, but envtest enforces no network policy).
 
 Runner requirements for the replay job: Linux, `git` on PATH, the envtest
 assets for the pinned Kubernetes version (the job resolves them with

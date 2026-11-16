@@ -267,12 +267,30 @@ func (f *fixtureA) invocation(t *testing.T) executor.Invocation {
 // from the live world. The pull-request title and body are not part of the
 // seam: the coordinator's finish passes the model's declared pair to
 // OpenPullRequest (#844).
-func (f *fixtureA) publisherFor(proposal, expected string) *fixturePublisher {
+//
+// The seam reaches the broker over its own HTTP routes, with the
+// incarnation's own credential, so the route's answers are the evidence.
+func (f *fixtureA) publisherFor(t *testing.T, proposal, expected, token string) *fixturePublisher {
+	t.Helper()
 	return &fixturePublisher{
-		engine:   f.engine,
-		runUID:   f.runUID,
+		broker:   f.brokerClient(t, token),
 		proposal: proposal,
 		expected: expected,
+	}
+}
+
+// brokerClient builds the production control-side client for the fixture's
+// broker server: the typed API the real control side calls, with the
+// incarnation's own bearer token.
+func (f *fixtureA) brokerClient(t *testing.T, token string) *harness.BrokerClient {
+	t.Helper()
+	if f.brokerServer == nil {
+		t.Fatal("the publication seam needs the fixture's broker server")
+	}
+	return &harness.BrokerClient{
+		BaseURL:     f.brokerServer.URL,
+		TokenSource: harness.NewStaticBrokerTokenSource([]byte(token)),
+		HTTP:        f.brokerServer.Client(),
 	}
 }
 
@@ -305,6 +323,9 @@ func (f *fixtureA) waitForPhase(t *testing.T, ctx context.Context, phase courier
 			t.Fatalf("reconcile: %v", err)
 		}
 		run := f.fetch(t)
+		// The merge path is closed, so no settle path may reach Done: the
+		// claim is checked at every step of the path, not only at its end.
+		f.assertNeverDone(t, run)
 		if run.Status.Phase == phase {
 			return
 		}

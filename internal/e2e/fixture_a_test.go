@@ -24,7 +24,10 @@ package e2e
 //	publication     the production broker policy engine publishes the
 //	                 proposal to the pinned work ref and opens exactly one
 //	                 pull request, through the production forge adapter over
-//	                 the local-git forge double.
+//	                 the local-git forge double. The control side reaches
+//	                 both over the broker's own HTTP routes, through the
+//	                 production client, so the route's answers — the
+//	                 confirmation and the refusal alike — are the evidence.
 //	settlement       the operator observes the control pod's termination with
 //	                 the fenced native terminal result, verifies the world,
 //	                 and settles the source.
@@ -34,6 +37,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -138,6 +142,10 @@ type fixtureA struct {
 	runUID string
 	// engine is the production broker policy engine.
 	engine *broker.PolicyEngine
+	// brokerServer is the fixture's broker listener: the production broker
+	// served over the fixture's own TLS server. The control side reaches it
+	// through the production client, as the real control side does.
+	brokerServer *httptest.Server
 	// policy is the broker policy bound to the live run.
 	policy broker.Policy
 	// adapter is the production forge adapter over the local-git double.
@@ -163,24 +171,33 @@ type fixtureA struct {
 	// coordinator is the production harness coordinator.
 	// result is the harness's terminal result.
 	result executor.HarnessResult
-	// pullRequest is the pull request the publication opened.
-	pullRequest broker.PullRequestState
+	// pullRequest is the pull request the publication opened, as the
+	// control side received it back from the broker's create route.
+	pullRequest harness.PullRequest
 }
 
 // fixturePublisher is the trusted publication seam the coordinator drives.
 // It holds no policy of its own: every publication decision — the pinned
 // identity, the fast-forward check, the duplicate-pull-request guard, the
 // linkage contract — is the production broker policy engine's.
+//
+// The seam reaches that engine the way the production control side reaches
+// it: over the broker's own HTTP routes, through the production
+// control-side client. The route is where the refusal and the confirmation
+// live, so driving it is what makes the route's own answers the fixture's
+// evidence.
 type fixturePublisher struct {
-	engine   *broker.PolicyEngine
-	runUID   string
+	// broker is the production control-side client. Its calls travel the
+	// broker's typed API exactly as the real control side's do.
+	broker *harness.BrokerClient
+	// proposal is the commit this incarnation publishes.
 	proposal string
 	// expected is the work tip this incarnation expects to find, exactly as
 	// the production control side derives it from the live world: empty for
 	// the run's first commit, the live tip for every later one.
 	expected string
 	// opened is the pull request the publication opened.
-	opened broker.PullRequestState
+	opened harness.PullRequest
 	// publications counts the publication attempts this seam made, so a
 	// fixture can prove that two publications produced one pull request.
 	publications int
@@ -196,116 +213,166 @@ func (p *fixturePublisher) Integrate(context.Context, harness.IntegrationRequest
 }
 
 // Publish fast-forwards the pinned work ref to the proposal through the
-// production broker policy engine. The pull request is not opened here: the
+// broker's publication route: the production control side publishes over
+// that route, and the broker's own confirmation of the push — never the
+// transport outcome — decides. The pull request is not opened here: the
 // coordinator's finish opens it through OpenPullRequest with the title and
 // body the model declared (#844).
 func (p *fixturePublisher) Publish(ctx context.Context) (harness.Publication, error) {
 	p.publications++
-	result, err := p.engine.Publish(ctx, broker.PublicationRequest{RunUID: p.runUID, ProposedOID: p.proposal, ExpectedWorkOID: p.expected})
-	if err != nil {
-		return harness.Publication{}, err
-	}
-	return harness.Publication{OID: result.OID, AlreadyPublished: result.AlreadyPublished}, nil
+	return p.broker.Publish(ctx, p.expected, p.proposal)
 }
 
 // OpenPullRequest opens the run's pull request at the proposed head through
-// the production broker policy engine's create route (#844), with the
-// title and body the model declared: the linkage contract and the
-// duplicate-pull-request guard are the engine's decision, so a re-open after
-// a restart adopts the discovered pull request instead of creating a second
-// one.
+// the broker's pull-request creation route (#844): the production control
+// side opens a pull request over that route and nowhere else, so the mode
+// gate, the linkage contract, and the duplicate-pull-request guard stay the
+// engine's decision, and a re-open after a restart adopts the discovered
+// pull request instead of creating a second one.
 func (p *fixturePublisher) OpenPullRequest(ctx context.Context, title, body string, draft bool) (harness.PullRequest, error) {
-	pr, report, err := p.engine.CreatePullRequest(ctx, p.proposal, title, body, draft)
+	pr, err := p.broker.CreatePullRequest(ctx, p.proposal, title, body, draft)
 	if err != nil {
-		return harness.PullRequest{}, classifyCreateRefusal(ctx, err)
+		return harness.PullRequest{}, classifyCreateRefusal(err)
 	}
 	p.opened = pr
-	opened := harness.PullRequest{
-		Number:   pr.Number,
-		State:    pr.State,
-		HeadRepo: pr.HeadRepo,
-		HeadRef:  pr.HeadRef,
-		HeadOID:  pr.HeadOID,
-	}
-	if report != nil {
-		opened.Coverage = report.Coverage
-	}
-	return opened, nil
+	return pr, nil
 }
 
-// classifyCreateRefusal maps the policy engine's answer to the create route
-// into the coordinator's taxonomy, the way the broker's own HTTP route
-// classifies it (internal/broker/server.go): the route answers every error
-// the engine returns with HTTP 422, and the harness reads a non-retryable 4xx
-// as a definite denial — a blocked world, never an infrastructure failure. A
-// forge outage inside the engine is a denial here for the same reason it is
-// one in production: the route collapses every engine error into that one
-// status.
+// classifyCreateRefusal maps the create route's answer into the
+// coordinator's taxonomy, the way the production publication engine
+// classifies the same call (internal/harness/publisher.go): a definite
+// refusal — a status the broker states as a denial — is a blocked world,
+// never an infrastructure failure, and a call that never received an answer
+// is an infrastructure failure.
 //
-// The fixture classifies the engine's answer instead of matching its error
-// text, so a reworded refusal still reads as a refusal instead of silently
-// becoming a transport failure.
-//
-// Only the transport class stays an infrastructure failure: a call whose
-// context is done never received an answer, exactly as it never receives one
-// on the wire, and a context error the engine passed through is that same
-// class.
-func classifyCreateRefusal(ctx context.Context, err error) error {
+// The rule is the route's own: the broker answers every engine error with
+// HTTP 422 (internal/broker/server.go), and the control-side client reads a
+// definite 4xx as a denial and everything else — a transport failure, a
+// retryable status, a malformed answer — as a failure it may retry. The
+// fixture classifies the answer, never the engine's wording, so a reworded
+// refusal still reads as a refusal.
+func classifyCreateRefusal(err error) error {
 	if err == nil {
 		return nil
 	}
-	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return err
+	var blocked *harness.PublicationBlockedError
+	if errors.As(err, &blocked) {
+		return blocked
 	}
-	return &harness.PublicationBlockedError{Reason: err.Error(), Err: err}
+	var callErr *harness.BrokerCallError
+	if errors.As(err, &callErr) && !callErr.Retryable && definiteDenialStatus(callErr.StatusCode) {
+		return &harness.PublicationBlockedError{
+			Reason: "the broker denied the pull request creation (" + callErr.Category + ")",
+			Err:    err,
+		}
+	}
+	return &harness.TransientPublicationError{Err: err}
+}
+
+// definiteDenialStatus reports whether one status is a definite refusal.
+// The rule is the production one: a request timeout and a rate limit are
+// ambiguous, and every other 4xx is the broker refusing outright.
+func definiteDenialStatus(status int) bool {
+	switch status {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return false
+	default:
+		return status >= 400 && status < 500
+	}
 }
 
 // TestCreateRefusalClassification pins the classification the coordinator
-// sees when the create route refuses: a refusal the engine states is a
+// sees when the create route refuses: a refusal the broker states is a
 // blocked world, whatever the engine words it with, and only a call that
 // never received an answer is an infrastructure failure.
 func TestCreateRefusalClassification(t *testing.T) {
-	live := context.Background()
-	for _, refusal := range []error{
-		errors.New("publication denied: the proposed commit is not the exact live head"),
-		errors.New("publication denied: multiple pull requests claim the pinned head"),
-		errors.New("check existing pull request failed"),
-	} {
-		classified := classifyCreateRefusal(live, refusal)
+	// The route's own denials: a definite status the broker states.
+	for _, status := range []int{http.StatusUnprocessableEntity, http.StatusBadRequest, http.StatusForbidden} {
+		denial := &harness.BrokerCallError{StatusCode: status, Category: "denied the operation"}
+		classified := classifyCreateRefusal(denial)
 		var blocked *harness.PublicationBlockedError
 		if !errors.As(classified, &blocked) {
-			t.Fatalf("classified refusal = %v, want a publication block", classified)
+			t.Fatalf("classified %d = %v, want a publication block", status, classified)
 		}
-		if blocked.Err != refusal {
-			t.Fatalf("blocked error = %v, want the engine's own answer", blocked.Err)
+		if blocked.Err != denial {
+			t.Fatalf("blocked error = %v, want the route's own answer", blocked.Err)
 		}
-		if blocked.Reason != refusal.Error() {
-			t.Fatalf("blocked reason = %q, want the engine's own wording %q", blocked.Reason, refusal.Error())
+		if !strings.Contains(blocked.Reason, "denied the operation") {
+			t.Fatalf("blocked reason = %q, want it to name the route's own category", blocked.Reason)
 		}
 	}
-	// The engine answers a failed call with its own sanitized refusal, so
-	// the transport class is the call's state, not the error's type: an
-	// expired call never received the answer the engine states.
-	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
-	defer cancel()
-	refusal := errors.New("observe pinned base failed")
-	classified := classifyCreateRefusal(expired, refusal)
+	// The ambiguous statuses are never denials: the same call may still
+	// succeed on a later attempt.
+	for _, status := range []int{http.StatusRequestTimeout, http.StatusTooManyRequests} {
+		ambiguous := &harness.BrokerCallError{StatusCode: status, Category: "is temporarily unavailable", Retryable: true}
+		classified := classifyCreateRefusal(ambiguous)
+		var blocked *harness.PublicationBlockedError
+		if errors.As(classified, &blocked) {
+			t.Fatalf("classified %d = %v, want an infrastructure failure", status, classified)
+		}
+	}
+	// A call that never received an answer is an infrastructure failure: the
+	// world never refused anything.
+	transport := &harness.BrokerCallError{Category: "is unreachable", Retryable: true}
+	classified := classifyCreateRefusal(transport)
 	var blocked *harness.PublicationBlockedError
 	if errors.As(classified, &blocked) {
-		t.Fatalf("classified expired call = %v, want an infrastructure failure", classified)
+		t.Fatalf("classified transport failure = %v, want an infrastructure failure", classified)
 	}
-	if classified != refusal {
-		t.Fatalf("classified expired call = %v, want the engine's own answer", classified)
+	var transient *harness.TransientPublicationError
+	if !errors.As(classified, &transient) {
+		t.Fatalf("classified transport failure = %v, want a transient publication failure", classified)
 	}
-	for _, transport := range []error{context.Canceled, context.DeadlineExceeded} {
-		classified := classifyCreateRefusal(live, transport)
-		if errors.As(classified, &blocked) {
-			t.Fatalf("classified transport failure = %v, want an infrastructure failure", classified)
-		}
-	}
-	if classified := classifyCreateRefusal(live, nil); classified != nil {
+	if classified := classifyCreateRefusal(nil); classified != nil {
 		t.Fatalf("classified absence = %v, want no error", classified)
 	}
+}
+
+// TestCreateRouteRefusalIsAPublicationBlock proves the classification
+// against the production route itself: the broker's create route refuses a
+// body that closes no work item, answers that refusal with the status it
+// answers every engine error with, and the seam reads the answer as a
+// blocked world — never an infrastructure failure — while the refusal
+// reaches no forge.
+func TestCreateRouteRefusalIsAPublicationBlock(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), fixtureDeadline)
+	defer cancel()
+
+	f := newRefusalFixtureA(t)
+	f.admit(t, ctx)
+	f.buildPublication(t, ctx)
+	f.importProposal(t, ctx, f.proposal, f.git.BaseOID)
+
+	username := "system:serviceaccount:" + f.namespace + ":" + topology.ControlSAName(f.run.Name)
+	reviews := newTokenReviews(username, f.controlSAUID, f.controlPod.Name, string(f.controlPod.UID))
+	reviews.register(fixtureBrokerToken, username, f.controlSAUID, f.controlPod.Name, string(f.controlPod.UID))
+	authenticator := f.buildAuthenticator(t, ctx, reviews)
+	f.startBrokerServer(t, authenticator, f.gitBroker)
+
+	publisher := f.publisherFor(t, f.proposal, "", fixtureBrokerToken)
+	// The body closes no work item: the engine's linkage contract refuses
+	// the create before any forge write.
+	_, err := publisher.OpenPullRequest(ctx, "Add the widget", "a body that closes nothing", false)
+	var blocked *harness.PublicationBlockedError
+	if !errors.As(err, &blocked) {
+		t.Fatalf("create refusal = %v, want a publication block", err)
+	}
+	// The refusal is the route's own answer: the broker answers every
+	// engine error with 422, so the classification reads the status the
+	// route stated and not the engine's wording.
+	var callErr *harness.BrokerCallError
+	if !errors.As(err, &callErr) {
+		t.Fatalf("create refusal = %v, want the broker's own answer", err)
+	}
+	if callErr.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("create refusal status = %d, want %d: the route answers every engine error with 422", callErr.StatusCode, http.StatusUnprocessableEntity)
+	}
+	// The refusal reached no forge: no pull request claims the pinned head
+	// and no create was recorded.
+	assertNoPullRequest(t, ctx, f.provider, f.policy.BaseRepo, f.policy.WorkRepo, f.policy.WorkRef)
 }
 
 // TestFixtureANativeControlPath is the fixture itself.
@@ -328,12 +395,33 @@ func TestFixtureANativeControlPath(t *testing.T) {
 // operator will admit.
 func newFixtureA(t *testing.T) *fixtureA {
 	t.Helper()
-	f := newFixtureWorld(t, scriptedResponses(), fixtureProposal{name: "widget.txt", content: "the widget\n"})
-	f.src = newRecordingSource("receipt-" + f.git.BaseOID[:8])
-	f.sourceAdapter = f.src
+	f := newFixtureAWorld(t)
 	f.runName = "e2e-fixture-a"
 	f.laneName = "e2e-lane"
 	f.prepareCluster(t)
+	return f
+}
+
+// newRefusalFixtureA builds the same world under a run name of its own: the
+// fixtures share one run namespace inside the API server, so a fixture that
+// needs its own run beside the others' must not reuse their name.
+func newRefusalFixtureA(t *testing.T) *fixtureA {
+	t.Helper()
+	f := newFixtureAWorld(t)
+	f.runName = "e2e-fixture-a-refusal"
+	f.laneName = "e2e-lane-a-refusal"
+	f.prepareCluster(t)
+	return f
+}
+
+// newFixtureAWorld builds the parts of Fixture A's world that do not name
+// the run: the local git forge, the scripted model gateway, the worker
+// double, and the recording source.
+func newFixtureAWorld(t *testing.T) *fixtureA {
+	t.Helper()
+	f := newFixtureWorld(t, scriptedResponses(), fixtureProposal{name: "widget.txt", content: "the widget\n"})
+	f.src = newRecordingSource("receipt-" + f.git.BaseOID[:8])
+	f.sourceAdapter = f.src
 	return f
 }
 
@@ -661,7 +749,7 @@ func (f *fixtureA) runControl(t *testing.T, ctx context.Context) {
 	f.capabilityGate(t, ctx, gateway, probe)
 
 	delegator := f.newDelegator(t, f.controlPod, f.workerKey)
-	f.publisher = f.publisherFor(f.proposal, "")
+	f.publisher = f.publisherFor(t, f.proposal, "", fixtureBrokerToken)
 	coordinator := f.newCoordinator(t, gateway, delegator, f.publisher, f.reporter)
 
 	f.result = coordinator.Run(ctx, f.invocation(t))
@@ -727,6 +815,7 @@ func (f *fixtureA) startBrokerServer(t *testing.T, authenticator broker.RequestA
 	}
 	httpServer := httptest.NewTLSServer(server.Handler())
 	t.Cleanup(httpServer.Close)
+	f.brokerServer = httpServer
 	return httpServer
 }
 
@@ -784,13 +873,17 @@ func (f *fixtureA) settle(t *testing.T, ctx context.Context) {
 	// The operator verifies the world before it settles: the observation
 	// names the published pull request and a green check, and the settle
 	// needs two identical observations.
-	observer := &fixtureObserver{pullRequest: f.pullRequest, head: f.proposal}
+	observer := &fixtureObserver{pullRequest: f.pullRequest.Number, head: f.proposal}
 	f.reconciler.Observer = observer
 	for attempt := 0; attempt < 6; attempt++ {
 		if _, err := f.reconciler.Reconcile(ctx, f.request()); err != nil {
 			t.Fatalf("reconcile: %v", err)
 		}
 		run := f.fetch(t)
+		// The settle path never reaches Done: the merge path is closed, so
+		// the run's ending is the review handoff. The claim is checked at
+		// every step of the path, not only at its end.
+		f.assertNeverDone(t, run)
 		if run.Status.Phase == courierv1alpha1.PhaseAwaitingReview {
 			return
 		}
@@ -798,17 +891,28 @@ func (f *fixtureA) settle(t *testing.T, ctx context.Context) {
 	t.Fatalf("phase = %q, want AwaitingReview after the operator verified the world", f.fetch(t).Status.Phase)
 }
 
+// assertNeverDone proves the run never reached Done. The merge path is
+// closed — the forge vocabulary has no merge verb, and the coordinator
+// offers the model no merge-shaped tool — so a run that ends in Done would
+// name a merge that the contract cannot express.
+func (f *fixtureA) assertNeverDone(t *testing.T, run *courierv1alpha1.CoderRun) {
+	t.Helper()
+	if run.Status.Phase == courierv1alpha1.PhaseDone {
+		t.Fatal("the run reached Done: a merge happened that the contract has no verb for")
+	}
+}
+
 // fixtureObserver is the world observer the operator verifies the published
 // pull request with. It reports the pull request the publication opened and
 // a green check on it.
 type fixtureObserver struct {
-	pullRequest broker.PullRequestState
+	pullRequest int
 	head        string
 }
 
 func (o *fixtureObserver) Observe(context.Context, string, controller.HeadRef) (controller.PRObservation, error) {
 	return controller.PRObservation{
-		PR:   fmt.Sprint(o.pullRequest.Number),
+		PR:   fmt.Sprint(o.pullRequest),
 		Head: o.head,
 		Checks: []controller.CheckObservation{
 			{Name: "check-a", State: controller.CheckStatePassed},
@@ -855,28 +959,55 @@ func TestFixtureANonDispatchSource(t *testing.T) {
 	}
 }
 
+// publishedPullRequest reads the forge's own record of the pull request on
+// the pinned head: the published identity the forge holds, including the
+// base it was opened against and the body it was opened with. Exactly one
+// pull request may claim the pinned head, so a second one is a duplicate
+// publication.
+func (f *fixtureA) publishedPullRequest(t *testing.T, ctx context.Context) forge.PullRequest {
+	t.Helper()
+	pulls, err := f.provider.ListPullRequestsByHead(ctx, forge.PullRequestRef{Repo: f.policy.BaseRepo}, f.policy.WorkRepo, f.policy.WorkRef)
+	if err != nil {
+		t.Fatalf("list the pull requests on the pinned head: %v", err)
+	}
+	if len(pulls) != 1 {
+		t.Fatalf("pull requests on the pinned head = %d, want exactly one", len(pulls))
+	}
+	return pulls[0]
+}
+
 // assertions are the fixture's claims. Every one of them is negative where
 // it can be: the fixture proves what did not happen as much as what did.
 func (f *fixtureA) assertions(t *testing.T, ctx context.Context) {
 	t.Helper()
 	run := f.fetch(t)
 
-	// The published identity is exactly the run's pinned identity.
+	// The published identity is exactly the run's pinned identity. The
+	// forge's own record is the authority for the base the pull request was
+	// opened against and the head it was opened on; the create route's
+	// answer is the authority for the number the run records.
 	if got := f.provider.Tip(f.policy.WorkRepo, f.policy.WorkRef); got != f.proposal {
 		t.Fatalf("published work tip = %q, want the proposal %q", got, f.proposal)
 	}
 	pr := f.pullRequest
-	if pr.BaseRepo != f.policy.BaseRepo || pr.BaseRef != f.policy.BaseRef {
-		t.Fatalf("pull request base = %q/%q, want the pinned %q/%q", pr.BaseRepo, pr.BaseRef, f.policy.BaseRepo, f.policy.BaseRef)
+	published := f.publishedPullRequest(t, ctx)
+	if published.BaseRepo != f.policy.BaseRepo || published.BaseRef != f.policy.BaseRef {
+		t.Fatalf("pull request base = %q/%q, want the pinned %q/%q", published.BaseRepo, published.BaseRef, f.policy.BaseRepo, f.policy.BaseRef)
 	}
-	if pr.HeadRepo != f.policy.WorkRepo || pr.HeadRef != f.policy.WorkRef {
-		t.Fatalf("pull request head = %q/%q, want the pinned %q/%q", pr.HeadRepo, pr.HeadRef, f.policy.WorkRepo, f.policy.WorkRef)
+	if published.HeadRepo != f.policy.WorkRepo || published.HeadRef != f.policy.WorkRef {
+		t.Fatalf("pull request head = %q/%q, want the pinned %q/%q", published.HeadRepo, published.HeadRef, f.policy.WorkRepo, f.policy.WorkRef)
+	}
+	if published.HeadSHA != f.proposal {
+		t.Fatalf("pull request head OID = %q, want the published %q", published.HeadSHA, f.proposal)
+	}
+	if published.BaseSHA != f.policy.BaseOID {
+		t.Fatalf("pull request base OID = %q, want the pinned %q", published.BaseSHA, f.policy.BaseOID)
 	}
 	if pr.HeadOID != f.proposal {
-		t.Fatalf("pull request head OID = %q, want the published %q", pr.HeadOID, f.proposal)
+		t.Fatalf("the create route answered head OID %q, want the published %q", pr.HeadOID, f.proposal)
 	}
-	if pr.BaseOID != f.policy.BaseOID {
-		t.Fatalf("pull request base OID = %q, want the pinned %q", pr.BaseOID, f.policy.BaseOID)
+	if published.Number != pr.Number {
+		t.Fatalf("the forge holds pull request #%d, want the #%d the create route answered", published.Number, pr.Number)
 	}
 	if run.Status.PR != fmt.Sprint(pr.Number) {
 		t.Fatalf("run PR = %q, want the published pull request %d", run.Status.PR, pr.Number)
@@ -887,16 +1018,6 @@ func (f *fixtureA) assertions(t *testing.T, ctx context.Context) {
 
 	// Exactly one pull request claims the pinned head: a second one would be
 	// a duplicate publication.
-	pulls, err := f.provider.ListPullRequestsByHead(ctx, forge.PullRequestRef{Repo: f.policy.BaseRepo}, f.policy.WorkRepo, f.policy.WorkRef)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(pulls) != 1 {
-		t.Fatalf("pull requests on the pinned head = %d, want exactly one", len(pulls))
-	}
-	if pulls[0].Number != pr.Number {
-		t.Fatalf("the pull request on the pinned head is #%d, want #%d", pulls[0].Number, pr.Number)
-	}
 	if creates := f.provider.OpsOf(forgetest.LocalGitOpCreatePullRequest); len(creates) != 1 {
 		t.Fatalf("the forge recorded %d pull-request creates, want exactly one: the publication must not duplicate itself", len(creates))
 	}
@@ -911,7 +1032,7 @@ func (f *fixtureA) assertions(t *testing.T, ctx context.Context) {
 		surface(t, "recorded status patches", f.statusTransport.Patches()),
 		surface(t, "the CoderRun's status", run.Status),
 		surface(t, "the CoderRun's metadata", run.ObjectMeta),
-		surface(t, "the published pull request", pr),
+		surface(t, "the published pull request", published),
 		surface(t, "the source's recorded calls", f.src.Calls()),
 		surface(t, "the source's recorded lifecycle", f.src.Reports()),
 		surface(t, "the control pod's spec", f.controlPod.Spec),
@@ -944,12 +1065,16 @@ func (f *fixtureA) assertions(t *testing.T, ctx context.Context) {
 			t.Fatalf("the coordinator offered the model the merge-shaped tool %q", tool)
 		}
 	}
+	if published.State != "open" {
+		t.Fatalf("pull request state = %q, want it open: nothing merged it", published.State)
+	}
 	if pr.State != "open" {
-		t.Fatalf("pull request state = %q, want it open: nothing merged it", pr.State)
+		t.Fatalf("the create route answered state %q, want it open: nothing merged it", pr.State)
 	}
-	if run.Status.Phase == courierv1alpha1.PhaseDone {
-		t.Fatal("the run reached Done; a merge happened that the contract has no verb for")
-	}
+	// The run never reaches Done. The settle path asserts this at every one
+	// of its observations, so the claim is an invariant over that path and
+	// not a single reading of its last state.
+	f.assertNeverDone(t, run)
 
 	// The status progress that landed came from the authenticated control
 	// pod identity.

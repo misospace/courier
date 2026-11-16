@@ -151,7 +151,7 @@ func (f *fixtureC) runFirstIncarnation(t *testing.T, ctx context.Context) {
 	f.capabilityGate(t, ctx, gateway, probe)
 
 	delegator := f.newDelegator(t, f.controlPod, f.workerKey)
-	f.firstPublisher = f.publisherFor(f.proposals[0], "")
+	f.firstPublisher = f.publisherFor(t, f.proposals[0], "", fixtureBrokerToken)
 	coordinator := f.newCoordinator(t, gateway, delegator, f.firstPublisher, f.reporter)
 
 	result := coordinator.Run(ctx, f.invocation(t))
@@ -268,7 +268,7 @@ func (f *fixtureC) runSecondIncarnation(t *testing.T, ctx context.Context) {
 	f.capabilityGate(t, ctx, gateway, probe)
 
 	delegator := f.newDelegator(t, f.replacement, f.workerKey)
-	f.secondPublisher = f.publisherFor(f.proposals[1], f.proposals[0])
+	f.secondPublisher = f.publisherFor(t, f.proposals[1], f.proposals[0], fixtureBrokerTokenTwo)
 	coordinator := f.newCoordinator(t, gateway, delegator, f.secondPublisher, f.reporter)
 
 	result := coordinator.Run(ctx, f.invocation(t))
@@ -330,7 +330,7 @@ func (f *fixtureC) staleWrite(t *testing.T, ctx context.Context) error {
 func (f *fixtureC) settle(t *testing.T, ctx context.Context) {
 	t.Helper()
 	f.terminateControlPod(t, ctx, f.replacement, nativeHandoff("published"), 0)
-	observer := &fixtureObserver{pullRequest: f.secondPublisher.opened, head: f.proposals[1]}
+	observer := &fixtureObserver{pullRequest: f.secondPublisher.opened.Number, head: f.proposals[1]}
 	f.reconciler.Observer = observer
 	f.waitForPhase(t, ctx, courierv1alpha1.PhaseAwaitingReview)
 }
