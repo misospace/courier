@@ -146,6 +146,11 @@ type fixtureA struct {
 	// served over the fixture's own TLS server. The control side reaches it
 	// through the production client, as the real control side does.
 	brokerServer *httptest.Server
+	// brokerServerStarts counts the broker listeners the fixture started.
+	// A restart of the control side must not start another one: the broker
+	// is a separate pod, and the successor talks to the broker that
+	// survived.
+	brokerServerStarts int
 	// policy is the broker policy bound to the live run.
 	policy broker.Policy
 	// adapter is the production forge adapter over the local-git double.
@@ -842,6 +847,7 @@ func (f *fixtureA) startBrokerServer(t *testing.T, authenticator broker.RequestA
 	httpServer := httptest.NewTLSServer(server.Handler())
 	t.Cleanup(httpServer.Close)
 	f.brokerServer = httpServer
+	f.brokerServerStarts++
 	return httpServer
 }
 

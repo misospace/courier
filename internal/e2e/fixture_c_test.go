@@ -20,6 +20,8 @@ package e2e
 //
 //   - the source identity did not move: the same work item, the same
 //     receipt, no successor run,
+//   - the broker survived the control restart: the same broker pod and the
+//     same broker listener served both incarnations,
 //   - the publication stayed singular: two publication attempts, one pull
 //     request, one create,
 //   - no stale publication survived: the run's confirmed commit is the OID
@@ -77,6 +79,9 @@ type fixtureC struct {
 	// broker is a separate pod in the run's topology, and a control
 	// incarnation's death does not replace it.
 	brokerUIDBefore string
+	// brokerURLBefore is the broker listener the first incarnation talked
+	// to: the successor must reach the same listener.
+	brokerURLBefore string
 }
 
 // restartResponses is the model script of the two incarnations: the first
@@ -148,6 +153,10 @@ func (f *fixtureC) runFirstIncarnation(t *testing.T, ctx context.Context) {
 
 	probe := f.newProbe(t, ctx, authenticator, fixtureBrokerToken)
 	f.capabilityGate(t, ctx, gateway, probe)
+	// The broker listener the first incarnation talked to: the successor
+	// must reach this one, because the broker is a pod of its own and the
+	// control incarnation's death does not replace it.
+	f.brokerURLBefore = f.brokerServer.URL
 
 	// The proposal reaches the broker over the broker's own import route:
 	// the work ref is still absent, so the run's first commit creates it.
@@ -181,7 +190,9 @@ func (f *fixtureC) restart(t *testing.T, ctx context.Context) {
 	// failed, so a control incarnation's death leaves the broker standing.
 	// The successor's publication authority is therefore the broker's own
 	// confirmation of the first incarnation's tip — the trust the broker
-	// exists to hold. The fixture asserts the broker pod was not replaced.
+	// exists to hold. The fixture asserts the broker pod was not replaced
+	// and that the successor reached the broker listener the first
+	// incarnation used.
 	f.brokerUIDBefore = string(f.brokerPod.UID)
 	old := f.controlPod
 	f.deadPodUID = string(old.UID)
@@ -265,7 +276,11 @@ func (f *fixtureC) runSecondIncarnation(t *testing.T, ctx context.Context) {
 	authenticator := f.buildAuthenticator(t, ctx, f.tokenReviews(t))
 	f.statusTransport, f.reporter = f.buildStatusPath(t, ctx, authenticator, f.replacement, fixtureBrokerTokenTwo)
 
-	probe := f.newProbe(t, ctx, authenticator, fixtureBrokerTokenTwo)
+	// The successor probes the broker that survived: the broker is a
+	// separate pod in the run's topology, so the control incarnation's
+	// death leaves it standing and the replacement reaches the same
+	// listener the first incarnation used.
+	probe := f.probeOverBrokerServer(t, ctx, fixtureBrokerTokenTwo)
 	f.capabilityGate(t, ctx, gateway, probe)
 
 	// The replacement's proposal reaches the broker over the broker's own
@@ -378,6 +393,18 @@ func (f *fixtureC) assertions(t *testing.T, ctx context.Context) {
 	// first incarnation's tip.
 	if got := string(f.brokerPod.UID); got != f.brokerUIDBefore {
 		t.Fatalf("broker pod UID = %q, want the surviving %q: the restart replaced the broker", got, f.brokerUIDBefore)
+	}
+	// The broker listener the control side talks to is the same one the
+	// first incarnation used: the successor started no broker of its own
+	// and reached the listener that stood through the restart. The state
+	// that authorized its publication — the pull request the first
+	// incarnation opened and the tip it confirmed — is therefore the
+	// surviving broker's own state, not a fresh broker's.
+	if f.brokerServerStarts != 1 {
+		t.Fatalf("broker listeners started = %d, want one: the successor incarnation must reach the broker that survived the control restart", f.brokerServerStarts)
+	}
+	if f.brokerServer.URL != f.brokerURLBefore {
+		t.Fatalf("broker listener = %q, want the one the first incarnation used %q: the restart replaced the broker", f.brokerServer.URL, f.brokerURLBefore)
 	}
 	// Every heartbeat the dead incarnation wrote names the incarnation that
 	// earned it: a heartbeat is fenced to the pod that produced it.

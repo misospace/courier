@@ -184,6 +184,23 @@ func (f *fixtureA) newProbe(t *testing.T, ctx context.Context, authenticator bro
 	return probe
 }
 
+// probeOverBrokerServer builds the production capability probe over the
+// fixture's running broker listener, without starting another one. A control
+// incarnation that replaces a dead one talks to the broker that survived:
+// the broker is a separate pod, and its listener, its state, and its
+// authority are the ones the first incarnation already used.
+func (f *fixtureA) probeOverBrokerServer(t *testing.T, ctx context.Context, token string) *harness.BrokerProbeClient {
+	t.Helper()
+	if f.brokerServer == nil {
+		t.Fatal("the fixture has no broker listener")
+	}
+	return &harness.BrokerProbeClient{
+		BaseURL:     f.brokerServer.URL,
+		TokenSource: harness.NewStaticBrokerTokenSource([]byte(token)),
+		HTTP:        f.brokerServer.Client(),
+	}
+}
+
 // capabilityGate runs the production probe and the production gate: the run
 // proceeds only when the broker's own capability report and the model
 // transport both answer.
