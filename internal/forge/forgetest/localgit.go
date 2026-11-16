@@ -11,14 +11,18 @@ package forgetest
 // Endpoint resolver the broker's git transport pins its destinations with.
 // It reads live refs out of the local git directory with the real git
 // binary, so a publication that claims a tip is checked against the actual
-// object store, and it keeps pull requests in memory.
+// object store, and it keeps pull requests, reviews, comments, and checks in
+// memory.
+//
+// Every capability the double registers is one it serves: the operations it
+// registers it also answers, so a capability gate that passes on the double
+// is a gate the double can satisfy.
 //
 // Like every other double in this package it is test support only: no
 // production package imports it.
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -60,14 +64,19 @@ type LocalGitOp struct {
 	Repo string
 	// Ref is the ref the call named, when it named one.
 	Ref string
+	// Head is the head commit argument of ReadChecks.
+	Head string
 	// PR is the pull-request reference the call named.
 	PR forge.PullRequestRef
-	// Number is the pull-request number a create or update named.
+	// Number is the pull-request number a create, an update, or a comment
+	// named.
 	Number int
 	// HeadRepo and HeadRef are the head identity a head listing named.
 	HeadRepo string
 	// WorkItem is the work-item reference the call named.
 	WorkItem forge.WorkItemRef
+	// Body is the comment body of CommentPullRequest and CommentWorkItem.
+	Body string
 }
 
 // LocalGitConfig seeds a LocalGit double.
@@ -90,6 +99,15 @@ type LocalGitConfig struct {
 	// PullRequests are the pull requests the double knows before any
 	// create. A create joins them.
 	PullRequests []forge.PullRequest
+	// Reviews maps a pull-request reference to the reviews the double
+	// serves on it.
+	Reviews map[forge.PullRequestRef][]forge.Review
+	// Comments maps a pull-request reference to the comments the double
+	// serves on it. A comment the control side adds joins them.
+	Comments map[forge.PullRequestRef][]forge.Comment
+	// Checks maps a pull-request reference to the checks the double serves
+	// on it.
+	Checks map[forge.PullRequestRef][]forge.Check
 	// NextPullRequest is the number the first created pull request takes.
 	// Zero starts at 10.
 	NextPullRequest int
@@ -121,6 +139,16 @@ type LocalGit struct {
 	workItems map[string]forge.WorkItem
 	// pullRequests is the known pull-request set; created requests join it.
 	pullRequests []forge.PullRequest
+	// reviews maps a pull-request reference to its reviews.
+	reviews map[forge.PullRequestRef][]forge.Review
+	// comments maps a pull-request reference to its comments.
+	comments map[forge.PullRequestRef][]forge.Comment
+	// checks maps a pull-request reference to its checks.
+	checks map[forge.PullRequestRef][]forge.Check
+	// workItemComments maps a work-item reference to its comments.
+	workItemComments map[forge.WorkItemRef][]forge.Comment
+	// nextComment is the number the next added comment takes.
+	nextComment int
 	// nextPullRequest is the number the next created request takes.
 	nextPullRequest int
 	// racePullRequest makes a create record a competing request for the
@@ -160,6 +188,18 @@ func NewLocalGit(cfg LocalGitConfig) *LocalGit {
 	for i, pr := range cfg.PullRequests {
 		pulls[i] = copyPullRequest(pr)
 	}
+	reviews := make(map[forge.PullRequestRef][]forge.Review, len(cfg.Reviews))
+	for ref, list := range cfg.Reviews {
+		reviews[ref] = append([]forge.Review{}, list...)
+	}
+	comments := make(map[forge.PullRequestRef][]forge.Comment, len(cfg.Comments))
+	for ref, list := range cfg.Comments {
+		comments[ref] = append([]forge.Comment{}, list...)
+	}
+	checks := make(map[forge.PullRequestRef][]forge.Check, len(cfg.Checks))
+	for ref, list := range cfg.Checks {
+		checks[ref] = append([]forge.Check{}, list...)
+	}
 	next := cfg.NextPullRequest
 	if next == 0 {
 		next = 10
@@ -177,13 +217,18 @@ func NewLocalGit(cfg LocalGitConfig) *LocalGit {
 			forge.CapabilityComment,
 			forge.CapabilityCommentWorkItem,
 		),
-		repositories:    repositories,
-		paths:           paths,
-		protected:       protected,
-		workItems:       workItems,
-		pullRequests:    pulls,
-		nextPullRequest: next,
-		racePullRequest: cfg.RacePullRequest,
+		repositories:     repositories,
+		paths:            paths,
+		protected:        protected,
+		workItems:        workItems,
+		pullRequests:     pulls,
+		reviews:          reviews,
+		comments:         comments,
+		checks:           checks,
+		workItemComments: map[forge.WorkItemRef][]forge.Comment{},
+		nextComment:      1,
+		nextPullRequest:  next,
+		racePullRequest:  cfg.RacePullRequest,
 	}
 }
 
@@ -202,7 +247,7 @@ func (g *LocalGit) Capabilities() forge.Capabilities {
 }
 
 // ResolveRepository resolves a canonical identity (or a repository ID) to its
-// repository identity.
+// repository identity. An identity the double does not know is not found.
 func (g *LocalGit) ResolveRepository(_ context.Context, name string) (forge.Repository, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -212,7 +257,7 @@ func (g *LocalGit) ResolveRepository(_ context.Context, name string) (forge.Repo
 			return repo, nil
 		}
 	}
-	return forge.Repository{}, errors.New("unknown repository")
+	return forge.Repository{}, ErrNotFound
 }
 
 // ReadRef reads the live state of a ref out of the local git directory. An
@@ -244,15 +289,15 @@ func (g *LocalGit) CanWriteRepository(_ context.Context, repo forge.Repository) 
 	return true, nil
 }
 
-// ReadWorkItem reads a seeded work item. An unseeded work item is
-// unsupported, like every operation the double does not offer.
+// ReadWorkItem reads a seeded work item. A work item the double does not
+// hold is not found, exactly like a work item a live forge does not have.
 func (g *LocalGit) ReadWorkItem(_ context.Context, ref forge.WorkItemRef) (forge.WorkItem, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.record(LocalGitOp{Kind: LocalGitOpReadWorkItem, Repo: ref.Repo, WorkItem: ref})
 	item, ok := g.workItems[ref.Repo+"/"+ref.ID]
 	if !ok {
-		return forge.WorkItem{}, forge.ErrUnsupported
+		return forge.WorkItem{}, ErrNotFound
 	}
 	return item, nil
 }
@@ -262,7 +307,7 @@ func (g *LocalGit) ReadWorkItem(_ context.Context, ref forge.WorkItemRef) (forge
 func (g *LocalGit) ReadPullRequest(_ context.Context, ref forge.PullRequestRef) (forge.PullRequest, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.record(LocalGitOp{Kind: LocalGitOpReadPullRequest, Repo: ref.Repo, PR: ref})
+	g.record(LocalGitOp{Kind: LocalGitOpReadPullRequest, Repo: ref.Repo, PR: ref, Number: ref.Number})
 	for _, pr := range g.pullRequests {
 		if pr.Number == ref.Number && pr.BaseRepo == ref.Repo {
 			if tip, ok := g.tipLocked(pr.HeadRepo, pr.HeadRef); ok {
@@ -271,31 +316,44 @@ func (g *LocalGit) ReadPullRequest(_ context.Context, ref forge.PullRequestRef) 
 			return pr, nil
 		}
 	}
-	return forge.PullRequest{}, errors.New("pull request not found")
+	return forge.PullRequest{}, ErrNotFound
 }
 
-// ListReviews is unsupported: the double serves no reviews.
-func (g *LocalGit) ListReviews(context.Context, forge.PullRequestRef) ([]forge.Review, error) {
+// ListReviews returns the reviews the double holds on the pull request. A
+// pull request the double does not hold is not found; one it holds without
+// reviews has none.
+func (g *LocalGit) ListReviews(_ context.Context, ref forge.PullRequestRef) ([]forge.Review, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.record(LocalGitOp{Kind: LocalGitOpListReviews})
-	return nil, forge.ErrUnsupported
+	g.record(LocalGitOp{Kind: LocalGitOpListReviews, Repo: ref.Repo, PR: ref, Number: ref.Number})
+	if !g.knowsPullRequestLocked(ref) {
+		return nil, ErrNotFound
+	}
+	return append([]forge.Review{}, g.reviews[ref]...), nil
 }
 
-// ListComments is unsupported: the double serves no comments.
-func (g *LocalGit) ListComments(context.Context, forge.PullRequestRef) ([]forge.Comment, error) {
+// ListComments returns the comments the double holds on the pull request: the
+// seeded ones and the ones the control side added.
+func (g *LocalGit) ListComments(_ context.Context, ref forge.PullRequestRef) ([]forge.Comment, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.record(LocalGitOp{Kind: LocalGitOpListComments})
-	return nil, forge.ErrUnsupported
+	g.record(LocalGitOp{Kind: LocalGitOpListComments, Repo: ref.Repo, PR: ref, Number: ref.Number})
+	if !g.knowsPullRequestLocked(ref) {
+		return nil, ErrNotFound
+	}
+	return append([]forge.Comment{}, g.comments[ref]...), nil
 }
 
-// ReadChecks is unsupported: the double serves no checks.
-func (g *LocalGit) ReadChecks(context.Context, forge.PullRequestRef, string) ([]forge.Check, error) {
+// ReadChecks returns the checks the double holds for the pull request. The
+// head SHA is recorded, not filtered on.
+func (g *LocalGit) ReadChecks(_ context.Context, ref forge.PullRequestRef, headSHA string) ([]forge.Check, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.record(LocalGitOp{Kind: LocalGitOpReadChecks})
-	return nil, forge.ErrUnsupported
+	g.record(LocalGitOp{Kind: LocalGitOpReadChecks, Repo: ref.Repo, PR: ref, Number: ref.Number, Head: headSHA})
+	if !g.knowsPullRequestLocked(ref) {
+		return nil, ErrNotFound
+	}
+	return append([]forge.Check{}, g.checks[ref]...), nil
 }
 
 // CreatePullRequest opens a pull request in the double's in-memory set. The
@@ -360,23 +418,45 @@ func (g *LocalGit) UpdatePullRequest(_ context.Context, ref forge.PullRequestRef
 			return g.pullRequests[i], nil
 		}
 	}
-	return forge.PullRequest{}, errors.New("pull request not found")
+	return forge.PullRequest{}, ErrNotFound
 }
 
-// CommentPullRequest is unsupported: the double serves no comments.
-func (g *LocalGit) CommentPullRequest(context.Context, forge.PullRequestRef, string) (forge.Comment, error) {
+// CommentPullRequest adds a comment to a known pull request and returns it.
+func (g *LocalGit) CommentPullRequest(_ context.Context, ref forge.PullRequestRef, body string) (forge.Comment, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.record(LocalGitOp{Kind: LocalGitOpCommentPullRequest})
-	return forge.Comment{}, forge.ErrUnsupported
+	g.record(LocalGitOp{Kind: LocalGitOpCommentPullRequest, Repo: ref.Repo, PR: ref, Number: ref.Number, Body: body})
+	if !g.knowsPullRequestLocked(ref) {
+		return forge.Comment{}, ErrNotFound
+	}
+	comment := g.addCommentLocked(body)
+	g.comments[ref] = append(g.comments[ref], comment)
+	return comment, nil
 }
 
-// CommentWorkItem is unsupported: the double serves no comments.
-func (g *LocalGit) CommentWorkItem(context.Context, forge.WorkItemRef, string) (forge.Comment, error) {
+// CommentWorkItem adds a comment to a known work item and returns it.
+func (g *LocalGit) CommentWorkItem(_ context.Context, ref forge.WorkItemRef, body string) (forge.Comment, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.record(LocalGitOp{Kind: LocalGitOpCommentWorkItem})
-	return forge.Comment{}, forge.ErrUnsupported
+	g.record(LocalGitOp{Kind: LocalGitOpCommentWorkItem, Repo: ref.Repo, WorkItem: ref, Body: body})
+	if _, ok := g.workItems[ref.Repo+"/"+ref.ID]; !ok {
+		return forge.Comment{}, ErrNotFound
+	}
+	comment := g.addCommentLocked(body)
+	g.workItemComments[ref] = append(g.workItemComments[ref], comment)
+	return comment, nil
+}
+
+// addCommentLocked builds the next comment the double serves. Callers must
+// hold g.mu.
+func (g *LocalGit) addCommentLocked(body string) forge.Comment {
+	comment := forge.Comment{
+		ID:     fmt.Sprintf("comment-%d", g.nextComment),
+		Author: "forgetest",
+		Body:   body,
+	}
+	g.nextComment++
+	return comment
 }
 
 // ListPullRequestsByHead lists every known pull request whose base
@@ -402,13 +482,13 @@ func (g *LocalGit) ListPullRequestsByHead(_ context.Context, base forge.PullRequ
 // Endpoint resolves a canonical repository identity to the local git
 // directory that holds it. It is the trusted resolver the broker's git
 // transport pins its destinations with; an identity the double does not know
-// is refused.
+// is not found.
 func (g *LocalGit) Endpoint(_ context.Context, identity string) (string, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	path := g.paths[identity]
 	if path == "" {
-		return "", errors.New("unknown endpoint")
+		return "", ErrNotFound
 	}
 	return path, nil
 }
@@ -440,6 +520,16 @@ func (g *LocalGit) PullRequests() []forge.PullRequest {
 		out[i] = copyPullRequest(pr)
 	}
 	return out
+}
+
+// WorkItemComments returns the comments the double holds on a work item: the
+// ones the control side added through CommentWorkItem. The contract has no
+// read for work-item comments, so this accessor is how a caller observes
+// that write.
+func (g *LocalGit) WorkItemComments(ref forge.WorkItemRef) []forge.Comment {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]forge.Comment{}, g.workItemComments[ref]...)
 }
 
 // SetProtected sets the effective write protection of one ref. It is a world
@@ -498,6 +588,17 @@ func (g *LocalGit) OpsOf(kind LocalGitOpKind) []LocalGitOp {
 		}
 	}
 	return out
+}
+
+// knowsPullRequestLocked reports whether the double holds the pull request.
+// Callers must hold g.mu.
+func (g *LocalGit) knowsPullRequestLocked(ref forge.PullRequestRef) bool {
+	for _, pr := range g.pullRequests {
+		if pr.Number == ref.Number && pr.BaseRepo == ref.Repo {
+			return true
+		}
+	}
+	return false
 }
 
 // tipOrEmpty returns the live tip of a ref, or an empty string when the ref
