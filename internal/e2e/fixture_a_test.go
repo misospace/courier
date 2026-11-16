@@ -220,7 +220,11 @@ func (p *fixturePublisher) Integrate(context.Context, harness.IntegrationRequest
 // body the model declared (#844).
 func (p *fixturePublisher) Publish(ctx context.Context) (harness.Publication, error) {
 	p.publications++
-	return p.broker.Publish(ctx, p.expected, p.proposal)
+	publication, err := p.broker.Publish(ctx, p.expected, p.proposal)
+	if err != nil {
+		return harness.Publication{}, classifyRouteRefusal("the publication", err)
+	}
+	return publication, nil
 }
 
 // OpenPullRequest opens the run's pull request at the proposed head through
@@ -232,18 +236,18 @@ func (p *fixturePublisher) Publish(ctx context.Context) (harness.Publication, er
 func (p *fixturePublisher) OpenPullRequest(ctx context.Context, title, body string, draft bool) (harness.PullRequest, error) {
 	pr, err := p.broker.CreatePullRequest(ctx, p.proposal, title, body, draft)
 	if err != nil {
-		return harness.PullRequest{}, classifyCreateRefusal(err)
+		return harness.PullRequest{}, classifyRouteRefusal("the pull request creation", err)
 	}
 	p.opened = pr
 	return pr, nil
 }
 
-// classifyCreateRefusal maps the create route's answer into the
-// coordinator's taxonomy, the way the production publication engine
-// classifies the same call (internal/harness/publisher.go): a definite
-// refusal — a status the broker states as a denial — is a blocked world,
-// never an infrastructure failure, and a call that never received an answer
-// is an infrastructure failure.
+// classifyRouteRefusal maps the route's answer into the coordinator's
+// taxonomy, the way the production publication engine classifies the same
+// call (internal/harness/publisher.go): a definite refusal — a status the
+// broker states as a denial — is a blocked world, never an infrastructure
+// failure, and a call that never received an answer is an infrastructure
+// failure.
 //
 // The rule is the route's own: the broker answers every engine error with
 // HTTP 422 (internal/broker/server.go), and the control-side client reads a
@@ -251,7 +255,7 @@ func (p *fixturePublisher) OpenPullRequest(ctx context.Context, title, body stri
 // retryable status, a malformed answer — as a failure it may retry. The
 // fixture classifies the answer, never the engine's wording, so a reworded
 // refusal still reads as a refusal.
-func classifyCreateRefusal(err error) error {
+func classifyRouteRefusal(what string, err error) error {
 	if err == nil {
 		return nil
 	}
@@ -262,7 +266,7 @@ func classifyCreateRefusal(err error) error {
 	var callErr *harness.BrokerCallError
 	if errors.As(err, &callErr) && !callErr.Retryable && definiteDenialStatus(callErr.StatusCode) {
 		return &harness.PublicationBlockedError{
-			Reason: "the broker denied the pull request creation (" + callErr.Category + ")",
+			Reason: "the broker denied " + what + " (" + callErr.Category + ")",
 			Err:    err,
 		}
 	}
@@ -289,7 +293,7 @@ func TestCreateRefusalClassification(t *testing.T) {
 	// The route's own denials: a definite status the broker states.
 	for _, status := range []int{http.StatusUnprocessableEntity, http.StatusBadRequest, http.StatusForbidden} {
 		denial := &harness.BrokerCallError{StatusCode: status, Category: "denied the operation"}
-		classified := classifyCreateRefusal(denial)
+		classified := classifyRouteRefusal("the pull request creation", denial)
 		var blocked *harness.PublicationBlockedError
 		if !errors.As(classified, &blocked) {
 			t.Fatalf("classified %d = %v, want a publication block", status, classified)
@@ -305,7 +309,7 @@ func TestCreateRefusalClassification(t *testing.T) {
 	// succeed on a later attempt.
 	for _, status := range []int{http.StatusRequestTimeout, http.StatusTooManyRequests} {
 		ambiguous := &harness.BrokerCallError{StatusCode: status, Category: "is temporarily unavailable", Retryable: true}
-		classified := classifyCreateRefusal(ambiguous)
+		classified := classifyRouteRefusal("the pull request creation", ambiguous)
 		var blocked *harness.PublicationBlockedError
 		if errors.As(classified, &blocked) {
 			t.Fatalf("classified %d = %v, want an infrastructure failure", status, classified)
@@ -314,7 +318,7 @@ func TestCreateRefusalClassification(t *testing.T) {
 	// A call that never received an answer is an infrastructure failure: the
 	// world never refused anything.
 	transport := &harness.BrokerCallError{Category: "is unreachable", Retryable: true}
-	classified := classifyCreateRefusal(transport)
+	classified := classifyRouteRefusal("the pull request creation", transport)
 	var blocked *harness.PublicationBlockedError
 	if errors.As(classified, &blocked) {
 		t.Fatalf("classified transport failure = %v, want an infrastructure failure", classified)
@@ -323,7 +327,19 @@ func TestCreateRefusalClassification(t *testing.T) {
 	if !errors.As(classified, &transient) {
 		t.Fatalf("classified transport failure = %v, want a transient publication failure", classified)
 	}
-	if classified := classifyCreateRefusal(nil); classified != nil {
+	// The publication route is classified by the same rule, so a refused
+	// publication is a blocked world there too.
+	publication := classifyRouteRefusal("the publication", &harness.BrokerCallError{
+		StatusCode: http.StatusUnprocessableEntity,
+		Category:   "denied the operation",
+	})
+	if !errors.As(publication, &blocked) {
+		t.Fatalf("classified publication refusal = %v, want a publication block", publication)
+	}
+	if !strings.Contains(blocked.Reason, "the publication") {
+		t.Fatalf("blocked reason = %q, want it to name the refused call", blocked.Reason)
+	}
+	if classified := classifyRouteRefusal("the publication", nil); classified != nil {
 		t.Fatalf("classified absence = %v, want no error", classified)
 	}
 }
@@ -344,7 +360,6 @@ func TestCreateRouteRefusalIsAPublicationBlock(t *testing.T) {
 	f := newRefusalFixtureA(t)
 	f.admit(t, ctx)
 	f.buildPublication(t, ctx)
-	f.importProposal(t, ctx, f.proposal, f.git.BaseOID)
 
 	username := "system:serviceaccount:" + f.namespace + ":" + topology.ControlSAName(f.run.Name)
 	reviews := newTokenReviews(username, f.controlSAUID, f.controlPod.Name, string(f.controlPod.UID))
@@ -353,6 +368,12 @@ func TestCreateRouteRefusalIsAPublicationBlock(t *testing.T) {
 	f.startBrokerServer(t, authenticator, f.gitBroker)
 
 	publisher := f.publisherFor(t, f.proposal, "", fixtureBrokerToken)
+	f.importProposal(t, ctx, f.proposal, "", fixtureBrokerToken)
+	// The proposal is published first, so the create route's own head check
+	// passes: the only refusal left is the linkage contract's.
+	if _, err := publisher.Publish(ctx); err != nil {
+		t.Fatalf("publish the proposal: %v", err)
+	}
 	// The body closes no work item: the engine's linkage contract refuses
 	// the create before any forge write.
 	_, err := publisher.OpenPullRequest(ctx, "Add the widget", "a body that closes nothing", false)
@@ -402,14 +423,16 @@ func newFixtureA(t *testing.T) *fixtureA {
 	return f
 }
 
-// newRefusalFixtureA builds the same world under a run name of its own: the
-// fixtures share one run namespace inside the API server, so a fixture that
-// needs its own run beside the others' must not reuse their name.
+// newRefusalFixtureA builds the same world under a run name and a namespace
+// of its own: the fixtures share one API server, so a fixture that admits
+// its own run beside the others' must not reuse their run or their
+// namespace.
 func newRefusalFixtureA(t *testing.T) *fixtureA {
 	t.Helper()
 	f := newFixtureAWorld(t)
 	f.runName = "e2e-fixture-a-refusal"
 	f.laneName = "e2e-lane-a-refusal"
+	f.namespace = "courier-runs-refusal"
 	f.prepareCluster(t)
 	return f
 }
@@ -731,7 +754,6 @@ func (f *fixtureA) runControl(t *testing.T, ctx context.Context) {
 	// The publication seam: the production broker policy engine over the
 	// production forge adapter and the local-git forge double.
 	f.buildPublication(t, ctx)
-	f.importProposal(t, ctx, f.proposal, f.git.BaseOID)
 
 	// The trusted status path: the production broker authenticator, the
 	// production status writer, and the production trusted status handler,
@@ -747,6 +769,10 @@ func (f *fixtureA) runControl(t *testing.T, ctx context.Context) {
 	// production broker's own capability report.
 	probe := f.newProbe(t, ctx, authenticator, fixtureBrokerToken)
 	f.capabilityGate(t, ctx, gateway, probe)
+
+	// The proposal reaches the broker over the broker's own import route,
+	// the way the production control side delivers it.
+	f.importProposal(t, ctx, f.proposal, "", fixtureBrokerToken)
 
 	delegator := f.newDelegator(t, f.controlPod, f.workerKey)
 	f.publisher = f.publisherFor(t, f.proposal, "", fixtureBrokerToken)
@@ -976,6 +1002,21 @@ func (f *fixtureA) publishedPullRequest(t *testing.T, ctx context.Context) forge
 	return pulls[0]
 }
 
+// storedPullRequest reads the forge double's own record of one pull
+// request, as it was written when the pull request was opened: the head it
+// names is the head the create ran against, not the live tip the double
+// refreshes on every read.
+func (f *fixtureA) storedPullRequest(t *testing.T, number int) forge.PullRequest {
+	t.Helper()
+	for _, pr := range f.provider.PullRequests() {
+		if pr.Number == number {
+			return pr
+		}
+	}
+	t.Fatalf("the forge holds no pull request #%d", number)
+	return forge.PullRequest{}
+}
+
 // assertions are the fixture's claims. Every one of them is negative where
 // it can be: the fixture proves what did not happen as much as what did.
 func (f *fixtureA) assertions(t *testing.T, ctx context.Context) {
@@ -983,28 +1024,26 @@ func (f *fixtureA) assertions(t *testing.T, ctx context.Context) {
 	run := f.fetch(t)
 
 	// The published identity is exactly the run's pinned identity. The
-	// forge's own record is the authority for the base the pull request was
-	// opened against and the head it was opened on; the create route's
-	// answer is the authority for the number the run records.
+	// forge's record as it was written when the pull request was opened
+	// names the head and the base it was opened against; the create route's
+	// answer names the number the run records.
 	if got := f.provider.Tip(f.policy.WorkRepo, f.policy.WorkRef); got != f.proposal {
 		t.Fatalf("published work tip = %q, want the proposal %q", got, f.proposal)
 	}
 	pr := f.pullRequest
 	published := f.publishedPullRequest(t, ctx)
+	stored := f.storedPullRequest(t, pr.Number)
 	if published.BaseRepo != f.policy.BaseRepo || published.BaseRef != f.policy.BaseRef {
 		t.Fatalf("pull request base = %q/%q, want the pinned %q/%q", published.BaseRepo, published.BaseRef, f.policy.BaseRepo, f.policy.BaseRef)
 	}
 	if published.HeadRepo != f.policy.WorkRepo || published.HeadRef != f.policy.WorkRef {
 		t.Fatalf("pull request head = %q/%q, want the pinned %q/%q", published.HeadRepo, published.HeadRef, f.policy.WorkRepo, f.policy.WorkRef)
 	}
-	if published.HeadSHA != f.proposal {
-		t.Fatalf("pull request head OID = %q, want the published %q", published.HeadSHA, f.proposal)
+	if stored.HeadSHA != f.proposal {
+		t.Fatalf("the pull request was opened at head %q, want the published %q", stored.HeadSHA, f.proposal)
 	}
-	if published.BaseSHA != f.policy.BaseOID {
-		t.Fatalf("pull request base OID = %q, want the pinned %q", published.BaseSHA, f.policy.BaseOID)
-	}
-	if pr.HeadOID != f.proposal {
-		t.Fatalf("the create route answered head OID %q, want the published %q", pr.HeadOID, f.proposal)
+	if stored.BaseSHA != f.policy.BaseOID {
+		t.Fatalf("the pull request was opened against base %q, want the pinned %q", stored.BaseSHA, f.policy.BaseOID)
 	}
 	if published.Number != pr.Number {
 		t.Fatalf("the forge holds pull request #%d, want the #%d the create route answered", published.Number, pr.Number)

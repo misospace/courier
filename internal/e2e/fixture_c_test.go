@@ -140,7 +140,6 @@ func (f *fixtureC) runFirstIncarnation(t *testing.T, ctx context.Context) {
 	t.Helper()
 	gateway := f.newGateway()
 	f.buildPublication(t, ctx)
-	f.importProposal(t, ctx, f.proposals[0], f.git.BaseOID)
 
 	reviews := f.tokenReviews(t)
 	authenticator := f.buildAuthenticator(t, ctx, reviews)
@@ -149,6 +148,10 @@ func (f *fixtureC) runFirstIncarnation(t *testing.T, ctx context.Context) {
 
 	probe := f.newProbe(t, ctx, authenticator, fixtureBrokerToken)
 	f.capabilityGate(t, ctx, gateway, probe)
+
+	// The proposal reaches the broker over the broker's own import route:
+	// the work ref is still absent, so the run's first commit creates it.
+	f.importProposal(t, ctx, f.proposals[0], "", fixtureBrokerToken)
 
 	delegator := f.newDelegator(t, f.controlPod, f.workerKey)
 	f.firstPublisher = f.publisherFor(t, f.proposals[0], "", fixtureBrokerToken)
@@ -259,13 +262,15 @@ func (f *fixtureC) runSecondIncarnation(t *testing.T, ctx context.Context) {
 	// The replacement publishes the commit on top of the one the dead
 	// incarnation published: the broker's fence accepts it as a
 	// fast-forward of the confirmed tip.
-	f.importProposal(t, ctx, f.proposals[1], f.proposals[0])
-
 	authenticator := f.buildAuthenticator(t, ctx, f.tokenReviews(t))
 	f.statusTransport, f.reporter = f.buildStatusPath(t, ctx, authenticator, f.replacement, fixtureBrokerTokenTwo)
 
 	probe := f.newProbe(t, ctx, authenticator, fixtureBrokerTokenTwo)
 	f.capabilityGate(t, ctx, gateway, probe)
+
+	// The replacement's proposal reaches the broker over the broker's own
+	// import route, with the confirmed tip as the expected one.
+	f.importProposal(t, ctx, f.proposals[1], f.proposals[0], fixtureBrokerTokenTwo)
 
 	delegator := f.newDelegator(t, f.replacement, f.workerKey)
 	f.secondPublisher = f.publisherFor(t, f.proposals[1], f.proposals[0], fixtureBrokerTokenTwo)

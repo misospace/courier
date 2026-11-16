@@ -96,13 +96,17 @@ func (f *fixtureA) buildPublication(t *testing.T, ctx context.Context) {
 	f.engine = engine
 }
 
-// importProposal imports the proposal into the broker's own private object
-// store, the way the control side does before it publishes: the broker
-// verifies the bundle carries the proposed commit and that it is a
-// fast-forward of the expected tip.
-func (f *fixtureA) importProposal(t *testing.T, ctx context.Context, proposal, expected string) {
+// importProposal delivers the proposal's bundle to the broker over the
+// broker's own import route, the way the production control side delivers
+// it: the bundle bytes are the body, and the expected tip is the work ref's
+// own tip — empty when the run's first commit creates the ref.
+func (f *fixtureA) importProposal(t *testing.T, ctx context.Context, proposal, expected, token string) {
 	t.Helper()
-	if err := f.gitBroker.ImportBundle(ctx, f.bundlePath, proposal, expected); err != nil {
+	bundle, err := os.ReadFile(f.bundlePath)
+	if err != nil {
+		t.Fatalf("read the bundle: %v", err)
+	}
+	if err := f.brokerClient(t, token).ImportBundle(ctx, bundle, proposal, expected); err != nil {
 		t.Fatalf("import proposal %s: %v", proposal, err)
 	}
 }
