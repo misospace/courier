@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.1.26](https://github.com/misospace/courier/compare/v0.1.25...v0.1.26) (2026-11-17)
+
+
+### Features
+
+* **api:** authenticated read-only Courier run and contribution lifecycle contract ([#836](https://github.com/misospace/courier/issues/836)) ([4ab7899](https://github.com/misospace/courier/commit/4ab7899bd8c1f97bf272b45805bf1a719849c935))
+* consume the PR Reviewer remediation handoff for fix-pr work ([#833](https://github.com/misospace/courier/issues/833)) ([0df6e59](https://github.com/misospace/courier/commit/0df6e59aa2a7b3233ee859f79cbf32a75cd8b083))
+* **deps:** update module github.com/prometheus/common (v0.73.1 → v0.74.0) ([#810](https://github.com/misospace/courier/issues/810)) ([ab1c02f](https://github.com/misospace/courier/commit/ab1c02f410ce680221854847037413d0181aaa7d))
+* **harness:** open and record the run pull request from the coordinator finish step ([#845](https://github.com/misospace/courier/issues/845)) ([65f2107](https://github.com/misospace/courier/commit/65f210703725b7cc1c2d2aaba84f65b79df4e571))
+* **harness:** open the run pull request through the broker's pull-request creation route ([#843](https://github.com/misospace/courier/issues/843)) ([8b0acc6](https://github.com/misospace/courier/commit/8b0acc625fd95ef8edf155623bd857888ddd1ae1))
+
+
+### Bug Fixes
+
+* **deps:** update dependency astro (7.4.11 → 7.4.12) ([#835](https://github.com/misospace/courier/issues/835)) ([cf5dc74](https://github.com/misospace/courier/commit/cf5dc74e011e19fba95819afffe5803eda516b9d))
+* **deps:** update module sigs.k8s.io/controller-runtime (v0.25.2 → v0.25.3) ([#851](https://github.com/misospace/courier/issues/851)) ([0329c45](https://github.com/misospace/courier/commit/0329c45217dc1a519f350804be11891d29e8f1b5))
+* **dispatch:** resolve the rebase executor to one binding at startup ([#796](https://github.com/misospace/courier/issues/796)) ([#813](https://github.com/misospace/courier/issues/813)) ([9db8b13](https://github.com/misospace/courier/commit/9db8b13e489b397efa0a8be9f2e49d52091b03cf))
+* **github-release:** update release helm (4.3.1 → 4.3.2) ([#816](https://github.com/misospace/courier/issues/816)) ([797dfad](https://github.com/misospace/courier/commit/797dfadc428cabfef2365dc10b937325774d9439))
+* **github:** select the newest same-head reviewer handoff across comments and reviews ([#847](https://github.com/misospace/courier/issues/847)) ([f9b58ec](https://github.com/misospace/courier/commit/f9b58ecea453a4fea8cff0783ee59b71dd16d158))
+* **harness:** send the model half of provider/model bindings to the gateway ([#817](https://github.com/misospace/courier/issues/817)) ([244644e](https://github.com/misospace/courier/commit/244644ef5c724688dcb8c0eb4c7583b77966f095))
+* **metrics:** report bootstrap-managed lanes under an ownership boundary ([#838](https://github.com/misospace/courier/issues/838)) ([6597a0a](https://github.com/misospace/courier/commit/6597a0aac55f078f8a4a15638a6f6bc0336989cd))
+
+
+### Chores
+
+* **container:** update image gcr.io/distroless/static (25ac8f0 → aafe993) ([#814](https://github.com/misospace/courier/issues/814)) ([48f9733](https://github.com/misospace/courier/commit/48f97334837ed028276a268277592d8b8a0d721b))
+* **container:** update image golang (08bcb99 → 5e8afd4) ([#848](https://github.com/misospace/courier/issues/848)) ([d301106](https://github.com/misospace/courier/commit/d30110639a668d9fd7579b8c4165438962d5640a))
+* **container:** update image node (add5c17 → 5df7998) ([#840](https://github.com/misospace/courier/issues/840)) ([23170ab](https://github.com/misospace/courier/commit/23170ab36fec2f708d3924fd86df51432cf0a235))
+* **deps:** lock file maintenance ([#850](https://github.com/misospace/courier/issues/850)) ([d90ee0e](https://github.com/misospace/courier/commit/d90ee0ef1417fe916ec66ca5b260bd02c3bb7c2f))
+
+
+### Documentation
+
+* **native:** versioned graduation, coexistence, rollback and evidence runbook ([#831](https://github.com/misospace/courier/issues/831)) ([4223cdc](https://github.com/misospace/courier/commit/4223cdce35c96f4c1329fb0c76b3ca19181d5394))
+
 ## [0.1.25](https://github.com/misospace/courier/compare/v0.1.24...v0.1.25) (2026-11-12)
 
 
