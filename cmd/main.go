@@ -334,14 +334,14 @@ func main() {
 		laneProfileMetricNamespaces(ownedRunNamespaces, operatorNamespace, managedLanes != nil),
 		managedLanes,
 	))
-	// The oldest retained terminal-run age is likewise read from the live
-	// cluster at scrape time, so the retention reaper's observability half
-	// needs only the manager's client.
-	crmetrics.Registry.MustRegister(controller.NewTerminalAgeCollector(mgr.GetClient(), ownedRunNamespaces...))
-	// The terminal-run backlog (held runs and the unsettled lifecycle-report
-	// queue they wait on) is likewise read from the live cluster at scrape
-	// time.
-	crmetrics.Registry.MustRegister(controller.NewTerminalBacklogCollector(mgr.GetClient(), ownedRunNamespaces...))
+	// The oldest retained terminal-run age and the terminal-run backlog
+	// (held runs and the unsettled lifecycle-report queue they wait on) are
+	// likewise read from the live cluster at scrape time, so the retention
+	// reaper's observability half needs only the manager's client. One
+	// scoped CoderRun list per scrape feeds both halves, so the paired
+	// signals describe one snapshot and the retained set is copied once
+	// (#854).
+	crmetrics.Registry.MustRegister(controller.NewTerminalCollector(mgr.GetClient(), ownedRunNamespaces...))
 
 	// Deployment-approved skill bundles register once at trusted setup from
 	// a deployment-mounted file; nothing run- or model-controlled ever

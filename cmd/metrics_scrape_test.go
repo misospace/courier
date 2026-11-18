@@ -239,8 +239,7 @@ func buildScrapeFixture() (*scrapeFixture, error) {
 
 	// The same scrape-time collectors the manager registers on its registry.
 	crmetrics.Registry.MustRegister(controller.NewLaneCollector(kube))
-	crmetrics.Registry.MustRegister(controller.NewTerminalAgeCollector(kube))
-	crmetrics.Registry.MustRegister(controller.NewTerminalBacklogCollector(kube))
+	crmetrics.Registry.MustRegister(controller.NewTerminalCollector(kube))
 	// The run recorder the reconciler registers on the manager's registry.
 	recorder := controller.NewRunRecorder(crmetrics.Registry)
 

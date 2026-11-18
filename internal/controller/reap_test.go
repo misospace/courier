@@ -802,7 +802,7 @@ func TestReapRequestCountsAcceptedDeleteWhileFinalizerHolds(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	recorder := NewRunRecorder(registry)
 	ageRegistry := prometheus.NewRegistry()
-	collector := NewTerminalAgeCollector(nil)
+	collector := NewTerminalCollector(nil)
 	collector.now = func() time.Time { return reapClock }
 
 	c := phaseClient(t, run)
