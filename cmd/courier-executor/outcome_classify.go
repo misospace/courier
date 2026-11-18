@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/broker"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/git"
 	"github.com/misospace/courier/internal/github"
@@ -271,7 +272,7 @@ func (r reporter) postOutcomeComment(ctx context.Context, body string) {
 		return
 	}
 	body = r.red.Redact(body)
-	owner, name, ok := splitOwnerRepo(r.cfg.Repo)
+	owner, name, ok := broker.SplitOwnerRepo(r.cfg.Repo)
 	if !ok {
 		r.event(courierlog.EventOutcomeComment, courierlog.StatusError, map[string]any{"status": "error", "reason": "no owner/repo to comment on"})
 		return

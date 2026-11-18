@@ -68,7 +68,7 @@ func NewAuthenticator(ctx context.Context, reader ctrlclient.Reader, tokens kube
 	if pod.DeletionTimestamp != nil || pod.UID == "" {
 		return nil, fmt.Errorf("broker pod is terminating or has no UID")
 	}
-	runName, runUID, ok := controllerRunOwner(pod)
+	runName, runUID, ok := ControllerRunOwner(pod)
 	if !ok {
 		return nil, fmt.Errorf("broker pod has no unambiguous CoderRun controller owner")
 	}
@@ -119,7 +119,7 @@ func (a *Authenticator) Authenticate(ctx context.Context, token string) (Identit
 	if pod.DeletionTimestamp != nil || string(pod.UID) != podUID || pod.Spec.ServiceAccountName != a.controlSAName || pod.Labels[topology.LabelRun] != topology.RunLabelValue(a.runName) || pod.Labels["courier.misospace.dev/component"] != "coordinator" {
 		return Identity{}, fmt.Errorf("authenticated control pod is stale, terminating, or uses another service account")
 	}
-	runName, runUID, ok := controllerRunOwner(pod)
+	runName, runUID, ok := ControllerRunOwner(pod)
 	if !ok || runName != a.runName || runUID != a.runUID {
 		return Identity{}, fmt.Errorf("control pod is not owned by this broker's CoderRun")
 	}
@@ -142,7 +142,7 @@ func (a *Authenticator) Authenticate(ctx context.Context, token string) (Identit
 	liveControls := 0
 	for i := range pods.Items {
 		candidate := &pods.Items[i]
-		ownerName, ownerUID, owned := controllerRunOwner(candidate)
+		ownerName, ownerUID, owned := ControllerRunOwner(candidate)
 		if owned && ownerName == a.runName && ownerUID == a.runUID && candidate.Spec.ServiceAccountName == a.controlSAName && candidate.DeletionTimestamp == nil {
 			liveControls++
 			if candidate.Name != podName || candidate.UID != pod.UID {
@@ -158,7 +158,7 @@ func (a *Authenticator) Authenticate(ctx context.Context, token string) (Identit
 	if err := a.reader.Get(ctx, types.NamespacedName{Namespace: a.namespace, Name: a.brokerPodName}, broker); err != nil {
 		return Identity{}, liveReadFailure(err, "read current broker pod")
 	}
-	brokerRunName, brokerRunUID, brokerOwned := controllerRunOwner(broker)
+	brokerRunName, brokerRunUID, brokerOwned := ControllerRunOwner(broker)
 	if broker.UID != a.brokerPodUID || broker.DeletionTimestamp != nil || !brokerOwned || brokerRunName != a.runName || brokerRunUID != a.runUID {
 		return Identity{}, fmt.Errorf("broker pod incarnation or owner is no longer live")
 	}
@@ -175,7 +175,11 @@ func liveReadFailure(err error, message string) error {
 	return &IdentityUnavailableError{Err: fmt.Errorf("%s: %w", message, err)}
 }
 
-func controllerRunOwner(pod *corev1.Pod) (string, types.UID, bool) {
+// ControllerRunOwner returns the name and UID of the CoderRun that controls the
+// pod, and reports false unless exactly one owner reference is that controller.
+// Broker authorization and the broker binary's own live-run read share it, so
+// both classify a pod's owner the same way.
+func ControllerRunOwner(pod *corev1.Pod) (string, types.UID, bool) {
 	var name string
 	var uid types.UID
 	for _, owner := range pod.OwnerReferences {
