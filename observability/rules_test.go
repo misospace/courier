@@ -830,6 +830,20 @@ func TestAlertScenarios(t *testing.T) {
 		assertSilent(t, evalAt(t, flat, exprFor(t, "CourierMetricsScrapeErrors"), 300*time.Second))
 	})
 
+	t.Run("A7 one failed terminal list raises both counters and fires once", func(t *testing.T) {
+		both := loadStorage(t, `load 30s
+  courier_terminal_age_scrape_errors_total 0x5 1x39
+  courier_terminal_backlog_scrape_errors_total 0x5 1x39
+`)
+		assertFiring(t, evalAt(t, both, exprFor(t, "CourierMetricsScrapeErrors"), 300*time.Second),
+			[]string{"///"})
+		flat := loadStorage(t, `load 30s
+  courier_terminal_age_scrape_errors_total 5x44
+  courier_terminal_backlog_scrape_errors_total 5x44
+`)
+		assertSilent(t, evalAt(t, flat, exprFor(t, "CourierMetricsScrapeErrors"), 300*time.Second))
+	})
+
 	t.Run("A4 failure ratio fires above threshold and floor", func(t *testing.T) {
 		script := `load 30s
   courier_coderuns_total{lane="main",mode="resolve",phase="Failed"} 0x59 4x61

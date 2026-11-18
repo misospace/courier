@@ -100,7 +100,7 @@ controller-runtime on the `--metrics-bind-address` endpoint (default `:8080`,
 | `courier_lane_oldest_reservation_age_seconds` | gauge | `lane` | age of the oldest reservation by `metadata.creationTimestamp`; absent when the lane has none |
 | `courier_metrics_scrape_errors_total` | counter | — | failed `List` calls during lane collection |
 
-**Scrape-time signals** from the terminal collectors (read from the cluster at
+**Scrape-time signals** from the terminal collector (read from the cluster at
 scrape time, so they survive an operator restart):
 
 | Metric | Type | Labels | Semantics |
@@ -108,8 +108,8 @@ scrape time, so they survive an operator restart):
 | `courier_coderuns_awaiting_reap` | gauge | `phase` | terminal runs retained for inspection and not yet reaped, per terminal phase |
 | `courier_coderuns_lifecycle_pending` | gauge | `lane` | terminal runs whose lifecycle report has not settled, per lane — mirrors the reaper's hold gate |
 | `courier_coderuns_lifecycle_pending_oldest_age_seconds` | gauge | `lane` | age of the oldest unsettled-report run (from `FinishedAt`), per lane |
-| `courier_terminal_age_scrape_errors_total` | counter | — | failed `List` calls during terminal-age collection |
-| `courier_terminal_backlog_scrape_errors_total` | counter | — | failed `List` calls during terminal-backlog collection |
+| `courier_terminal_age_scrape_errors_total` | counter | — | failed `List` calls during terminal collection; one failed read also increments the backlog counter below |
+| `courier_terminal_backlog_scrape_errors_total` | counter | — | failed `List` calls during terminal collection; one failed read also increments the age counter above |
 
 controller-runtime additionally exposes `go_*`, `process_*`, and
 `controller_runtime_*` series on the same registry. The chart's
@@ -478,10 +478,11 @@ Common rules that apply to every alert:
 
 | Field | Value |
 | --- | --- |
-| Condition | `courier_metrics_scrape_errors_total` increases over the window |
+| Condition | any of the three scrape-error counters increases over the window |
 | Evidence | `courier_metrics_scrape_errors_total`, `courier_terminal_age_scrape_errors_total`, `courier_terminal_backlog_scrape_errors_total` |
 | Window | 10m |
 | Threshold rationale | a failing scrape means lane gauges are stale; even a low rate is worth surfacing because it silently degrades sections 3.2 and 3.5 |
+| Counting | each counter is tested alone (increase over the window above zero) and the results are ORed; a failed terminal `List` increments both terminal counters, but the union reports that one failure once, not twice |
 | Recovery | counter stops increasing |
 | Severity | warning |
 | Expected action | inspect the operator's RBAC and API server reachability for `LaneProfile`/`CoderRun` list calls |
