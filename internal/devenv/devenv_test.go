@@ -286,6 +286,12 @@ func TestBootstrapAndEnvCaptureScripts(t *testing.T) {
 		`toolchain="${COURIER_MISE_TOOLCHAIN_DIR:-` + DefaultToolchainDir + `}"`,
 		"MISE_OFFLINE=true\n",
 		"export MISE_OFFLINE\n",
+		// The state dir rides the same writable overlay: the image bake runs
+		// mise as root with the task user's HOME, leaving the trusted-configs
+		// registry root-owned — a task user's trust write there is refused
+		// EACCES and the bootstrap dies behind an opaque exit 1.
+		"XDG_STATE_HOME=\"$cache_root/state\"\n",
+		"export XDG_STATE_HOME\n",
 		"courier-mise-toolchain=",
 		"courier-mise-offline=",
 	} {

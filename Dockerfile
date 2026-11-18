@@ -166,7 +166,13 @@ RUN set -eux; \
 	printf 'controller-gen %s\nsetup-envtest %s\n' "$cg_pin" "$se_pin" > /usr/local/share/courier/tools/.tool-pins && \
 	XDG_DATA_HOME=/usr/local/share/courier/envtest-store /usr/local/share/courier/tools/bin/setup-envtest use "${k8s}" && \
 	chmod -R a+rX /usr/local/share/courier && \
-	rm -rf /tmp/courier-toolchain /root/.cache /root/.local /courier-toolchain-cache/go-mod /courier-toolchain-cache/go-build /usr/local/share/courier/mise-data/downloads
+	rm -rf /tmp/courier-toolchain /root/.cache /root/.local /home/courier/.local/state /courier-toolchain-cache/go-mod /courier-toolchain-cache/go-build /usr/local/share/courier/mise-data/downloads
+# The bake's mise install runs as root with the task user's HOME, so its
+# state tree (trusted-configs registry included) lands root-owned under
+# /home/courier/.local/state — a task user's later trust write is refused
+# EACCES and the whole bootstrap dies behind an opaque exit 1. Removing the
+# tree lets mise recreate it under the runtime uid at first use; the devenv
+# wiring also redirects XDG_STATE_HOME for defense in depth.
 
 USER 65532:65532
 
