@@ -15,6 +15,7 @@ GOVULNCHECK_VERSION ?= v1.10.0
 LOCALBIN ?= $(shell pwd)/bin
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 SETUP_ENVTEST ?= $(LOCALBIN)/setup-envtest
+GOVULNCHECK ?= $(LOCALBIN)/govulncheck
 
 .PHONY: all
 all: build
@@ -50,9 +51,9 @@ envtest: setup-envtest ## Download Kubernetes assets for envtest.
 		go test -race ./internal/controller -coverprofile cover.out
 
 .PHONY: govulncheck
-govulncheck: ## Run the Go vulnerability scanner.
-	go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
-	govulncheck ./...
+govulncheck: $(LOCALBIN) ## Run the Go vulnerability scanner.
+	GOBIN=$(LOCALBIN) go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
+	$(GOVULNCHECK) ./...
 
 .PHONY: ci-gating-test
 ci-gating-test: ## Run the image-gating truth table and the Docker build-context guard.
