@@ -251,8 +251,7 @@ func knownMetricNames(t *testing.T) map[string]struct{} {
 	}
 	for _, c := range []prometheus.Collector{
 		controller.NewLaneCollector(nil),
-		controller.NewTerminalAgeCollector(nil),
-		controller.NewTerminalBacklogCollector(nil),
+		controller.NewTerminalCollector(nil),
 	} {
 		for _, name := range describedNames(c) {
 			known[name] = struct{}{}
