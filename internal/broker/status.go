@@ -219,7 +219,7 @@ func (w *StatusWriter) Write(ctx context.Context, identity StatusIdentity, patch
 			}
 			return &StatusUnavailableError{Err: fmt.Errorf("read current control pod: %w", err)}
 		}
-		ownerName, ownerUID, ok := controllerRunOwner(pod)
+		ownerName, ownerUID, ok := ControllerRunOwner(pod)
 		if pod.UID != identity.ControlPodUID || pod.DeletionTimestamp != nil || pod.Spec.ServiceAccountName != identity.ControlServiceAccount || !ok || ownerName != w.runName || ownerUID != identity.RunUID || pod.Labels[topology.LabelRun] != topology.RunLabelValue(w.runName) || pod.Labels["courier.misospace.dev/component"] != "coordinator" {
 			return fmt.Errorf("authenticated control pod is stale or is not owned by this CoderRun")
 		}
@@ -230,7 +230,7 @@ func (w *StatusWriter) Write(ctx context.Context, identity StatusIdentity, patch
 		current := 0
 		for i := range pods.Items {
 			candidate := &pods.Items[i]
-			candidateOwner, candidateUID, owned := controllerRunOwner(candidate)
+			candidateOwner, candidateUID, owned := ControllerRunOwner(candidate)
 			if candidate.DeletionTimestamp == nil && candidate.Spec.ServiceAccountName == identity.ControlServiceAccount && owned && candidateOwner == w.runName && candidateUID == identity.RunUID {
 				current++
 				if candidate.UID != identity.ControlPodUID || candidate.Name != identity.ControlPod {

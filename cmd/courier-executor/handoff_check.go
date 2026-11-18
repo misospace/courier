@@ -20,7 +20,7 @@ func trustedSourceIssue(cfg config) (broker.SourceIssue, bool) {
 	if !strings.EqualFold(cfg.Mode, "resolve-issue") {
 		return broker.SourceIssue{}, false
 	}
-	owner, name, ok := splitOwnerRepo(cfg.Repo)
+	owner, name, ok := broker.SplitOwnerRepo(cfg.Repo)
 	if !ok || cfg.Ref <= 0 {
 		return broker.SourceIssue{}, false
 	}

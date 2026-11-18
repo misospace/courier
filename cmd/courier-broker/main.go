@@ -34,7 +34,6 @@ import (
 	couriergithub "github.com/misospace/courier/internal/github"
 	"github.com/misospace/courier/internal/topology"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/types"
 )
 
 const kubeCACertPath = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
@@ -366,7 +365,7 @@ func liveReadRun(ctx context.Context, reader ctrlclient.Reader, namespace string
 	if err := reader.Get(ctx, ctrlclient.ObjectKey{Namespace: namespace, Name: os.Getenv(topology.EnvBrokerPodName)}, pod); err != nil {
 		return nil, fmt.Errorf("courier-broker: read own pod: %w", err)
 	}
-	runName, runUID, ok := controllerRunOwner(pod)
+	runName, runUID, ok := broker.ControllerRunOwner(pod)
 	if !ok {
 		return nil, errors.New("courier-broker: own pod has no unambiguous CoderRun controller owner")
 	}
@@ -378,21 +377,6 @@ func liveReadRun(ctx context.Context, reader ctrlclient.Reader, namespace string
 		return nil, errors.New("courier-broker: owner run incarnation does not match the pod owner reference")
 	}
 	return run, nil
-}
-
-func controllerRunOwner(pod *corev1.Pod) (string, types.UID, bool) {
-	var name string
-	var uid types.UID
-	for _, owner := range pod.OwnerReferences {
-		if owner.Controller == nil || !*owner.Controller {
-			continue
-		}
-		if owner.APIVersion != courier.GroupVersion.String() || owner.Kind != "CoderRun" || owner.Name == "" || owner.UID == "" || name != "" {
-			return "", "", false
-		}
-		name, uid = owner.Name, owner.UID
-	}
-	return name, uid, name != "" && uid != ""
 }
 
 // runtimeScheme builds the scheme for the live API clients.
