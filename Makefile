@@ -10,6 +10,7 @@ OPENCODE_VERSION ?= 1.18.31
 CONTROLLER_TOOLS_VERSION ?= v0.16.5
 ENVTEST_VERSION ?= release-0.25
 ENVTEST_K8S_VERSION ?= 1.37.0
+GOVULNCHECK_VERSION ?= v1.10.0
 
 LOCALBIN ?= $(shell pwd)/bin
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
@@ -50,7 +51,7 @@ envtest: setup-envtest ## Download Kubernetes assets for envtest.
 
 .PHONY: govulncheck
 govulncheck: ## Run the Go vulnerability scanner.
-	go install golang.org/x/vuln/cmd/govulncheck@latest
+	go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
 	govulncheck ./...
 
 .PHONY: ci-gating-test
