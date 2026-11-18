@@ -65,12 +65,12 @@ implementation evidence. They never count as live proof.
 
 | # | Criterion | Evidence source | Test proof | Live proof | Status |
 | --- | --- | --- | --- | --- | --- |
-| 1 | `status.heartbeat` advances at the coalesced cadence during real stream and tool activity. | #102 criterion 1, #731 | Status reporter coalescing and cadence under test (`internal/harness/status.go`, `internal/status/status.go`). | One heartbeat persisted in the #797 canary. Sustained cadence over a long tool or subagent episode is unobserved. | No-go. #731 is open and blocked on live evidence. |
-| 2 | Long-tool liveness and failure behavior. The reaper treats a stalled run conservatively and stays bounded. | #731, #102 criterion 2 | `internal/controller/liveness.go` and `liveness_test.go` cover reaping decisions and UID fencing. | No recorded live stall-and-reap on a native run. | No-go for live proof. |
-| 3 | Meaningful checkpoint and resume. | HARNESS.md section 7 | Checkpoint types and ordering tests (`api/v1alpha1/coderun_types.go`, `native_termination_test.go`). | Restart and resume of a real interrupted run is unobserved in production. | No-go for live proof. |
-| 4 | Publication `lastCommit`. Only a broker-confirmed remote OID is recorded. | #102, HARNESS.md section 7 | Publication verification tests. | A native run that publishes to a real pull request with confirmed `status.lastCommit` is unobserved. | No-go for live proof. |
+| 1 | `status.heartbeat` advances at the coalesced cadence during real stream and tool activity. | #102 criterion 1, #731 | Status reporter coalescing and cadence under test (`internal/harness/status.go`, `internal/status/status.go`). The replay proves a heartbeat lands only after earned activity and is fenced to the control pod (`internal/e2e/fixture_a_test.go`). | One heartbeat persisted in the #797 canary. Sustained cadence over a long tool or subagent episode is unobserved. | No-go. #731 is open and blocked on live evidence. |
+| 2 | Long-tool liveness and failure behavior. The reaper treats a stalled run conservatively and stays bounded. | #731, #102 criterion 2 | `internal/controller/liveness.go` and `liveness_test.go` cover reaping decisions and UID fencing. The replay proves a failed turn writes no heartbeat and ends the run truthfully (`internal/e2e/fixture_b_test.go`). | No recorded live stall-and-reap on a native run. | No-go for live proof. |
+| 3 | Meaningful checkpoint and resume. | HARNESS.md section 7 | Checkpoint types and ordering tests (`api/v1alpha1/coderun_types.go`, `native_termination_test.go`). The replay proves a second control incarnation's status write is refused and that lastCommit names the commit actually published (`internal/e2e/fixture_c_test.go`). | Restart and resume of a real interrupted run is unobserved in production. | No-go for live proof. |
+| 4 | Publication `lastCommit`. Only a broker-confirmed remote OID is recorded. | #102, HARNESS.md section 7 | Publication verification tests. The replay proves lastCommit equals the published OID and that exactly one pull request exists on the pinned head across a restart (`internal/e2e/fixture_a_test.go`, `internal/e2e/fixture_c_test.go`). | A native run that publishes to a real pull request with confirmed `status.lastCommit` is unobserved. | No-go for live proof. |
 | 5 | Current-head CI and PR handoff after publication. | #102 | Tests cover the `Verifying` handoff contract. | No native run carried a published branch through CI to merge. | No-go for live proof. |
-| 6 | Trusted status and credential boundary. The broker can patch only one named run status subresource. | HARNESS.md section 4 | `TestNativeCanaryDoesNotMutateForeignNamespaceRun` and the cross-direction isolation tests in `internal/controller/native_canary_isolation_test.go`. | Native canaries have run in production beside v1, but no deployment carries a complete acceptance record for the boundary. | No-go for live proof. Isolation is the strongest tested area. |
+| 6 | Trusted status and credential boundary. The broker can patch only one named run status subresource. | HARNESS.md section 4 | `TestNativeCanaryDoesNotMutateForeignNamespaceRun` and the cross-direction isolation tests in `internal/controller/native_canary_isolation_test.go`. The replay proves the deployment credential reaches no recorded surface, no run status, and no workload spec (`internal/e2e/assertions_test.go`). | Native canaries have run in production beside v1, but no deployment carries a complete acceptance record for the boundary. | No-go for live proof. Isolation is the strongest tested area. |
 
 Rule for reading this table: a criterion moves to go when #731 or #102 records
 live observations from a deployed run, with the deployed run version named.
@@ -79,6 +79,43 @@ Keep the two evidence classes separate in every entry.
 Decision today: no-go for cutover. Do not start a broad canary to reproduce
 the #731 environment failure. If fresh defects appear, file them narrowly, as
 #731 instructs.
+
+## Deterministic replay coverage
+
+The native path has a deterministic end-to-end replay that runs in CI
+(`internal/e2e`, its own `test / e2e` job). It exercises the production
+packages at their contract boundaries under envtest, against a local git
+world, a scripted model gateway, a worker-protocol double, a recording source
+adapter, and a local-git forge double. It spends no inference and opens no
+third-party pull request.
+
+| Scenario | What it proves | What it cannot prove |
+| --- | --- | --- |
+| Published path (`internal/e2e/fixture_a_test.go`) | Admission, source claim with a receipt, capability gate, a role-bound turn with earned tool activity, authenticated status progress, a fenced publication and a pull request created over the broker's own routes — the bundle import, the publication, and the pull-request creation — with the production control-side client, source settlement, the published identity, exactly one pull request on the pinned head, and the absence of any merge path. | Pod execution: envtest has no kubelet, so the harness half runs in-process. |
+| Refused create (`internal/e2e/fixture_a_test.go`) | The broker's pull-request creation route refuses a body that closes no work item before any forge write, answers with the status it answers every engine error with, and the refusal reads as a blocked world, never an infrastructure failure. | The forge's own behavior on a real provider: the refusal is the engine's, not the provider's. |
+| Failed path (`internal/e2e/fixture_b_test.go`) | An injected provider throttle produces no heartbeat, a bounded request count, a truthful blocked-external ending with the observed cause, a finished attempt, a released lane, and no publication. | Real provider throttling, and any provider behavior the scripted gateway does not model. |
+| Restarted path (`internal/e2e/fixture_c_test.go`) | A second control incarnation keeps the source identity, has the stale incarnation's status write refused, leaves exactly one pull request on the pinned head, and records the commit actually published. | The operator's own relaunch path: the fixture provisions the replacement control pod, because a test cannot run one. A broker restart is a different case: the broker is its own pod, so a control restart leaves it standing and the successor's publication rides the broker's confirmation. |
+
+What stays live-only, and is tracked in #102 rather than here: sustained
+heartbeat cadence over a long tool or subagent episode, a real published pull
+request with real CI, the operator's relaunch of a real interrupted run,
+cluster RBAC and network-policy enforcement, and the worker's residual shell
+path to a forge (the worker holds no forge credential and the secure topology
+denies it network access, but envtest enforces no network policy).
+
+Runner requirements for the replay job: Linux, `git` on PATH, the envtest
+assets for the pinned Kubernetes version (the job resolves them with
+`setup-envtest`), and a C compiler, because the replay runs under the race
+detector. The suite skips itself when the envtest assets are absent, so a
+checkout without them still builds and vets; the CI job fails closed instead of
+passing with nothing replayed.
+
+Namespace requirements: the replay never touches a cluster. Each scenario
+creates its own run namespace (`courier-runs`, `courier-runs-b`,
+`courier-runs-c`, `courier-runs-refusal`) inside the envtest API server, and
+the non-Dispatch scenario reuses `courier-runs`. The operator namespace
+(`courier-system`) is shared by the scenarios in that same API server. The
+production run namespace and the ownership boundary settings are untouched.
 
 ## Coexistence invariants
 

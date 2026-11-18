@@ -38,6 +38,12 @@ type remoteObserver struct {
 	baseRef     string
 	workRef     string
 	workProtect bool
+
+	// createdPR is the single pull request this forge double holds, and
+	// pullCreates counts create calls, so a test can distinguish a create
+	// from the duplicate guard's adoption of a discovered pull request.
+	createdPR   *broker.PullRequestState
+	pullCreates int
 }
 
 func (o *remoteObserver) tip(path, ref string) (string, bool, error) {
@@ -87,16 +93,50 @@ func (o *remoteObserver) liveWorkTip() (string, bool, error) {
 	return o.tip(o.workPath, o.workRef)
 }
 
-func (o *remoteObserver) PullRequest(context.Context, int) (broker.PullRequestState, error) {
-	return broker.PullRequestState{}, errors.New("not used in this fixture")
+// pullRequests, pullRequest, and createPullRequest give the fixture a
+// world-truthful pull-request surface: the created record carries the exact
+// live head and base identities read at create time, and creates are
+// counted so adoption can be told apart from a second write.
+func (o *remoteObserver) PullRequest(_ context.Context, number int) (broker.PullRequestState, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.createdPR == nil || o.createdPR.Number != number {
+		return broker.PullRequestState{}, errors.New("unknown pull request")
+	}
+	return *o.createdPR, nil
 }
 
-func (o *remoteObserver) FindPullRequest(context.Context, string, string) ([]broker.PullRequestState, error) {
-	return nil, errors.New("not used in this fixture")
+func (o *remoteObserver) FindPullRequest(_ context.Context, headRepo, headRef string) ([]broker.PullRequestState, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.createdPR == nil || o.createdPR.HeadRepo != headRepo || o.createdPR.HeadRef != headRef {
+		return nil, nil
+	}
+	return []broker.PullRequestState{*o.createdPR}, nil
 }
 
-func (o *remoteObserver) CreatePullRequest(context.Context, broker.CreatePullRequest) (int, error) {
-	return 0, errors.New("not used in this fixture")
+func (o *remoteObserver) CreatePullRequest(_ context.Context, req broker.CreatePullRequest) (int, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.pullCreates++
+	if o.createdPR != nil {
+		return 0, errors.New("duplicate create: pull request already exists")
+	}
+	headOID, _, err := o.tip(o.workPath, o.workRef)
+	if err != nil {
+		return 0, err
+	}
+	baseOID, _, err := o.tip(o.basePath, o.baseRef)
+	if err != nil {
+		return 0, err
+	}
+	o.createdPR = &broker.PullRequestState{
+		Number: 7, State: "open",
+		BaseRepo: req.BaseRepo, BaseRef: req.BaseRef, BaseOID: baseOID,
+		HeadRepo: req.HeadRepo, HeadRef: req.HeadRef, HeadOID: headOID,
+		Title: req.Title, Body: req.Body, Draft: req.Draft,
+	}
+	return 7, nil
 }
 
 func (o *remoteObserver) UpdatePullRequest(context.Context, int, broker.UpdatePullRequest) error {
@@ -1030,5 +1070,131 @@ func TestPublicationConflictedResyncLeavesTreeUsable(t *testing.T) {
 	parents := gitRev(t, engine.tree.Dir, "log", "--format=%P", "-1", integration3.Commit)
 	if strings.Count(strings.TrimSpace(parents), " ") != 0 {
 		t.Fatalf("post-conflict integration commit has parents %q, want exactly one parent", parents)
+	}
+}
+
+// TestOpenPullRequestThroughCreateRoute drives the full control→broker
+// chain for the pull-request creation route (#842): the control side
+// publishes, then asks the broker to open the run's pull request at the
+// broker-confirmed head. The broker's body contract, duplicate guard, and
+// re-read confirmation all run server-side; the client carries only OIDs.
+func TestOpenPullRequestThroughCreateRoute(t *testing.T) {
+	f := newBrokerFixture(t)
+	engine := f.engineFor()
+	tip := f.prepare(t, engine)
+	bundle := f.workerBundle(tip, "pr1", "pr.txt", "pull request work\n", engine)
+	integration, err := engine.Integrate(context.Background(), f.request("pr1", tip, bundle))
+	if err != nil {
+		t.Fatalf("integrate: %v", err)
+	}
+	body := "What changed.\n\nCloses org/repo#1\n"
+	pr, err := engine.OpenPullRequest(context.Background(), "fix: open a pull request", body, false)
+	if err != nil {
+		t.Fatalf("open pull request: %v", err)
+	}
+	if pr.Number != 7 || pr.State != "open" || pr.HeadOID != integration.Commit {
+		t.Fatalf("pull request = %+v, want the confirmed create at the published head", pr)
+	}
+	if pr.HeadRepo != "org/repo" || pr.HeadRef != observerWorkRef {
+		t.Fatalf("pull request head identity = %s %s, want the pinned work identity", pr.HeadRepo, pr.HeadRef)
+	}
+	if f.observer.pullCreates != 1 {
+		t.Fatalf("forge creates = %d, want exactly one", f.observer.pullCreates)
+	}
+
+	// A second open publishes nothing new and adopts the discovered pull
+	// request instead of writing a second one.
+	again, err := engine.OpenPullRequest(context.Background(), "a different title", body, false)
+	if err != nil {
+		t.Fatalf("second open pull request: %v", err)
+	}
+	if again.Number != 7 || again.State != "open" || again.HeadOID != integration.Commit {
+		t.Fatalf("adopted pull request = %+v, want adoption of the discovered one", again)
+	}
+	if f.observer.pullCreates != 1 {
+		t.Fatalf("forge creates = %d after adoption, want the duplicate guard to forbid a second write", f.observer.pullCreates)
+	}
+}
+
+// TestOpenPullRequestRefusesUnlinkageBody proves the broker's body contract
+// runs before any forge write: a body without the closing reference to the
+// pinned source issue is a definite denial, classified as a blocked world,
+// and the forge records no create. The branch itself is still published.
+func TestOpenPullRequestRefusesUnlinkageBody(t *testing.T) {
+	f := newBrokerFixture(t)
+	engine := f.engineFor()
+	tip := f.prepare(t, engine)
+	bundle := f.workerBundle(tip, "pr2", "pr.txt", "work\n", engine)
+	if _, err := engine.Integrate(context.Background(), f.request("pr2", tip, bundle)); err != nil {
+		t.Fatalf("integrate: %v", err)
+	}
+	_, err := engine.OpenPullRequest(context.Background(), "fix: missing linkage", "no closing reference at all\n", false)
+	var blocked *PublicationBlockedError
+	if !errors.As(err, &blocked) {
+		t.Fatalf("open error = %v, want a PublicationBlockedError", err)
+	}
+	if f.observer.pullCreates != 0 {
+		t.Fatalf("forge creates = %d, want none: the body contract runs before any write", f.observer.pullCreates)
+	}
+	if _, exists, err := f.remoteWorkTip(); err != nil || !exists {
+		t.Fatalf("the refused body must not roll back the publication (exists %v, err %v)", exists, err)
+	}
+}
+
+// TestCreatePullRequestClientRefusesForeignHead pins the client→route
+// head contract directly: a proposal that is not the exact live work tip
+// earns the broker's definite 422, classified as a denial rather than a
+// transport failure, and no pull request is created.
+func TestCreatePullRequestClientRefusesForeignHead(t *testing.T) {
+	f := newBrokerFixture(t)
+	engine := f.engineFor()
+	tip := f.prepare(t, engine)
+	bundle := f.workerBundle(tip, "pr3", "pr.txt", "work\n", engine)
+	if _, err := engine.Integrate(context.Background(), f.request("pr3", tip, bundle)); err != nil {
+		t.Fatalf("integrate: %v", err)
+	}
+	if _, err := engine.Publish(context.Background()); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	_, err := f.client().CreatePullRequest(context.Background(), f.baseOID, "fix: stale head", "Closes org/repo#1\n", false)
+	var callErr *BrokerCallError
+	if !errors.As(err, &callErr) || callErr.Retryable || callErr.StatusCode != 422 {
+		t.Fatalf("create with a foreign head = %v, want a definite denial (422)", err)
+	}
+	if f.observer.pullCreates != 0 {
+		t.Fatalf("forge creates = %d, want none for a refused head", f.observer.pullCreates)
+	}
+}
+
+// TestCreatePullRequestClientRejectsInconsistentResponse pins the client's
+// own answer guards over the create route: a 200 whose record does not
+// carry the proposed head or carries a non-positive number is the same
+// no-status mismatch a publication answer earns — never a creation — and a
+// truncated record is retryable malformed, never a silent success.
+func TestCreatePullRequestClientRejectsInconsistentResponse(t *testing.T) {
+	const proposed = "1111111111111111111111111111111111111111"
+	cases := []struct {
+		name      string
+		body      string
+		retryable bool
+	}{
+		{"head does not match the proposal", `{"Number":7,"State":"open","HeadRepo":"org/repo","HeadRef":"r","HeadOID":"0000000000000000000000000000000000000000"}`, false},
+		{"provider number is not positive", `{"Number":0,"State":"open","HeadRepo":"org/repo","HeadRef":"r","HeadOID":"` + proposed + `"}`, false},
+		{"record is truncated", `{"Number":7,"State":"open","HeadOID":"` + proposed, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			t.Cleanup(server.Close)
+			client := &BrokerClient{BaseURL: server.URL, TokenSource: NewStaticBrokerTokenSource([]byte("valid-token")), HTTP: server.Client()}
+			_, err := client.CreatePullRequest(context.Background(), proposed, "title", "body", false)
+			var callErr *BrokerCallError
+			if !errors.As(err, &callErr) || callErr.Retryable != tc.retryable {
+				t.Fatalf("create with inconsistent answer = %v, want failure (retryable = %v)", err, tc.retryable)
+			}
+		})
 	}
 }

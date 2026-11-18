@@ -14,11 +14,14 @@ import (
 // Pending when launch fails.
 type LaunchFunc func(context.Context, *courierv1alpha1.CoderRun) error
 
-// phaseConsumesCapacity reports whether a run has been admitted to a lane.
+// PhaseConsumesCapacity reports whether a run has been admitted to a lane.
 // Claimed reserves capacity while the operator is launching the coordinator;
 // Running continues to reserve it until the coordinator exits. Verifying has
 // no coordinator execution capacity to reserve.
-func phaseConsumesCapacity(phase courierv1alpha1.Phase) bool {
+//
+// It is exported so the end-to-end replay harness asserts the operator's own
+// lane-reservation rule instead of mirroring it.
+func PhaseConsumesCapacity(phase courierv1alpha1.Phase) bool {
 	return phase == courierv1alpha1.PhaseClaimed || phase == courierv1alpha1.PhaseRunning
 }
 
@@ -27,7 +30,7 @@ func phaseConsumesCapacity(phase courierv1alpha1.Phase) bool {
 func admittedCount(runs []courierv1alpha1.CoderRun, lane string) int {
 	count := 0
 	for i := range runs {
-		if runs[i].Spec.Lane == lane && phaseConsumesCapacity(runs[i].Status.Phase) {
+		if runs[i].Spec.Lane == lane && PhaseConsumesCapacity(runs[i].Status.Phase) {
 			count++
 		}
 	}

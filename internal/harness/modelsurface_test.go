@@ -297,6 +297,11 @@ func TestModelSurfaceMaterialChanges(t *testing.T) {
 			inputs:   ModelSurfaceInputs{GatewayTransport: "openai", SkillsJSON: basePins},
 			skillSet: nil,
 		},
+		{
+			name:     "pull-request-opening run mode",
+			inputs:   ModelSurfaceInputs{GatewayTransport: "openai", SkillsJSON: basePins, Mode: courierv1alpha1.ModeResolveIssue},
+			skillSet: skillSet,
+		},
 	}
 	for _, variation := range variations {
 		variation := variation

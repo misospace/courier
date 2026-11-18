@@ -9,11 +9,11 @@ import (
 	"github.com/misospace/courier/internal/branch"
 )
 
-// splitOwnerRepo splits a "owner/name" repository identity on the
-// final separator. Empty parts, a leading separator, or a trailing
-// separator fail. The function is local to the broker package to keep
-// the helper near the binding code that needs it.
-func splitOwnerRepo(value string) (owner, name string, ok bool) {
+// SplitOwnerRepo splits an "owner/name" repository identity on the final
+// separator. Empty parts, a leading separator, or a trailing separator fail.
+// Policy binding and the executor binary's forge calls share it, so a
+// configured identity parses the same way on both sides.
+func SplitOwnerRepo(value string) (owner, name string, ok bool) {
 	value = strings.TrimSpace(value)
 	idx := strings.LastIndex(value, "/")
 	if idx <= 0 || idx == len(value)-1 {
@@ -30,7 +30,7 @@ func splitOwnerRepo(value string) (owner, name string, ok bool) {
 // carries the provider's exact canonical casing, which only admission's
 // provider read establishes and records.
 func canonicalRepoIdentity(value string) (string, bool) {
-	owner, name, ok := splitOwnerRepo(value)
+	owner, name, ok := SplitOwnerRepo(value)
 	if !ok {
 		return "", false
 	}
@@ -128,7 +128,7 @@ func PolicyFromRun(run *v1alpha1.CoderRun, providerConfigRef, canonicalSpecRepo 
 		// identity above) and Spec.Ref is the issue number. Wiring
 		// it here means the broker is the only component that
 		// reasons about PR-body linkage against this identity.
-		owner, name, ok := splitOwnerRepo(persisted.BaseRepo)
+		owner, name, ok := SplitOwnerRepo(persisted.BaseRepo)
 		if !ok {
 			return Policy{}, fmt.Errorf("broker binding: persisted base repository %q is not an owner/name", persisted.BaseRepo)
 		}

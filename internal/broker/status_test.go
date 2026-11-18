@@ -725,3 +725,111 @@ func TestStatusWriterFencesModelSurfaceIdentity(t *testing.T) {
 		t.Fatal("a record with no time was accepted")
 	}
 }
+
+// TestStatusWriterAppliesPullRequestIdentity proves the created pull
+// request (#844) lands on status.pr — the number-string identity the
+// operator's verification already reads — as a decimal, and the identical
+// rewrite is the idempotent retry.
+func TestStatusWriterAppliesPullRequestIdentity(t *testing.T) {
+	w, c, identity := statusFixture(t)
+	if err := w.Write(context.Background(), identity, HarnessPatch{PullRequest: &PullRequestRecord{Number: 845}}, nil); err != nil {
+		t.Fatalf("write pull-request identity: %v", err)
+	}
+	if err := w.Write(context.Background(), identity, HarnessPatch{PullRequest: &PullRequestRecord{Number: 845}}, nil); err != nil {
+		t.Fatalf("idempotent rewrite of the identical identity: %v", err)
+	}
+	var run courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: testRunName}, &run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Status.PR != "845" {
+		t.Fatalf("status.pr = %q, want the recorded number", run.Status.PR)
+	}
+}
+
+// TestStatusWriterPullRequestIsOneIdentityPerRun proves the create route
+// can never legitimately open a second pull request at the pinned head, so
+// a different number after one is recorded is refused and the recorded one
+// stands — the same value written by a replacement incarnation is the
+// adopted-pull-request recovery and stays accepted.
+func TestStatusWriterPullRequestIsOneIdentityPerRun(t *testing.T) {
+	w, c, identity := statusFixture(t)
+	if err := w.Write(context.Background(), identity, HarnessPatch{PullRequest: &PullRequestRecord{Number: 845}}, nil); err != nil {
+		t.Fatalf("write first identity: %v", err)
+	}
+	if err := w.Write(context.Background(), identity, HarnessPatch{PullRequest: &PullRequestRecord{Number: 999}}, nil); err == nil {
+		t.Fatal("a second pull-request identity was accepted")
+	}
+	if err := w.Write(context.Background(), identity, HarnessPatch{PullRequest: &PullRequestRecord{Number: 845}}, nil); err != nil {
+		t.Fatalf("a replacement incarnation re-recording the adopted identity: %v", err)
+	}
+	var run courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: testRunName}, &run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Status.PR != "845" {
+		t.Fatalf("status.pr = %q, want the first identity left standing", run.Status.PR)
+	}
+}
+
+// TestStatusWriterRejectsMalformedPullRequestIdentity proves the structural
+// bound: only a real positive number is a pull-request identity, and the
+// malformed write never touches the run.
+func TestStatusWriterRejectsMalformedPullRequestIdentity(t *testing.T) {
+	w, c, identity := statusFixture(t)
+	for _, number := range []int{0, -1} {
+		if err := w.Write(context.Background(), identity, HarnessPatch{PullRequest: &PullRequestRecord{Number: number}}, nil); err == nil {
+			t.Fatalf("malformed pull-request number %d was accepted", number)
+		}
+	}
+	var run courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: testRunName}, &run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Status.PR != "" {
+		t.Fatalf("status.pr = %q, want the refused writes to have recorded nothing", run.Status.PR)
+	}
+}
+
+// TestStatusWriterPullRequestFenceComparesNumerically proves the fence
+// survives non-canonical identities the operator may already have recorded:
+// a recorded " 845 " still matches a write of 845 and normalizes, while an
+// identity that is not a number (a hand-recorded URL) is refused rather than
+// laundered into a canonical number (#844).
+func TestStatusWriterPullRequestFenceComparesNumerically(t *testing.T) {
+	w, c, identity := statusFixture(t)
+	seed := func(value string) {
+		var run courier.CoderRun
+		if err := c.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: testRunName}, &run); err != nil {
+			t.Fatal(err)
+		}
+		run.Status.PR = value
+		if err := c.Status().Update(context.Background(), &run); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed(" 845 ")
+	if err := w.Write(context.Background(), identity, HarnessPatch{PullRequest: &PullRequestRecord{Number: 845}}, nil); err != nil {
+		t.Fatalf("write matching a whitespace-recorded number: %v", err)
+	}
+	var run courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: testRunName}, &run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Status.PR != "845" {
+		t.Fatalf("status.pr = %q, want the canonical number", run.Status.PR)
+	}
+	seed("https://github.com/owner/repo/pull/845")
+	if err := w.Write(context.Background(), identity, HarnessPatch{PullRequest: &PullRequestRecord{Number: 845}}, nil); err == nil {
+		t.Fatal("a non-numeric recorded identity was rewritten without proof it names the same pull request")
+	}
+	if err := w.Write(context.Background(), identity, HarnessPatch{PullRequest: &PullRequestRecord{Number: 846}}, nil); err == nil {
+		t.Fatal("a different number than the recorded identity was accepted")
+	}
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: testRunName}, &run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Status.PR != "https://github.com/owner/repo/pull/845" {
+		t.Fatalf("status.pr = %q, want the refused writes to have left the recorded identity standing", run.Status.PR)
+	}
+}

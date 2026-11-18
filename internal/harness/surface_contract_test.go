@@ -198,6 +198,12 @@ func surfaceSuccessfulSkill(t *testing.T, c *Coordinator, name, briefID string) 
 	return result.Content
 }
 
+// surfaceSurfaceMode is the run mode the model-surface digest assembly and
+// the harvested outcome clarification share: the clarification is
+// mode-specific grammar (#845 review), so the harvest and the assembly must
+// read the same mode for the digest pin to bite.
+const surfaceSurfaceMode = courierv1alpha1.ModeResolveIssue
+
 // surfaceCoordinatorSurface collects the coordinator role's surface for one
 // wiring. Sections mirror exactly what Run pins and what the coordinator's
 // own tool paths emit.
@@ -208,8 +214,12 @@ func surfaceCoordinatorSurface(t *testing.T, skillSet *SkillSet) roleSurface {
 		forge = surfaceStubForge{}
 	}
 	c := surfaceCoordinator(t, forge, skillSet, nil)
+	// One framing variant enters the surface scan: a run pins exactly one
+	// mode's framing, and the per-mode grammar tie lives in
+	// TestHarnessFramingCarriesTheModeGrammar rather than by double-counting
+	// both variants against the role's surface budget (#845 review).
 	sections := []surfaceSection{
-		{owner: "coordinator pinned framing (harnessFraming)", text: harnessFraming},
+		{owner: "coordinator pinned framing (harnessFraming)", text: harnessFraming(surfaceSurfaceMode)},
 	}
 	if skillSet != nil {
 		sections = append(sections, surfaceSection{owner: "pinned skills section (SkillSet.Section)", text: skillSet.Section()})
@@ -227,7 +237,7 @@ func surfaceCoordinatorNotices(t *testing.T, c *Coordinator, skillful bool) []su
 	t.Helper()
 	sections := []surfaceSection{
 		{owner: "notice: injected control turn (controlTurnText)", text: controlTurnText},
-		{owner: "notice: outcome clarification (outcomeClarification)", text: outcomeClarification},
+		{owner: "notice: outcome clarification (outcomeClarification)", text: outcomeClarification(surfaceSurfaceMode)},
 		{owner: "notice: step-boundary compaction digest (compactDigest)", text: compactDigest(2, "", []Message{
 			{Role: "user", Content: "earlier directive"},
 			{Role: "tool", Content: "earlier tool output"},
@@ -349,7 +359,7 @@ func TestModelVisibleSurfaceContract(t *testing.T) {
 	// rendered against the same fixture the harvest used. A new literal in
 	// a tool path that never entered the fixed-notice table fails here.
 	t.Run("every fixed notice is pinned in the model-surface digest", func(t *testing.T) {
-		surface, err := AssembleModelSurface(testBindings(), nil, nil, ModelSurfaceInputs{GatewayTransport: "openai"})
+		surface, err := AssembleModelSurface(testBindings(), nil, nil, ModelSurfaceInputs{GatewayTransport: "openai", Mode: surfaceSurfaceMode})
 		if err != nil {
 			t.Fatalf("assemble: %v", err)
 		}
@@ -546,12 +556,29 @@ func TestModelVisibleSurfaceContract(t *testing.T) {
 			}
 		}
 		// Every flat outcome shape the text carries must parse through the
-		// production parser (the "..." placeholders are non-empty strings,
-		// exactly as the parser sees them).
+		// production parser in the mode it documents (the "..." placeholders
+		// are non-empty strings, exactly as the parser sees them): a bare
+		// changes shape is a fix-pr/rebase ending, and the prTitle/prBody
+		// shape is the resolve-issue/contribute ending (#844).
 		for _, shape := range regexp.MustCompile(`\{"outcome":[^{}]*\}`).FindAllString(text.String(), -1) {
-			if _, _, err := parseOutcome(shape); err != nil {
-				t.Errorf("coordinator text documents outcome shape the parser rejects: %s: %v", shape, err)
+			_, _, _, openErr := parseOutcome(shape, courierv1alpha1.ModeResolveIssue)
+			_, _, _, actErr := parseOutcome(shape, courierv1alpha1.ModeFixPR)
+			if openErr != nil && actErr != nil {
+				t.Errorf("coordinator text documents outcome shape the parser rejects in every mode: %s: resolve-issue: %v; fix-pr: %v", shape, openErr, actErr)
 			}
+		}
+		// The pr fields the text teaches must be required exactly where the
+		// text claims they are: the bare changes shape must parse only for a
+		// mode that never opens a pull request, and the pr-carrying shape
+		// only for a mode that does (#844).
+		if _, _, _, err := parseOutcome(`{"outcome":"changes"}`, courierv1alpha1.ModeResolveIssue); err == nil {
+			t.Error("a bare changes declaration parses for resolve-issue although the text requires prTitle and prBody there")
+		}
+		if _, _, pr, err := parseOutcome(`{"outcome":"changes","prTitle":"...","prBody":"..."}`, courierv1alpha1.ModeResolveIssue); err != nil || pr == nil {
+			t.Errorf("the documented pr-carrying changes shape must parse for resolve-issue: %v", err)
+		}
+		if _, _, _, err := parseOutcome(`{"outcome":"changes","prTitle":"...","prBody":"..."}`, courierv1alpha1.ModeFixPR); err == nil {
+			t.Error("a pr-carrying changes declaration parses for fix-pr although that run never opens a pull request")
 		}
 		// The close shape rides inside the flat regex's blind spot (nested
 		// braces); probe it through parseOutcome as the parser reads it:
@@ -562,7 +589,7 @@ func TestModelVisibleSurfaceContract(t *testing.T) {
 			t.Fatalf("coordinator text documents no close criterion shape; the no-change close grammar left the surface")
 		}
 		probe := `{"outcome":"no_change_needed","evidence":"...","close":{"criteria":[` + closeShape + `]}}`
-		if _, _, err := parseOutcome(probe); err != nil {
+		if _, _, _, err := parseOutcome(probe, courierv1alpha1.ModeResolveIssue); err != nil {
 			t.Errorf("coordinator text documents a close shape the parser rejects: %s: %v", probe, err)
 		}
 		// The close keys the text teaches must be the keys the persisted

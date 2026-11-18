@@ -67,6 +67,24 @@ type StatusPatch struct {
 	// that incarnation, and a replacement incarnation records its own.
 	// +optional
 	ModelSurface *courierv1alpha1.ModelSurfaceProvenance `json:"modelSurface,omitempty"`
+
+	// PullRequest records the pull request the run's broker created for this
+	// run through the pull-request creation route (#844): the number the
+	// create route returned, which the broker re-read from the forge before
+	// answering. The broker records it as the run's pull-request identity —
+	// the same status field the operator's verification reads — and refuses
+	// a different number once one is recorded, so the identical rewrite is
+	// the idempotent retry.
+	// +optional
+	PullRequest *PullRequestRecord `json:"pullRequest,omitempty"`
+}
+
+// PullRequestRecord carries the created pull request's number. The run's
+// branch and head-repository identities are already recorded on the run, so
+// the number is the missing half of the identity the operator's Verifying
+// phase verifies through the forge read-pull-request capability.
+type PullRequestRecord struct {
+	Number int `json:"number"`
 }
 
 // OperationAddition carries the operation ID (the set's key) and its entry.
@@ -330,6 +348,38 @@ func (r *StatusReporter) ModelSurface(ctx context.Context, schemaVersion int, di
 		CoordinatorPodUID: r.controlUID,
 		At:                metav1.NewTime(r.now()),
 	}})
+}
+
+// durable reports whether this reporter can carry a load-bearing status
+// write (#844). Telemetry writes tolerate an unconfigured path; an identity
+// write does not, and callers gate on this before taking side effects whose
+// record they can never make durable.
+func (r *StatusReporter) durable() bool {
+	return r != nil && r.transport != nil
+}
+
+// PullRequestOpened records the pull request the run's broker created
+// through its pull-request creation route (#844), through the broker's
+// trusted status path, before the finish honors the published result. The
+// broker writes it into the run's recorded pull-request identity and
+// refuses a different number once one is recorded, so a re-write of the
+// same number — the relaunch recovery, where the create route adopts the
+// discovered pull request instead of creating a second one — is the
+// idempotent retry. A persistent failure is returned to the caller, which
+// fails closed on the infrastructure path: recovery is the relaunch that
+// adopts and re-records, never a claim of a pull request the status path
+// never persisted.
+func (r *StatusReporter) PullRequestOpened(ctx context.Context, number int) error {
+	if r == nil {
+		return errors.New("harness: pull-request identity has no status path")
+	}
+	if r.transport == nil {
+		return errors.New("harness: pull-request identity has no configured status path")
+	}
+	if number <= 0 {
+		return errors.New("harness: pull-request identity is malformed")
+	}
+	return r.retried(ctx, StatusPatch{PullRequest: &PullRequestRecord{Number: number}})
 }
 
 // ReconcileDebt retries a retained checkpoint write. The broker's

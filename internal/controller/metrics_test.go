@@ -425,19 +425,16 @@ func TestMetricLabelsExcludeIdentity(t *testing.T) {
 		t.Fatalf("in-flight for a drained lane = %v, want 0", got)
 	}
 
-	// The oldest-terminal-age gauge carries only the bounded terminal phase.
-	ageRegistry := prometheus.NewRegistry()
-	ageRegistry.MustRegister(NewTerminalAgeCollector(runsClient))
-	assertGatheredLabelSet(t, ageRegistry, "courier_coderuns_oldest_terminal_age_seconds", "phase")
-
-	// The terminal-backlog gauges carry only bounded phase and lane labels.
-	backlogRegistry := prometheus.NewRegistry()
-	backlogCollector := NewTerminalBacklogCollector(runsClient)
-	backlogCollector.now = func() time.Time { return timestampClock }
-	backlogRegistry.MustRegister(backlogCollector)
-	assertGatheredLabelSet(t, backlogRegistry, "courier_coderuns_awaiting_reap", "phase")
-	assertGatheredLabelSet(t, backlogRegistry, "courier_coderuns_lifecycle_pending", "lane")
-	assertGatheredLabelSet(t, backlogRegistry, "courier_coderuns_lifecycle_pending_oldest_age_seconds", "lane")
+	// The terminal collector publishes both halves from one list, and its
+	// gauges carry only the bounded terminal phase and lane labels.
+	terminalRegistry := prometheus.NewRegistry()
+	terminalCollector := NewTerminalCollector(runsClient)
+	terminalCollector.now = func() time.Time { return timestampClock }
+	terminalRegistry.MustRegister(terminalCollector)
+	assertGatheredLabelSet(t, terminalRegistry, "courier_coderuns_oldest_terminal_age_seconds", "phase")
+	assertGatheredLabelSet(t, terminalRegistry, "courier_coderuns_awaiting_reap", "phase")
+	assertGatheredLabelSet(t, terminalRegistry, "courier_coderuns_lifecycle_pending", "lane")
+	assertGatheredLabelSet(t, terminalRegistry, "courier_coderuns_lifecycle_pending_oldest_age_seconds", "lane")
 
 	// No label value may carry work-item identity.
 	identity := map[string]bool{
@@ -446,7 +443,7 @@ func TestMetricLabelsExcludeIdentity(t *testing.T) {
 		run.Name:            true,
 		"1":                 true,
 	}
-	for _, g := range []prometheus.Gatherer{registry, laneRegistry, ageRegistry, backlogRegistry} {
+	for _, g := range []prometheus.Gatherer{registry, laneRegistry, terminalRegistry} {
 		families, err := g.Gather()
 		if err != nil {
 			t.Fatalf("gather: %v", err)
@@ -604,10 +601,12 @@ func TestReapObservesReapRequestCounter(t *testing.T) {
 	}
 }
 
-// TestTerminalAgeCollectorReportsOldestPerPhase checks the age half of the
-// retention observability: the gauge reports the age of the oldest retained
-// run per terminal phase, ignoring non-terminal runs.
-func TestTerminalAgeCollectorReportsOldestPerPhase(t *testing.T) {
+// TestTerminalCollectorReportsOldestPerPhase checks the age half of the
+// retention observability on the merged collector: the gauge reports the age of
+// the oldest retained run per terminal phase, ignoring non-terminal runs. The
+// backlog half shares the collector and the list, but this fixture only pins
+// the age series.
+func TestTerminalCollectorReportsOldestPerPhase(t *testing.T) {
 	now := timestampClock
 	failedOld := terminalReapRun("failed-old", courierv1alpha1.PhaseFailed, now.Add(-3*time.Hour))
 	failedNew := terminalReapRun("failed-new", courierv1alpha1.PhaseFailed, now.Add(-1*time.Hour))
@@ -615,7 +614,7 @@ func TestTerminalAgeCollectorReportsOldestPerPhase(t *testing.T) {
 	pending := admissionRun("pending", "local", courierv1alpha1.PhasePending)
 
 	c := phaseClient(t, failedOld, failedNew, needs, pending)
-	collector := NewTerminalAgeCollector(c)
+	collector := NewTerminalCollector(c)
 	collector.now = func() time.Time { return now }
 
 	registry := prometheus.NewRegistry()
@@ -629,10 +628,58 @@ func TestTerminalAgeCollectorReportsOldestPerPhase(t *testing.T) {
 	}
 }
 
-// TestTerminalAgeCollectorListFailure checks the scrape-error path: a failed
-// List must increment the dedicated counter instead of silently dropping the
-// scrape or panicking.
-func TestTerminalAgeCollectorListFailure(t *testing.T) {
+// assertTerminalScrapeFailure gathers once and asserts the merged collector's
+// failed-collection posture from that single snapshot: both per-half
+// scrape-error counters counted the one failed List, and no terminal gauge
+// family published a series — a page that listed before the failure is never
+// reported on its own.
+func assertTerminalScrapeFailure(t *testing.T, reg *prometheus.Registry) {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, name := range []string{
+		"courier_terminal_age_scrape_errors_total",
+		"courier_terminal_backlog_scrape_errors_total",
+	} {
+		value, found := 0.0, false
+		for _, f := range families {
+			if f.GetName() != name {
+				continue
+			}
+			for _, m := range f.GetMetric() {
+				if m.GetCounter() != nil && len(m.GetLabel()) == 0 {
+					value, found = m.GetCounter().GetValue(), true
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("%s not found after one gather", name)
+		}
+		if value != 1 {
+			t.Fatalf("%s = %v, want 1", name, value)
+		}
+	}
+	for _, name := range []string{
+		"courier_coderuns_oldest_terminal_age_seconds",
+		"courier_coderuns_awaiting_reap",
+		"courier_coderuns_lifecycle_pending",
+		"courier_coderuns_lifecycle_pending_oldest_age_seconds",
+	} {
+		for _, f := range families {
+			if f.GetName() == name && len(f.GetMetric()) > 0 {
+				t.Fatalf("%s published a series despite the failed List", name)
+			}
+		}
+	}
+}
+
+// TestTerminalCollectorListFailure checks the scrape-error path of the merged
+// collector: one failed List fails the collection of both halves, so a single
+// gather increments both dedicated counters and publishes no terminal gauges
+// instead of silently dropping the scrape or panicking.
+func TestTerminalCollectorListFailure(t *testing.T) {
 	base := phaseClient(t)
 	withWatch, ok := base.(client.WithWatch)
 	if !ok {
@@ -645,12 +692,9 @@ func TestTerminalAgeCollectorListFailure(t *testing.T) {
 	})
 
 	registry := prometheus.NewRegistry()
-	registry.MustRegister(NewTerminalAgeCollector(failing))
+	registry.MustRegister(NewTerminalCollector(failing))
 
-	m := gatherMetric(t, registry, "courier_terminal_age_scrape_errors_total", map[string]string{})
-	if m.GetCounter() == nil || m.GetCounter().GetValue() != 1 {
-		t.Fatalf("courier_terminal_age_scrape_errors_total = %v, want 1", m.GetCounter())
-	}
+	assertTerminalScrapeFailure(t, registry)
 }
 
 func patchReconciler(t *testing.T, c client.Client, now time.Time) (*CoderRunReconciler, *prometheus.Registry) {
@@ -1139,12 +1183,13 @@ func sourceWorkItemForTest(t *testing.T, run *courierv1alpha1.CoderRun) source.W
 	return item
 }
 
-// TestTerminalBacklogCollector checks the scrape-time backlog gauges: the
-// per-phase count of retained terminal runs, the per-lane count of terminal
-// runs whose lifecycle report has not settled, and the age of the oldest
-// unsettled run from FinishedAt — with runs lacking FinishedAt skipped for
-// age and settled runs excluded from the pending gauges.
-func TestTerminalBacklogCollector(t *testing.T) {
+// TestTerminalCollectorReportsBacklog checks the scrape-time backlog gauges on
+// the merged collector: the per-phase count of retained terminal runs, the
+// per-lane count of terminal runs whose lifecycle report has not settled, and
+// the age of the oldest unsettled run from FinishedAt — with runs lacking
+// FinishedAt skipped for age and settled runs excluded from the pending gauges.
+// The age half is published from the same list but is pinned elsewhere.
+func TestTerminalCollectorReportsBacklog(t *testing.T) {
 	now := timestampClock
 	settled := withLifecycleSettled(terminalReapRun("settled", courierv1alpha1.PhaseFailed, now.Add(-3*time.Hour)))
 	pendingAged := withLifecycleReported(admissionRun("pending-aged", "local", courierv1alpha1.PhaseNeedsHuman), metav1.ConditionFalse, lifecycleReportPendingReason)
@@ -1153,7 +1198,7 @@ func TestTerminalBacklogCollector(t *testing.T) {
 	running := admissionRun("running", "local", courierv1alpha1.PhaseRunning)
 
 	c := phaseClient(t, settled, pendingAged, pendingNoFinish, running)
-	collector := NewTerminalBacklogCollector(c)
+	collector := NewTerminalCollector(c)
 	collector.now = func() time.Time { return now }
 
 	registry := prometheus.NewRegistry()
@@ -1176,28 +1221,6 @@ func TestTerminalBacklogCollector(t *testing.T) {
 	}
 	if _, present := gaugeValueIfPresent(t, registry, "courier_coderuns_lifecycle_pending_oldest_age_seconds", map[string]string{"lane": "cloud"}); present {
 		t.Fatal("a pending run without FinishedAt must be skipped for the oldest-age gauge")
-	}
-}
-
-// TestTerminalBacklogCollectorListFailure checks the scrape-error path.
-func TestTerminalBacklogCollectorListFailure(t *testing.T) {
-	base := phaseClient(t)
-	withWatch, ok := base.(client.WithWatch)
-	if !ok {
-		t.Fatal("fake client does not implement client.WithWatch")
-	}
-	failing := interceptor.NewClient(withWatch, interceptor.Funcs{
-		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
-			return errors.New("list failed")
-		},
-	})
-
-	registry := prometheus.NewRegistry()
-	registry.MustRegister(NewTerminalBacklogCollector(failing))
-
-	m := gatherMetric(t, registry, "courier_terminal_backlog_scrape_errors_total", map[string]string{})
-	if m.GetCounter() == nil || m.GetCounter().GetValue() != 1 {
-		t.Fatalf("courier_terminal_backlog_scrape_errors_total = %v, want 1", m.GetCounter())
 	}
 }
 
@@ -1262,10 +1285,230 @@ func TestLaneCollectorScopedToNamespace(t *testing.T) {
 	}
 }
 
-// A terminal-age collector scoped to one namespace reports only that
-// namespace's oldest terminal run; the unscoped default sees the whole
+// TestLaneCollectorScopedReportsOperatorNamespaceLanes covers the bootstrap
+// wiring (#837): a LaneProfile consulted in the operator namespace, outside
+// the owned run namespaces, still seeds every lane gauge at zero, so a
+// bootstrap-managed lane is reported instead of looking unscheduled. The run
+// scope stays narrow — the operator namespace's runs are not counted — and a
+// namespace outside the consulted scope stays invisible.
+func TestLaneCollectorScopedReportsOperatorNamespaceLanes(t *testing.T) {
+	local := admissionLane("local", 2)
+	bootstrap := admissionLane("bootstrap", 3)
+	bootstrap.Namespace = "operator-ns"
+	foreign := admissionLane("foreign", 4)
+	foreign.Namespace = "foreign-ns"
+	localRunning := admissionRun("local-running", "local", courierv1alpha1.PhaseRunning)
+	bootstrapRunning := admissionRun("bootstrap-running", "bootstrap", courierv1alpha1.PhaseRunning)
+	bootstrapRunning.Namespace = "operator-ns"
+
+	c := phaseClient(t, local, bootstrap, foreign, localRunning, bootstrapRunning)
+	collector := NewLaneCollectorScoped(c, []string{"default"}, []string{"default", "operator-ns"})
+	collector.now = func() time.Time { return timestampClock }
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(collector)
+
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_lane_concurrency", map[string]string{"lane": "bootstrap"}), "courier_lane_concurrency"); got != 3 {
+		t.Fatalf("concurrency bootstrap = %v, want 3", got)
+	}
+	for name, want := range map[string]float64{
+		"courier_coderuns_in_flight": 0,
+		"courier_lane_suspended":     0,
+		"courier_lane_reservations":  0,
+		"courier_coderuns_pending":   0,
+	} {
+		if got := gaugeValue(t, gatherMetric(t, registry, name, map[string]string{"lane": "bootstrap"}), name); got != want {
+			t.Fatalf("%s bootstrap = %v, want %v (seeded zero for an operator-namespace lane)", name, got, want)
+		}
+	}
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_coderuns_in_flight", map[string]string{"lane": "local"}), "courier_coderuns_in_flight"); got != 1 {
+		t.Fatalf("in-flight local = %v, want 1", got)
+	}
+	// The widened lane scope does not widen the run scope: the run in the
+	// operator namespace is outside the owned run namespaces and uncounted.
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_coderuns_in_flight", map[string]string{"lane": "bootstrap"}), "courier_coderuns_in_flight"); got != 0 {
+		t.Fatalf("in-flight bootstrap = %v, want 0 (runs stay scoped to the owned run namespaces)", got)
+	}
+	// A side-by-side deployment's namespace is in neither scope.
+	for _, name := range []string{"courier_lane_concurrency", "courier_lane_suspended", "courier_coderuns_in_flight"} {
+		if _, present := gaugeValueIfPresent(t, registry, name, map[string]string{"lane": "foreign"}); present {
+			t.Fatalf("%s present for a foreign namespace's lane, want absent", name)
+		}
+	}
+}
+
+// TestLaneCollectorDedupesLaneProfilesByName pins the shared-name rule: lane
+// labels carry only the name, so one name listed from several consulted
+// namespaces seeds exactly one sample per gauge, and the consult-order-first
+// copy is authoritative — first the owned run namespaces in scope order, then
+// the operator namespace — the same copies the lane resolutions of runs in
+// those namespaces read.
+func TestLaneCollectorDedupesLaneProfilesByName(t *testing.T) {
+	runSide := admissionLane("shared", 5)
+	secondOwned := admissionLane("shared", 7)
+	secondOwned.Namespace = "runs-b"
+	operatorSide := admissionLane("shared", 9)
+	operatorSide.Namespace = "operator-ns"
+	operatorSide.Annotations = map[string]string{courierv1alpha1.SuspendAnnotation: "true"}
+
+	c := phaseClient(t, runSide, secondOwned, operatorSide)
+	collector := NewLaneCollectorScoped(c, []string{"default", "runs-b"}, []string{"default", "runs-b", "operator-ns"})
+	collector.now = func() time.Time { return timestampClock }
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(collector)
+
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_lane_concurrency", map[string]string{"lane": "shared"}), "courier_lane_concurrency"); got != 5 {
+		t.Fatalf("concurrency shared = %v, want 5 (the run-namespace copy wins)", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_lane_suspended", map[string]string{"lane": "shared"}), "courier_lane_suspended"); got != 0 {
+		t.Fatalf("suspended shared = %v, want 0 (the run-namespace copy wins)", got)
+	}
+
+	count := func(name string) int {
+		families, err := registry.Gather()
+		if err != nil {
+			t.Fatalf("gather: %v", err)
+		}
+		n := 0
+		for _, f := range families {
+			if f.GetName() != name {
+				continue
+			}
+			for _, m := range f.GetMetric() {
+				for _, lp := range m.GetLabel() {
+					if lp.GetName() == "lane" && lp.GetValue() == "shared" {
+						n++
+					}
+				}
+			}
+		}
+		return n
+	}
+	for _, name := range []string{
+		"courier_coderuns_in_flight",
+		"courier_lane_suspended",
+		"courier_lane_concurrency",
+		"courier_lane_reservations",
+		"courier_coderuns_pending",
+	} {
+		if n := count(name); n != 1 {
+			t.Fatalf("%s has %d samples for the shared lane, want exactly 1", name, n)
+		}
+	}
+}
+
+// TestLaneCollectorLaneProfileListFailureScoped keeps the scrape-error
+// posture (#837): a failed LaneProfile read in the widened lane scope
+// increments the dedicated counter instead of dropping the scrape or
+// panicking, while CoderRun reads still succeed.
+func TestLaneCollectorLaneProfileListFailureScoped(t *testing.T) {
+	base := phaseClient(t, admissionRun("local-running", "local", courierv1alpha1.PhaseRunning))
+	withWatch, ok := base.(client.WithWatch)
+	if !ok {
+		t.Fatal("fake client does not implement client.WithWatch")
+	}
+	failing := interceptor.NewClient(withWatch, interceptor.Funcs{
+		List: func(_ context.Context, _ client.WithWatch, list client.ObjectList, _ ...client.ListOption) error {
+			if _, ok := list.(*courierv1alpha1.LaneProfileList); ok {
+				return errors.New("lane profile list failed")
+			}
+			return nil
+		},
+	})
+
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(NewLaneCollectorScoped(failing, []string{"default"}, []string{"default", "operator-ns"}))
+
+	m := gatherMetric(t, registry, "courier_metrics_scrape_errors_total", map[string]string{})
+	if m.GetCounter() == nil || m.GetCounter().GetValue() != 1 {
+		t.Fatalf("courier_metrics_scrape_errors_total = %v, want 1", m.GetCounter())
+	}
+}
+
+// staticManagedLanes returns a managedLanes resolver pinned to one name set,
+// the stand-in for a live bootstrap provider read.
+func staticManagedLanes(names ...string) func(context.Context) (map[string]bool, error) {
+	set := make(map[string]bool, len(names))
+	for _, name := range names {
+		set[name] = true
+	}
+	return func(context.Context) (map[string]bool, error) {
+		return set, nil
+	}
+}
+
+// TestLaneCollectorFiltersSharedOperatorNamespaceToManagedLanes pins the
+// side-by-side rule (#837): two bootstrap-configured releases share
+// POD_NAMESPACE but own disjoint run namespaces and manage distinct bootstrap
+// lanes. Each collector seeds only its own managed lanes from the shared
+// namespace — never its neighbor's — while its owned run-namespace pages
+// stay unfiltered, even for a name the managed set does not list.
+func TestLaneCollectorFiltersSharedOperatorNamespaceToManagedLanes(t *testing.T) {
+	legacy := admissionLane("legacy-lane", 2)
+	legacy.Namespace = "courier-system"
+	native := admissionLane("native-lane", 7)
+	native.Namespace = "courier-system"
+	// An owned run-namespace profile whose name is in neither managed set:
+	// owned pages are never filtered.
+	unmanaged := admissionLane("unmanaged", 4)
+	unmanaged.Namespace = "runs-v1"
+
+	c := phaseClient(t, legacy, native, unmanaged)
+	now := func() time.Time { return timestampClock }
+
+	v1 := NewLaneCollectorManaged(c, []string{"runs-v1"}, []string{"runs-v1", "courier-system"}, staticManagedLanes("legacy-lane"))
+	v1.now = now
+	v1Registry := prometheus.NewRegistry()
+	v1Registry.MustRegister(v1)
+	if got := gaugeValue(t, gatherMetric(t, v1Registry, "courier_lane_concurrency", map[string]string{"lane": "legacy-lane"}), "courier_lane_concurrency"); got != 2 {
+		t.Fatalf("concurrency legacy-lane = %v, want 2", got)
+	}
+	if _, present := gaugeValueIfPresent(t, v1Registry, "courier_lane_concurrency", map[string]string{"lane": "native-lane"}); present {
+		t.Fatal("shared operator namespace leaked the neighbor's native-lane into the v1 release")
+	}
+	if got := gaugeValue(t, gatherMetric(t, v1Registry, "courier_lane_concurrency", map[string]string{"lane": "unmanaged"}), "courier_lane_concurrency"); got != 4 {
+		t.Fatalf("concurrency unmanaged = %v, want 4 (owned run-namespace pages stay unfiltered)", got)
+	}
+
+	nativeRelease := NewLaneCollectorManaged(c, []string{"runs-native"}, []string{"runs-native", "courier-system"}, staticManagedLanes("native-lane"))
+	nativeRelease.now = now
+	nativeRegistry := prometheus.NewRegistry()
+	nativeRegistry.MustRegister(nativeRelease)
+	if got := gaugeValue(t, gatherMetric(t, nativeRegistry, "courier_lane_concurrency", map[string]string{"lane": "native-lane"}), "courier_lane_concurrency"); got != 7 {
+		t.Fatalf("concurrency native-lane = %v, want 7", got)
+	}
+	for _, lane := range []string{"legacy-lane", "unmanaged"} {
+		if _, present := gaugeValueIfPresent(t, nativeRegistry, "courier_lane_concurrency", map[string]string{"lane": lane}); present {
+			t.Fatalf("the native release advertised %s, want absent", lane)
+		}
+	}
+}
+
+// TestLaneCollectorManagedLanesFailure pins the scrape-error posture for the
+// managed-lane filter (#837): a failed provider read counts as a scrape
+// failure instead of emitting a half-truth lane set, and no lane series are
+// seeded from it.
+func TestLaneCollectorManagedLanesFailure(t *testing.T) {
+	c := phaseClient(t, admissionRun("local-running", "local", courierv1alpha1.PhaseRunning))
+	failing := func(context.Context) (map[string]bool, error) {
+		return nil, errors.New("bootstrap provider failed")
+	}
+
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(NewLaneCollectorManaged(c, []string{"default"}, []string{"default", "courier-system"}, failing))
+
+	m := gatherMetric(t, registry, "courier_metrics_scrape_errors_total", map[string]string{})
+	if m.GetCounter() == nil || m.GetCounter().GetValue() != 1 {
+		t.Fatalf("courier_metrics_scrape_errors_total = %v, want 1", m.GetCounter())
+	}
+	if _, present := gaugeValueIfPresent(t, registry, "courier_lane_concurrency", map[string]string{"lane": "local"}); present {
+		t.Fatal("a failed managed-lane read must not seed lane series")
+	}
+}
+
+// The terminal collector scoped to one namespace reports only that namespace's
+// oldest terminal run on the age half; the unscoped default sees the whole
 // cluster's oldest.
-func TestTerminalAgeCollectorScopedToNamespace(t *testing.T) {
+func TestTerminalCollectorAgeScopedToNamespace(t *testing.T) {
 	now := timestampClock
 	owned := terminalReapRun("owned-failed", courierv1alpha1.PhaseFailed, now.Add(-3*time.Hour))
 	foreign := terminalReapRun("foreign-failed", courierv1alpha1.PhaseFailed, now.Add(-5*time.Hour))
@@ -1273,7 +1516,7 @@ func TestTerminalAgeCollectorScopedToNamespace(t *testing.T) {
 
 	c := phaseClient(t, owned, foreign)
 
-	scoped := NewTerminalAgeCollector(c, "default")
+	scoped := NewTerminalCollector(c, "default")
 	scoped.now = func() time.Time { return now }
 	scopedRegistry := prometheus.NewRegistry()
 	scopedRegistry.MustRegister(scoped)
@@ -1281,7 +1524,7 @@ func TestTerminalAgeCollectorScopedToNamespace(t *testing.T) {
 		t.Fatalf("scoped oldest Failed = %v, want %v", got, (3 * time.Hour).Seconds())
 	}
 
-	unscoped := NewTerminalAgeCollector(c)
+	unscoped := NewTerminalCollector(c)
 	unscoped.now = func() time.Time { return now }
 	unscopedRegistry := prometheus.NewRegistry()
 	unscopedRegistry.MustRegister(unscoped)
@@ -1290,9 +1533,9 @@ func TestTerminalAgeCollectorScopedToNamespace(t *testing.T) {
 	}
 }
 
-// A terminal-backlog collector scoped to one namespace reports only that
-// namespace's terminal runs; the unscoped default reports both.
-func TestTerminalBacklogCollectorScopedToNamespace(t *testing.T) {
+// The terminal collector scoped to one namespace reports only that namespace's
+// terminal runs on the backlog half; the unscoped default reports both.
+func TestTerminalCollectorBacklogScopedToNamespace(t *testing.T) {
 	now := timestampClock
 	owned := withLifecycleReported(admissionRun("owned-pending", "local", courierv1alpha1.PhaseNeedsHuman), metav1.ConditionFalse, lifecycleReportPendingReason)
 	owned.Status.FinishedAt = &metav1.Time{Time: now.Add(-2 * time.Hour)}
@@ -1302,7 +1545,7 @@ func TestTerminalBacklogCollectorScopedToNamespace(t *testing.T) {
 
 	c := phaseClient(t, owned, foreign)
 
-	scoped := NewTerminalBacklogCollector(c, "default")
+	scoped := NewTerminalCollector(c, "default")
 	scoped.now = func() time.Time { return now }
 	scopedRegistry := prometheus.NewRegistry()
 	scopedRegistry.MustRegister(scoped)
@@ -1319,7 +1562,7 @@ func TestTerminalBacklogCollectorScopedToNamespace(t *testing.T) {
 		t.Fatal("scoped collector must not count a foreign namespace's pending report")
 	}
 
-	unscoped := NewTerminalBacklogCollector(c)
+	unscoped := NewTerminalCollector(c)
 	unscoped.now = func() time.Time { return now }
 	unscopedRegistry := prometheus.NewRegistry()
 	unscopedRegistry.MustRegister(unscoped)
@@ -1335,4 +1578,111 @@ func TestTerminalBacklogCollectorScopedToNamespace(t *testing.T) {
 	if got := gaugeValue(t, gatherMetric(t, unscopedRegistry, "courier_coderuns_lifecycle_pending_oldest_age_seconds", map[string]string{"lane": "cloud"}), "courier_coderuns_lifecycle_pending_oldest_age_seconds"); got != (5 * time.Hour).Seconds() {
 		t.Fatalf("unscoped oldest pending age cloud = %v, want %v", got, (5 * time.Hour).Seconds())
 	}
+}
+
+// TestTerminalCollectorSharesOneListAcrossHalves pins the consolidation (#854):
+// one Collect() lists CoderRuns once per owned namespace — two namespaces, two
+// lists — and both the age and backlog halves report the runs of every owned
+// namespace from that single snapshot. The unscoped default lists the whole
+// cluster exactly once.
+func TestTerminalCollectorSharesOneListAcrossHalves(t *testing.T) {
+	now := timestampClock
+	owned := terminalReapRun("owned-failed", courierv1alpha1.PhaseFailed, now.Add(-3*time.Hour))
+	neighbor := terminalReapRun("neighbor-failed", courierv1alpha1.PhaseFailed, now.Add(-1*time.Hour))
+	neighbor.Namespace = "runs-b"
+
+	base := phaseClient(t, owned, neighbor)
+	withWatch, ok := base.(client.WithWatch)
+	if !ok {
+		t.Fatal("fake client does not implement client.WithWatch")
+	}
+	var runLists int
+	counting := interceptor.NewClient(withWatch, interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, objList client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := objList.(*courierv1alpha1.CoderRunList); ok {
+				runLists++
+			}
+			return c.List(ctx, objList, opts...)
+		},
+	})
+
+	scoped := NewTerminalCollector(counting, "default", "runs-b")
+	scoped.now = func() time.Time { return now }
+	scopedRegistry := prometheus.NewRegistry()
+	scopedRegistry.MustRegister(scoped)
+
+	labels := map[string]string{"phase": "Failed"}
+	if got := gaugeValue(t, gatherMetric(t, scopedRegistry, "courier_coderuns_awaiting_reap", labels), "courier_coderuns_awaiting_reap"); got != 2 {
+		t.Fatalf("scoped awaiting reap Failed = %v, want 2 (one retained run in each owned namespace)", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, scopedRegistry, "courier_coderuns_oldest_terminal_age_seconds", labels), "courier_coderuns_oldest_terminal_age_seconds"); got != (3 * time.Hour).Seconds() {
+		t.Fatalf("scoped oldest Failed = %v, want %v (the older run, whichever namespace holds it)", got, (3 * time.Hour).Seconds())
+	}
+
+	// A final gather measures the list cost of exactly one Collect pass.
+	runLists = 0
+	if _, err := scopedRegistry.Gather(); err != nil {
+		t.Fatalf("gather scoped: %v", err)
+	}
+	if runLists != 2 {
+		t.Fatalf("CoderRun lists per scoped gather = %d, want 2 (one per owned namespace)", runLists)
+	}
+
+	unscoped := NewTerminalCollector(counting)
+	unscoped.now = func() time.Time { return now }
+	unscopedRegistry := prometheus.NewRegistry()
+	unscopedRegistry.MustRegister(unscoped)
+	if got := gaugeValue(t, gatherMetric(t, unscopedRegistry, "courier_coderuns_awaiting_reap", labels), "courier_coderuns_awaiting_reap"); got != 2 {
+		t.Fatalf("unscoped awaiting reap Failed = %v, want 2", got)
+	}
+	runLists = 0
+	if _, err := unscopedRegistry.Gather(); err != nil {
+		t.Fatalf("gather unscoped: %v", err)
+	}
+	if runLists != 1 {
+		t.Fatalf("CoderRun lists per unscoped gather = %d, want 1 (one cluster-wide list)", runLists)
+	}
+}
+
+// TestTerminalCollectorFailedPagePublishesNoGauges pins the fail-fast posture
+// across namespaces: a failed page for a later owned namespace fails the whole
+// collection, so one gather counts the failure on both scrape-error counters
+// and the runs the earlier namespace listed successfully are never published as
+// partial terminal gauges.
+func TestTerminalCollectorFailedPagePublishesNoGauges(t *testing.T) {
+	now := timestampClock
+	owned := terminalReapRun("owned-failed", courierv1alpha1.PhaseFailed, now.Add(-3*time.Hour))
+	neighbor := terminalReapRun("neighbor-failed", courierv1alpha1.PhaseFailed, now.Add(-2*time.Hour))
+	neighbor.Namespace = "runs-b"
+
+	base := phaseClient(t, owned, neighbor)
+	withWatch, ok := base.(client.WithWatch)
+	if !ok {
+		t.Fatal("fake client does not implement client.WithWatch")
+	}
+	failing := interceptor.NewClient(withWatch, interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, objList client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := objList.(*courierv1alpha1.CoderRunList); ok {
+				listOpts := client.ListOptions{}
+				for _, opt := range opts {
+					opt.ApplyToList(&listOpts)
+				}
+				if listOpts.Namespace == "runs-b" {
+					return errors.New("list failed")
+				}
+			}
+			return c.List(ctx, objList, opts...)
+		},
+	})
+
+	collector := NewTerminalCollector(failing, "default", "runs-b")
+	collector.now = func() time.Time { return now }
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(collector)
+
+	// The owned namespace's settled Failed run would have produced a Failed
+	// phase series on the age and awaiting-reap gauges (settled runs leave
+	// the pending gauges); the failed page suppresses even those, and both
+	// halves count the failure once.
+	assertTerminalScrapeFailure(t, registry)
 }

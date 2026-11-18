@@ -200,6 +200,11 @@ groups:
             courier_terminal_age_scrape_errors_total,
             courier_terminal_backlog_scrape_errors_total. Even a low rate is worth
             surfacing because it silently degrades lane capacity and retention views.
+            Encoding: each arm tests one counter alone (its increase over 10m is above
+            zero) and the arms are ORed, so any one counter rising fires. The terminal
+            collector increments both terminal counters on one failed List; the OR union
+            collapses the matching arms into one firing series, so a single scrape
+            failure fires once and no counter sum carries it past the threshold.
             Inspect the operator's RBAC and API server reachability for LaneProfile and
             CoderRun list calls.
       - alert: CourierControllerDown

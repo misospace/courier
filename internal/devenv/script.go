@@ -45,12 +45,18 @@ const ToolchainDirEnv = "COURIER_MISE_TOOLCHAIN_DIR"
 // request into a fast, local refusal — a pin the bake cannot satisfy
 // fails in milliseconds with an actionable error instead of stalling
 // into the worker's network-policy black hole and dying as an opaque
-// exit 1. The overlay lives on the per-run toolchain-cache volume when
-// one is mounted writable, so the environment capture's MISE_DATA_DIR
-// survives into every later task and mise keeps resolving the baked
-// tools for the model's own commands; a topology without the volume
-// falls back to a temporary dir. When the baked dir is absent the wiring
-// exports nothing: networked mise, exactly the pre-#797 behavior.
+// exit 1. XDG_STATE_HOME redirects mise's state — the trusted-configs
+// registry included — into the same writable root: the image bake runs
+// mise as root with the task user's HOME, and the state tree it leaves
+// behind is root-owned, so a task user's trust write into the default
+// ~/.local/state path is refused with EACCES and the whole bootstrap
+// dies behind an opaque exit 1. The overlay lives on the per-run
+// toolchain-cache volume when one is mounted writable, so the
+// environment capture's MISE_DATA_DIR survives into every later task and
+// mise keeps resolving the baked tools for the model's own commands; a
+// topology without the volume falls back to a temporary dir. When the
+// baked dir is absent the wiring exports nothing: networked mise,
+// exactly the pre-#797 behavior.
 const hermeticWiring = "toolchain=\"${" + ToolchainDirEnv + ":-" + DefaultToolchainDir + "}\"\n" + "if [ -d \"$toolchain\" ]; then\n" +
 	"  cache_root=/courier-toolchain-cache\n" +
 	"  if [ ! -w \"$cache_root\" ]; then\n" +
@@ -68,6 +74,8 @@ const hermeticWiring = "toolchain=\"${" + ToolchainDirEnv + ":-" + DefaultToolch
 	"  export MISE_DATA_DIR\n" +
 	"  MISE_OFFLINE=true\n" +
 	"  export MISE_OFFLINE\n" +
+	"  XDG_STATE_HOME=\"$cache_root/state\"\n" +
+	"  export XDG_STATE_HOME\n" +
 	"fi\n"
 
 // oidPattern is the strict shape a base revision OID must have before it is

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"time"
 
@@ -395,31 +396,84 @@ func nonNegativeSeconds(d time.Duration) float64 {
 }
 
 // LaneCollector reports per-lane CoderRun capacity usage and lane suspension
-// by reading the live cluster at scrape time. Every LaneProfile is reported on
-// both gauges, with drained lanes carrying a zero in-flight count, and a
-// failed List increments the scrape-errors counter instead of silently
-// dropping the scrape. Capacity consumption follows phaseConsumesCapacity:
-// only Claimed and Running runs count, so a Verifying run no longer blocks new
-// admissions. The discovery-side reservation gauges are deliberately broader:
-// source.PhaseReservesDiscovery also counts Pending and empty-phase runs, so a
-// binding does not hoard materialized-but-unadmitted work.
+// by reading the live cluster at scrape time. Every LaneProfile visible in
+// the lane-profile scope is reported on both gauges, with drained lanes
+// carrying a zero in-flight count, and a failed List increments the
+// scrape-errors counter instead of silently dropping the scrape. Capacity
+// consumption follows PhaseConsumesCapacity: only Claimed and Running runs
+// count, so a Verifying run no longer blocks new admissions. The discovery-side
+// reservation gauges are deliberately broader: source.PhaseReservesDiscovery
+// also counts Pending and empty-phase runs, so a binding does not hoard
+// materialized-but-unadmitted work.
+//
+// The two namespace scopes are separate (#837): CoderRun lists follow the
+// owned run namespaces, while LaneProfile lists follow the namespaces lane
+// resolution consults, which additionally include the operator namespace
+// where the bootstrap reconciler writes managed profiles. That extra
+// namespace can be shared between side-by-side releases, so its pages are
+// filtered to the profiles this deployment's bootstrap provider actually
+// manages (#837): a release never advertises a neighbor's bootstrap lanes.
+// The lane series are keyed by name only, so a profile name listed from more
+// than one consulted namespace seeds exactly one series set: the
+// consult-order-first profile wins, which makes the run-namespace copy
+// authoritative for a lane that also exists in the operator namespace.
 type LaneCollector struct {
-	client       client.Client
-	namespaces   []string
+	client         client.Client
+	namespaces     []string
+	laneNamespaces []string
+	// managedLanes resolves the names of the bootstrap profiles this
+	// deployment manages. LaneProfile pages from namespaces outside the run
+	// scope are filtered to these names; pages from owned run namespaces are
+	// taken whole. nil disables the filter, the single-scope default.
+	managedLanes func(ctx context.Context) (map[string]bool, error)
 	now          func() time.Time
 	scrapeErrors prometheus.Counter
 }
 
-// NewLaneCollector builds a lane collector. The optional namespaces scope
-// the collection to the run namespaces of one deployment (#632): each is
-// listed in turn and the pages accumulate, so a scoped collector observes
-// only the namespaces it owns. With none given the collector lists the
-// whole cluster, the single-controller default.
+// NewLaneCollector builds a lane collector with one namespace scope: the
+// optional namespaces scope both the run lists and the LaneProfile seed lists
+// to the run namespaces of one deployment (#632). Each is listed in turn and
+// the pages accumulate, so a scoped collector observes only the namespaces it
+// owns. With none given the collector lists the whole cluster, the
+// single-controller default. A deployment whose LaneProfiles are consulted in
+// namespaces wider than its run namespaces (a bootstrap-managed deployment,
+// #837) uses NewLaneCollectorScoped.
 func NewLaneCollector(c client.Client, namespaces ...string) *LaneCollector {
+	return NewLaneCollectorScoped(c, namespaces, nil)
+}
+
+// NewLaneCollectorScoped builds a lane collector with separate run and
+// lane-profile scopes. runNamespaces scopes the CoderRun lists;
+// laneNamespaces scopes the LaneProfile lists that seed the per-lane series.
+// Lane profiles live in the namespaces lane resolution consults: a secure
+// deployment authors them in the owned run namespaces, but the bootstrap
+// reconciler writes managed profiles to the operator namespace, which need
+// not be an owned run namespace (#837). An empty laneNamespaces falls back to
+// runNamespaces, the single-scope default.
+func NewLaneCollectorScoped(c client.Client, runNamespaces, laneNamespaces []string) *LaneCollector {
+	return NewLaneCollectorManaged(c, runNamespaces, laneNamespaces, nil)
+}
+
+// NewLaneCollectorManaged builds a scoped lane collector whose extra
+// lane-profile scope is filtered to the bootstrap profiles this deployment
+// manages (#837). The operator namespace a bootstrap-managed deployment
+// consults can be shared between side-by-side releases, so pages from
+// namespaces the run scope does not own are filtered to the names
+// managedLanes resolves — read live at scrape time, so a rotated bootstrap
+// config stays in step with the reconciler. A managedLanes failure counts as
+// a scrape failure: half a seed list would report a stale lane set. Pages
+// from the owned run namespaces stay unfiltered. managedLanes nil (or an
+// empty extra scope) is NewLaneCollectorScoped.
+func NewLaneCollectorManaged(c client.Client, runNamespaces, laneNamespaces []string, managedLanes func(ctx context.Context) (map[string]bool, error)) *LaneCollector {
+	if len(laneNamespaces) == 0 {
+		laneNamespaces = runNamespaces
+	}
 	return &LaneCollector{
-		client:     c,
-		now:        time.Now,
-		namespaces: namespaces,
+		client:         c,
+		namespaces:     runNamespaces,
+		laneNamespaces: laneNamespaces,
+		managedLanes:   managedLanes,
+		now:            time.Now,
 		scrapeErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "courier_metrics_scrape_errors_total",
 			Help: "List calls that failed while the LaneCollector collected lane metrics.",
@@ -445,6 +499,39 @@ func listScoped(ctx context.Context, namespaces []string, list func(opts ...clie
 	return nil
 }
 
+// listLaneProfiles lists the consulted namespaces in turn, mirroring
+// listScoped's fail-fast posture: an empty scope is one cluster-wide List,
+// and a failed page stops the collection. Pages from namespaces the run
+// scope already owns are taken whole; pages from any other consulted
+// namespace (the operator namespace a bootstrap-managed deployment shares,
+// #837) are filtered to the managed bootstrap names, so a side-by-side
+// release never seeds its neighbor's lanes. A nil managed disables the
+// filter.
+func (c *LaneCollector) listLaneProfiles(ctx context.Context, managed map[string]bool, lanes *[]courierv1alpha1.LaneProfile) error {
+	if len(c.laneNamespaces) == 0 {
+		page := &courierv1alpha1.LaneProfileList{}
+		if err := c.client.List(ctx, page); err != nil {
+			return err
+		}
+		*lanes = append(*lanes, page.Items...)
+		return nil
+	}
+	for _, namespace := range c.laneNamespaces {
+		filtered := managed != nil && !slices.Contains(c.namespaces, namespace)
+		page := &courierv1alpha1.LaneProfileList{}
+		if err := c.client.List(ctx, page, client.InNamespace(namespace)); err != nil {
+			return err
+		}
+		for i := range page.Items {
+			if filtered && !managed[page.Items[i].Name] {
+				continue
+			}
+			*lanes = append(*lanes, page.Items[i])
+		}
+	}
+	return nil
+}
+
 // Describe implements prometheus.Collector.
 func (c *LaneCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- inFlightDesc
@@ -462,21 +549,44 @@ func (c *LaneCollector) Collect(ch chan<- prometheus.Metric) {
 	defer cancel()
 	defer func() { ch <- c.scrapeErrors }()
 
-	var lanes []courierv1alpha1.LaneProfile
-	if err := listScoped(ctx, c.namespaces, func(opts ...client.ListOption) error {
-		page := &courierv1alpha1.LaneProfileList{}
-		if err := c.client.List(ctx, page, opts...); err != nil {
-			return err
+	// Lane profiles seed the per-lane series from every namespace lane
+	// resolution consults (#837), not only the run namespaces: a
+	// bootstrap-managed deployment writes managed profiles to the operator
+	// namespace, which a side-by-side boundary may keep out of the owned run
+	// namespaces. That extra namespace can be shared between releases, so
+	// its pages carry only the profiles this deployment's bootstrap provider
+	// manages (#837) — a neighbor's lanes are never advertised. The lane
+	// labels are name-keyed, so a name seen in more than one consulted
+	// namespace seeds once — the consult-order-first profile wins, keeping
+	// the run-namespace copy authoritative.
+	var managed map[string]bool
+	if c.managedLanes != nil {
+		var err error
+		managed, err = c.managedLanes(ctx)
+		if err != nil {
+			c.scrapeErrors.Inc()
+			crlog.Log.Error(err, "metrics scrape: resolving managed bootstrap lanes failed")
+			return
 		}
-		lanes = append(lanes, page.Items...)
-		return nil
-	}); err != nil {
+	}
+	var lanes []courierv1alpha1.LaneProfile
+	if err := c.listLaneProfiles(ctx, managed, &lanes); err != nil {
 		c.scrapeErrors.Inc()
 		crlog.Log.Error(err, "metrics scrape: listing LaneProfiles failed")
 		return
 	}
 	// Seed every lane at zero so a lane whose runs all drained keeps
 	// reporting 0 instead of disappearing from the series.
+	seen := make(map[string]bool, len(lanes))
+	unique := lanes[:0]
+	for i := range lanes {
+		if seen[lanes[i].Name] {
+			continue
+		}
+		seen[lanes[i].Name] = true
+		unique = append(unique, lanes[i])
+	}
+	lanes = unique
 	inFlight := make(map[string]int, len(lanes))
 	reservations := make(map[string]int, len(lanes))
 	pending := make(map[string]int, len(lanes))
@@ -509,7 +619,7 @@ func (c *LaneCollector) Collect(ch chan<- prometheus.Metric) {
 	oldestReservation := make(map[string]time.Time)
 	for i := range runs {
 		run := &runs[i]
-		if phaseConsumesCapacity(run.Status.Phase) {
+		if PhaseConsumesCapacity(run.Status.Phase) {
 			inFlight[run.Spec.Lane]++
 		}
 		if source.PhaseReservesDiscovery(run.Status.Phase) {
@@ -517,7 +627,7 @@ func (c *LaneCollector) Collect(ch chan<- prometheus.Metric) {
 			// A run without a creation timestamp has an unknown age, not a
 			// zero age: it is skipped for the age series only, so the
 			// reservation counts stay truthful (the same rule the
-			// TerminalAgeCollector applies to terminal timestamps).
+			// TerminalCollector applies to terminal timestamps).
 			if !run.CreationTimestamp.IsZero() {
 				if current, ok := oldestReservation[run.Spec.Lane]; !ok || run.CreationTimestamp.Time.Before(current) {
 					oldestReservation[run.Spec.Lane] = run.CreationTimestamp.Time
@@ -562,127 +672,77 @@ func (c *LaneCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 }
 
-// TerminalAgeCollector reports the age of the oldest retained terminal
-// CoderRun per phase, read from the live cluster at scrape time. It is the
-// observability half of the retention reaper (#287): the reap-request counter
-// shows deletions the API server accepted, and this gauge shows what is
-// actually retained — an object a finalizer still holds stays on it, so a
-// request that never completed cleanup is visible. It also shows whether
-// anything is aging past its window — a stuck lifecycle report or an
-// audit-floor hold. A failed List increments the scrape-errors counter instead
-// of silently dropping the scrape.
-type TerminalAgeCollector struct {
-	client       client.Client
-	namespaces   []string
-	now          func() time.Time
-	scrapeErrors prometheus.Counter
+// TerminalCollector reports the terminal-run signals at scrape time from one
+// scoped CoderRun list (#854): the age of the oldest retained terminal run
+// per phase, how many terminal runs the retention policy still holds, and
+// how many of those carry an unsettled source lifecycle report — the
+// pending-report backlog the retention reaper holds runs for — with the age
+// of the oldest unsettled run per lane. One list serves both halves, so a
+// gather copies the retained runs once and the paired signals always
+// describe the same snapshot, even while reconciliation mutates them.
+//
+// The collector is the observability half of the retention reaper (#287): the
+// reap-request counter shows deletions the API server accepted, the age gauge
+// shows what is actually retained — an object a finalizer still holds stays
+// on it, so a request that never completed cleanup is visible — and it also
+// shows whether anything is aging past its window — a stuck lifecycle report
+// or an audit-floor hold. The namespaces scope the collection to the run
+// namespaces of one deployment (#632); with none given the collector lists
+// the whole cluster, the single-controller default. A failed List increments
+// both per-half scrape-errors counters instead of silently dropping the
+// scrape, and publishes no partial terminal gauges.
+type TerminalCollector struct {
+	client     client.Client
+	namespaces []string
+	now        func() time.Time
+	// ageErrors and backlogErrors keep the two scrape-error series the
+	// paired collectors published before they shared one list (#854): one
+	// failed read fails the collection of both halves, so both count it.
+	ageErrors     prometheus.Counter
+	backlogErrors prometheus.Counter
 }
 
-// NewTerminalAgeCollector builds a terminal-age collector. The optional
-// namespaces scope the collection to the run namespaces of one deployment
-// (#632); with none given the collector lists the whole cluster, the
-// single-controller default.
-func NewTerminalAgeCollector(c client.Client, namespaces ...string) *TerminalAgeCollector {
-	return &TerminalAgeCollector{
+// NewTerminalCollector builds the terminal collector. The optional namespaces
+// scope the collection to the run namespaces of one deployment (#632); with
+// none given the collector lists the whole cluster, the single-controller
+// default.
+func NewTerminalCollector(c client.Client, namespaces ...string) *TerminalCollector {
+	return &TerminalCollector{
 		client:     c,
 		now:        time.Now,
 		namespaces: namespaces,
-		scrapeErrors: prometheus.NewCounter(prometheus.CounterOpts{
+		ageErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "courier_terminal_age_scrape_errors_total",
-			Help: "List calls that failed while the TerminalAgeCollector collected terminal-age metrics.",
+			Help: "List calls that failed while the TerminalCollector collected terminal-age metrics.",
 		}),
-	}
-}
-
-// Describe implements prometheus.Collector.
-func (c *TerminalAgeCollector) Describe(ch chan<- *prometheus.Desc) {
-	ch <- oldestTerminalAgeDesc
-	ch <- c.scrapeErrors.Desc()
-}
-
-// Collect implements prometheus.Collector.
-func (c *TerminalAgeCollector) Collect(ch chan<- prometheus.Metric) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	defer func() { ch <- c.scrapeErrors }()
-
-	var runs []courierv1alpha1.CoderRun
-	if err := listScoped(ctx, c.namespaces, func(opts ...client.ListOption) error {
-		page := &courierv1alpha1.CoderRunList{}
-		if err := c.client.List(ctx, page, opts...); err != nil {
-			return err
-		}
-		runs = append(runs, page.Items...)
-		return nil
-	}); err != nil {
-		c.scrapeErrors.Inc()
-		crlog.Log.Error(err, "metrics scrape: listing CoderRuns failed")
-		return
-	}
-	oldest := make(map[courierv1alpha1.Phase]time.Time, 6)
-	for i := range runs {
-		run := &runs[i]
-		if !terminalPhase(run.Status.Phase) {
-			continue
-		}
-		at := terminalTime(run)
-		if at.IsZero() {
-			continue
-		}
-		if current, ok := oldest[run.Status.Phase]; !ok || at.Before(current) {
-			oldest[run.Status.Phase] = at
-		}
-	}
-	now := c.now()
-	for phase, at := range oldest {
-		ch <- prometheus.MustNewConstMetric(
-			oldestTerminalAgeDesc, prometheus.GaugeValue, nonNegativeSeconds(now.Sub(at)), string(phase))
-	}
-}
-
-// TerminalBacklogCollector reports the terminal-run backlog at scrape time:
-// how many terminal runs the retention policy still holds, and how many of
-// those carry an unsettled source lifecycle report — the pending-report
-// backlog the retention reaper holds runs for — with the age of the oldest
-// unsettled run per lane. It mirrors TerminalAgeCollector: a failed List
-// increments the dedicated scrape-errors counter instead of silently
-// dropping the scrape.
-type TerminalBacklogCollector struct {
-	client       client.Client
-	namespaces   []string
-	now          func() time.Time
-	scrapeErrors prometheus.Counter
-}
-
-// NewTerminalBacklogCollector builds a terminal-backlog collector. The
-// optional namespaces scope the collection to the run namespaces of one
-// deployment (#632); with none given the collector lists the whole cluster,
-// the single-controller default.
-func NewTerminalBacklogCollector(c client.Client, namespaces ...string) *TerminalBacklogCollector {
-	return &TerminalBacklogCollector{
-		client:     c,
-		now:        time.Now,
-		namespaces: namespaces,
-		scrapeErrors: prometheus.NewCounter(prometheus.CounterOpts{
+		backlogErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "courier_terminal_backlog_scrape_errors_total",
-			Help: "List calls that failed while the TerminalBacklogCollector collected terminal-backlog metrics.",
+			Help: "List calls that failed while the TerminalCollector collected terminal-backlog metrics.",
 		}),
 	}
 }
 
 // Describe implements prometheus.Collector.
-func (c *TerminalBacklogCollector) Describe(ch chan<- *prometheus.Desc) {
+func (c *TerminalCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- oldestTerminalAgeDesc
 	ch <- awaitingReapDesc
 	ch <- lifecyclePendingDesc
 	ch <- lifecyclePendingOldestDesc
-	ch <- c.scrapeErrors.Desc()
+	ch <- c.ageErrors.Desc()
+	ch <- c.backlogErrors.Desc()
 }
 
-// Collect implements prometheus.Collector.
-func (c *TerminalBacklogCollector) Collect(ch chan<- prometheus.Metric) {
+// Collect implements prometheus.Collector. The single scoped list feeds both
+// metric halves: one CoderRun list per owned namespace, or one cluster-wide
+// list with no ownership boundary, and one fail-fast posture — a failed page
+// increments both scrape-error counters and publishes no terminal gauges.
+func (c *TerminalCollector) Collect(ch chan<- prometheus.Metric) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	defer func() { ch <- c.scrapeErrors }()
+	defer func() {
+		ch <- c.ageErrors
+		ch <- c.backlogErrors
+	}()
 
 	var runs []courierv1alpha1.CoderRun
 	if err := listScoped(ctx, c.namespaces, func(opts ...client.ListOption) error {
@@ -693,17 +753,28 @@ func (c *TerminalBacklogCollector) Collect(ch chan<- prometheus.Metric) {
 		runs = append(runs, page.Items...)
 		return nil
 	}); err != nil {
-		c.scrapeErrors.Inc()
+		c.ageErrors.Inc()
+		c.backlogErrors.Inc()
 		crlog.Log.Error(err, "metrics scrape: listing CoderRuns failed")
 		return
 	}
+
+	oldestTerminal := make(map[courierv1alpha1.Phase]time.Time, 6)
 	awaitingReap := make(map[courierv1alpha1.Phase]int, 6)
 	pending := make(map[string]int)
-	oldest := make(map[string]time.Time)
+	oldestPending := make(map[string]time.Time)
 	for i := range runs {
 		run := &runs[i]
 		if !terminalPhase(run.Status.Phase) {
 			continue
+		}
+		// A run without a terminal timestamp has an unknown age, not a zero
+		// age: it is skipped for the age series only, so the backlog counts
+		// stay truthful.
+		if at := terminalTime(run); !at.IsZero() {
+			if current, ok := oldestTerminal[run.Status.Phase]; !ok || at.Before(current) {
+				oldestTerminal[run.Status.Phase] = at
+			}
 		}
 		awaitingReap[run.Status.Phase]++
 		// Mirror the reaper's hold gate: only a positively settled report
@@ -718,11 +789,15 @@ func (c *TerminalBacklogCollector) Collect(ch chan<- prometheus.Metric) {
 		if run.Status.FinishedAt == nil {
 			continue
 		}
-		if current, ok := oldest[run.Spec.Lane]; !ok || run.Status.FinishedAt.Time.Before(current) {
-			oldest[run.Spec.Lane] = run.Status.FinishedAt.Time
+		if current, ok := oldestPending[run.Spec.Lane]; !ok || run.Status.FinishedAt.Time.Before(current) {
+			oldestPending[run.Spec.Lane] = run.Status.FinishedAt.Time
 		}
 	}
 	now := c.now()
+	for phase, at := range oldestTerminal {
+		ch <- prometheus.MustNewConstMetric(
+			oldestTerminalAgeDesc, prometheus.GaugeValue, nonNegativeSeconds(now.Sub(at)), string(phase))
+	}
 	for phase, count := range awaitingReap {
 		ch <- prometheus.MustNewConstMetric(
 			awaitingReapDesc, prometheus.GaugeValue, float64(count), string(phase))
@@ -731,7 +806,7 @@ func (c *TerminalBacklogCollector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(
 			lifecyclePendingDesc, prometheus.GaugeValue, float64(count), lane)
 	}
-	for lane, at := range oldest {
+	for lane, at := range oldestPending {
 		ch <- prometheus.MustNewConstMetric(
 			lifecyclePendingOldestDesc, prometheus.GaugeValue, nonNegativeSeconds(now.Sub(at)), lane)
 	}

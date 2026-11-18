@@ -9,7 +9,7 @@
 ARG BINARIES=builder
 
 # Build the manager and executor binaries.
-FROM golang:1.27.4@sha256:08bcb99a38f85a265f9a93d1d3323e2440eec333380f3ea26ee0dec9264bb41c AS builder
+FROM golang:1.27.4@sha256:5e8afd493a7124a8586e134d9b532731161d4b9becf9dee5a5956b107426f93d AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -43,7 +43,7 @@ COPY dist/ /workspace/
 
 FROM binaries-${BINARIES} AS binaries
 
-FROM golang:1.27.4@sha256:08bcb99a38f85a265f9a93d1d3323e2440eec333380f3ea26ee0dec9264bb41c AS toolchain
+FROM golang:1.27.4@sha256:5e8afd493a7124a8586e134d9b532731161d4b9becf9dee5a5956b107426f93d AS toolchain
 ARG CONTROLLER_TOOLS_VERSION=v0.16.5
 ARG HELM_VERSION=v3.18.6
 
@@ -167,7 +167,13 @@ RUN set -eux; \
 	printf 'controller-gen %s\nsetup-envtest %s\n' "$cg_pin" "$se_pin" > /usr/local/share/courier/tools/.tool-pins && \
 	XDG_DATA_HOME=/usr/local/share/courier/envtest-store /usr/local/share/courier/tools/bin/setup-envtest use "${k8s}" && \
 	chmod -R a+rX /usr/local/share/courier && \
-	rm -rf /tmp/courier-toolchain /root/.cache /root/.local /courier-toolchain-cache/go-mod /courier-toolchain-cache/go-build /usr/local/share/courier/mise-data/downloads
+	rm -rf /tmp/courier-toolchain /root/.cache /root/.local /home/courier/.local/state /courier-toolchain-cache/go-mod /courier-toolchain-cache/go-build /usr/local/share/courier/mise-data/downloads
+# The bake's mise install runs as root with the task user's HOME, so its
+# state tree (trusted-configs registry included) lands root-owned under
+# /home/courier/.local/state — a task user's later trust write is refused
+# EACCES and the whole bootstrap dies behind an opaque exit 1. Removing the
+# tree lets mise recreate it under the runtime uid at first use; the devenv
+# wiring also redirects XDG_STATE_HOME for defense in depth.
 
 USER 65532:65532
 

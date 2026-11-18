@@ -50,6 +50,17 @@ type Publisher interface {
 	Publish(ctx context.Context) (Publication, error)
 }
 
+// PullRequestOpener is the publication engine's optional pull-request seam
+// (#844): it opens the run's pull request at the broker-confirmed head and
+// returns the broker's re-read identity. The Publisher interface stays the
+// two-method snapshot/publication contract every fixture implements; the
+// finish flow discovers this seam from the engine it already holds, so an
+// absent seam on a run that opens a pull request is a named wiring failure,
+// never a silent skip.
+type PullRequestOpener interface {
+	OpenPullRequest(ctx context.Context, title, body string, draft bool) (PullRequest, error)
+}
+
 // PublicationEngine is the trusted control-side implementation of the
 // snapshot and publication seams: it seeds and renders snapshots from its
 // private integration tree, validates and integrates returned artifacts,
@@ -249,6 +260,30 @@ func (e *PublicationEngine) Publish(ctx context.Context) (Publication, error) {
 		expected = reconciled.expected
 	}
 	return Publication{}, &PublicationBlockedError{Reason: "the live work ref did not settle across reconciliation rounds; refusing to race it"}
+}
+
+// OpenPullRequest opens the run's pull request through the broker's pull-
+// request creation route (#842). It publishes first: the route pins the pull
+// request head to the exact live work tip, so the head it cites must be a
+// broker-confirmed publication. Publish is idempotent against the world, so
+// this stays correct when the branch was published by an earlier call or an
+// earlier incarnation. The broker then enforces the body contracts and the
+// pinned-head duplicate guard before any forge write and confirms the
+// created pull request by re-read. A create that succeeded but whose
+// response was lost is recovered by the duplicate guard's adoption, so the
+// transport-class retry is safe.
+func (e *PublicationEngine) OpenPullRequest(ctx context.Context, title, body string, draft bool) (PullRequest, error) {
+	pub, err := e.Publish(ctx)
+	if err != nil {
+		return PullRequest{}, err
+	}
+	pr, err := retried(ctx, func(ctx context.Context) (PullRequest, error) {
+		return e.broker.CreatePullRequest(ctx, pub.OID, title, body, draft)
+	})
+	if err != nil {
+		return PullRequest{}, e.classify(err, "the pull request creation")
+	}
+	return pr, nil
 }
 
 // expectedTip derives the expected work tip for this incarnation's first

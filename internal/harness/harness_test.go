@@ -703,8 +703,17 @@ type mockPublisher struct {
 	publishes  int
 	commits    int
 
-	integrateErr error
-	publishErr   error
+	integrateErr   error
+	publishErr     error
+	pullRequestErr error
+	pullRequests   []pullRequestCall
+}
+
+// pullRequestCall records one OpenPullRequest seam call (#844).
+type pullRequestCall struct {
+	title string
+	body  string
+	draft bool
 }
 
 func (p *mockPublisher) Integrate(_ context.Context, req IntegrationRequest) (Integration, error) {
@@ -726,6 +735,24 @@ func (p *mockPublisher) Publish(_ context.Context) (Publication, error) {
 	}
 	p.publishes++
 	return Publication{OID: fmt.Sprintf("remote-%d", p.publishes)}, nil
+}
+
+// OpenPullRequest implements the PullRequestOpener seam for coordinator
+// finish tests (#844).
+func (p *mockPublisher) OpenPullRequest(_ context.Context, title, body string, draft bool) (PullRequest, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.pullRequestErr != nil {
+		return PullRequest{}, p.pullRequestErr
+	}
+	p.pullRequests = append(p.pullRequests, pullRequestCall{title: title, body: body, draft: draft})
+	return PullRequest{Number: 900 + len(p.pullRequests), State: "open"}, nil
+}
+
+func (p *mockPublisher) opens() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.pullRequests)
 }
 
 func (p *mockPublisher) count() int {
@@ -1990,7 +2017,7 @@ func TestSubagentShellRoutesThroughWorkerAndOnlyControlPublishes(t *testing.T) {
 		// Coder sub-agent: done.
 		gatewayResponse{body: sse(contentChunk("work done"), finishChunk("stop"))},
 		// Coordinator: declare changes.
-		gatewayResponse{body: sse(contentChunk(`{"outcome":"changes"}`), finishChunk("stop"))},
+		gatewayResponse{body: sse(contentChunk(`{"outcome":"changes","prTitle":"Resolve issue #7","prBody":"Closes #7. Ships the fix."}`), finishChunk("stop"))},
 	)
 	defer cleanup()
 
@@ -2003,6 +2030,7 @@ func TestSubagentShellRoutesThroughWorkerAndOnlyControlPublishes(t *testing.T) {
 		Snapshot:  snapshotProvider("snap-tip"),
 		Publisher: publisher,
 		Activity:  activity,
+		Status:    NewStatusReporter(&recordingStatusTransport{}, testControlUID, testWorkerUID, 0),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2590,7 +2618,7 @@ func TestBriefResultRetention(t *testing.T) {
 			finishChunk("tool_calls"),
 		)},
 		gatewayResponse{body: sse(contentChunk("the actual delegate summary"), finishChunk("stop"))},
-		gatewayResponse{body: sse(contentChunk(`{"outcome":"changes"}`), finishChunk("stop"))},
+		gatewayResponse{body: sse(contentChunk(`{"outcome":"changes","prTitle":"Resolve issue #7","prBody":"Closes #7. Ships the fix."}`), finishChunk("stop"))},
 	)
 	defer cleanup()
 	worker.snapshotTip = "snap-tip"
@@ -2602,6 +2630,7 @@ func TestBriefResultRetention(t *testing.T) {
 		Worker:    delegator,
 		Snapshot:  snapshotProvider("snap-tip"),
 		Publisher: publisher,
+		Status:    NewStatusReporter(&recordingStatusTransport{}, testControlUID, testWorkerUID, 0),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2655,7 +2684,7 @@ func TestCoordinatorShellRefreshesPublishedIntegrationSnapshot(t *testing.T) {
 			toolCallChunk(0, "validate", toolShell, `{"command":"go test ./..."}`),
 			finishChunk("tool_calls"),
 		)},
-		gatewayResponse{body: sse(contentChunk(`{"outcome":"changes"}`), finishChunk("stop"))},
+		gatewayResponse{body: sse(contentChunk(`{"outcome":"changes","prTitle":"Resolve issue #7","prBody":"Closes #7. Ships the fix."}`), finishChunk("stop"))},
 	)
 	defer cleanup()
 	publisher := &mockPublisher{}
@@ -2663,6 +2692,7 @@ func TestCoordinatorShellRefreshesPublishedIntegrationSnapshot(t *testing.T) {
 		Transport: gateway, Bindings: testBindings(), Worker: delegator,
 		Snapshot:  sequenceSnapshotProvider("brief-base", "published-head", "published-head"),
 		Publisher: publisher,
+		Status:    NewStatusReporter(&recordingStatusTransport{}, testControlUID, testWorkerUID, 0),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -3461,7 +3491,7 @@ func TestOpenAIRendersTheProductionPinnedShapeVerbatim(t *testing.T) {
 	gateway, mock, close := gatewayFor(gatewayResponse{body: sse(contentChunk("ok"), finishChunk("stop"))})
 	defer close()
 	transcript := []Message{
-		{Role: "system", Content: harnessFraming},
+		{Role: "system", Content: harnessFraming(courier.ModeResolveIssue)},
 		{Role: "system", Content: "lane framing: production native canary"},
 		{Role: "system", Content: "skills index: shell, git"},
 		{Role: "user", Content: "goal: land the fix"},
@@ -3493,7 +3523,7 @@ func TestOpenAIRendersTheProductionPinnedShapeVerbatim(t *testing.T) {
 	if wire.Messages[3].Content != "goal: land the fix" {
 		t.Fatalf("task turn = %q; want the goal verbatim as the user turn", wire.Messages[3].Content)
 	}
-	if wire.Messages[0].Content != harnessFraming {
+	if wire.Messages[0].Content != harnessFraming(courier.ModeResolveIssue) {
 		t.Fatalf("framing message = %q; want the harness framing verbatim as system", wire.Messages[0].Content)
 	}
 }
@@ -3607,7 +3637,7 @@ func TestCoordinatorRunPinsFramingSystemAndGoalUser(t *testing.T) {
 	}
 	messages := decodeFirstRequest(t, mock.calls[0].rawBody)
 	wantRoles := []string{"system", "system", "system", "user"}
-	wantContent := []string{harnessFraming, inv.Framing, skillSet.Section(), inv.Goal}
+	wantContent := []string{harnessFraming(inv.Mode), inv.Framing, skillSet.Section(), inv.Goal}
 	if len(messages) != len(wantRoles) {
 		t.Fatalf("first request carries %d messages; want the pinned shape in full: %+v", len(messages), messages)
 	}

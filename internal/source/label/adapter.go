@@ -7,10 +7,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/misospace/courier/internal/connector"
 	"github.com/misospace/courier/internal/forge"
+	"github.com/misospace/courier/internal/skills"
 	"github.com/misospace/courier/internal/source"
 )
 
@@ -375,21 +375,9 @@ func boundedContext(item forge.WorkItem) string {
 		b.WriteString(item.URL)
 		b.WriteString("\n")
 	}
-	return truncateUTF8Bytes(strings.TrimRight(b.String(), "\n"), source.MaxSourceContextBytes)
+	return skills.TruncateRunes(strings.TrimRight(b.String(), "\n"), source.MaxSourceContextBytes)
 }
 
 func boundReason(reason string) string {
-	return truncateUTF8Bytes(reason, assignmentMaxBytes)
-}
-
-// truncateUTF8Bytes cuts s to at most max bytes without splitting a rune.
-func truncateUTF8Bytes(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	cut := s[:max]
-	for len(cut) > 0 && !utf8.ValidString(cut) {
-		cut = cut[:len(cut)-1]
-	}
-	return cut
+	return skills.TruncateRunes(reason, assignmentMaxBytes)
 }

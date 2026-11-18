@@ -251,8 +251,7 @@ func knownMetricNames(t *testing.T) map[string]struct{} {
 	}
 	for _, c := range []prometheus.Collector{
 		controller.NewLaneCollector(nil),
-		controller.NewTerminalAgeCollector(nil),
-		controller.NewTerminalBacklogCollector(nil),
+		controller.NewTerminalCollector(nil),
 	} {
 		for _, name := range describedNames(c) {
 			known[name] = struct{}{}
@@ -827,6 +826,20 @@ func TestAlertScenarios(t *testing.T) {
 			[]string{"///"})
 		flat := loadStorage(t, `load 30s
   courier_metrics_scrape_errors_total 5x44
+`)
+		assertSilent(t, evalAt(t, flat, exprFor(t, "CourierMetricsScrapeErrors"), 300*time.Second))
+	})
+
+	t.Run("A7 one failed terminal list raises both counters and fires once", func(t *testing.T) {
+		both := loadStorage(t, `load 30s
+  courier_terminal_age_scrape_errors_total 0x5 1x39
+  courier_terminal_backlog_scrape_errors_total 0x5 1x39
+`)
+		assertFiring(t, evalAt(t, both, exprFor(t, "CourierMetricsScrapeErrors"), 300*time.Second),
+			[]string{"///"})
+		flat := loadStorage(t, `load 30s
+  courier_terminal_age_scrape_errors_total 5x44
+  courier_terminal_backlog_scrape_errors_total 5x44
 `)
 		assertSilent(t, evalAt(t, flat, exprFor(t, "CourierMetricsScrapeErrors"), 300*time.Second))
 	})
