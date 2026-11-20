@@ -2895,6 +2895,58 @@ func TestChartOperatorConsoleHeaderModeNetworkPolicy(t *testing.T) {
 	}
 }
 
+// TestChartOperatorConsoleHeaderToTokenArgsOverride covers the reverse
+// args-override direction of the header-mode boundary test: values header
+// mode with a raw --auth-mode=token override must render exactly the token
+// console — the session-key and operator-tokens Secret mounts and flags, no
+// trusted-header flag, no NetworkPolicy — and must fail the render when the
+// token Secrets are missing, so the chart and the binary agree on which
+// mode actually runs instead of rendering one that exits on startup.
+func TestChartOperatorConsoleHeaderToTokenArgsOverride(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	overrideArgs := operatorConsoleHeaderRenderArgs(
+		"--set", "controllers.console.containers.console.args[0]=--auth-mode=token",
+	)
+
+	// Without the token Secrets the render fails naming the missing value:
+	// the effective token mode needs them even though the values block
+	// still says header.
+	out, err := runHelmOutput(t, chartDir, overrideArgs...)
+	if err == nil || !strings.Contains(out, "operatorConsole.enabled requires operatorConsole.auth.sessionKeySecret") {
+		t.Fatalf("expected a header-to-token args override without the token Secrets to fail on sessionKeySecret, err = %v:\n%s", err, out)
+	}
+
+	// With the Secrets supplied, the same override renders the full token
+	// console: both Secret mounts and their file flags, no trusted-header
+	// flag, and no NetworkPolicy.
+	tokenized := runHelm(t, chartDir, append(overrideArgs,
+		"--set", "operatorConsole.auth.sessionKeySecret=courier-console-session",
+		"--set", "operatorConsole.auth.operatorTokensSecret=courier-console-tokens",
+	)...)
+	for _, want := range []string{
+		"--session-key-file=/etc/courier/console/session-key",
+		"--operator-tokens-file=/etc/courier/console/tokens",
+		"secretName: courier-console-session",
+		"secretName: courier-console-tokens",
+	} {
+		if !strings.Contains(tokenized, want) {
+			t.Fatalf("header-to-token args-override console is missing %q:\n%s", want, tokenized)
+		}
+	}
+	for _, unwanted := range []string{"--trusted-header", "kind: NetworkPolicy"} {
+		if strings.Contains(tokenized, unwanted) {
+			t.Fatalf("header-to-token args-override console unexpectedly contains %q:\n%s", unwanted, tokenized)
+		}
+	}
+}
+
 // TestChartOperatorConsoleRejectsIncompleteConfiguration covers the
 // render-time guards: an enabled console without the required secret
 // references for its chosen auth mode fails the render naming the missing
@@ -2975,6 +3027,36 @@ func TestChartOperatorConsoleRejectsIncompleteConfiguration(t *testing.T) {
 				"--set", "operatorConsole.auth.cookieSecure=maybe",
 			},
 			want: "operatorConsole.auth.cookieSecure must be a boolean",
+		},
+		{
+			name: "header values overridden to token mode without the token secrets",
+			args: []string{
+				"--set", "operatorConsole.enabled=true",
+				"--set", "operatorConsole.auth.mode=header",
+				"--set", "operatorConsole.auth.trustedHeader=X-Forwarded-User",
+				"--set", "controllers.console.containers.console.args[0]=--auth-mode=token",
+			},
+			want: "operatorConsole.enabled requires operatorConsole.auth.sessionKeySecret",
+		},
+		{
+			name: "token values overridden to header mode without a trusted header",
+			args: []string{
+				"--set", "operatorConsole.enabled=true",
+				"--set", "operatorConsole.auth.sessionKeySecret=courier-console-session",
+				"--set", "operatorConsole.auth.operatorTokensSecret=courier-console-tokens",
+				"--set", "controllers.console.containers.console.args[0]=--auth-mode=header",
+			},
+			want: "operatorConsole.enabled requires operatorConsole.auth.trustedHeader",
+		},
+		{
+			name: "unknown auth mode via raw args override",
+			args: []string{
+				"--set", "operatorConsole.enabled=true",
+				"--set", "operatorConsole.auth.sessionKeySecret=courier-console-session",
+				"--set", "operatorConsole.auth.operatorTokensSecret=courier-console-tokens",
+				"--set", "controllers.console.containers.console.args[0]=--auth-mode=cookie",
+			},
+			want: "must be token or header",
 		},
 		{
 			name: "unknown auth mode",

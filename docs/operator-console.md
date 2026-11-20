@@ -88,7 +88,11 @@ helm upgrade --install courier charts/courier \
 ```
 
 The rendered chart fails closed at upgrade time when the console is enabled
-without the secret references its auth mode requires. In header mode, set
+without the secret references its auth mode requires. The guards follow the
+mode the binary will actually run: a raw `--auth-mode` override in
+`controllers.console.containers.console.args` wins over
+`operatorConsole.auth.mode`, and the secret requirements, mounts, and
+injected flags follow that effective mode. In header mode, set
 the mode, the header, and at least one proxy peer instead; no secret volumes
 are mounted in that mode:
 

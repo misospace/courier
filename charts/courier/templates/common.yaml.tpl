@@ -546,33 +546,16 @@
 {{- if and (not $consoleImage.tag) (not $consoleImage.digest) }}
 {{- $_ := set $consoleImage "tag" .Chart.AppVersion }}
 {{- end }}
-{{- $consoleAuthMode := $operatorConsole.auth.mode }}
-{{- if and (ne $consoleAuthMode "token") (ne $consoleAuthMode "header") }}
-{{- fail (printf "operatorConsole.auth.mode %q must be token or header" $consoleAuthMode) }}
-{{- end }}
-{{- if eq $consoleAuthMode "token" }}
-{{- if not $operatorConsole.auth.sessionKeySecret }}
-{{- fail "operatorConsole.enabled requires operatorConsole.auth.sessionKeySecret" }}
-{{- end }}
-{{- if not $operatorConsole.auth.operatorTokensSecret }}
-{{- fail "operatorConsole.enabled requires operatorConsole.auth.operatorTokensSecret" }}
-{{- end }}
-{{- else if not $operatorConsole.auth.trustedHeader }}
-{{- fail "operatorConsole.enabled requires operatorConsole.auth.trustedHeader" }}
-{{- end }}
-{{- /* header mode trusts the identity header its source network carries,
-so the boundary must be enforced not documented: the chart pairs header mode
-with a default-deny-ingress NetworkPolicy built from
-operatorConsole.auth.headerAllowedPeers, and a header-mode render without
-peers fails. console-networkpolicy.yaml.tpl owns the peers guards and drives
-them off the mode the binary actually runs (raw --auth-mode overrides win);
-where both templates can fail for one input they emit identical messages, so
-helm's concurrent template rendering stays deterministic per failure class. */}}
-{{- $consoleCookieSecure := $operatorConsole.auth.cookieSecure }}
-{{- if not (kindIs "bool" $consoleCookieSecure) }}
-{{- fail "operatorConsole.auth.cookieSecure must be a boolean" }}
-{{- end }}
 {{- $consoleArgs := concat (list) ($consoleContainer.args | default (list)) }}
+{{- /* The mode-dependent guards, flag injection, and Secret mounts follow
+the mode the binary will actually run, not only operatorConsole.auth.mode: a
+raw --auth-mode/--trusted-header override in controllers.console args wins,
+exactly as console-networkpolicy.yaml.tpl derives the effective mode for the
+peers guards. Settling it before those mode-dependent steps keeps the chart
+from rendering an unstartable console: values header mode overridden to
+token requires and mounts the token Secrets, and a token-to-header override
+without a trusted header fails the render instead of booting a binary that
+exits on its missing --trusted-header. */}}
 {{- $hasConsoleAuthMode := false }}
 {{- $hasConsoleSessionKeyFile := false }}
 {{- $hasConsoleTokensFile := false }}
@@ -580,21 +563,48 @@ helm's concurrent template rendering stays deterministic per failure class. */}}
 {{- $hasConsoleBackendURL := false }}
 {{- $hasConsoleBind := false }}
 {{- $hasConsoleCookieSecure := false }}
+{{- $effectiveMode := $operatorConsole.auth.mode }}
+{{- $effectiveTrustedHeader := $operatorConsole.auth.trustedHeader }}
 {{- range $arg := $consoleArgs }}
-{{- if hasPrefix "--auth-mode=" $arg }}{{- $hasConsoleAuthMode = true }}{{- end }}
+{{- if hasPrefix "--auth-mode=" $arg }}{{- $hasConsoleAuthMode = true }}{{- $effectiveMode = trimPrefix "--auth-mode=" $arg }}{{- end }}
+{{- if hasPrefix "--trusted-header=" $arg }}{{- $hasConsoleTrustedHeader = true }}{{- $effectiveTrustedHeader = trimPrefix "--trusted-header=" $arg }}{{- end }}
 {{- if hasPrefix "--session-key-file=" $arg }}{{- $hasConsoleSessionKeyFile = true }}{{- end }}
 {{- if hasPrefix "--operator-tokens-file=" $arg }}{{- $hasConsoleTokensFile = true }}{{- end }}
-{{- if hasPrefix "--trusted-header=" $arg }}{{- $hasConsoleTrustedHeader = true }}{{- end }}
 {{- if hasPrefix "--backend-url=" $arg }}{{- $hasConsoleBackendURL = true }}{{- end }}
 {{- if hasPrefix "--bind=" $arg }}{{- $hasConsoleBind = true }}{{- end }}
 {{- if hasPrefix "--cookie-secure=" $arg }}{{- $hasConsoleCookieSecure = true }}{{- end }}
 {{- end }}
-{{- if not $hasConsoleAuthMode }}{{- $consoleArgs = append $consoleArgs (printf "--auth-mode=%s" $consoleAuthMode) }}{{- end }}
-{{- if eq $consoleAuthMode "token" }}
+{{- if and (ne $effectiveMode "token") (ne $effectiveMode "header") }}
+{{- fail (printf "operator console auth mode %q must be token or header (operatorConsole.auth.mode or a raw --auth-mode override)" $effectiveMode) }}
+{{- end }}
+{{- if eq $effectiveMode "token" }}
+{{- if not $operatorConsole.auth.sessionKeySecret }}
+{{- fail "operatorConsole.enabled requires operatorConsole.auth.sessionKeySecret" }}
+{{- end }}
+{{- if not $operatorConsole.auth.operatorTokensSecret }}
+{{- fail "operatorConsole.enabled requires operatorConsole.auth.operatorTokensSecret" }}
+{{- end }}
+{{- else if not $effectiveTrustedHeader }}
+{{- fail "operatorConsole.enabled requires operatorConsole.auth.trustedHeader" }}
+{{- end }}
+{{- /* header mode trusts the identity header its source network carries,
+so the boundary must be enforced not documented: the chart pairs header mode
+with a default-deny-ingress NetworkPolicy built from
+operatorConsole.auth.headerAllowedPeers, and a header-mode render without
+peers fails. console-networkpolicy.yaml.tpl owns the peers guards and drives
+them off the same effective mode this template settles above; where both
+templates can fail for one input they emit identical messages, so helm's
+concurrent template rendering stays deterministic per failure class. */}}
+{{- $consoleCookieSecure := $operatorConsole.auth.cookieSecure }}
+{{- if not (kindIs "bool" $consoleCookieSecure) }}
+{{- fail "operatorConsole.auth.cookieSecure must be a boolean" }}
+{{- end }}
+{{- if not $hasConsoleAuthMode }}{{- $consoleArgs = append $consoleArgs (printf "--auth-mode=%s" $effectiveMode) }}{{- end }}
+{{- if eq $effectiveMode "token" }}
 {{- if not $hasConsoleSessionKeyFile }}{{- $consoleArgs = append $consoleArgs "--session-key-file=/etc/courier/console/session-key" }}{{- end }}
 {{- if not $hasConsoleTokensFile }}{{- $consoleArgs = append $consoleArgs "--operator-tokens-file=/etc/courier/console/tokens" }}{{- end }}
 {{- else if not $hasConsoleTrustedHeader }}
-{{- $consoleArgs = append $consoleArgs (printf "--trusted-header=%s" $operatorConsole.auth.trustedHeader) }}
+{{- $consoleArgs = append $consoleArgs (printf "--trusted-header=%s" $effectiveTrustedHeader) }}
 {{- end }}
 {{- if and $operatorConsole.backendURL (not $hasConsoleBackendURL) }}
 {{- $consoleArgs = append $consoleArgs (printf "--backend-url=%s" $operatorConsole.backendURL) }}
@@ -611,7 +621,7 @@ Secure-cookie setting without reading defaults. */}}
 {{- if $probe.spec.httpGet }}{{- $_ := set $probe.spec.httpGet "port" (int $operatorConsole.port) }}{{- end }}
 {{- end }}
 {{- $_ := set $consoleContainer "probes" $consoleProbes }}
-{{- if eq $consoleAuthMode "token" }}
+{{- if eq $effectiveMode "token" }}
 {{- $persistence := deepCopy (.Values.persistence | default dict) }}
 {{- $_ := set $persistence "console-session-key" (dict
   "type" "secret"
