@@ -1,0 +1,8 @@
+{{define "content"}}
+<h1>Runs</h1>
+{{if .BackendErr}}
+<p class="state state-error">The operator read API is not available: {{.BackendErr}}</p>
+{{else}}
+<p class="state">No runs — the operator read API is not available yet.</p>
+{{end}}
+{{end}}
