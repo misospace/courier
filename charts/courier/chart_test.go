@@ -1139,6 +1139,72 @@ func writeNetworkPolicySelectorValues(t *testing.T, chartDir, name, selector str
 	}
 }
 
+// TestDefaultChartRenderCreatesNoNetworkPolicies keeps chart-owned deployment
+// policies opt-in behind explicit values; per-run secure isolation is
+// operator-owned, mandatory in secure mode, and never a chart resource. The
+// secure case carries its own arguments so a later change to the shared
+// secureRenderArgs helper cannot silently redefine what it guards.
+func TestDefaultChartRenderCreatesNoNetworkPolicies(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	secureOnly := []string{
+		"--set", "secure.enabled=true",
+		"--set", "secure.runNamespace=courier-runs",
+		"--set", "secure.providers[0].name=github",
+		"--set", "secure.providers[0].type=github",
+		"--set", "secure.providers[0].endpoint=https://api.github.com/",
+		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
+	}
+	for _, testCase := range []struct {
+		name string
+		args []string
+	}{
+		{name: "default"},
+		{name: "cache without secure mode", args: []string{"--set", "secure.dependencyCache.enabled=true"}},
+		{name: "secure mode without chart policy", args: secureOnly},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			// The controller Deployment renders under the release name (the
+			// bjw-s common library derives its fullname from it), so one
+			// constant pins both the render and the guard below.
+			const releaseName = "courier"
+			output := runHelm(t, chartDir, append([]string{"template", releaseName, "."}, testCase.args...)...)
+			// A render that lost the controller Deployment guards nothing,
+			// even if another chart Deployment (e.g. the dependency cache's)
+			// survived; pin the guard to the controller Deployment by name.
+			var controllerDeployment bool
+			for _, doc := range strings.Split(output, "\n---") {
+				var header struct {
+					Kind     string `json:"kind"`
+					Metadata struct {
+						Name string `json:"name"`
+					} `json:"metadata"`
+				}
+				if err := yaml.Unmarshal([]byte(doc), &header); err != nil {
+					t.Fatalf("parse rendered document header: %v\n%s", err, doc)
+				}
+				if header.Kind == "NetworkPolicy" {
+					t.Fatalf("render unexpectedly contains a NetworkPolicy document:\n%s", doc)
+				}
+				if header.Kind == "Deployment" && header.Metadata.Name == releaseName {
+					controllerDeployment = true
+				}
+			}
+			if !controllerDeployment {
+				t.Fatal("render produced no controller Deployment, so the zero-policy assertion guards nothing")
+			}
+		})
+	}
+}
+
 // TestChartRendersModelGatewayNetworkPolicy covers #763: the chart owns the
 // deployment-level model-gateway egress policy, renders it into the run
 // namespace, and shapes it exactly like the policy that replaces the

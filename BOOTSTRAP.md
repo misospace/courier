@@ -509,6 +509,22 @@ and the render fails naming the missing field. Once the block is set, the
 deployment's hand-authored copy of the same policy can be deleted — but only
 after verifying that it grants no path beyond the model gateway.
 
+This policy is one of the chart-owned NetworkPolicy roles, and the roles must
+not be confused. Chart policies are opt-in. Two of them need secure mode:
+this gateway block (`secure.enabled` plus the fully specified
+`secure.modelGateway.networkPolicy` block), or the dependency-cache policy
+(`secure.enabled` plus `secure.dependencyCache.enabled`). A third ships with
+the console's header mode (docs/operator-console.md). With every value at its
+default, a chart render contains zero NetworkPolicy objects, and a chart test
+guards that default. The two secure-mode chart policies also behave
+differently: the gateway policy only adds a path — control pods may reach the
+gateway — while the dependency-cache policy constrains the cache pod itself,
+denying it all egress and admitting ingress only from the run's workers on
+the cache port. Per-run policies are the other role: in secure mode the
+operator creates one NetworkPolicy for each run's control, worker, and broker
+pods at launch, before any run pod exists. That isolation is mandatory, not
+hardening you can decline, and no opt-in chart policy weakens it.
+
 A run namespace belongs to one release: two releases sharing one run
 namespace render two policies whose egress grants union. In a secure release
 every coordinator-labelled pod in the run namespace is a secure control pod
