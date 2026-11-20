@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"os"
@@ -94,6 +97,13 @@ func main() {
 	var githubTokenKey string
 	var observerCredentialSecret string
 	var observerCredentialKey string
+	var githubAppID int64
+	var githubAppInstallationID int64
+	var githubAppOwner string
+	var githubAppPrivateKeySecret string
+	var githubAppPrivateKeyName string
+	var githubAppEndpoint string
+
 	var workItemCommentCredentialSecret string
 	var workItemCommentCredentialKey string
 	var executorEnvironmentSecret string
@@ -162,6 +172,12 @@ func main() {
 	flag.StringVar(&githubTokenKey, "github-token-key", "", "Optional key in the GitHub API credential Secret; empty falls back to --git-token-key or token.")
 	flag.StringVar(&observerCredentialSecret, "observer-credential-secret", "", "Optional Secret carrying the trusted operator's own forge credential; when set it wins over --github-credential-secret and --git-credential-secret for operator observation and is never injected into coordinator pods (#638).")
 	flag.StringVar(&observerCredentialKey, "observer-credential-key", "", "Optional key in the observer credential Secret; requires --observer-credential-secret; empty falls back to --github-token-key, --git-token-key, or token.")
+	flag.Int64Var(&githubAppID, "github-app-id", 0, "Optional GitHub App ID for trusted operator observation and admission reads.")
+	flag.Int64Var(&githubAppInstallationID, "github-app-installation-id", 0, "Installation ID for --github-app-id.")
+	flag.StringVar(&githubAppOwner, "github-app-owner", "", "GitHub account that owns repositories served by the configured installation; required with --github-app-id.")
+	flag.StringVar(&githubAppPrivateKeySecret, "github-app-private-key-secret", "", "Operator-namespace Secret containing a GitHub App PEM private key; never passed to run pods.")
+	flag.StringVar(&githubAppPrivateKeyName, "github-app-private-key-name", "private-key.pem", "Key in --github-app-private-key-secret containing the GitHub App PEM private key.")
+	flag.StringVar(&githubAppEndpoint, "github-app-endpoint", "https://api.github.com/", "GitHub REST API endpoint used for App installation token exchange and operator observation.")
 	flag.StringVar(&workItemCommentCredentialSecret, "work-item-comment-credential-secret", "", "Secret carrying the operator's own forge WRITE credential for work-item close announcements; must be configured explicitly — never falls back to the observer/read credential; empty disables the announcement entirely (#727).")
 	flag.StringVar(&workItemCommentCredentialKey, "work-item-comment-credential-key", "", "Optional key in the work-item comment credential Secret; requires --work-item-comment-credential-secret.")
 	flag.StringVar(&executorEnvironmentSecret, "executor-environment-secret", "", "Optional Secret exposed as coordinator environment variables for model/provider configuration.")
@@ -566,6 +582,23 @@ func main() {
 		setupLog.Error(err, "unable to configure the operator forge credential")
 		os.Exit(1)
 	}
+	appAuth, err := loadGitHubAppAuth(startupCtx, mgr.GetAPIReader(), os.Getenv("POD_NAMESPACE"), githubAppID, githubAppInstallationID, githubAppOwner, githubAppPrivateKeySecret, githubAppPrivateKeyName, githubAppEndpoint)
+	if err != nil {
+		setupLog.Error(err, "unable to configure GitHub App authentication")
+		os.Exit(1)
+	}
+	var appClient *couriergithub.Client
+	if appAuth != nil {
+		if err := validateGitHubAppSecretIsolation(*appAuth, observerCredentialSecret, githubCredentialSecret, gitCredentialSecret, executorEnvironmentSecret, modelGatewayKeySecret, workItemCommentCredentialSecret, evidenceIntakeKeySecret, contributeAdmissionKeySecret, contributeReadKeySecret, forgeRegistry, os.Getenv("POD_NAMESPACE")); err != nil {
+			setupLog.Error(err, "unable to configure GitHub App authentication")
+			os.Exit(1)
+		}
+		appClient, err = couriergithub.NewInstallationClient(*appAuth)
+		if err != nil {
+			setupLog.Error(err, "unable to configure GitHub App authentication")
+			os.Exit(1)
+		}
+	}
 	// The work-item close announcement posts through the operator's own
 	// forge WRITE identity (#727): it is a separately configured credential,
 	// never a reuse of the observer's read identity, and it is built by its
@@ -586,12 +619,18 @@ func main() {
 		setupLog.Info("work-item close announcements disabled; no --work-item-comment-credential-secret configured")
 	}
 
-	githubObserver, err := githubObserver(startupCtx, mgr.GetAPIReader(), os.Getenv("POD_NAMESPACE"), operatorCredentialSecret, operatorCredentialKey, forgeRegistry)
+	var worldObserver controller.WorldObserver
+	if appAuth != nil {
+		setupLog.Info("GitHub App read identity enabled", "owner", appAuth.Owner, "appID", appAuth.AppID, "installationID", appAuth.InstallationID)
+		worldObserver = couriergithub.Observer{Client: appClient, Registrations: forgeRegistry}
+	} else {
+		worldObserver, err = githubObserver(startupCtx, mgr.GetAPIReader(), os.Getenv("POD_NAMESPACE"), operatorCredentialSecret, operatorCredentialKey, forgeRegistry)
+	}
 	if err != nil {
 		setupLog.Error(err, "unable to configure GitHub observer")
 		os.Exit(1)
 	}
-	if githubObserver == nil {
+	if worldObserver == nil {
 		setupLog.Info("GitHub observer disabled; no API credential Secret configured")
 	}
 	// The legacy coordinator launcher pins a fix-pr run's coordinator pod to
@@ -599,7 +638,7 @@ func main() {
 	// the same identity-checked forge capability the reconciler resolves the
 	// run's head through. Without that resolver a fix-pr run's launch fails
 	// closed instead of guessing a base.
-	launcher.PRHeadResolver = existingPRHeadResolver(githubObserver)
+	launcher.PRHeadResolver = existingPRHeadResolver(worldObserver)
 	// Structured run events go to stdout as JSON lines alongside
 	// controller-runtime's ordinary operational logs; the deployment's log
 	// collection stack is the transport. Verbosity is per run: the
@@ -682,7 +721,7 @@ func main() {
 			setupLog.Error(fmt.Errorf("DISPATCH_AGENT_TOKEN is empty"), "unable to configure Dispatch source")
 			os.Exit(1)
 		}
-		checker, err := dispatchPRStateChecker(githubObserver)
+		checker, err := dispatchPRStateChecker(worldObserver)
 		if err != nil {
 			setupLog.Error(err, "unable to configure Dispatch source: GitHub pull request state lookup is unavailable")
 			os.Exit(1)
@@ -891,13 +930,13 @@ func main() {
 		Launch:                     launcher.Launch,
 		Sources:                    sources,
 		StatusWriter:               status.KubePatchWriter{Client: mgr.GetClient()},
-		Observer:                   githubObserver,
-		PullRequests:               pullRequestReader(githubObserver),
+		Observer:                   worldObserver,
+		PullRequests:               pullRequestReader(worldObserver),
 		WorkItemComments:           workItemCommenter(commentObserver),
 		WorkItemLinks:              workItemLinker(commentObserver),
 		Events:                     runEvents,
 		Evidence:                   evidenceIntake,
-		PRHeadResolver:             existingPRHeadResolver(githubObserver),
+		PRHeadResolver:             existingPRHeadResolver(worldObserver),
 		DoneRetention:              doneRetention,
 		FailedRetention:            failedRetention,
 		NeedsHumanRetention:        needsHumanRetention,
@@ -920,7 +959,7 @@ func main() {
 			gatewayKeyName:    modelGatewayKeyName,
 			gatewayCIDR:       modelGatewayCIDR,
 			gatewayPort:       modelGatewayPort,
-			observer:          githubObserver,
+			observer:          worldObserver,
 			observerSecret:    observerCredentialSecret,
 			reviewerIdentity:  prReviewerIdentity,
 			legacyGitSecret:   gitCredentialSecret,
@@ -1571,6 +1610,74 @@ func resolveWorkItemCommentCredential(secret, key string) error {
 // can run without the credential treat it as disabled while callers that
 // cannot fail fast on the empty token. The fallback chain that settles which
 // Secret and key to read lives in resolveOperatorForgeCredential.
+func validateGitHubAppSecretIsolation(auth couriergithub.InstallationAuth, observerSecret, githubSecret, gitSecret, executorEnvSecret, gatewaySecret, workItemSecret, evidenceSecret, admissionSecret, readSecret string, registry *forge.Registry, operatorNamespace string) error {
+	appSecret := strings.TrimSpace(auth.PrivateKeySecret)
+	for _, exposed := range []struct{ name, flag string }{
+		{observerSecret, "--observer-credential-secret"},
+		{githubSecret, "--github-credential-secret"},
+		{gitSecret, "--git-credential-secret"},
+		{executorEnvSecret, "--executor-environment-secret"},
+		{gatewaySecret, "--model-gateway-key-secret"},
+		{workItemSecret, "--work-item-comment-credential-secret"},
+		{evidenceSecret, "--evidence-intake-key-secret"},
+		{admissionSecret, "--contribute-admission-key-secret"},
+		{readSecret, "--contribute-read-key-secret"},
+	} {
+		if appSecret != "" && appSecret == strings.TrimSpace(exposed.name) {
+			return fmt.Errorf("GitHub App private-key Secret %q must not also be used by %s", appSecret, exposed.flag)
+		}
+	}
+	for _, registration := range registry.Registrations() {
+		for purpose, ref := range registration.Credentials {
+			if strings.TrimSpace(ref.SecretName) == appSecret {
+				return fmt.Errorf("GitHub App private-key Secret %q must not be referenced by provider %q credential purpose %q in operator namespace %q", appSecret, registration.Name, purpose, operatorNamespace)
+			}
+		}
+	}
+	return nil
+}
+
+func loadGitHubAppAuth(ctx context.Context, reader client.Reader, namespace string, appID, installationID int64, owner, secretName, secretKey, endpoint string) (*couriergithub.InstallationAuth, error) {
+	secretName = strings.TrimSpace(secretName)
+	owner = strings.TrimSpace(owner)
+	configured := appID != 0 || installationID != 0 || owner != "" || secretName != ""
+	if !configured {
+		return nil, nil
+	}
+	if appID <= 0 || installationID <= 0 || owner == "" || secretName == "" {
+		return nil, fmt.Errorf("GitHub App authentication requires --github-app-id, --github-app-installation-id, --github-app-owner, and --github-app-private-key-secret")
+	}
+	namespace = strings.TrimSpace(namespace)
+	if namespace == "" {
+		return nil, fmt.Errorf("POD_NAMESPACE is required when GitHub App authentication is configured")
+	}
+	secretKey = strings.TrimSpace(secretKey)
+	if secretKey == "" {
+		secretKey = "private-key.pem"
+	}
+	var secret corev1.Secret
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretName}, &secret); err != nil {
+		return nil, fmt.Errorf("read GitHub App private-key Secret %s/%s: %w", namespace, secretName, err)
+	}
+	block, _ := pem.Decode(secret.Data[secretKey])
+	if block == nil {
+		return nil, fmt.Errorf("GitHub App private-key Secret %s/%s has no valid PEM key", namespace, secretName)
+	}
+	key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		parsed, parseErr := x509.ParsePKCS8PrivateKey(block.Bytes)
+		if parseErr != nil {
+			return nil, fmt.Errorf("GitHub App private-key Secret %s/%s has an invalid RSA key", namespace, secretName)
+		}
+		var ok bool
+		key, ok = parsed.(*rsa.PrivateKey)
+		if !ok {
+			return nil, fmt.Errorf("GitHub App private-key Secret %s/%s must contain an RSA key", namespace, secretName)
+		}
+	}
+	return &couriergithub.InstallationAuth{AppID: appID, InstallationID: installationID, Owner: owner, PrivateKey: key, PrivateKeySecret: secretName, Endpoint: endpoint}, nil
+}
+
 func loadGitHubToken(ctx context.Context, reader client.Reader, namespace, secretName, secretKey string) (string, error) {
 	secretName = strings.TrimSpace(secretName)
 	if secretName == "" {
@@ -1792,7 +1899,7 @@ func buildSecureControl(config secureConfig) (*controller.SecureControl, error) 
 	}
 	observer, ok := config.observer.(couriergithub.Observer)
 	if !ok || observer.Client == nil {
-		return nil, fmt.Errorf("secure mode requires an operator forge credential for admission-time provider reads: configure --observer-credential-secret or a legacy credential Secret")
+		return nil, fmt.Errorf("secure mode requires an operator forge credential for admission-time provider reads: configure --observer-credential-secret, --github-app-id with --github-app-installation-id and --github-app-private-key-secret, or a legacy credential Secret")
 	}
 	if config.restConfig == nil {
 		return nil, fmt.Errorf("secure mode requires an API server connection for access reviews")

@@ -13,7 +13,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -46,10 +45,13 @@ type HTTPDoer interface {
 
 // Client is a minimal GitHub REST API client for pull requests and CI checks.
 type Client struct {
-	baseURL        *url.URL
-	token          string
-	httpClient     HTTPDoer
-	requestTimeout time.Duration
+	baseURL         *url.URL
+	token           string
+	httpClient      HTTPDoer
+	requestTimeout  time.Duration
+	readOnly        bool
+	endpointBound   bool
+	appInstallation bool
 }
 
 // NewClient creates a GitHub client. baseURL is normally left as
@@ -98,9 +100,23 @@ func New(token string, httpClient ...HTTPDoer) (*Client, error) {
 // URL is refused rather than silently falling back to GitHub.com, so a
 // missing endpoint configuration cannot redirect a custom registration's
 // traffic (and credential) to the public API.
+func sameHTTPSBaseURL(left *url.URL, rightRaw string) bool {
+	right, err := url.Parse(strings.TrimSpace(rightRaw))
+	if err != nil || left == nil || right.Scheme != "https" || right.Host == "" || right.User != nil || right.RawQuery != "" || right.Fragment != "" || right.Opaque != "" {
+		return false
+	}
+	return strings.EqualFold(left.Scheme, right.Scheme) && strings.EqualFold(left.Host, right.Host) && endpointPath(left) == endpointPath(right)
+}
+
 func (c *Client) WithBaseURL(baseURL string) (*Client, error) {
 	if strings.TrimSpace(baseURL) == "" {
 		return nil, errors.New("GitHub base URL must not be empty")
+	}
+	if c.endpointBound {
+		if !sameHTTPSBaseURL(c.baseURL, baseURL) {
+			return nil, errors.New("GitHub App credential refused a mismatched API endpoint")
+		}
+		return c, nil
 	}
 	return newClient(baseURL, c.token, c.requestTimeout, c.httpClient)
 }
@@ -144,11 +160,16 @@ type RepoOwner struct {
 
 // Repository is the authoritative repository metadata GitHub returns.
 type Repository struct {
-	ID            int64  `json:"id"`
-	FullName      string `json:"full_name"`
-	DefaultBranch string `json:"default_branch"`
+	ID            int64     `json:"id"`
+	FullName      string    `json:"full_name"`
+	DefaultBranch string    `json:"default_branch"`
+	Owner         RepoOwner `json:"owner"`
 	Permissions   *struct {
-		Push bool `json:"push"`
+		Push     bool `json:"push"`
+		Admin    bool `json:"admin"`
+		Maintain bool `json:"maintain"`
+		Triage   bool `json:"triage"`
+		Pull     bool `json:"pull"`
 	} `json:"permissions"`
 }
 
@@ -677,12 +698,10 @@ func (c *Client) endpointWithQuery(relative, query string) *url.URL {
 	if !strings.HasPrefix(basePath, "/") {
 		basePath = "/" + basePath
 	}
-	rawPath := path.Join(basePath, relative)
+	rawPath := strings.TrimRight(basePath, "/") + "/" + strings.TrimLeft(relative, "/")
 	decodedPath, err := url.PathUnescape(rawPath)
 	if err != nil {
-		// relative is assembled by this package and only contains valid escapes.
-		// Keep a safe fallback for a future caller that adds an invalid segment.
-		decodedPath = path.Join(u.Path, relative)
+		decodedPath = strings.TrimRight(u.Path, "/") + "/" + strings.TrimLeft(relative, "/")
 		rawPath = ""
 	}
 	u.Path = decodedPath
@@ -703,6 +722,9 @@ func (c *Client) doJSON(ctx context.Context, method, relative string, input, out
 // response-body read is covered even when a caller injects an HTTPDoer with no
 // timeout of its own; an earlier caller deadline remains the effective one.
 func (c *Client) doJSONQuery(ctx context.Context, method, relative, query string, input, output any) error {
+	if c.readOnly && method != http.MethodGet {
+		return errors.New("GitHub App credential permits read-only API requests")
+	}
 	bound := c.requestTimeout
 	if bound <= 0 {
 		bound = defaultRequestTimeout
@@ -717,7 +739,8 @@ func (c *Client) doJSONQuery(ctx context.Context, method, relative, query string
 		}
 		body = bytes.NewReader(encoded)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, c.endpointWithQuery(relative, query).String(), body)
+	endpoint := c.endpointWithQuery(relative, query)
+	req, err := http.NewRequestWithContext(ctx, method, endpoint.String(), body)
 	if err != nil {
 		return fmt.Errorf("create GitHub request: %w", err)
 	}
@@ -732,6 +755,9 @@ func (c *Client) doJSONQuery(ctx context.Context, method, relative, query string
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		if c.appInstallation {
+			return err
+		}
 		return &transportError{err: fmt.Errorf("GitHub request: %w", err)}
 	}
 	if resp == nil {
@@ -740,6 +766,9 @@ func (c *Client) doJSONQuery(ctx context.Context, method, relative, query string
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
+		if c.readOnly {
+			return &transportError{err: errors.New("GitHub App response read failed")}
+		}
 		return &transportError{err: fmt.Errorf("read GitHub response: %w", err)}
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
