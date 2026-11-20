@@ -421,6 +421,38 @@ and trusted observation without the §9 taint, while the taint rule still
 rejects any registration referencing a Secret that legacy pod injection
 exposes, including the `--executor-environment-secret` envFrom source.
 
+### GitHub App credentials for operator reads
+
+To use an installation instead of a static observer token, add these arguments
+under `controllers.main.containers.main.args` in the Helm values:
+
+```yaml
+- --github-app-id=12345
+- --github-app-installation-id=67890
+- --github-app-owner=example-org
+- --github-app-private-key-secret=courier-app-key
+```
+
+Store the RSA PEM key at `private-key.pem` in the named Secret in the operator
+namespace. To use another key name, set `--github-app-private-key-name`. Do not
+reuse this Secret for any other Courier credential or pod environment. Remove
+`--observer-credential-secret` and `--observer-credential-key` when you switch.
+Restart the operator after you replace the private key.
+
+Install the app on the repositories that Courier must read. Grant read access
+to Administration, Checks, Contents, Issues, Metadata, Pull requests, and Commit
+statuses. The operator requests a separate token for each repository and refreshes
+it before it expires. If the app cannot supply a token, Courier does not use a
+static token instead.
+
+The installation must belong to the account in `--github-app-owner`. This mode
+cannot read forks owned by another account. The default API endpoint is
+`https://api.github.com/`. If you set `--github-app-endpoint`, the repository's
+provider registration must use that endpoint for the operator to read it.
+
+This mode covers observation and secure admission reads. Label settlement,
+broker writes, legacy Git, and hosted GitHub MCP keep their existing credentials.
+
 ### Model-influenced forge operations
 
 Expose registered semantic reads and writes (issue/PR/review/comment/check

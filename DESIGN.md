@@ -4171,6 +4171,10 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   registration and to the operator's own identity — instead of duplicating it
   into two, and the chart's label-source guard accepts the seam as a
   credential argument, mirroring the Go rule.
+  GitHub App authentication can replace the static identity for operator observation
+  and admission reads. The operator keeps the private key and refreshes read-only
+  tokens for individual repositories. See [HARNESS.md](./HARNESS.md) for setup and
+  limits. Label discovery and settlement still use the static credential chain.
 - The gateway response is untrusted, unbounded input, and trusted control
   bounds both its shape and what it will hold: one SSE line is capped at 1 MiB,
   and per completion the buffered content deltas (8 MiB), the buffered
