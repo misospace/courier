@@ -1172,11 +1172,18 @@ func TestDefaultChartRenderCreatesNoNetworkPolicies(t *testing.T) {
 		{name: "secure mode without chart policy", args: secureOnly},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			// The controller Deployment renders under the release name (the
-			// bjw-s common library derives its fullname from it), so one
-			// constant pins both the render and the guard below.
+			// One constant drives the release name, the values-level
+			// fullnameOverride that pins the controller Deployment's name,
+			// and the guard below: the library's fullname derivation may
+			// change between common-chart releases, so the Deployment check
+			// must depend on the pinned override instead — the only way it
+			// can fail is a render that genuinely lost the controller
+			// Deployment.
 			const releaseName = "courier"
-			output := runHelm(t, chartDir, append([]string{"template", releaseName, "."}, testCase.args...)...)
+			output := runHelm(t, chartDir, append([]string{
+				"template", releaseName, ".",
+				"--set", "fullnameOverride=" + releaseName,
+			}, testCase.args...)...)
 			// A render that lost the controller Deployment guards nothing,
 			// even if another chart Deployment (e.g. the dependency cache's)
 			// survived; pin the guard to the controller Deployment by name.
