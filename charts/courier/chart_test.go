@@ -1172,12 +1172,21 @@ func TestDefaultChartRenderCreatesNoNetworkPolicies(t *testing.T) {
 		{name: "secure mode without chart policy", args: secureOnly},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			output := runHelm(t, chartDir, append([]string{"template", "courier", "."}, testCase.args...)...)
-			// A render that produced no controller Deployment guards nothing.
-			var deployments int
+			// The controller Deployment renders under the release name (the
+			// bjw-s common library derives its fullname from it), so one
+			// constant pins both the render and the guard below.
+			const releaseName = "courier"
+			output := runHelm(t, chartDir, append([]string{"template", releaseName, "."}, testCase.args...)...)
+			// A render that lost the controller Deployment guards nothing,
+			// even if another chart Deployment (e.g. the dependency cache's)
+			// survived; pin the guard to the controller Deployment by name.
+			var controllerDeployment bool
 			for _, doc := range strings.Split(output, "\n---") {
 				var header struct {
-					Kind string `json:"kind"`
+					Kind     string `json:"kind"`
+					Metadata struct {
+						Name string `json:"name"`
+					} `json:"metadata"`
 				}
 				if err := yaml.Unmarshal([]byte(doc), &header); err != nil {
 					t.Fatalf("parse rendered document header: %v\n%s", err, doc)
@@ -1185,12 +1194,12 @@ func TestDefaultChartRenderCreatesNoNetworkPolicies(t *testing.T) {
 				if header.Kind == "NetworkPolicy" {
 					t.Fatalf("render unexpectedly contains a NetworkPolicy document:\n%s", doc)
 				}
-				if header.Kind == "Deployment" {
-					deployments++
+				if header.Kind == "Deployment" && header.Metadata.Name == releaseName {
+					controllerDeployment = true
 				}
 			}
-			if deployments == 0 {
-				t.Fatal("render produced no Deployment document, so the zero-policy assertion guards nothing")
+			if !controllerDeployment {
+				t.Fatal("render produced no controller Deployment, so the zero-policy assertion guards nothing")
 			}
 		})
 	}
