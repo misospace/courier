@@ -780,9 +780,21 @@ unsafe workspace still retains ownership.
 capacity identity; otherwise the lane name is the identity. Confirmed
 exhaustion persists a default 15-minute cooldown on LaneProfile status. Source
 discovery and admission pause only for that identity; already-running work and
-unrelated pools continue. The interval is an anti-hammering window, not a
-provider reset estimate. Operators may inspect the `CapacityRecovery`
-condition and LaneProfile `capacityCooldown` status.
+unrelated pools continue. The interval is an anti-hammering floor, not a
+provider reset estimate — but a confirmed-exhaustion handoff may carry the
+provider's own reset: the native harness renders the authoritative
+`Retry-After` it parsed at the gateway as a bounded
+`provider_reset_after_seconds` on the termination handoff, and the operator
+persists it on the capacity-exhaustion diagnostic as `providerResetAt` only
+when it is validated (positive, within a 24-hour horizon) on a handoff whose
+declared outcome is capacity exhaustion (#866). The cooldown deadline is then
+the latest contributing exhaustion's `max(window end, providerResetAt)`, so a
+lane is not re-admitted into capacity the provider itself says is still spent;
+a missing, malformed, or out-of-bounds hint falls back to the plain window,
+and the deadline is recomputed from durable per-run evidence, so it survives
+controller restarts. A transient rate limit never carries the hint — its
+`Retry-After` belongs to in-process retry policy. Operators may inspect the
+`CapacityRecovery` condition and LaneProfile `capacityCooldown` status.
 
 Before settlement, the controller reads run pods through the uncached API
 reader and fails closed if any topology writer is running, pending, unknown, or
@@ -1830,7 +1842,10 @@ unknown, not guessed.
 **Recovery ending.** A **deferred** failure — a confirmed exhaustion, or a
 transient rate limit (unhinted, hinted beyond the in-process bound, or
 persistent through the retries a short hint allowed) — ends the
-run as `blocked_external`. The operator already maps exit 2 plus the
+run as `blocked_external`. A confirmed exhaustion whose provider supplied an
+authoritative `Retry-After` also carries that hint through the capacity
+outcome to the lane cooldown, which honors the provider's reset instead of
+its default window (#866); a transient rate limit never carries it. The operator already maps exit 2 plus the
 `blocked_external` outcome to `PhaseBlockedExternal`, which reports the
 source-neutral `blocked-external` lifecycle result (Dispatch `waiting-external`
 plus the generation-fenced `WAITING_EXTERNAL` mark); that path is recoverable,
@@ -3598,8 +3613,10 @@ that mechanism, recovery fails closed and does not release ownership. Cooldown
 belongs to the exhausted capacity profile, so unrelated profiles remain
 eligible. Namespace-wide discovery and admission consult all profiles sharing
 `capacityGroup`; unrelated capacity remains eligible. The default cooldown is
-15 minutes, a retry-control window rather than a claimed provider reset time.
-Retries of the same exhaustion do not extend its deadline. Successfully settled
+15 minutes, a retry-control floor rather than a claimed provider reset time; a
+validated provider reset hint on the exhaustion diagnostic extends the
+deadline to that reset when it is later (#866). Retries of the same exhaustion
+do not extend its deadline. Successfully settled
 exhaustion history permits rediscovery with a fresh opaque source attempt ID;
 the successor name incorporates the settled predecessor UID, and the old run
 is retained for diagnostics. Source-issued ownership is reacquired before launch.

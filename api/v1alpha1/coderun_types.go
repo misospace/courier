@@ -573,6 +573,12 @@ type TerminalDiagnostic struct {
 	// ObservedAt is when the operator captured this diagnostic.
 	// +optional
 	ObservedAt *metav1.Time `json:"observedAt,omitempty"`
+	// ProviderResetAt is when the provider said the exhausted allowance may
+	// return, for a confirmed capacity-exhaustion diagnostic whose validated
+	// handoff carried an authoritative hint (#866). Absent when the hint was
+	// missing, malformed, or out of bounds; the operator never invents one.
+	// +optional
+	ProviderResetAt *metav1.Time `json:"providerResetAt,omitempty"`
 }
 
 // TerminalContainerDiagnostic is the bounded pod/container identity retained

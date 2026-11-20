@@ -55,6 +55,10 @@ type termination struct {
 	// fixed, code-owned strings travel here — never provider response bodies
 	// or model text.
 	Category string `json:"category,omitempty"`
+	// ProviderResetAfterSeconds is the bounded authoritative provider reset
+	// hint in seconds, capacity-exhaustion endings only; 0/absent means no
+	// hint, so the operator keeps its default cooldown.
+	ProviderResetAfterSeconds int64 `json:"provider_reset_after_seconds,omitempty"`
 }
 
 // Probe retry rounds are bounded infrastructure retries covering a
@@ -78,6 +82,11 @@ var probeRetryDelay = 10 * time.Second
 // reason that survives boundReason but inflates under JSON escaping is
 // still cut by the shared line fit (#210).
 const maxTerminationReasonBytes = 1200
+
+// maxTerminationResetSeconds clamps the rendered provider reset hint to the
+// 24h horizon: a hint beyond one day is not a cooldown the lane waits out,
+// and the operator must never see a reset window past its planning bound.
+const maxTerminationResetSeconds = int64((24 * time.Hour) / time.Second)
 
 // boundReason bounds the reason to maxTerminationReasonBytes, splitting only
 // on a rune boundary so the trusted reason remains valid UTF-8. It reuses the
@@ -969,15 +978,32 @@ func terminationFor(result executor.HarnessResult) termination {
 		category = string(courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion)
 	}
 	return termination{
-		Phase:           phase,
-		Result:          handoffResult,
-		ExitCode:        exit,
-		Reason:          boundReason(reason),
-		Outcome:         outcome,
-		ResultKind:      resultKind,
-		Category:        category,
-		WorkspaceSafety: result.WorkspaceSafety,
+		Phase:                     phase,
+		Result:                    handoffResult,
+		ExitCode:                  exit,
+		Reason:                    boundReason(reason),
+		Outcome:                   outcome,
+		ResultKind:                resultKind,
+		Category:                  category,
+		WorkspaceSafety:           result.WorkspaceSafety,
+		ProviderResetAfterSeconds: providerResetSeconds(result),
 	}
+}
+
+// providerResetSeconds renders the provider reset hint for a confirmed
+// capacity-exhaustion ending as whole seconds, rounded up so a sub-second
+// remainder never collapses to no-hint, and clamped to the 24h horizon. Any
+// other ending — including a transient rate limit — is hint-free: only the
+// authoritative exhaustion signal may extend the lane capacity cooldown.
+func providerResetSeconds(result executor.HarnessResult) int64 {
+	if result.Outcome != executor.OutcomeCapacityExhausted || result.CapacityResetAfter <= 0 {
+		return 0
+	}
+	seconds := int64((result.CapacityResetAfter + time.Second - 1) / time.Second)
+	if seconds > maxTerminationResetSeconds {
+		return maxTerminationResetSeconds
+	}
+	return seconds
 }
 
 // handoff writes the structured termination payload to stdout and the
