@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -45,7 +46,7 @@ func TestInstallationClientRefreshesRepositoryScopedReadToken(t *testing.T) {
 			if exchanges > 1 {
 				expires = "2026-11-20T14:00:00Z"
 			}
-			_, _ = io.WriteString(w, `{"token":"installation-token","expires_at":"`+expires+`","permissions":{"checks":"read","contents":"read","issues":"read","metadata":"read","pull_requests":"read","statuses":"read"}}`)
+			_, _ = io.WriteString(w, `{"token":"installation-token","expires_at":"`+expires+`","permissions":{"administration":"read","checks":"read","contents":"read","issues":"read","metadata":"read","pull_requests":"read","statuses":"read"}}`)
 		case "/api/v3/repos/acme/demo/issues/9":
 			observedAuth = r.Header.Get("Authorization")
 			w.Header().Set("Content-Type", "application/json")
@@ -72,10 +73,13 @@ func TestInstallationClientRefreshesRepositoryScopedReadToken(t *testing.T) {
 		t.Fatalf("repositories scope = %#v", exchangeBody["repositories"])
 	}
 	permissions := exchangeBody["permissions"].(map[string]any)
-	for _, permission := range permissions {
-		if permission != "read" {
-			t.Fatalf("unexpected installation permission: %#v", permissions)
+	for key, level := range map[string]any{"administration": "read", "checks": "read", "contents": "read", "issues": "read", "metadata": "read", "pull_requests": "read", "statuses": "read"} {
+		if permissions[key] != level {
+			t.Fatalf("requested permission %q = %#v, want %q", key, permissions[key], level)
 		}
+	}
+	if len(permissions) != 7 {
+		t.Fatalf("requested permission set = %#v, want exactly the 7 read permissions", permissions)
 	}
 	now = now.Add(60 * time.Minute)
 	if _, err := client.GetIssue(context.Background(), "acme", "demo", 9); err != nil {
@@ -99,7 +103,7 @@ func TestInstallationClientRefusesRedirectAndEndpointEscape(t *testing.T) {
 	defer destination.Close()
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/access_tokens") {
-			_, _ = io.WriteString(w, `{"token":"secret-token","expires_at":"2026-11-20T13:00:00Z","permissions":{"checks":"read","contents":"read","issues":"read","metadata":"read","pull_requests":"read","statuses":"read"}}`)
+			_, _ = io.WriteString(w, `{"token":"secret-token","expires_at":"2026-11-20T13:00:00Z","permissions":{"administration":"read","checks":"read","contents":"read","issues":"read","metadata":"read","pull_requests":"read","statuses":"read"}}`)
 			return
 		}
 		http.Redirect(w, r, destination.URL, http.StatusFound)
@@ -260,9 +264,10 @@ func TestInstallationClientRefusesInsufficientPermission(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, response := range []string{
-		`{"token":"secret-token","expires_at":"2026-11-20T13:00:00Z","permissions":{"checks":"read","contents":"read","issues":"read","metadata":"read","pull_requests":"read"}}`,
-		`{"token":"secret-token","expires_at":"2026-11-20T13:00:00Z","permissions":{"checks":"read","contents":"read","issues":"read","metadata":"read","pull_requests":"read","statuses":"write"}}`,
-		`{"token":"secret-token","expires_at":"2026-11-20T13:00:00Z","permissions":{"checks":"read","contents":"read","issues":"read","metadata":"read","pull_requests":"read","statuses":"read","deployments":"write"}}`,
+		`{"token":"secret-token","expires_at":"2026-11-20T13:00:00Z","permissions":{"administration":"read","checks":"read","contents":"read","issues":"read","metadata":"read","pull_requests":"read"}}`,
+		`{"token":"secret-token","expires_at":"2026-11-20T13:00:00Z","permissions":{"administration":"read","checks":"read","contents":"read","issues":"read","metadata":"read","pull_requests":"read","statuses":"write"}}`,
+		`{"token":"secret-token","expires_at":"2026-11-20T13:00:00Z","permissions":{"administration":"read","checks":"read","contents":"read","issues":"read","metadata":"read","pull_requests":"read","statuses":"read","deployments":"write"}}`,
+		`{"token":"secret-token","expires_at":"2026-11-20T13:00:00Z","permissions":{"administration":"read","checks":"read","contents":"read","issues":"read","metadata":"read","pull_requests":"read","deployments":"read"}}`,
 	} {
 		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			_, _ = io.WriteString(w, response)
@@ -291,12 +296,22 @@ func TestInstallationClientToleratesUnrequestedReadOnlyPermission(t *testing.T) 
 		case "/app/installations/42":
 			_, _ = io.WriteString(w, `{"account":{"login":"acme"}}`)
 		case "/app/installations/42/access_tokens":
-			var body map[string]any
-			_ = json.NewDecoder(r.Body).Decode(&body)
-			if _, requested := body["permissions"].(map[string]any)["administration"]; requested {
-				t.Errorf("token request asked for administration permission: %#v", body["permissions"])
+			var body struct {
+				Permissions map[string]string `json:"permissions"`
 			}
-			_, _ = io.WriteString(w, `{"token":"installation-token","expires_at":"2026-11-20T13:00:00Z","permissions":{"checks":"read","contents":"read","issues":"read","metadata":"read","pull_requests":"read","statuses":"read","deployments":"read"}}`)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode exchange body: %v", err)
+			}
+			want := requestedReadPermissions()
+			if len(body.Permissions) != len(want) {
+				t.Errorf("requested permission set = %#v, want %#v", body.Permissions, want)
+			}
+			for key, level := range want {
+				if body.Permissions[key] != level {
+					t.Errorf("requested permission %q = %q, want %q", key, body.Permissions[key], level)
+				}
+			}
+			_, _ = io.WriteString(w, `{"token":"installation-token","expires_at":"2026-11-20T13:00:00Z","permissions":{"administration":"read","checks":"read","contents":"read","issues":"read","metadata":"read","pull_requests":"read","statuses":"read","deployments":"read"}}`)
 		case "/repos/acme/demo/issues/9":
 			_, _ = io.WriteString(w, `{"number":9,"title":"issue"}`)
 		default:
@@ -308,7 +323,17 @@ func TestInstallationClientToleratesUnrequestedReadOnlyPermission(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.GetIssue(context.Background(), "acme", "demo", 9); err != nil {
+	rescue := os.Stderr
+	reader, writer, _ := os.Pipe()
+	os.Stderr = writer
+	_, err = client.GetIssue(context.Background(), "acme", "demo", 9)
+	writer.Close()
+	os.Stderr = rescue
+	if err != nil {
 		t.Fatalf("unrequested read-only permission rejected refresh: %v", err)
+	}
+	warning, _ := io.ReadAll(reader)
+	if !strings.Contains(string(warning), `"deployments"`) {
+		t.Fatalf("missing unrequested-permission warning: %q", warning)
 	}
 }

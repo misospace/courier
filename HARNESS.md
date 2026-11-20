@@ -440,8 +440,8 @@ reuse this Secret for any other Courier credential or pod environment. Remove
 Restart the operator after you replace the private key.
 
 Install the app on the repositories that Courier must read. Grant read access
-to Checks, Contents, Issues, Metadata, Pull requests, and Commit statuses. The
-operator requests a separate token for each repository and refreshes
+to Administration, Checks, Contents, Issues, Metadata, Pull requests, and Commit
+statuses. The operator requests a separate token for each repository and refreshes
 it before it expires. If the app cannot supply a token, Courier does not use a
 static token instead.
 

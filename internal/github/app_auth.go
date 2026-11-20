@@ -176,13 +176,16 @@ func (c *installationCredential) refreshToken(ctx context.Context, repository st
 
 	endpoint.RawPath = ""
 	parts := strings.SplitN(repository, "/", 2)
-	// Only the permissions the observation and admission reads exercise are
-	// requested; administration access would widen the credential beyond
-	// anything Courier reads.
+	// The requested set is the read surface the observation and admission
+	// reads exercise. administration read is not optional: the secure
+	// admission protection read walks the branch-rules and branch-protection
+	// endpoints, which GitHub gates on the Administration repository
+	// permission.
+	requested := requestedReadPermissions()
 	body, _ := json.Marshal(struct {
 		Repositories []string          `json:"repositories"`
 		Permissions  map[string]string `json:"permissions"`
-	}{[]string{parts[1]}, map[string]string{"checks": "read", "contents": "read", "issues": "read", "metadata": "read", "pull_requests": "read", "statuses": "read"}})
+	}{[]string{parts[1]}, requested})
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(body))
 	if err != nil {
 		return "", time.Time{}, errors.New("GitHub App authentication request could not be created")
@@ -207,7 +210,7 @@ func (c *installationCredential) refreshToken(ctx context.Context, repository st
 		if level != "read" {
 			return "", time.Time{}, errors.New("GitHub App installation token refresh returned excessive permissions")
 		}
-		if _, known := expectedReadPermissions[permission]; !known {
+		if _, known := requested[permission]; !known {
 			// A permission key outside the requested set is refused when it
 			// carries write access; for read access it is tolerated rather
 			// than rejected so GitHub introducing a new read-only key does
@@ -215,7 +218,7 @@ func (c *installationCredential) refreshToken(ctx context.Context, repository st
 			fmt.Fprintf(os.Stderr, "GitHub App installation token refresh for %q returned unrequested read permission %q\n", repository, permission)
 		}
 	}
-	for permission := range expectedReadPermissions {
+	for permission := range requested {
 		if result.Permissions[permission] != "read" {
 			return "", time.Time{}, errors.New("GitHub App installation token refresh returned insufficient read permissions")
 		}
@@ -223,11 +226,15 @@ func (c *installationCredential) refreshToken(ctx context.Context, repository st
 	return result.Token, result.ExpiresAt, nil
 }
 
-// expectedReadPermissions is the fixed permission set the token request asks
-// for and the refresh response must carry.
-var expectedReadPermissions = map[string]bool{
-	"checks": true, "contents": true, "issues": true,
-	"metadata": true, "pull_requests": true, "statuses": true,
+// requestedReadPermissions is the permission set the token request asks for
+// and the refresh response must carry. It builds a fresh map per call so no
+// caller can mutate shared state.
+func requestedReadPermissions() map[string]string {
+	return map[string]string{
+		"administration": "read", "checks": "read", "contents": "read",
+		"issues": "read", "metadata": "read", "pull_requests": "read",
+		"statuses": "read",
+	}
 }
 
 func (c *installationCredential) verifyInstallation(ctx context.Context, now time.Time) error {

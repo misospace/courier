@@ -631,8 +631,6 @@ func main() {
 		setupLog.Error(err, "unable to configure GitHub observer")
 		os.Exit(1)
 	}
-	// The disabled log covers every no-observer state, including a typed nil
-	// that a plain == nil comparison would miss.
 	if observerDisabled(worldObserver) {
 		setupLog.Info("GitHub observer disabled; no API credential Secret configured")
 	}
@@ -1545,9 +1543,10 @@ func dispatchPRStateChecker(observer controller.WorldObserver) (dispatch.PullReq
 }
 
 // observerDisabled reports whether no usable observer was wired: a nil
-// interface, a typed-nil pointer, or a clientless github.Observer, matching
-// how the converter helpers treat those states as absent. A plain == nil
-// comparison alone would miss the typed nil inside a non-nil interface.
+// interface, a typed-nil pointer, or a clientless github.Observer. A plain
+// == nil comparison alone would miss the typed nil inside a non-nil
+// interface. The check only gates the startup log; the converter helpers
+// below decide usability per capability.
 func observerDisabled(observer controller.WorldObserver) bool {
 	switch value := observer.(type) {
 	case nil:
@@ -1555,7 +1554,8 @@ func observerDisabled(observer controller.WorldObserver) bool {
 	case couriergithub.Observer:
 		return value.Client == nil
 	default:
-		return reflect.ValueOf(observer).Kind() == reflect.Ptr && reflect.ValueOf(observer).IsNil()
+		rv := reflect.ValueOf(observer)
+		return rv.Kind() == reflect.Ptr && rv.IsNil()
 	}
 }
 
