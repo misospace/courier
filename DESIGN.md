@@ -3042,6 +3042,52 @@ degrades an entry. The chart serializes `skillBundles` values into a release
 ConfigMap mounted beside the manager and passed through the same flag,
 mirroring the lane-profiles transport.
 
+## Operator console
+
+The operator console (`internal/console`, served by the standalone
+`courier-console` binary and enabled by `operatorConsole.enabled` in the
+chart) is a server-rendered scaffold for authenticated operators:
+placeholder pages today, the operator read API's UI later. It is
+deliberately independent of the manager and of the Kubernetes API — it
+imports only the standard library, never talks to a cluster, and can only
+probe the read API's `/healthz` path when `--backend-url` is configured.
+Secrets travel as file paths read from mounted Secrets, never environment
+values.
+
+One authorization model: every authenticated identity is an operator, and
+`IsOperator` in `internal/console/auth.go` is the single seam where a
+future per-identity policy lands. Token mode (the default) exchanges a
+shared operator token for an HMAC-signed session cookie backed by an
+in-memory store (12-hour TTL; a console restart signs everyone out). Header
+mode takes the identity verbatim from one configured trusted-proxy header,
+so the mode is only as strong as the network that carries it, and the chart
+enforces that precondition instead of documenting it: header mode fails the
+render without `operatorConsole.auth.headerAllowedPeers` and pairs with a
+chart-rendered NetworkPolicy that selects the console pods, declares
+`policyTypes: [Ingress]`, and admits only the configured peers on the
+console port, so a workload elsewhere in the cluster has no route on which
+to forge the identity header. The effective auth mode is recomputed from
+raw `controllers.console` args, so an operator-supplied `--auth-mode=header`
+override can never drive the binary past the guards or the policy.
+Enforcement presumes a CNI that enforces NetworkPolicy, which the docs
+state; a hostNetwork proxy cannot be a peer and needs a companion ipBlock
+policy. Token mode renders no policy: it authenticates a token over the
+wire, not network position.
+
+The `Secure` cookie posture is configured, never inferred: every supported
+deployment terminates TLS at a proxy whose hop to the console listener is
+plaintext HTTP, so inferring from the listener would leave the flag
+permanently off. `Secure` defaults to true on the session cookie and on the
+mirrored clearing cookie (a browser is not guaranteed to remove a cookie
+whose attributes differ from the one `Set-Cookie` replaces), and
+`--cookie-secure=false` (`operatorConsole.auth.cookieSecure=false`) is the
+only opt-out; the chart renders the flag explicitly so the posture is
+visible in the Deployment. The listener is bounded by fixed
+read-header/read/write/idle timeouts. With the chart's default values
+(`operatorConsole.enabled=false` and no `controllers.console` block) the
+chart renders exactly what a headless release rendered before: no second
+controller, no console Service, no new flags, and no policy.
+
 ## Reconcile loop
 
 Two operator releases may run side-by-side on one cluster (a native canary
