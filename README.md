@@ -168,6 +168,33 @@ field needs a Cilium release that accepts it. Older releases take a boolean
 and reject this form.
 IP-based CNIs (kube-proxy) need nothing extra.
 
+### Network policies: two roles
+
+The chart installs no NetworkPolicy of its own. It renders one only behind an
+explicit opt-in, and the opt-ins differ. Two need secure mode: the
+model-gateway egress policy (`secure.enabled` plus a fully specified
+`secure.modelGateway.networkPolicy` block) and the dependency-cache policy
+(`secure.enabled` plus `secure.dependencyCache.enabled`). A third ships with
+the console's header mode (console enabled, header auth, trusted header); it
+default-denies ingress to the console pods except the trusted proxy and is
+documented with the console in [docs/operator-console.md](./docs/operator-console.md).
+
+A default, non-secure install creates no chart NetworkPolicy and needs no
+node-IP, CIDR, or CNI-specific exception to start; policies you apply
+yourself, like the Cilium companion above, stay untouched. Chart tests guard
+that default-off posture for every chart-owned policy.
+
+Per-run isolation in secure mode is the second role, and it is not optional.
+When `secure.enabled` is true, the operator creates one NetworkPolicy for
+each run's control, worker, and broker pods before it launches any run pod.
+The chart policies and the per-run policies do different jobs: the gateway
+policy only adds a path (control pods may reach the model gateway); the
+dependency-cache policy constrains the cache pod itself (no egress, ingress
+only from the run's workers on the cache port); the console policy guards the
+console's header identity; the per-run policies fence untrusted workers.
+Secure-mode tests require the per-run policies to exist before any run pod
+is created.
+
 ## Design
 
 - **Inform, don't constrain.** Give the coordinator context and tools; trust its
