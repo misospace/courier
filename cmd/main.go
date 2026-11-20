@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -615,7 +616,7 @@ func main() {
 		setupLog.Error(err, "unable to configure the work-item comment identity")
 		os.Exit(1)
 	}
-	if commentObserver == nil {
+	if observerDisabled(commentObserver) {
 		setupLog.Info("work-item close announcements disabled; no --work-item-comment-credential-secret configured")
 	}
 
@@ -630,7 +631,9 @@ func main() {
 		setupLog.Error(err, "unable to configure GitHub observer")
 		os.Exit(1)
 	}
-	if worldObserver == nil {
+	// The disabled log covers every no-observer state, including a typed nil
+	// that a plain == nil comparison would miss.
+	if observerDisabled(worldObserver) {
 		setupLog.Info("GitHub observer disabled; no API credential Secret configured")
 	}
 	// The legacy coordinator launcher pins a fix-pr run's coordinator pod to
@@ -1539,6 +1542,21 @@ func dispatchPRStateChecker(observer controller.WorldObserver) (dispatch.PullReq
 		}
 		return dispatch.PullRequestState{State: pull.State, Merged: strings.TrimSpace(pull.MergedAt) != ""}, nil
 	}), nil
+}
+
+// observerDisabled reports whether no usable observer was wired: a nil
+// interface, a typed-nil pointer, or a clientless github.Observer, matching
+// how the converter helpers treat those states as absent. A plain == nil
+// comparison alone would miss the typed nil inside a non-nil interface.
+func observerDisabled(observer controller.WorldObserver) bool {
+	switch value := observer.(type) {
+	case nil:
+		return true
+	case couriergithub.Observer:
+		return value.Client == nil
+	default:
+		return reflect.ValueOf(observer).Kind() == reflect.Ptr && reflect.ValueOf(observer).IsNil()
+	}
 }
 
 // githubObserver builds the operator's own forge read identity. The registry

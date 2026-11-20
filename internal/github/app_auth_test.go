@@ -45,7 +45,7 @@ func TestInstallationClientRefreshesRepositoryScopedReadToken(t *testing.T) {
 			if exchanges > 1 {
 				expires = "2026-11-20T14:00:00Z"
 			}
-			_, _ = io.WriteString(w, `{"token":"installation-token","expires_at":"`+expires+`","permissions":{"administration":"read","checks":"read","contents":"read","issues":"read","metadata":"read","pull_requests":"read","statuses":"read"}}`)
+			_, _ = io.WriteString(w, `{"token":"installation-token","expires_at":"`+expires+`","permissions":{"checks":"read","contents":"read","issues":"read","metadata":"read","pull_requests":"read","statuses":"read"}}`)
 		case "/api/v3/repos/acme/demo/issues/9":
 			observedAuth = r.Header.Get("Authorization")
 			w.Header().Set("Content-Type", "application/json")
@@ -99,7 +99,7 @@ func TestInstallationClientRefusesRedirectAndEndpointEscape(t *testing.T) {
 	defer destination.Close()
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/access_tokens") {
-			_, _ = io.WriteString(w, `{"token":"secret-token","expires_at":"2026-11-20T13:00:00Z","permissions":{"administration":"read","checks":"read","contents":"read","issues":"read","metadata":"read","pull_requests":"read","statuses":"read"}}`)
+			_, _ = io.WriteString(w, `{"token":"secret-token","expires_at":"2026-11-20T13:00:00Z","permissions":{"checks":"read","contents":"read","issues":"read","metadata":"read","pull_requests":"read","statuses":"read"}}`)
 			return
 		}
 		http.Redirect(w, r, destination.URL, http.StatusFound)
@@ -260,9 +260,9 @@ func TestInstallationClientRefusesInsufficientPermission(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, response := range []string{
-		`{"token":"secret-token","expires_at":"2026-11-20T13:00:00Z","permissions":{"administration":"read","checks":"read","contents":"read","issues":"read","metadata":"read","pull_requests":"read"}}`,
-		`{"token":"secret-token","expires_at":"2026-11-20T13:00:00Z","permissions":{"administration":"read","checks":"read","contents":"read","issues":"read","metadata":"read","pull_requests":"read","statuses":"write"}}`,
-		`{"token":"secret-token","expires_at":"2026-11-20T13:00:00Z","permissions":{"administration":"read","checks":"read","contents":"read","issues":"read","metadata":"read","pull_requests":"read","statuses":"read","deployments":"read"}}`,
+		`{"token":"secret-token","expires_at":"2026-11-20T13:00:00Z","permissions":{"checks":"read","contents":"read","issues":"read","metadata":"read","pull_requests":"read"}}`,
+		`{"token":"secret-token","expires_at":"2026-11-20T13:00:00Z","permissions":{"checks":"read","contents":"read","issues":"read","metadata":"read","pull_requests":"read","statuses":"write"}}`,
+		`{"token":"secret-token","expires_at":"2026-11-20T13:00:00Z","permissions":{"checks":"read","contents":"read","issues":"read","metadata":"read","pull_requests":"read","statuses":"read","deployments":"write"}}`,
 	} {
 		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			_, _ = io.WriteString(w, response)
@@ -277,5 +277,38 @@ func TestInstallationClientRefusesInsufficientPermission(t *testing.T) {
 		if err == nil || strings.Contains(err.Error(), "secret-token") {
 			t.Fatalf("invalid mint response accepted or leaked: %v", err)
 		}
+	}
+}
+
+func TestInstallationClientToleratesUnrequestedReadOnlyPermission(t *testing.T) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/app/installations/42":
+			_, _ = io.WriteString(w, `{"account":{"login":"acme"}}`)
+		case "/app/installations/42/access_tokens":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if _, requested := body["permissions"].(map[string]any)["administration"]; requested {
+				t.Errorf("token request asked for administration permission: %#v", body["permissions"])
+			}
+			_, _ = io.WriteString(w, `{"token":"installation-token","expires_at":"2026-11-20T13:00:00Z","permissions":{"checks":"read","contents":"read","issues":"read","metadata":"read","pull_requests":"read","statuses":"read","deployments":"read"}}`)
+		case "/repos/acme/demo/issues/9":
+			_, _ = io.WriteString(w, `{"number":9,"title":"issue"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := NewInstallationClient(InstallationAuth{AppID: 1, InstallationID: 42, Owner: "acme", PrivateKey: privateKey, Endpoint: server.URL, HTTPClient: server.Client(), Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.GetIssue(context.Background(), "acme", "demo", 9); err != nil {
+		t.Fatalf("unrequested read-only permission rejected refresh: %v", err)
 	}
 }

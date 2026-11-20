@@ -63,6 +63,28 @@ func TestExistingPRHeadResolver(t *testing.T) {
 	}
 }
 
+func TestObserverDisabled(t *testing.T) {
+	if !observerDisabled(nil) {
+		t.Fatal("observerDisabled(nil) = false, want disabled")
+	}
+	if observerDisabled(observerWithHeadResolver{}) {
+		t.Fatal("observerDisabled() = true for an enabled non-GitHub observer")
+	}
+	if !observerDisabled((*couriergithub.Observer)(nil)) {
+		t.Fatal("observerDisabled() = false for a typed-nil GitHub observer")
+	}
+	if !observerDisabled(couriergithub.Observer{}) {
+		t.Fatal("observerDisabled() = false for a clientless GitHub observer")
+	}
+	client, err := couriergithub.New("test-token")
+	if err != nil {
+		t.Fatalf("build GitHub client: %v", err)
+	}
+	if observerDisabled(couriergithub.Observer{Client: client}) {
+		t.Fatal("observerDisabled() = true for a wired GitHub observer")
+	}
+}
+
 func TestPullRequestReaderWiresForgeCapability(t *testing.T) {
 	if got := pullRequestReader(nil); got != nil {
 		t.Fatal("pullRequestReader(nil) returned a reader")

@@ -92,14 +92,10 @@ func New(token string, httpClient ...HTTPDoer) (*Client, error) {
 	return NewClient(defaultBaseURL, token, httpClient...)
 }
 
-// WithBaseURL returns a client for a different API base URL carrying this
-// client's credential, transport, and request bound. Secure-mode wiring uses
-// it to build one client per registered endpoint from a single read
-// identity: the registration decides the destination, and a credential is
-// only ever sent to the endpoint its identity is scoped to. An empty base
-// URL is refused rather than silently falling back to GitHub.com, so a
-// missing endpoint configuration cannot redirect a custom registration's
-// traffic (and credential) to the public API.
+// sameHTTPSBaseURL reports whether rightRaw parses to the same HTTPS origin
+// and endpoint path as left, rejecting userinfo, query strings, fragments,
+// opaque forms, and relative URLs. Endpoint-bound credentials use it to
+// decide whether a re-destination request may reuse their identity.
 func sameHTTPSBaseURL(left *url.URL, rightRaw string) bool {
 	right, err := url.Parse(strings.TrimSpace(rightRaw))
 	if err != nil || left == nil || right.Scheme != "https" || right.Host == "" || right.User != nil || right.RawQuery != "" || right.Fragment != "" || right.Opaque != "" {
@@ -108,6 +104,14 @@ func sameHTTPSBaseURL(left *url.URL, rightRaw string) bool {
 	return strings.EqualFold(left.Scheme, right.Scheme) && strings.EqualFold(left.Host, right.Host) && endpointPath(left) == endpointPath(right)
 }
 
+// WithBaseURL returns a client for a different API base URL carrying this
+// client's credential, transport, and request bound. Secure-mode wiring uses
+// it to build one client per registered endpoint from a single read
+// identity: the registration decides the destination, and a credential is
+// only ever sent to the endpoint its identity is scoped to. An empty base
+// URL is refused rather than silently falling back to GitHub.com, so a
+// missing endpoint configuration cannot redirect a custom registration's
+// traffic (and credential) to the public API.
 func (c *Client) WithBaseURL(baseURL string) (*Client, error) {
 	if strings.TrimSpace(baseURL) == "" {
 		return nil, errors.New("GitHub base URL must not be empty")
