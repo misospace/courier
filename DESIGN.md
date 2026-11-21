@@ -1567,7 +1567,7 @@ Role/RoleBinding rendered by the chart — deliberately not added to the
 generated operator ClusterRole, whose ClusterRoleBinding would widen the
 evidence verbs cluster-wide and attach them to installs that keep evidence
 disabled. The residual: the generated ClusterRole already
-carries `create/delete/get/list` on `secrets` cluster-wide for the secure-mode
+carries `create/delete/get/list/update` on `secrets` cluster-wide for the secure-mode
 launcher, so against a shipped install the namespaced evidence grant's marginal
 verb is `patch`, which the intake uses to supersede a slot it already wrote
 (`list` is required by the condition derivation and the AwaitingReview/Done
@@ -4214,7 +4214,7 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   ClusterRoleBinding would widen them cluster-wide and attach them to installs
   that keep evidence disabled. The authority expansion is real but bounded.
   The whole residual: the generated
-  ClusterRole already grants `create/delete/get/list` on `secrets` cluster-wide
+  ClusterRole already grants `create/delete/get/list/update` on `secrets` cluster-wide
   for the secure-mode launcher, and the chart's namespaced `credential-reader`
   Role grants the operator's service account `get` on every Secret in the run
   namespace (no `resourceNames`), so the evidence Role's marginal verb against a
