@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.1.27](https://github.com/misospace/courier/compare/v0.1.26...v0.1.27) (2026-11-21)
+
+
+### Features
+
+* **operator-ui:** authenticated console shell and independent deployment scaffold ([#832](https://github.com/misospace/courier/issues/832)) ([3f9b859](https://github.com/misospace/courier/commit/3f9b8597988271bb61c976496c3a2f9ba403d27e))
+* **operator-ui:** namespace-scoped safe read model for lanes, sources, and runs ([#834](https://github.com/misospace/courier/issues/834)) ([f81b20f](https://github.com/misospace/courier/commit/f81b20fa179befbc5686c33d46c780e6caa98802))
+* support GitHub App authentication for operator reads ([#868](https://github.com/misospace/courier/issues/868)) ([f83bc16](https://github.com/misospace/courier/commit/f83bc16034962787df3f6c29fb55b4dbfa123fe4))
+
+
+### Bug Fixes
+
+* **deps:** update dependency astro (7.4.12 → 7.4.13) ([#864](https://github.com/misospace/courier/issues/864)) ([fe0de25](https://github.com/misospace/courier/commit/fe0de252afb88cd342cf5353f86b508f4aa18328))
+* **devenv:** redirect mise state off the root-owned home the bake leaves ([#859](https://github.com/misospace/courier/issues/859)) ([e46d458](https://github.com/misospace/courier/commit/e46d458a69127999b37b68260c59b7b8a3fa3a60))
+* pin the govulncheck version used by CI ([#857](https://github.com/misospace/courier/issues/857)) ([ff2d9fd](https://github.com/misospace/courier/commit/ff2d9fd5591e6837dc35923a5f6708ec779391fe))
+
+
+### Chores
+
+* add LiteLLM review session affinity ([#874](https://github.com/misospace/courier/issues/874)) ([7ec9563](https://github.com/misospace/courier/commit/7ec95637ef413592a9de35eda5a568abfcbf0010))
+* **container:** update image golang (5e8afd4 → 205c763) ([#867](https://github.com/misospace/courier/issues/867)) ([5ecd11a](https://github.com/misospace/courier/commit/5ecd11ab01b0df7b8585d9ebcc51dda7fe4363a5))
+
+
+### Refactors
+
+* **metrics:** serve terminal age and backlog gauges from one scoped CoderRun list ([#856](https://github.com/misospace/courier/issues/856)) ([f9a17bb](https://github.com/misospace/courier/commit/f9a17bbdf2020011b5ab50c3c5971493a3fdffef))
+
 ## [0.1.26](https://github.com/misospace/courier/compare/v0.1.25...v0.1.26) (2026-11-17)
 
 
