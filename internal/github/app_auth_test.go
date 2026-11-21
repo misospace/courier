@@ -391,7 +391,7 @@ func TestInstallationTokenMinterMint(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Errorf("decode request: %v", err)
 			}
-			if len(body.Repositories) != 1 || body.Repositories[0] != "acme/demo" || body.Permissions["contents"] != "write" || body.Permissions["issues"] != "read" {
+			if len(body.Repositories) != 2 || body.Repositories[0] != "demo" || body.Repositories[1] != "widgets" || body.Permissions["contents"] != "write" || body.Permissions["issues"] != "read" {
 				t.Errorf("mint request body = %#v", body)
 			}
 			_, _ = io.WriteString(w, `{"token":"minted-token","expires_at":"2026-11-20T13:00:00Z","permissions":{"contents":"write","issues":"read"}}`)
@@ -404,7 +404,7 @@ func TestInstallationTokenMinterMint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	token, expiry, err := minter.Mint(context.Background(), []string{"acme/demo"}, map[string]string{"contents": "write", "issues": "read"})
+	token, expiry, err := minter.Mint(context.Background(), []string{"acme/demo", "acme/widgets"}, map[string]string{"contents": "write", "issues": "read"})
 	if err != nil || token != "minted-token" || !expiry.Equal(now.Add(time.Hour)) || !verified || !minted {
 		t.Fatalf("Mint = %q, %v, %v; verified=%v minted=%v", token, expiry, err, verified, minted)
 	}

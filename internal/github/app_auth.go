@@ -71,11 +71,16 @@ func (m *InstallationTokenMinter) Mint(ctx context.Context, repositories []strin
 	if len(repositories) == 0 {
 		return "", time.Time{}, errors.New("GitHub App token mint requires repositories")
 	}
+	// Callers name repositories as owner/name; the create-installation-access-token
+	// contract scopes a mint by bare repository name, so the exchange request
+	// carries the validated names without their owner.
+	names := make([]string, 0, len(repositories))
 	for _, repository := range repositories {
 		parts := strings.Split(repository, "/")
 		if len(parts) != 2 || parts[0] == "" || !strings.EqualFold(parts[0], c.owner) || parts[1] == "" {
 			return "", time.Time{}, errors.New("GitHub App token mint requires repositories owned by the configured account")
 		}
+		names = append(names, parts[1])
 	}
 	if len(permissions) == 0 {
 		return "", time.Time{}, errors.New("GitHub App token mint requires permissions")
@@ -99,7 +104,7 @@ func (m *InstallationTokenMinter) Mint(ctx context.Context, repositories []strin
 	body, _ := json.Marshal(struct {
 		Repositories []string          `json:"repositories"`
 		Permissions  map[string]string `json:"permissions"`
-	}{repositories, permissions})
+	}{names, permissions})
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(body))
 	if err != nil {
 		return "", time.Time{}, errors.New("GitHub App token mint request could not be created")

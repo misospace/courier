@@ -85,7 +85,7 @@ func (d brokerInstallationDoer) Do(req *http.Request) (*http.Response, error) {
 	if len(d.repositories) > 0 {
 		pinned := false
 		for _, repository := range d.repositories {
-			if _, name, _ := strings.Cut(repository, "/"); strings.EqualFold(name, repo) {
+			if strings.EqualFold(repository, owner+"/"+repo) {
 				pinned = true
 				break
 			}
