@@ -207,7 +207,14 @@ func secureForge() *fakeAdmissionForge {
 	}
 }
 
-func secureControl(t *testing.T, objects ...client.Object) (*SecureControl, client.Client) {
+// secureControlBase builds the control and client every secure-launch test
+// shares: the scheme, the lane every test run names, and a fake client whose
+// Create interceptor stands in for the API server — it assigns UIDs, rejects
+// the known-bad dry-run specs the preflight uses to prove restricted
+// admission, and records every object it lets through, in order. A non-nil
+// onCreate returning an error replaces a create with that failure; tests
+// read the recorded order through the returned slice.
+func secureControlBase(t *testing.T, objects []client.Object, onCreate func(client.Object) error) (*SecureControl, client.Client, *[]client.Object) {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	for _, add := range []func(*runtime.Scheme) error{courier.AddToScheme, corev1.AddToScheme, rbacv1.AddToScheme, networkingv1.AddToScheme} {
@@ -227,6 +234,7 @@ func secureControl(t *testing.T, objects ...client.Object) (*SecureControl, clie
 		},
 	}
 	objects = append([]client.Object{lane}, objects...)
+	var created []client.Object
 	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&courier.CoderRun{}).
 		WithObjects(objects...).
 		WithInterceptorFuncs(interceptor.Funcs{
@@ -240,6 +248,12 @@ func secureControl(t *testing.T, objects ...client.Object) (*SecureControl, clie
 				if strings.Contains(obj.GetName(), "-bad-dryrun") {
 					return errors.New("admission denied: known-bad pod spec")
 				}
+				if onCreate != nil {
+					if err := onCreate(obj); err != nil {
+						return err
+					}
+				}
+				created = append(created, obj.DeepCopyObject().(client.Object))
 				return c.Create(ctx, obj, opts...)
 			},
 		}).
@@ -263,6 +277,11 @@ func secureControl(t *testing.T, objects ...client.Object) (*SecureControl, clie
 			Now:               func() time.Time { return time.Now() },
 		},
 	}
+	return control, c, &created
+}
+
+func secureControl(t *testing.T, objects ...client.Object) (*SecureControl, client.Client) {
+	control, c, _ := secureControlBase(t, objects, nil)
 	return control, c
 }
 
@@ -1269,6 +1288,116 @@ func TestLaunchSecureProvisionsTopology(t *testing.T) {
 	}
 	if !foundGoal {
 		t.Fatal("control pod carries no run-context goal")
+	}
+}
+
+// secureControlRecordingCreates exposes the create recording
+// secureControlBase always performs, for the launch-order and fail-closed
+// tests, which need create visibility plain secureControl does not surface.
+func secureControlRecordingCreates(t *testing.T, onCreate func(client.Object) error) (*SecureControl, client.Client, *[]client.Object) {
+	return secureControlBase(t, nil, onCreate)
+}
+
+// seedLaunchTopology creates the claimed run, the restricted run namespace,
+// and the forge credential copy a secure launch needs.
+func seedLaunchTopology(t *testing.T, c client.Client, name string) *courier.CoderRun {
+	t.Helper()
+	run := secureRun(name)
+	run.Status.Phase = courier.PhaseClaimed
+	run.Status.PublicationPolicy = &courier.PublicationPolicy{
+		RunUID: string(run.UID), ProviderConfigRef: "github", ProviderEndpoint: "https://api.github.com/",
+		CredentialRefDigest: secureRegistry().Registrations()[0].Projection().Digest,
+		BaseRepo:            "Acme/Widgets", BaseRef: "main", BaseOID: "baseoid", WorkRepo: "Acme/Widgets",
+		WorkRef: "courier/Acme/Widgets/issue-7", WorkInitiallyAbsent: true,
+	}
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: secureTestNamespace, Labels: map[string]string{"pod-security.kubernetes.io/enforce": "restricted"}}}
+	if err := c.Create(context.Background(), namespace); err != nil {
+		t.Fatal(err)
+	}
+	creds := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "courier-system", Name: "forge-creds"}, Data: map[string][]byte{"token": []byte("tok-123")}}
+	if err := c.Create(context.Background(), creds); err != nil {
+		t.Fatal(err)
+	}
+	return run
+}
+
+// TestLaunchSecureCreatesNetworkPoliciesBeforeAnyRunPod pins the launch order:
+// every mandatory per-run isolation policy exists, and all three are created
+// before the first real run pod. Dry-run preflight probes are excluded from
+// the anchor so the guard stays about workload pods.
+func TestLaunchSecureCreatesNetworkPoliciesBeforeAnyRunPod(t *testing.T) {
+	control, c, created := secureControlRecordingCreates(t, nil)
+	run := seedLaunchTopology(t, c, "policy-order")
+	seeded := len(*created)
+
+	if _, err := control.LaunchSecure(context.Background(), run); err != nil {
+		t.Fatalf("LaunchSecure: %v", err)
+	}
+	launched := (*created)[seeded:]
+
+	policyNames := []string{
+		topology.WorkerNetworkPolicyName(run.Name),
+		topology.ControlNetworkPolicyName(run.Name),
+		topology.BrokerNetworkPolicyName(run.Name),
+	}
+	positions := make(map[string]int, len(policyNames))
+	firstPod := -1
+	for i, obj := range launched {
+		switch o := obj.(type) {
+		case *networkingv1.NetworkPolicy:
+			positions[o.Name] = i
+		case *corev1.Pod:
+			isDryRun := strings.HasSuffix(o.Name, "-dryrun") || strings.HasSuffix(o.Name, "-bad-dryrun")
+			if !isDryRun && firstPod < 0 {
+				firstPod = i
+			}
+		}
+	}
+	for _, name := range policyNames {
+		policy := &networkingv1.NetworkPolicy{}
+		if err := c.Get(context.Background(), client.ObjectKey{Namespace: secureTestNamespace, Name: name}, policy); err != nil {
+			t.Fatalf("get per-run NetworkPolicy %q: %v", name, err)
+		}
+		if _, ok := positions[name]; !ok {
+			t.Fatalf("create order is missing per-run NetworkPolicy %q among %d created objects", name, len(launched))
+		}
+	}
+	if firstPod < 0 {
+		t.Fatalf("launch created no run pod among %d created objects", len(launched))
+	}
+	for _, name := range policyNames {
+		if positions[name] >= firstPod {
+			t.Errorf("NetworkPolicy %q create position %d does not precede the first run pod at position %d", name, positions[name], firstPod)
+		}
+	}
+}
+
+// TestLaunchSecureRefusesToLaunchWithoutNetworkPolicies pins the fail-closed
+// path: a rejected per-run policy create must abort launch before any run pod
+// exists, never degrade into an unrestricted launch.
+func TestLaunchSecureRefusesToLaunchWithoutNetworkPolicies(t *testing.T) {
+	control, c, _ := secureControlRecordingCreates(t, func(obj client.Object) error {
+		if _, ok := obj.(*networkingv1.NetworkPolicy); ok {
+			return errors.New("policy create denied")
+		}
+		return nil
+	})
+	run := seedLaunchTopology(t, c, "policy-denied")
+
+	if _, err := control.LaunchSecure(context.Background(), run); err == nil {
+		t.Fatal("LaunchSecure succeeded despite rejected NetworkPolicy creates")
+	} else if !strings.Contains(err.Error(), "network policy") {
+		t.Fatalf("launch failed for an unexpected reason, not the rejected policy create: %v", err)
+	}
+	pods := &corev1.PodList{}
+	if err := c.List(context.Background(), pods, client.InNamespace(secureTestNamespace)); err != nil {
+		t.Fatal(err)
+	}
+	if len(pods.Items) != 0 {
+		t.Fatalf("launch created pods despite rejected NetworkPolicy creates: %d pods", len(pods.Items))
 	}
 }
 

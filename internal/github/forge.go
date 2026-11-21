@@ -101,6 +101,9 @@ func (p *Provider) ResolveRepository(ctx context.Context, name string) (forge.Re
 	if got.ID == 0 || got.FullName == "" || got.DefaultBranch == "" {
 		return forge.Repository{}, fmt.Errorf("GitHub repository response is missing canonical identity or default branch")
 	}
+	if p.client.appInstallation && (got.Owner.Login == "" || !strings.EqualFold(got.Owner.Login, strings.SplitN(name, "/", 2)[0])) {
+		return forge.Repository{}, fmt.Errorf("GitHub repository response owner does not match the configured installation account")
+	}
 	return forge.Repository{ID: strconv.FormatInt(got.ID, 10), Canonical: got.FullName, DefaultRef: got.DefaultBranch}, nil
 }
 
