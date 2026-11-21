@@ -8,9 +8,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -78,9 +80,10 @@ type SkillMount struct {
 // references. The source Secret values are never referenced directly by run
 // pods, and the copy is garbage-collected with the run.
 const (
-	CredKeyForgeAPIToken = "forge-api-token"
-	CredKeyGitUsername   = "git-username"
-	CredKeyGitToken      = "git-token"
+	CredKeyForgeAPIToken     = "forge-api-token"
+	CredKeyGitUsername       = "git-username"
+	CredKeyGitToken          = "git-token"
+	CredKeyInstallationToken = "forge-installation-token"
 )
 
 // Labels returns the standard label set for one component of one run. The
@@ -184,11 +187,36 @@ func ServiceAccounts(run *courier.CoderRun) []*corev1.ServiceAccount {
 }
 
 // BrokerRole renders the run-scoped Role for the broker's service account:
+// BrokerRole renders the run-scoped Role for the broker's service account:
 // named reads and status patches on exactly this CoderRun and namespace pod
 // reads for current-incarnation checks. TokenReview creation is
 // cluster-scoped and granted through BrokerTokenReviewBinding.
 func BrokerRole(run *courier.CoderRun) *rbacv1.Role {
-	return &rbacv1.Role{
+	return brokerRole(run, false)
+}
+
+// BrokerRoleWithInstallationToken renders BrokerRole plus the namespaced get
+// on exactly the run's credentials Secret that an App-mode broker needs to
+// read its rotated installation-token document. Static-mode roles never gain
+// Secret read.
+func BrokerRoleWithInstallationToken(run *courier.CoderRun) *rbacv1.Role {
+	return brokerRole(run, true)
+}
+
+// BrokerInstallationTokenRoleRule is the single Secret rule an App-mode
+// broker needs: a named get on the run's own credentials Secret, nothing
+// else in the namespace.
+func BrokerInstallationTokenRoleRule(run *courier.CoderRun) rbacv1.PolicyRule {
+	return rbacv1.PolicyRule{
+		APIGroups:     []string{""},
+		Resources:     []string{"secrets"},
+		ResourceNames: []string{CredentialsSecretName(run.Name)},
+		Verbs:         []string{"get"},
+	}
+}
+
+func brokerRole(run *courier.CoderRun, installationToken bool) *rbacv1.Role {
+	role := &rbacv1.Role{
 		ObjectMeta: objectMeta(run, BrokerRoleName(run.Name), ComponentBroker),
 		Rules: []rbacv1.PolicyRule{
 			{
@@ -222,6 +250,10 @@ func BrokerRole(run *courier.CoderRun) *rbacv1.Role {
 			},
 		},
 	}
+	if installationToken {
+		role.Rules = append(role.Rules, BrokerInstallationTokenRoleRule(run))
+	}
+	return role
 }
 
 // BrokerRoleBinding binds the broker Role to the run's broker service
@@ -319,11 +351,36 @@ func PolicySecret(run *courier.CoderRun, document BrokerPolicyDocument) (*corev1
 	}, nil
 }
 
+// InstallationTokenDocumentVersion is the schema version of
+// InstallationTokenDocument. A broker that does not know the version refuses
+// the document rather than guessing.
+const InstallationTokenDocumentVersion = 1
+
+// InstallationTokenDocument is the on-wire content of the per-run credentials
+// Secret's installation-token entry: one short-lived repository-scoped GitHub
+// App installation token minted by the operator, plus the identity it is
+// bound to. It rides a Secret, never pod environment, so the token value is
+// not exposed through environment dumps.
+type InstallationTokenDocument struct {
+	Version   int       `json:"version"`
+	Token     string    `json:"token"`
+	ExpiresAt time.Time `json:"expiresAt"`
+	Owner     string    `json:"owner"`
+	Endpoint  string    `json:"endpoint"`
+}
+
+// InstallationTokenSecretRef names the credentials Secret key carrying the
+// InstallationTokenDocument.
+type InstallationTokenSecretRef struct {
+	SecretKey string `json:"secretKey"`
+}
+
 // BrokerPolicyDocument is the on-wire shape of the broker's policy Secret:
 // the persisted publication policy plus the single projected registration.
 type BrokerPolicyDocument struct {
-	PublicationPolicy *courier.PublicationPolicy `json:"publicationPolicy"`
-	Provider          forge.Projection           `json:"provider"`
+	PublicationPolicy *courier.PublicationPolicy  `json:"publicationPolicy"`
+	Provider          forge.Projection            `json:"provider"`
+	InstallationToken *InstallationTokenSecretRef `json:"installationToken,omitempty"`
 }
 
 // GatewaySecret renders the per-run copy of the deployment's model-gateway
@@ -337,6 +394,28 @@ func GatewaySecret(run *courier.CoderRun, key []byte) (*corev1.Secret, error) {
 		ObjectMeta: objectMeta(run, GatewaySecretName(run.Name), ComponentCoordinator),
 		Type:       corev1.SecretTypeOpaque,
 		Data:       map[string][]byte{GatewayKeyName: key},
+	}, nil
+}
+
+// InstallationTokenCredentials renders the per-run credentials Secret carrying
+// only the installation-token entry. Static credential entries are deliberately
+// absent: an App-mode broker has no static credential to fall back to.
+func InstallationTokenCredentials(run *courier.CoderRun, document InstallationTokenDocument) (*corev1.Secret, error) {
+	if document.Version != InstallationTokenDocumentVersion || document.Token == "" || document.ExpiresAt.IsZero() || document.Owner == "" {
+		return nil, errors.New("topology: installation-token document is incomplete or unsupported")
+	}
+	endpoint, err := url.Parse(document.Endpoint)
+	if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" || endpoint.Opaque != "" {
+		return nil, errors.New("topology: installation-token endpoint must be an absolute HTTPS URL")
+	}
+	data, err := json.Marshal(document)
+	if err != nil {
+		return nil, fmt.Errorf("topology: marshal installation-token document: %w", err)
+	}
+	return &corev1.Secret{
+		ObjectMeta: objectMeta(run, CredentialsSecretName(run.Name), ComponentBroker),
+		Type:       corev1.SecretTypeOpaque,
+		Data:       map[string][]byte{CredKeyInstallationToken: data},
 	}, nil
 }
 
@@ -642,6 +721,17 @@ func WorkerPod(run *courier.CoderRun, image string, controlIncarnationUID string
 // resources is the lane-configured sizing; the zero value renders the
 // built-in default rather than a BestEffort pod.
 func BrokerPod(run *courier.CoderRun, image string, projection forge.Projection, controlSAUID string, resources corev1.ResourceRequirements) (*corev1.Pod, error) {
+	return brokerPod(run, image, projection, controlSAUID, resources, false)
+}
+
+// BrokerPodWithInstallationToken renders the broker without static credential
+// environment references; App-mode credentials are read from the Secret via
+// the broker's live API reader.
+func BrokerPodWithInstallationToken(run *courier.CoderRun, image string, projection forge.Projection, controlSAUID string, resources corev1.ResourceRequirements) (*corev1.Pod, error) {
+	return brokerPod(run, image, projection, controlSAUID, resources, true)
+}
+
+func brokerPod(run *courier.CoderRun, image string, projection forge.Projection, controlSAUID string, resources corev1.ResourceRequirements, installationToken bool) (*corev1.Pod, error) {
 	if controlSAUID == "" {
 		return nil, errors.New("topology: broker pod requires the control service account UID")
 	}
@@ -658,11 +748,15 @@ func BrokerPod(run *courier.CoderRun, image string, projection forge.Projection,
 		{Name: EnvProviderType, Value: projection.Type},
 		{Name: EnvProviderEndpoint, Value: projection.Endpoint},
 		{Name: EnvProviderGitEndp, Value: projection.GitTemplate},
-		{Name: EnvForgeAPIToken, ValueFrom: secretKeyRef(CredentialsSecretName(run.Name), CredKeyForgeAPIToken)},
-		{Name: EnvGitUsername, ValueFrom: secretKeyRef(CredentialsSecretName(run.Name), CredKeyGitUsername)},
-		{Name: EnvGitToken, ValueFrom: secretKeyRef(CredentialsSecretName(run.Name), CredKeyGitToken)},
-		{Name: EnvAPITokenFile, Value: brokerTokenPath},
 	}
+	if !installationToken {
+		env = append(env,
+			corev1.EnvVar{Name: EnvForgeAPIToken, ValueFrom: secretKeyRef(CredentialsSecretName(run.Name), CredKeyForgeAPIToken)},
+			corev1.EnvVar{Name: EnvGitUsername, ValueFrom: secretKeyRef(CredentialsSecretName(run.Name), CredKeyGitUsername)},
+			corev1.EnvVar{Name: EnvGitToken, ValueFrom: secretKeyRef(CredentialsSecretName(run.Name), CredKeyGitToken)},
+		)
+	}
+	env = append(env, corev1.EnvVar{Name: EnvAPITokenFile, Value: brokerTokenPath})
 	return &corev1.Pod{
 		ObjectMeta: objectMeta(run, BrokerPodName(run.Name), ComponentBroker),
 		Spec: corev1.PodSpec{

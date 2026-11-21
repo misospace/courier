@@ -589,6 +589,7 @@ func main() {
 		os.Exit(1)
 	}
 	var appClient *couriergithub.Client
+	var installationTokenMinter controller.InstallationTokenMinter
 	if appAuth != nil {
 		if err := validateGitHubAppSecretIsolation(*appAuth, observerCredentialSecret, githubCredentialSecret, gitCredentialSecret, executorEnvironmentSecret, modelGatewayKeySecret, workItemCommentCredentialSecret, evidenceIntakeKeySecret, contributeAdmissionKeySecret, contributeReadKeySecret, forgeRegistry, os.Getenv("POD_NAMESPACE")); err != nil {
 			setupLog.Error(err, "unable to configure GitHub App authentication")
@@ -599,6 +600,12 @@ func main() {
 			setupLog.Error(err, "unable to configure GitHub App authentication")
 			os.Exit(1)
 		}
+		installationTokenMinter, err = couriergithub.NewInstallationTokenMinter(*appAuth)
+		if err != nil {
+			setupLog.Error(err, "unable to configure GitHub App broker credentials")
+			os.Exit(1)
+		}
+		setupLog.Info("GitHub App broker credentials enabled", "owner", appAuth.Owner, "installationID", appAuth.InstallationID)
 	}
 	// The work-item close announcement posts through the operator's own
 	// forge WRITE identity (#727): it is a separately configured credential,
@@ -947,29 +954,30 @@ func main() {
 	}
 	if secureMode {
 		secure, err := buildSecureControl(secureConfig{
-			providersFile:     forgeProvidersFile,
-			registry:          forgeRegistry,
-			runNamespace:      runNamespace,
-			harnessImage:      harnessImage,
-			laneRuntimeImage:  laneRuntimeImage,
-			probeImage:        probeImage,
-			cacheService:      dependencyCacheService,
-			cachePort:         dependencyCachePort,
-			gatewayURL:        modelGatewayURL,
-			gatewayKeySecret:  modelGatewayKeySecret,
-			gatewayKeyName:    modelGatewayKeyName,
-			gatewayCIDR:       modelGatewayCIDR,
-			gatewayPort:       modelGatewayPort,
-			observer:          worldObserver,
-			observerSecret:    observerCredentialSecret,
-			reviewerIdentity:  prReviewerIdentity,
-			legacyGitSecret:   gitCredentialSecret,
-			legacyAPISecret:   githubCredentialSecret,
-			executorEnvSecret: executorEnvironmentSecret,
-			operatorNS:        os.Getenv("POD_NAMESPACE"),
-			restConfig:        mgr.GetConfig(),
-			tokenReviewRole:   brokerTokenReviewClusterRole,
-			skillRegistry:     skillRegistry,
+			providersFile:           forgeProvidersFile,
+			registry:                forgeRegistry,
+			runNamespace:            runNamespace,
+			harnessImage:            harnessImage,
+			laneRuntimeImage:        laneRuntimeImage,
+			probeImage:              probeImage,
+			cacheService:            dependencyCacheService,
+			cachePort:               dependencyCachePort,
+			gatewayURL:              modelGatewayURL,
+			gatewayKeySecret:        modelGatewayKeySecret,
+			gatewayKeyName:          modelGatewayKeyName,
+			gatewayCIDR:             modelGatewayCIDR,
+			gatewayPort:             modelGatewayPort,
+			observer:                worldObserver,
+			installationTokenMinter: installationTokenMinter,
+			observerSecret:          observerCredentialSecret,
+			reviewerIdentity:        prReviewerIdentity,
+			legacyGitSecret:         gitCredentialSecret,
+			legacyAPISecret:         githubCredentialSecret,
+			executorEnvSecret:       executorEnvironmentSecret,
+			operatorNS:              os.Getenv("POD_NAMESPACE"),
+			restConfig:              mgr.GetConfig(),
+			tokenReviewRole:         brokerTokenReviewClusterRole,
+			skillRegistry:           skillRegistry,
 		})
 		if err != nil {
 			setupLog.Error(err, "unable to configure secure mode")
@@ -1787,21 +1795,22 @@ func loadAdmissionToken(ctx context.Context, reader client.Reader, namespace, la
 
 // secureConfig carries the parsed secure-mode flags into buildSecureControl.
 type secureConfig struct {
-	providersFile    string
-	registry         *forge.Registry
-	runNamespace     string
-	harnessImage     string
-	laneRuntimeImage string
-	probeImage       string
-	cacheService     string
-	cachePort        int
-	gatewayURL       string
-	gatewayKeySecret string
-	gatewayKeyName   string
-	gatewayCIDR      string
-	gatewayPort      int
-	observer         controller.WorldObserver
-	observerSecret   string
+	providersFile           string
+	registry                *forge.Registry
+	runNamespace            string
+	harnessImage            string
+	laneRuntimeImage        string
+	probeImage              string
+	cacheService            string
+	cachePort               int
+	gatewayURL              string
+	gatewayKeySecret        string
+	gatewayKeyName          string
+	gatewayCIDR             string
+	gatewayPort             int
+	observer                controller.WorldObserver
+	installationTokenMinter controller.InstallationTokenMinter
+	observerSecret          string
 	// reviewerIdentity is the forge login the pull-request reviewer posts
 	// under; see --pr-reviewer-identity and SecureConfig.ReviewerIdentity
 	// (#755).
@@ -1940,24 +1949,25 @@ func buildSecureControl(config secureConfig) (*controller.SecureControl, error) 
 	}
 	return &controller.SecureControl{
 		Config: controller.SecureConfig{
-			RunNamespace:           strings.TrimSpace(config.runNamespace),
-			Registry:               registry,
-			HarnessImage:           harnessImage,
-			LaneRuntimeImage:       laneRuntimeImage,
-			ProbeImage:             probeImage,
-			CacheService:           strings.TrimSpace(config.cacheService),
-			CachePort:              int32(config.cachePort),
-			GatewayCIDR:            strings.TrimSpace(config.gatewayCIDR),
-			GatewayPort:            int32(config.gatewayPort),
-			GatewayURL:             strings.TrimSpace(config.gatewayURL),
-			GatewayKeySecret:       strings.TrimSpace(config.gatewayKeySecret),
-			GatewayKeyName:         strings.TrimSpace(config.gatewayKeyName),
-			TokenReviewClusterRole: strings.TrimSpace(config.tokenReviewRole),
-			Skills:                 config.skillRegistry,
-			ReviewerIdentity:       strings.TrimSpace(config.reviewerIdentity),
-			LiveProbes:             true,
-			Kubernetes:             clientset,
-			OperatorNamespace:      strings.TrimSpace(config.operatorNS),
+			RunNamespace:            strings.TrimSpace(config.runNamespace),
+			Registry:                registry,
+			HarnessImage:            harnessImage,
+			LaneRuntimeImage:        laneRuntimeImage,
+			ProbeImage:              probeImage,
+			CacheService:            strings.TrimSpace(config.cacheService),
+			CachePort:               int32(config.cachePort),
+			GatewayCIDR:             strings.TrimSpace(config.gatewayCIDR),
+			GatewayPort:             int32(config.gatewayPort),
+			GatewayURL:              strings.TrimSpace(config.gatewayURL),
+			GatewayKeySecret:        strings.TrimSpace(config.gatewayKeySecret),
+			GatewayKeyName:          strings.TrimSpace(config.gatewayKeyName),
+			TokenReviewClusterRole:  strings.TrimSpace(config.tokenReviewRole),
+			Skills:                  config.skillRegistry,
+			ReviewerIdentity:        strings.TrimSpace(config.reviewerIdentity),
+			InstallationTokenMinter: config.installationTokenMinter,
+			LiveProbes:              true,
+			Kubernetes:              clientset,
+			OperatorNamespace:       strings.TrimSpace(config.operatorNS),
 			Providers: func(ctx context.Context, registration *forge.Registration) (controller.AdmissionProvider, error) {
 				// Admission reads use the operator's own read identity. The
 				// registration's credential reference is never resolved here.

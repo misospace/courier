@@ -87,6 +87,7 @@ func TestCheckOperatorAccessReviewScoping(t *testing.T) {
 			want := map[key]int{
 				{"", "secrets", "create", "", runNamespace}:                               1,
 				{"", "secrets", "delete", "", runNamespace}:                               1,
+				{"", "secrets", "update", "", runNamespace}:                               1,
 				{"", "serviceaccounts", "create", "", runNamespace}:                       1,
 				{"", "serviceaccounts", "delete", "", runNamespace}:                       1,
 				{"", "pods", "create", "", runNamespace}:                                  1,

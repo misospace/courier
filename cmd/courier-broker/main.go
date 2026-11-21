@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -86,6 +87,10 @@ func run(ctx context.Context, config runConfig) error {
 	if err != nil {
 		return err
 	}
+	appMode, err := resolveCredentialMode(document, env)
+	if err != nil {
+		return err
+	}
 	if err := verifyProjection(env, document); err != nil {
 		return err
 	}
@@ -118,7 +123,21 @@ func run(ctx context.Context, config runConfig) error {
 		return err
 	}
 
-	provider, err := newProvider(env, document)
+	var tokenSource couriergithub.InstallationTokenSource
+	if appMode {
+		owner := repositoryOwner(policy.BaseRepo)
+		tokenSource, err = broker.NewSecretInstallationTokenSource(liveClient, env.namespace,
+			topology.CredentialsSecretName(run.Name), document.InstallationToken.SecretKey,
+			owner, env.providerEndpt, time.Now)
+		if err != nil {
+			return fmt.Errorf("courier-broker: configure installation token source: %w", err)
+		}
+	}
+	pinnedRepositories := []string{policy.BaseRepo}
+	if policy.WorkRepo != policy.BaseRepo {
+		pinnedRepositories = append(pinnedRepositories, policy.WorkRepo)
+	}
+	provider, err := newProvider(env, document, appMode, tokenSource, pinnedRepositories)
 	if err != nil {
 		return err
 	}
@@ -143,7 +162,7 @@ func run(ctx context.Context, config runConfig) error {
 		Policy:      policy,
 		Git:         gitBroker,
 		Resolver:    newPinnedResolver(policy, document.Provider),
-		Credentials: staticCredentials{username: env.gitUsername, token: env.gitToken},
+		Credentials: gitCredentialsForMode(appMode, tokenSource, env),
 	})
 	if err != nil {
 		return fmt.Errorf("courier-broker: git transport rejected the pinned policy: %w", err)
@@ -272,6 +291,9 @@ func loadEnv() (*brokerEnv, error) {
 		gitToken:       os.Getenv(topology.EnvGitToken),
 		apiTokenFile:   os.Getenv(topology.EnvAPITokenFile),
 	}
+	// The forge API and git token environment requirements are enforced in
+	// resolveCredentialMode, not here: in installation-token mode those
+	// variables must be absent, and the policy document decides the mode.
 	missing := map[string]string{
 		topology.EnvPodNamespace:     out.namespace,
 		topology.EnvBrokerPodName:    out.podName,
@@ -281,8 +303,6 @@ func loadEnv() (*brokerEnv, error) {
 		topology.EnvProviderType:     out.providerType,
 		topology.EnvProviderEndpoint: out.providerEndpt,
 		topology.EnvProviderGitEndp:  out.providerGitTpl,
-		topology.EnvForgeAPIToken:    out.forgeAPIToken,
-		topology.EnvGitToken:         out.gitToken,
 		topology.EnvAPITokenFile:     out.apiTokenFile,
 	}
 	for name, value := range missing {
@@ -403,7 +423,7 @@ func policyMatches(resolved broker.Policy, persisted *courier.PublicationPolicy)
 	return nil
 }
 
-func newProvider(env *brokerEnv, document *topology.BrokerPolicyDocument) (interface {
+func newProvider(env *brokerEnv, document *topology.BrokerPolicyDocument, appMode bool, source couriergithub.InstallationTokenSource, pinnedRepositories []string) (interface {
 	forge.Provider
 	forge.RepositoryPolicyProvider
 	forge.PullRequestHeadLister
@@ -411,6 +431,16 @@ func newProvider(env *brokerEnv, document *topology.BrokerPolicyDocument) (inter
 	cfg := forge.ProviderConfig{Name: document.Provider.Name, Endpoint: env.providerEndpt}
 	switch env.providerType {
 	case "github":
+		if appMode {
+			owner := repositoryOwner(document.PublicationPolicy.BaseRepo)
+			client, err := couriergithub.NewBrokerInstallationClient(couriergithub.BrokerInstallationAuth{
+				Owner: owner, Repositories: pinnedRepositories, Endpoint: env.providerEndpt,
+			}, source)
+			if err != nil {
+				return nil, fmt.Errorf("courier-broker: forge client rejected its configuration: %w", err)
+			}
+			return couriergithub.NewProvider(cfg, client), nil
+		}
 		// The verified projection's endpoint is the only forge destination:
 		// build the credential-bearing client against it so a GitHub
 		// Enterprise registration's traffic — and its resolved credential —
@@ -425,6 +455,50 @@ func newProvider(env *brokerEnv, document *topology.BrokerPolicyDocument) (inter
 		// check.
 		return nil, fmt.Errorf("courier-broker: provider type %q has no registered implementation", env.providerType)
 	}
+}
+
+func resolveCredentialMode(document *topology.BrokerPolicyDocument, env *brokerEnv) (bool, error) {
+	appMode := document != nil && document.InstallationToken != nil
+	staticPresent := env.forgeAPIToken != "" || env.gitToken != ""
+	if appMode && staticPresent {
+		return false, errors.New("courier-broker: static credential environment present in installation-token mode")
+	}
+	if !appMode {
+		if env.forgeAPIToken == "" {
+			return false, fmt.Errorf("courier-broker: environment %s is required", topology.EnvForgeAPIToken)
+		}
+		if env.gitToken == "" {
+			return false, fmt.Errorf("courier-broker: environment %s is required", topology.EnvGitToken)
+		}
+		return false, nil
+	}
+	policy := document.PublicationPolicy
+	if policy == nil {
+		return false, errors.New("courier-broker: policy file is incomplete")
+	}
+	baseOwner := repositoryOwner(policy.BaseRepo)
+	if baseOwner == "" || !strings.Contains(policy.WorkRepo, "/") || !strings.EqualFold(repositoryOwner(policy.WorkRepo), baseOwner) {
+		return false, errors.New("courier-broker: installation token serves a single repository owner")
+	}
+	if document.InstallationToken.SecretKey == "" {
+		return false, errors.New("courier-broker: installation token secret key is required")
+	}
+	return true, nil
+}
+
+func repositoryOwner(repository string) string {
+	owner, _, ok := strings.Cut(repository, "/")
+	if !ok || owner == "" {
+		return ""
+	}
+	return owner
+}
+
+func gitCredentialsForMode(appMode bool, source couriergithub.InstallationTokenSource, env *brokerEnv) broker.GitCredentialProvider {
+	if appMode {
+		return broker.NewInstallationGitCredentials(source)
+	}
+	return staticCredentials{username: env.gitUsername, token: env.gitToken}
 }
 
 // pinnedResolver derives every git endpoint from the projected registration

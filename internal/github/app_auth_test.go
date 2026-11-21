@@ -337,3 +337,135 @@ func TestInstallationClientToleratesUnrequestedReadOnlyPermission(t *testing.T) 
 		t.Fatalf("missing unrequested-permission warning: %q", warning)
 	}
 }
+
+func TestNewInstallationTokenMinterValidation(t *testing.T) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := InstallationAuth{AppID: 1, InstallationID: 2, Owner: "acme", PrivateKey: privateKey, Endpoint: "https://api.github.com"}
+	cases := []InstallationAuth{
+		{InstallationID: 2, Owner: "acme", PrivateKey: privateKey, Endpoint: valid.Endpoint},
+		{AppID: 1, Owner: "acme", PrivateKey: privateKey, Endpoint: valid.Endpoint},
+		{AppID: 1, InstallationID: 2, Owner: "acme", Endpoint: valid.Endpoint},
+		{AppID: 1, InstallationID: 2, PrivateKey: privateKey, Endpoint: valid.Endpoint},
+		{AppID: 1, InstallationID: 2, Owner: "acme", PrivateKey: privateKey, Endpoint: "http://api.github.com"},
+		{AppID: 1, InstallationID: 2, Owner: "acme", PrivateKey: privateKey, Endpoint: "https://user:pass@api.github.com"},
+		{AppID: 1, InstallationID: 2, Owner: "acme", PrivateKey: privateKey, Endpoint: "https://api.github.com?query=1"},
+		{AppID: 1, InstallationID: 2, Owner: "acme", PrivateKey: privateKey, Endpoint: "https://api.github.com#fragment"},
+	}
+	for i, auth := range cases {
+		if _, err := NewInstallationTokenMinter(auth); err == nil {
+			t.Errorf("invalid auth case %d accepted", i)
+		}
+	}
+	if _, err := NewInstallationTokenMinter(valid); err != nil {
+		t.Fatalf("valid auth rejected: %v", err)
+	}
+}
+
+func TestInstallationTokenMinterMint(t *testing.T) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	var verified, minted bool
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v3/app/installations/42":
+			verified = true
+			if r.Method != http.MethodGet || !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+				t.Errorf("installation verification request: %s %q", r.Method, r.Header.Get("Authorization"))
+			}
+			_, _ = io.WriteString(w, `{"account":{"login":"acme"}}`)
+		case "/api/v3/app/installations/42/access_tokens":
+			minted = true
+			if r.Method != http.MethodPost || !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") || r.Header.Get("Accept") != "application/vnd.github+json" {
+				t.Errorf("mint request: %s headers=%v", r.Method, r.Header)
+			}
+			var body struct {
+				Repositories []string          `json:"repositories"`
+				Permissions  map[string]string `json:"permissions"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode request: %v", err)
+			}
+			if len(body.Repositories) != 1 || body.Repositories[0] != "acme/demo" || body.Permissions["contents"] != "write" || body.Permissions["issues"] != "read" {
+				t.Errorf("mint request body = %#v", body)
+			}
+			_, _ = io.WriteString(w, `{"token":"minted-token","expires_at":"2026-11-20T13:00:00Z","permissions":{"contents":"write","issues":"read"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	minter, err := NewInstallationTokenMinter(InstallationAuth{AppID: 7, InstallationID: 42, Owner: "acme", PrivateKey: privateKey, Endpoint: server.URL + "/api/v3", HTTPClient: server.Client(), Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, expiry, err := minter.Mint(context.Background(), []string{"acme/demo"}, map[string]string{"contents": "write", "issues": "read"})
+	if err != nil || token != "minted-token" || !expiry.Equal(now.Add(time.Hour)) || !verified || !minted {
+		t.Fatalf("Mint = %q, %v, %v; verified=%v minted=%v", token, expiry, err, verified, minted)
+	}
+}
+
+func TestInstallationTokenMinterRefusals(t *testing.T) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	requested := map[string]string{"contents": "write"}
+	for _, tc := range []struct {
+		name, repositories string
+		permissions        map[string]string
+		response           string
+		wantError          bool
+	}{
+		{"empty repositories", "", requested, "", true},
+		{"wrong owner", "other/demo", requested, "", true},
+		{"empty name", "acme/", requested, "", true},
+		{"empty permissions", "acme/demo", map[string]string{}, "", true},
+		{"invalid permission", "acme/demo", map[string]string{"contents": "admin"}, "", true},
+		{"missing token", "acme/demo", requested, `{"expires_at":"2026-11-20T13:00:00Z","permissions":{"contents":"write"}}`, true},
+		{"expired", "acme/demo", requested, `{"token":"token","expires_at":"2026-11-20T11:00:00Z","permissions":{"contents":"write"}}`, true},
+		{"write granted read", "acme/demo", requested, `{"token":"token","expires_at":"2026-11-20T13:00:00Z","permissions":{"contents":"read"}}`, true},
+		{"read granted write", "acme/demo", map[string]string{"contents": "read"}, `{"token":"token","expires_at":"2026-11-20T13:00:00Z","permissions":{"contents":"write"}}`, true},
+		{"missing requested permission", "acme/demo", requested, `{"token":"token","expires_at":"2026-11-20T13:00:00Z","permissions":{}}`, true},
+		{"extra write", "acme/demo", requested, `{"token":"token","expires_at":"2026-11-20T13:00:00Z","permissions":{"contents":"write","deployments":"write"}}`, true},
+		{"extra read", "acme/demo", requested, `{"token":"token","expires_at":"2026-11-20T13:00:00Z","permissions":{"contents":"write","deployments":"read"}}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mintCalls int
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/app/installations/42" {
+					_, _ = io.WriteString(w, `{"account":{"login":"acme"}}`)
+					return
+				}
+				if r.URL.Path == "/app/installations/42/access_tokens" {
+					mintCalls++
+					_, _ = io.WriteString(w, tc.response)
+					return
+				}
+				http.NotFound(w, r)
+			}))
+			defer server.Close()
+			minter, err := NewInstallationTokenMinter(InstallationAuth{AppID: 1, InstallationID: 42, Owner: "acme", PrivateKey: privateKey, Endpoint: server.URL, HTTPClient: server.Client(), Now: func() time.Time { return now }})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var repositories []string
+			if tc.repositories != "" {
+				repositories = []string{tc.repositories}
+			}
+			_, _, err = minter.Mint(context.Background(), repositories, tc.permissions)
+			if (err != nil) != tc.wantError {
+				t.Fatalf("Mint error = %v, wantError=%v", err, tc.wantError)
+			}
+			if (tc.repositories == "" || tc.repositories == "other/demo" || tc.repositories == "acme/" || len(tc.permissions) == 0 || tc.permissions["contents"] == "admin") && mintCalls != 0 {
+				t.Fatalf("invalid request reached exchange %d times", mintCalls)
+			}
+		})
+	}
+}
