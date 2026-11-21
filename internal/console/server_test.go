@@ -251,9 +251,10 @@ func TestHeaderModeIdentity(t *testing.T) {
 }
 
 // TestBackendUnavailableRendersEmptyState covers (e): with no backend the
-// overview still renders its scaffold note and the run explorer states that
-// it is not configured; with a failing backend the overview surfaces the probe
-// error and the explorer surfaces an outage (never an empty namespace).
+// overview and the run explorer both state that the read API is not
+// configured, and the overview stops polling (no meta refresh); with a
+// failing backend the overview and the explorer surface an outage (never an
+// empty namespace) and back off to a slow refresh.
 func TestBackendUnavailableRendersEmptyState(t *testing.T) {
 	secrets := newTestSecrets(t)
 	// No backend URL at all.
@@ -264,8 +265,11 @@ func TestBackendUnavailableRendersEmptyState(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET / status = %d, want 200", resp.StatusCode)
 	}
-	if !strings.Contains(body, "run explorer is live") {
-		t.Fatalf("GET / body is missing the overview scaffold note:\n%s", body)
+	if !strings.Contains(body, "overview reads the operator read API, which is not configured") {
+		t.Fatalf("GET / body is missing the overview not-configured state:\n%s", body)
+	}
+	if strings.Contains(body, `http-equiv="refresh"`) {
+		t.Fatalf("GET / with no backend must not poll:\n%s", body)
 	}
 
 	resp, body = get(t, client, base+"/runs")
@@ -286,8 +290,14 @@ func TestBackendUnavailableRendersEmptyState(t *testing.T) {
 	failingClient := login(t, failingBase, secretsFailing.token)
 
 	_, body = get(t, failingClient, failingBase+"/")
-	if !strings.Contains(body, "backend health check returned status 500") {
-		t.Fatalf("GET / with a failing backend is missing the probe error text:\n%s", body)
+	if !strings.Contains(body, "unexpected status (500)") {
+		t.Fatalf("GET / with a failing backend is missing the outage text:\n%s", body)
+	}
+	if strings.Contains(body, "No runs in this namespace") {
+		t.Fatalf("GET / with a failing backend must not render an empty namespace:\n%s", body)
+	}
+	if !strings.Contains(body, `http-equiv="refresh" content="300"`) {
+		t.Fatalf("GET / with a failing backend must back off to the slow refresh:\n%s", body)
 	}
 
 	resp, body = get(t, failingClient, failingBase+"/runs")

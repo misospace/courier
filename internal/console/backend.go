@@ -27,11 +27,12 @@ var ErrBackendUnavailable = errors.New("operator read API is not configured")
 var ErrBackendTokenMissing = errors.New("operator read API bearer token is not configured")
 
 // ErrBackendUnexpectedResponse reports that the backend answered a projection
-// request with a 200 the console could not read as a run list: an unparseable
-// body, or a body whose kind is not the run-list kind. It exists so that a
-// mis-routed or mis-proxied 200 never renders as an empty namespace, which is
-// the same outage-masquerading-as-empty failure a 5xx would otherwise cause.
-var ErrBackendUnexpectedResponse = errors.New("operator read API did not return a run list")
+// request with a 200 the console could not read as the expected projection:
+// an unparseable body, or a body whose kind is not the kind the route must
+// carry. It exists so that a mis-routed or mis-proxied 200 never renders as
+// an empty namespace, which is the same outage-masquerading-as-empty failure
+// a 5xx would otherwise cause.
+var ErrBackendUnexpectedResponse = errors.New("operator read API returned an unexpected projection")
 
 // BackendError reports a projection reply that carried a non-200 status. It
 // carries only the status code, never the response body, so an operator-
@@ -52,8 +53,11 @@ func (e *BackendError) Error() string {
 // query string varies, so a filter value can never redirect the request to a
 // different path or host.
 var backendAllowlist = map[string]bool{
-	backendHealthPath: true,
-	backendRunsPath:   true,
+	backendHealthPath:   true,
+	backendRunsPath:     true,
+	backendOverviewPath: true,
+	backendLanesPath:    true,
+	backendSourcesPath:  true,
 }
 
 const (
@@ -63,18 +67,33 @@ const (
 	// reads. It mirrors readapi.PathRuns; the console never imports that
 	// package, so this constant is the wire contract the two agree on.
 	backendRunsPath = "/v1/runs"
+	// backendOverviewPath is the single-namespace summary the overview page
+	// reads. It mirrors readapi.PathOverview.
+	backendOverviewPath = "/v1/overview"
+	// backendLanesPath is the per-lane health list the overview page reads.
+	// It mirrors readapi.PathLanes.
+	backendLanesPath = "/v1/lanes"
+	// backendSourcesPath is the per-source health list the overview page
+	// reads. It mirrors readapi.PathSources.
+	backendSourcesPath = "/v1/sources"
 
-	// maxRunListBody bounds how much of a projection response the console
+	// maxProjectionBody bounds how much of a projection response the console
 	// will decode. The read API caps its own pages well below this; the
 	// bound is a defensive ceiling so a hostile or confused upstream cannot
 	// make the console buffer an unbounded body.
-	maxRunListBody = 4 << 20
+	maxProjectionBody = 4 << 20
 
 	// kindRunList is the envelope kind the run-list projection must carry.
 	// It mirrors readapi.KindRunList; a 200 carrying any other kind is an
 	// unexpected response, not an empty list. A test pins it against the
 	// read API's constant so the two cannot drift.
 	kindRunList = "RunSummaryList"
+	// kindOverview mirrors readapi.KindOverview.
+	kindOverview = "Overview"
+	// kindLaneList mirrors readapi.KindLaneList.
+	kindLaneList = "LaneHealthList"
+	// kindSourceList mirrors readapi.KindSourceList.
+	kindSourceList = "SourceHealthList"
 )
 
 // Backend is the allowlisted read client toward the operator read API. It
@@ -91,6 +110,15 @@ type Backend interface {
 	// is a transport or decode failure. The returned result never carries
 	// the bearer token or the raw response body.
 	Runs(ctx context.Context, filter RunsFilter) (*RunListResult, error)
+	// Overview fetches the single-namespace summary. The same error contract
+	// as Runs applies.
+	Overview(ctx context.Context) (*OverviewResult, error)
+	// Lanes fetches the per-lane health list. The same error contract as
+	// Runs applies.
+	Lanes(ctx context.Context) ([]LaneRow, error)
+	// Sources fetches the per-source health list. The same error contract as
+	// Runs applies.
+	Sources(ctx context.Context) ([]SourceRow, error)
 }
 
 // RunsFilter is one validated run-list request. The console bounds and
@@ -135,14 +163,87 @@ type RunListResult struct {
 	Truncated bool
 }
 
+// OverviewResult is the decoded GET /v1/overview payload. Freshness,
+// Truncated, and the per-state source counts keep the read API's explicit
+// state vocabulary: the page renders each state by name, so a zero count is
+// never read as "no problem" for a state the projection did not classify.
+// Timestamps stay raw strings; the page shows the state words, not derived
+// clock arithmetic.
+type OverviewResult struct {
+	Namespace      string
+	Freshness      string
+	Truncated      bool
+	RunsTotal      int
+	RunsByPhase    map[string]int
+	LaneCount      int
+	LanesSaturated bool
+	LanesSuspended bool
+	LanesCooldown  bool
+	LanesUnhealthy int
+	SourceCount    int
+	SourcesHealthy int
+	SourcesEmpty   int
+	SourcesStale   int
+	SourcesUnavail int
+	SourcesBlocked int
+	ConditionRuns  map[string]int
+}
+
+// LaneRow is one lane's decoded health from GET /v1/lanes. Admitted counts
+// runs holding an execution-capacity slot; Reserved counts runs holding a
+// discovery reservation and is a superset of Admitted, so the page renders
+// them as two labeled counts and never sums them. PendingOldestSeconds is nil
+// when no Pending run exists: absence renders as an em dash, never a zero.
+type LaneRow struct {
+	Name                  string       `json:"name"`
+	Availability          string       `json:"availability"`
+	Freshness             string       `json:"freshness"`
+	Notes                 []string     `json:"notes,omitempty"`
+	ConfiguredConcurrency int          `json:"configuredConcurrency"`
+	Admitted              int          `json:"admitted"`
+	Reserved              int          `json:"reserved"`
+	Saturated             bool         `json:"saturated"`
+	Suspended             bool         `json:"suspended"`
+	Cooldown              *CooldownRow `json:"cooldown,omitempty"`
+	PendingOldestSeconds  *int64       `json:"pendingOldestSeconds,omitempty"`
+}
+
+// CooldownRow is a lane's active capacity cooldown. NextEligibleAt is the
+// raw projected timestamp string; the page shows it verbatim rather than
+// deriving a countdown the console's clock could be wrong about.
+type CooldownRow struct {
+	CapacityID      string `json:"capacityID"`
+	Reason          string `json:"reason"`
+	ExhaustionCount int    `json:"exhaustionCount"`
+	NextEligibleAt  string `json:"nextEligibleAt,omitempty"`
+}
+
+// SourceRow is one source's decoded health from GET /v1/sources. ObservedAt
+// is the raw projected timestamp string, empty when the source carries no
+// run activity; the page pairs it with the freshness word so a missing
+// observation is never read as "now".
+type SourceRow struct {
+	Name                 string   `json:"name"`
+	Availability         string   `json:"availability"`
+	Freshness            string   `json:"freshness"`
+	Notes                []string `json:"notes,omitempty"`
+	ObservedAt           string   `json:"observedAt,omitempty"`
+	TotalRuns            int      `json:"totalRuns"`
+	OldestPendingSeconds *int64   `json:"oldestPendingSeconds,omitempty"`
+}
+
 // decode types mirroring the read API envelope. Unknown fields are ignored,
 // so a projection that grows a field never breaks the console; a field the
 // console decodes must match the wire name exactly.
 type (
-	runListEnvelope struct {
-		APIVersion string      `json:"apiVersion"`
-		Kind       string      `json:"kind"`
-		Payload    runListPage `json:"payload"`
+	// projectionEnvelope is the shared envelope every projection route
+	// carries. Payload is kept raw so the kind can be checked before any of
+	// the payload is interpreted: a 200 of the wrong kind is an unexpected
+	// response, never a partially decoded surprise.
+	projectionEnvelope struct {
+		APIVersion string          `json:"apiVersion"`
+		Kind       string          `json:"kind"`
+		Payload    json.RawMessage `json:"payload"`
 	}
 	runListPage struct {
 		Items      []RunRow      `json:"items"`
@@ -154,6 +255,37 @@ type (
 		Total     int  `json:"total"`
 		More      bool `json:"more"`
 		Truncated bool `json:"truncated"`
+	}
+	overviewPage struct {
+		Namespace string `json:"namespace"`
+		Freshness string `json:"freshness"`
+		Truncated bool   `json:"truncated"`
+		Runs      struct {
+			Total   int            `json:"total"`
+			ByPhase map[string]int `json:"byPhase"`
+		} `json:"runs"`
+		Lanes struct {
+			Count     int  `json:"count"`
+			Saturated bool `json:"saturated"`
+			Suspended bool `json:"suspended"`
+			Cooldown  bool `json:"cooldown"`
+			Unhealthy int  `json:"unhealthy"`
+		} `json:"lanes"`
+		Sources struct {
+			Count       int `json:"count"`
+			Healthy     int `json:"healthy"`
+			Empty       int `json:"empty"`
+			Stale       int `json:"stale"`
+			Unavailable int `json:"unavailable"`
+			Blocked     int `json:"blocked"`
+		} `json:"sources"`
+		ConditionRuns map[string]int `json:"conditionRuns"`
+	}
+	laneListPage struct {
+		Items []LaneRow `json:"items"`
+	}
+	sourceListPage struct {
+		Items []SourceRow `json:"items"`
 	}
 )
 
@@ -209,27 +341,76 @@ func (b *HTTPBackend) Health(ctx context.Context) error {
 	return nil
 }
 
-// Runs GETs the allowlisted run-list projection with the bearer token and the
-// validated filter's query parameters. Only the query string varies; the path
-// is the constant allowlist entry, so a filter value never steers the request
-// to another path or host. A non-200 reply becomes a *BackendError carrying
-// only the status; the body is discarded up to a small bound and never
-// reaches the browser.
-func (b *HTTPBackend) Runs(ctx context.Context, filter RunsFilter) (*RunListResult, error) {
+// projection GETs an allowlisted projection path with the bearer token,
+// checks the envelope kind, and decodes the payload into out. Only rawQuery
+// varies per call; the path is a constant the caller passes and is re-checked
+// against the allowlist before the request leaves, so no call site can steer
+// the console to another path or host. A non-200 reply becomes a
+// *BackendError carrying only the status; the body is discarded up to a small
+// bound and never reaches the browser. A 200 whose body is not valid JSON, or
+// whose kind is not wantKind, is ErrBackendUnexpectedResponse: an outage
+// signature, never an empty result.
+func (b *HTTPBackend) projection(ctx context.Context, path, rawQuery, wantKind string, out any) error {
 	if b.baseURL == "" {
-		return nil, ErrBackendUnavailable
+		return ErrBackendUnavailable
 	}
 	if len(b.token) == 0 {
-		return nil, ErrBackendTokenMissing
+		return ErrBackendTokenMissing
 	}
-	if !backendAllowlist[backendRunsPath] {
-		return nil, fmt.Errorf("backend path %q is not allowlisted", backendRunsPath)
+	if !backendAllowlist[path] {
+		return fmt.Errorf("backend path %q is not allowlisted", path)
 	}
-	target, err := url.Parse(b.baseURL + backendRunsPath)
+	target, err := url.Parse(b.baseURL + path)
 	if err != nil {
-		return nil, fmt.Errorf("backend runs url: %w", err)
+		return fmt.Errorf("backend %s url: %w", wantKind, err)
 	}
-	query := target.Query()
+	target.RawQuery = rawQuery
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+	if err != nil {
+		return fmt.Errorf("backend %s request: %w", wantKind, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+string(b.token))
+
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("backend %s request: %w", wantKind, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		// Drain a bounded amount so the connection can be reused; the body
+		// never crosses into a response or a log.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return &BackendError{Status: resp.StatusCode}
+	}
+
+	var env projectionEnvelope
+	dec := json.NewDecoder(io.LimitReader(resp.Body, maxProjectionBody))
+	if err := dec.Decode(&env); err != nil {
+		// A 200 whose body is not valid projection JSON is an unexpected
+		// response, never an empty list; the body itself is never surfaced.
+		return fmt.Errorf("%w: %v", ErrBackendUnexpectedResponse, err)
+	}
+	if env.Kind != wantKind {
+		// The read API always stamps the envelope kind, even on an empty
+		// page. Any other kind, including empty (a bare JSON error body or
+		// null), is an unexpected response, never an empty list.
+		return fmt.Errorf("%w: got kind %q", ErrBackendUnexpectedResponse, env.Kind)
+	}
+	if len(env.Payload) > 0 {
+		if err := json.Unmarshal(env.Payload, out); err != nil {
+			return fmt.Errorf("%w: %v", ErrBackendUnexpectedResponse, err)
+		}
+	}
+	return nil
+}
+
+// Runs GETs the allowlisted run-list projection with the validated filter's
+// query parameters. Only the query string varies; the path is the constant
+// allowlist entry, so a filter value never steers the request to another path
+// or host.
+func (b *HTTPBackend) Runs(ctx context.Context, filter RunsFilter) (*RunListResult, error) {
+	query := url.Values{}
 	if filter.Lane != "" {
 		query.Set("lane", filter.Lane)
 	}
@@ -245,45 +426,63 @@ func (b *HTTPBackend) Runs(ctx context.Context, filter RunsFilter) (*RunListResu
 	if filter.PageSize > 0 {
 		query.Set("pageSize", strconv.Itoa(filter.PageSize))
 	}
-	target.RawQuery = query.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("backend runs request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+string(b.token))
-
-	resp, err := b.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("backend runs request: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		// Drain a bounded amount so the connection can be reused; the body
-		// never crosses into a response or a log.
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		return nil, &BackendError{Status: resp.StatusCode}
-	}
-
-	var env runListEnvelope
-	dec := json.NewDecoder(io.LimitReader(resp.Body, maxRunListBody))
-	if err := dec.Decode(&env); err != nil {
-		// A 200 whose body is not valid projection JSON is an unexpected
-		// response, never an empty list; the body itself is never surfaced.
-		return nil, fmt.Errorf("%w: %v", ErrBackendUnexpectedResponse, err)
-	}
-	if env.Kind != kindRunList {
-		// The read API always stamps the run-list kind, even on an empty
-		// page. Any other kind, including empty (a bare JSON error body or
-		// null), is an unexpected response, never an empty list.
-		return nil, fmt.Errorf("%w: got kind %q", ErrBackendUnexpectedResponse, env.Kind)
+	var page runListPage
+	if err := b.projection(ctx, backendRunsPath, query.Encode(), kindRunList, &page); err != nil {
+		return nil, err
 	}
 	return &RunListResult{
-		Items:     env.Payload.Items,
-		Page:      env.Payload.Pagination.Page,
-		PageSize:  env.Payload.Pagination.PageSize,
-		Total:     env.Payload.Pagination.Total,
-		More:      env.Payload.Pagination.More,
-		Truncated: env.Payload.Pagination.Truncated,
+		Items:     page.Items,
+		Page:      page.Pagination.Page,
+		PageSize:  page.Pagination.PageSize,
+		Total:     page.Pagination.Total,
+		More:      page.Pagination.More,
+		Truncated: page.Pagination.Truncated,
 	}, nil
+}
+
+// Overview GETs the allowlisted namespace summary. The projection carries no
+// query state: the read API serves exactly the namespace it is configured
+// for, so nothing from a browser can shape the request.
+func (b *HTTPBackend) Overview(ctx context.Context) (*OverviewResult, error) {
+	var page overviewPage
+	if err := b.projection(ctx, backendOverviewPath, "", kindOverview, &page); err != nil {
+		return nil, err
+	}
+	return &OverviewResult{
+		Namespace:      page.Namespace,
+		Freshness:      page.Freshness,
+		Truncated:      page.Truncated,
+		RunsTotal:      page.Runs.Total,
+		RunsByPhase:    page.Runs.ByPhase,
+		LaneCount:      page.Lanes.Count,
+		LanesSaturated: page.Lanes.Saturated,
+		LanesSuspended: page.Lanes.Suspended,
+		LanesCooldown:  page.Lanes.Cooldown,
+		LanesUnhealthy: page.Lanes.Unhealthy,
+		SourceCount:    page.Sources.Count,
+		SourcesHealthy: page.Sources.Healthy,
+		SourcesEmpty:   page.Sources.Empty,
+		SourcesStale:   page.Sources.Stale,
+		SourcesUnavail: page.Sources.Unavailable,
+		SourcesBlocked: page.Sources.Blocked,
+		ConditionRuns:  page.ConditionRuns,
+	}, nil
+}
+
+// Lanes GETs the allowlisted per-lane health list.
+func (b *HTTPBackend) Lanes(ctx context.Context) ([]LaneRow, error) {
+	var page laneListPage
+	if err := b.projection(ctx, backendLanesPath, "", kindLaneList, &page); err != nil {
+		return nil, err
+	}
+	return page.Items, nil
+}
+
+// Sources GETs the allowlisted per-source health list.
+func (b *HTTPBackend) Sources(ctx context.Context) ([]SourceRow, error) {
+	var page sourceListPage
+	if err := b.projection(ctx, backendSourcesPath, "", kindSourceList, &page); err != nil {
+		return nil, err
+	}
+	return page.Items, nil
 }

@@ -1,12 +1,12 @@
 // Package console implements the Courier operator console: a small,
 // server-rendered UI for authenticated operators. It is deliberately
 // independent of the operator binary and of the Kubernetes API — it imports
-// only the standard library and never talks to a cluster. The run explorer
-// renders the operator read API's allowlisted projections over a fixed
-// allowlist of GET paths; the read API client lives in backend.go and decodes
-// the projection JSON into its own view types rather than importing the read
-// API package, so the standard-library-only invariant holds. Other pages are
-// still scaffold.
+// only the standard library and never talks to a cluster. The overview page
+// and the run explorer render the operator read API's allowlisted
+// projections over a fixed allowlist of GET paths; the read API client lives
+// in backend.go and decodes the projection JSON into its own view types
+// rather than importing the read API package, so the standard-library-only
+// invariant holds. The run-detail page is still a scaffold.
 package console
 
 import (
@@ -159,16 +159,8 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	http.ServeFileFS(w, r, content, "static/"+name)
 }
 
-// handleOverview renders the overview page with its explicit empty state,
-// plus the backend probe error when one failed.
-func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
-	data := s.pageData(r, "Overview", "overview")
-	data.BackendErr = s.backendError(r)
-	s.render(w, http.StatusOK, "overview", data)
-}
-
-// handleRuns renders the searchable, paginated CoderRun explorer. It lives
-// in runs.go.
+// handleOverview renders the namespace overview over the read API's
+// summary, lane, and source projections. It lives in overview.go.
 
 // handleRun renders the run detail placeholder for the requested run name.
 // The run detail page is a separate concern (issue #826); the explorer links
@@ -287,6 +279,30 @@ type pageData struct {
 	BackendErr string
 	// RunName is the requested run name on the detail page.
 	RunName string
+
+	// Overview page view. Only the overview page populates these.
+
+	// Overview is the decoded namespace summary; nil when OverviewErr is set.
+	Overview *OverviewResult
+	// OverviewErr replaces the whole page body with one state message when
+	// the namespace summary could not be read: an outage never renders as
+	// an empty namespace.
+	OverviewErr string
+	// Lanes / Sources are the per-entity health rows; LanesErr / SourcesErr
+	// replace only their own section when that one list could not be read.
+	Lanes      []LaneRow
+	LanesErr   string
+	Sources    []SourceRow
+	SourcesErr string
+	// PhaseRows are the run-phase chips in lifecycle order; ConditionRows
+	// list the allowlisted condition backlog.
+	PhaseRows     []PhaseCount
+	ConditionRows []LabeledCount
+	// RefreshSeconds is the meta-refresh interval for the page. Zero means
+	// no auto-refresh: the overview sets it only when there is a backend
+	// worth polling (slowly when healthy, slower on a backend error, never
+	// when the backend is unconfigured).
+	RefreshSeconds int
 
 	// Run explorer view. Only the runs page populates these; every other
 	// page leaves them at their zero value, which the runs template is the

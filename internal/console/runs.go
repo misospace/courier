@@ -21,7 +21,14 @@ import (
 // already-projected inputs and return plain strings; html/template escapes
 // their results in context.
 var pageFuncs = template.FuncMap{
-	"humanDuration": humanDuration,
+	"humanDuration":     humanDuration,
+	"availabilityClass": availabilityClass,
+	"availabilityLabel": availabilityLabel,
+	"freshnessClass":    freshnessClass,
+	"freshnessLabel":    freshnessLabel,
+	"runsLaneURL":       runsLaneURL,
+	"runsLanePhaseURL":  runsLanePhaseURL,
+	"runsSourceURL":     runsSourceURL,
 }
 
 // The explorer's filter bounds. They mirror the read API's own projection
