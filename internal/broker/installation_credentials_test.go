@@ -103,8 +103,9 @@ func TestSecretInstallationTokenSourceRejectsUnknownShapes(t *testing.T) {
 		t.Fatal(err)
 	}
 	shapes := map[string]string{
-		"unknown field":  strings.TrimSuffix(string(data), "}") + `,"futureField":"x"}`,
-		"trailing bytes": string(data) + `{"version":1}`,
+		"unknown field":    strings.TrimSuffix(string(data), "}") + `,"futureField":"x"}`,
+		"trailing bytes":   string(data) + `{"version":1}`,
+		"trailing bracket": string(data) + "}",
 	}
 	for name, content := range shapes {
 		t.Run(name, func(t *testing.T) {

@@ -20,6 +20,33 @@ import (
 	"github.com/misospace/courier/internal/topology"
 )
 
+type installationSourceFunc func(context.Context) (string, time.Time, error)
+
+func (f installationSourceFunc) InstallationToken(ctx context.Context) (string, time.Time, error) {
+	return f(ctx)
+}
+
+func TestGitCredentialsForModeBindsPinnedRepositories(t *testing.T) {
+	source := installationSourceFunc(func(context.Context) (string, time.Time, error) {
+		return "installation-token", time.Now().Add(time.Hour), nil
+	})
+	credentials := gitCredentialsForMode(true, source, []string{"org/base", "org/work"}, &brokerEnv{})
+	for _, repository := range []string{"org/base", "Org/Work"} {
+		got, err := credentials.Credentials(context.Background(), repository)
+		if err != nil || got.Username != topology.DefaultGitUsername || got.Token != "installation-token" {
+			t.Fatalf("installation Credentials(%q) = %+v, %v", repository, got, err)
+		}
+	}
+	if _, err := credentials.Credentials(context.Background(), "other/project"); err == nil {
+		t.Fatal("installation git credentials served a repository outside the pinned set")
+	}
+	static := gitCredentialsForMode(false, nil, []string{"org/base"}, &brokerEnv{gitUsername: "deployment-user", gitToken: "static-token"})
+	got, err := static.Credentials(context.Background(), "anything/at")
+	if err != nil || got.Username != "deployment-user" || got.Token != "static-token" {
+		t.Fatalf("static Credentials() = %+v, %v", got, err)
+	}
+}
+
 func TestResolveCredentialModeInstallationToken(t *testing.T) {
 	policy := &courierv1alpha1.PublicationPolicy{BaseRepo: "Acme/widgets", WorkRepo: "acme/fork"}
 	document := &topology.BrokerPolicyDocument{

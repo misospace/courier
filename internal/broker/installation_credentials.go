@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/url"
 	"strings"
 	"sync"
@@ -75,7 +76,7 @@ func (s *SecretInstallationTokenSource) InstallationToken(ctx context.Context) (
 	var document topology.InstallationTokenDocument
 	decoder := json.NewDecoder(strings.NewReader(string(data)))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&document); err != nil || decoder.More() {
+	if err := decoder.Decode(&document); err != nil || !documentStreamComplete(decoder) {
 		return "", time.Time{}, errors.New("broker installation token document is unusable")
 	}
 	if document.Version != topology.InstallationTokenDocumentVersion || document.Token == "" ||
@@ -87,6 +88,17 @@ func (s *SecretInstallationTokenSource) InstallationToken(ctx context.Context) (
 	s.expiresAt = document.ExpiresAt
 	s.usableUntil = document.ExpiresAt.Add(-2 * time.Minute)
 	return s.token, s.expiresAt, nil
+}
+
+// documentStreamComplete reports that the decoder consumed exactly one JSON
+// value: More() alone misses a lone trailing bracket, so the next decode must
+// fail with io.EOF rather than a parse error or another value.
+func documentStreamComplete(decoder *json.Decoder) bool {
+	if decoder.More() {
+		return false
+	}
+	var extra json.RawMessage
+	return errors.Is(decoder.Decode(&extra), io.EOF)
 }
 
 func sameInstallationEndpoint(actual, expected string) bool {
