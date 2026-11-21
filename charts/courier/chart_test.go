@@ -3323,4 +3323,31 @@ func TestChartRendersConsoleContributeForm(t *testing.T) {
 	if err == nil || !strings.Contains(out, "operatorConsole.contribute.url") || !strings.Contains(out, "raw --contribute-url") {
 		t.Fatalf("raw URL without effective token error = %v, want effective-pair message:\n%s", err, out)
 	}
+
+	// A bare --contribute-url whose value is the next argument is the
+	// spelling the binary's parser accepts, and it must count toward the
+	// pair guard the same as the = form.
+	out, err = runHelmOutput(t, chartDir, operatorConsoleRenderArgs(
+		"--set-string", "controllers.console.containers.console.args[0]=--contribute-url",
+		"--set-string", "controllers.console.containers.console.args[1]=http://operator-override",
+	)...)
+	if err == nil || !strings.Contains(out, "must be set together") {
+		t.Fatalf("bare raw URL without token error = %v, want effective-pair message:\n%s", err, out)
+	}
+
+	bareWithValue := runHelm(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.contribute.tokenSecret=contribute-token",
+		"--set-string", "controllers.console.containers.console.args[0]=--contribute-url",
+		"--set-string", "controllers.console.containers.console.args[1]=http://operator-override",
+	)...)
+	if !strings.Contains(bareWithValue, "--contribute-token-file=/etc/courier/console/contribute-token") {
+		t.Fatal("bare raw URL with a values token did not render the canonical token-file flag")
+	}
+
+	// A values override that omits the contribute block entirely must render
+	// a contribution-free console, not an opaque template error.
+	plain := runHelm(t, chartDir, operatorConsoleRenderArgs()...)
+	if strings.Contains(plain, "--contribute-url") || strings.Contains(plain, "contribute-token") {
+		t.Fatal("console without the contribute block unexpectedly rendered contribution configuration")
+	}
 }

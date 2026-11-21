@@ -71,19 +71,26 @@ ownership claim and never mutates the upstream issue. The form does not expose
 target host, git or API credentials, namespace, or fresh/debug idempotency
 escapes.
 
-The form is available only in token mode. Header mode renders an unavailable
-state because the form needs the session-bound CSRF token that only token mode
-has. All state-changing requests are CSRF-verified. The bearer token is a
-file-mounted Secret read only by the console process; it is never rendered or
-proxied to the browser. The console uses no JavaScript.
+The form is available only in token mode, because the form needs the
+session-bound CSRF token that only token mode has. A manually deployed
+header-mode console renders an unavailable state; the chart goes further and
+fails the render when the contribution pair is set with header mode, so a
+header-mode release can never ship the unused write credential. All
+state-changing requests are CSRF-verified. The bearer token is a file-mounted
+Secret read only by the console process; it is never rendered or proxied to
+the browser. The console uses no JavaScript.
 
 A signed intent cookie carries the idempotency key per browser, bound to the
 submitted content, across reloads, retries, and console restarts until the
-attempt is definitively settled. A timeout or server error has an uncertain
-outcome and is shown as "may have been admitted"; resubmitting identical
-content retries with the same key, so it cannot create a duplicate run. Changing
-the content starts a new attempt. A deliberate new contribution is the separate
-explicit "start a new contribution" action.
+attempt is definitively settled. The cookie signature uses the session key, so
+rotating that key discards an unsettled attempt; a later resubmission then
+starts a new attempt and the earlier one may still have been admitted. A
+timeout or server error has an uncertain outcome and is shown as "may have been
+admitted"; resubmitting identical content retries with the same key, so it
+cannot create a duplicate run. Changing the content starts a new attempt. A
+deliberate new contribution is the separate explicit "start a new contribution"
+action. A submission the console cannot encode under its own 32 KiB request
+bound is refused locally, before any network contact.
 
 Outcomes stay distinct: created (`201`), resumed (`200`), policy or validation
 refusal (`400`, `403`, or `409`, with the server's message), rejected
@@ -97,7 +104,10 @@ cluster-internal Service URL.
 
 Enable the manager's `contributeAPI.enabled` with its `keySecret`, then set
 `operatorConsole.contribute.url` and `tokenSecret` together. The chart render
-fails if only one is set. The form is off by default.
+fails if only one is set; a raw `--contribute-url` or `--contribute-token-file`
+arg in `controllers.console.containers.console.args` counts toward that pair,
+and a raw token-file path is the operator's own mount to provide. The form is
+off by default.
 
 ```sh
 kubectl create secret generic courier-contribute-token \

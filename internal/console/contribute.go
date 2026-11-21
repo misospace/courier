@@ -212,8 +212,14 @@ func (m *contributeMinter) keyFor(digest string, now time.Time) (string, error) 
 }
 
 func contributeDigest(sub contributeSubmission) string {
+	// Length-prefix every field: a bare separator would let a field
+	// carrying the separator byte collide two different submissions.
 	fields := []string{sub.Lane, sub.BaseRepo, sub.BaseRef, sub.WorkRepo, sub.Goal, sub.UpstreamIssue}
-	sum := sha256.Sum256([]byte(strings.Join(fields, "\x00")))
+	var canonical bytes.Buffer
+	for _, field := range fields {
+		fmt.Fprintf(&canonical, "%d\x00%s\x00", len(field), field)
+	}
+	sum := sha256.Sum256(canonical.Bytes())
 	return hex.EncodeToString(sum[:])[:16]
 }
 
@@ -331,9 +337,16 @@ func (s *Server) handleContributeSubmit(w http.ResponseWriter, r *http.Request) 
 	}
 	digest := contributeDigest(sub)
 	key := ""
+	// storedDigest records which attempt the browser's intent cookie holds,
+	// so a definitive settlement clears only its own attempt and never an
+	// unrelated unsettled one from changed content.
+	storedDigest := ""
 	if cookie, err := r.Cookie(contributeIntentCookie); err == nil {
-		if storedKey, storedDigest, valid := verifyContributeIntent(cookie.Value, s.auth.key); valid && storedDigest == digest {
-			key = storedKey
+		if storedKey, candidateDigest, valid := verifyContributeIntent(cookie.Value, s.auth.key); valid {
+			storedDigest = candidateDigest
+			if storedDigest == digest {
+				key = storedKey
+			}
 		}
 	}
 	if key == "" {
@@ -355,29 +368,44 @@ func (s *Server) handleContributeSubmit(w http.ResponseWriter, r *http.Request) 
 		s.render(w, http.StatusOK, "contribute", data)
 		return
 	}
+	// settledOwnIntent is true when the attempt that reached a definitive
+	// outcome is the one the intent cookie holds; only then may the
+	// response clear the cookie, because an uncertain attempt under other
+	// content may still have been admitted and must stay retryable.
+	settledOwnIntent := storedDigest == "" || storedDigest == digest
 	result := s.contribute.Submit(r.Context(), sub)
 	switch result.Outcome {
 	case outcomeCreated, outcomeResumed:
 		s.minter.forget(digest)
-		http.SetCookie(w, s.auth.expiredContributeIntentCookie())
+		if settledOwnIntent {
+			http.SetCookie(w, s.auth.expiredContributeIntentCookie())
+		}
 		data.State, data.StateClass = "success", "state-ok"
 		data.Run, data.Namespace, data.WorkItemID = result.Run, result.Namespace, result.WorkItemID
 		data.Resumed = result.Outcome == outcomeResumed
 	case outcomeRefused:
 		s.minter.forget(digest)
-		http.SetCookie(w, s.auth.expiredContributeIntentCookie())
+		if settledOwnIntent {
+			http.SetCookie(w, s.auth.expiredContributeIntentCookie())
+		}
 		data.State, data.StateClass, data.Message = "refused", "state-error", result.Message
 	case outcomeCredentialDenied:
 		s.minter.forget(digest)
-		http.SetCookie(w, s.auth.expiredContributeIntentCookie())
+		if settledOwnIntent {
+			http.SetCookie(w, s.auth.expiredContributeIntentCookie())
+		}
 		data.State, data.StateClass, data.Message = "credentialDenied", "state-error", result.Message
 	case outcomeAPIMismatch:
 		s.minter.forget(digest)
-		http.SetCookie(w, s.auth.expiredContributeIntentCookie())
+		if settledOwnIntent {
+			http.SetCookie(w, s.auth.expiredContributeIntentCookie())
+		}
 		data.State, data.StateClass, data.Message = "apiMismatch", "state-error", result.Message
 	case outcomeUnreachable:
 		s.minter.forget(digest)
-		http.SetCookie(w, s.auth.expiredContributeIntentCookie())
+		if settledOwnIntent {
+			http.SetCookie(w, s.auth.expiredContributeIntentCookie())
+		}
 		data.State, data.StateClass, data.Message = "unreachable", "state-error", "nothing was admitted; the contribution API could not be reached"
 	default:
 		http.SetCookie(w, s.auth.contributeIntentCookie(contributeIntentValue(key, digest, s.auth.key)))

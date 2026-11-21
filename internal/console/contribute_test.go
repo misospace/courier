@@ -391,3 +391,155 @@ func intentCookie(client *http.Client) *http.Cookie {
 	jar := client.Jar.(*singleCookieJar)
 	return jar.cookies[contributeIntentCookie]
 }
+
+func TestContributeIntentCookieVerification(t *testing.T) {
+	key := []byte("session-key-material")
+	value := contributeIntentValue("adhoc-console-0123456789abcdef", "0123456789abcdef", key)
+	if got, digest, ok := verifyContributeIntent(value, key); !ok || got != "adhoc-console-0123456789abcdef" || digest != "0123456789abcdef" {
+		t.Fatalf("verifyContributeIntent(valid) = %q, %q, %v", got, digest, ok)
+	}
+	for name, tc := range map[string]struct {
+		value string
+		key   []byte
+	}{
+		"forged signature":  {value[:len(value)-2] + "zz", key},
+		"wrong session key": {value, []byte("other-key")},
+		"empty session key": {value, nil},
+		"malformed shape":   {"adhoc-console-short.abc.def", key},
+		"truncated fields":  {"adhoc-console-0123456789abcdef.abc." + value[strings.LastIndex(value, ".")+1:], key},
+		"garbage":           {"nonsense", key},
+	} {
+		if _, _, ok := verifyContributeIntent(tc.value, tc.key); ok {
+			t.Fatalf("%s: verifyContributeIntent accepted an invalid cookie", name)
+		}
+	}
+}
+
+func TestContributeMinter(t *testing.T) {
+	var m contributeMinter
+	now := time.Unix(0, 0)
+	first, err := m.keyFor("digest-a", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := m.keyFor("digest-a", now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != again {
+		t.Fatal("minter minted a second key for the same digest inside the TTL")
+	}
+	m.forget("digest-a")
+	fresh, err := m.keyFor("digest-a", now.Add(90*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh == first {
+		t.Fatal("minter resurrected a forgotten digest")
+	}
+	// An entry past its TTL is swept, not served: the re-minted entry
+	// from 90s lives until 3m30s, so check past it.
+	expired, err := m.keyFor("digest-a", now.Add(4*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expired == fresh {
+		t.Fatal("minter served an expired entry")
+	}
+}
+
+func TestContributeDigestFieldBoundaries(t *testing.T) {
+	base := contributeSubmission{Lane: "default", BaseRepo: "owner/base", BaseRef: "main", WorkRepo: "owner/fork", Goal: "goal"}
+	digests := map[string]bool{contributeDigest(base): true}
+	for _, variant := range []contributeSubmission{
+		{Lane: "default\x00owner/base", BaseRepo: "base", BaseRef: "main", WorkRepo: "owner/fork", Goal: "goal"},
+		{Lane: "default", BaseRepo: "owner/base\x00main", BaseRef: "main", WorkRepo: "owner/fork", Goal: "goal"},
+		{Lane: "default", BaseRepo: "owner/base", BaseRef: "main", WorkRepo: "owner/fork", Goal: "goal\x00"},
+	} {
+		d := contributeDigest(variant)
+		if digests[d] {
+			t.Fatalf("digest collision for variant %+v", variant)
+		}
+		digests[d] = true
+	}
+}
+
+func TestContributeIntentCookieFlags(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"busy"}`))
+	}))
+	defer api.Close()
+	_, base, client := newContributionTestServer(t, api.URL, time.Second)
+	_, page := get(t, client, base+"/contribute")
+	csrf := findCSRFToken(t, page)
+	_, page = postContribution(t, client, base, csrf, contributionValues("goal"))
+	if !strings.Contains(page, "may have been admitted") {
+		t.Fatalf("uncertain state missing: %s", page)
+	}
+	cookie := intentCookie(client)
+	if cookie == nil {
+		t.Fatal("uncertain outcome wrote no intent cookie")
+	}
+	if !cookie.HttpOnly || cookie.SameSite != http.SameSiteLaxMode || cookie.Secure || cookie.Path != "/" || cookie.MaxAge <= 0 {
+		t.Fatalf("intent cookie posture wrong: %+v", cookie)
+	}
+	// Every form-visible state carries the explicit new-contribution action.
+	if !strings.Contains(page, "Start a new contribution") {
+		t.Fatal("uncertain page missing the new-contribution action")
+	}
+}
+
+func TestContributeDefinitiveOtherContentKeepsUnsettledIntent(t *testing.T) {
+	status := http.StatusServiceUnavailable
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(`{"error":"no"}`))
+	}))
+	defer api.Close()
+	_, base, client := newContributionTestServer(t, api.URL, time.Second)
+	_, page := get(t, client, base+"/contribute")
+	csrf := findCSRFToken(t, page)
+	_, page = postContribution(t, client, base, csrf, contributionValues("goal one"))
+	if !strings.Contains(page, "may have been admitted") {
+		t.Fatalf("first attempt not uncertain: %s", page)
+	}
+	kept := intentCookie(client)
+	if kept == nil {
+		t.Fatal("uncertain outcome lost the intent cookie")
+	}
+	status = http.StatusBadRequest
+	_, page = postContribution(t, client, base, csrf, contributionValues("goal two"))
+	if !strings.Contains(page, "no") {
+		t.Fatalf("refusal missing: %s", page)
+	}
+	after := intentCookie(client)
+	if after == nil || after.Value != kept.Value {
+		t.Fatal("a definitive outcome for other content destroyed the unsettled intent")
+	}
+	_, page = get(t, client, base+"/contribute")
+	if !strings.Contains(page, "unsettled attempt") {
+		t.Fatal("later GET lost the unsettled notice")
+	}
+	// Resubmitting the earlier content replays its key.
+	keys := map[string]int{}
+	recording := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			IdempotencyKey string `json:"idempotencyKey"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		keys[body.IdempotencyKey]++
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer recording.Close()
+	_, base2, client2 := newContributionTestServer(t, recording.URL, time.Second)
+	_, page = get(t, client2, base2+"/contribute")
+	csrf = findCSRFToken(t, page)
+	postContribution(t, client2, base2, csrf, contributionValues("goal one"))
+	first := intentCookie(client2)
+	_, _ = postContribution(t, client2, base2, csrf, contributionValues("goal one"))
+	second := intentCookie(client2)
+	if first == nil || second == nil || first.Value != second.Value || keys[first.Value[:len("adhoc-console-")+16]] != 2 {
+		t.Fatal("identical-content retry did not replay the same key")
+	}
+}
