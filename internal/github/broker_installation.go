@@ -9,20 +9,24 @@ import (
 	"time"
 )
 
-// InstallationTokenSource supplies the current repository-scoped GitHub App
-// installation token for broker forge reads and writes. Implementations
-// refresh on expiry; a returned token is short-lived and must never be
-// embedded in error strings or logs.
+// InstallationTokenSource supplies the current GitHub App installation token
+// minted for one named repository (full owner/name identity, compared
+// case-insensitively) for broker forge reads and writes. Implementations
+// refresh on expiry and refuse a repository outside the run's pinned set, so
+// a request is never accompanied by a token scoped to a different repository.
+// A returned token is short-lived and must never be embedded in error strings
+// or logs.
 type InstallationTokenSource interface {
-	InstallationToken(ctx context.Context) (token string, expiresAt time.Time, err error)
+	InstallationToken(ctx context.Context, repository string) (token string, expiresAt time.Time, err error)
 }
 
 // BrokerInstallationAuth is the non-secret identity a broker installation
 // client is bound to. The broker never holds the App private key; the token
-// source supplies short-lived tokens minted by the trusted operator. When
-// Repositories is non-empty, the client additionally refuses any repository
-// outside the pinned set, so a same-owner repository the run's policy does
-// not name is refused before a token is ever spent.
+// source supplies short-lived tokens minted by the trusted operator for one
+// repository at a time, and the client names the request's pinned repository
+// when it asks. When Repositories is non-empty, the client additionally
+// refuses any repository outside the pinned set, so a same-owner repository
+// the run's policy does not name is refused before a token is ever spent.
 type BrokerInstallationAuth struct {
 	Owner        string
 	Repositories []string
@@ -99,7 +103,10 @@ func (d brokerInstallationDoer) Do(req *http.Request) (*http.Response, error) {
 	default:
 		return nil, errors.New("GitHub App credential refused an unsupported request method")
 	}
-	token, _, err := d.source.InstallationToken(req.Context())
+	// The source is asked by full owner/name identity so it can serve the
+	// token minted for exactly this repository; the identity compared here is
+	// already pinned to d.owner above.
+	token, _, err := d.source.InstallationToken(req.Context(), owner+"/"+repo)
 	if err != nil {
 		return nil, err
 	}

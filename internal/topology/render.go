@@ -356,16 +356,40 @@ func PolicySecret(run *courier.CoderRun, document BrokerPolicyDocument) (*corev1
 const InstallationTokenDocumentVersion = 1
 
 // InstallationTokenDocument is the on-wire content of the per-run credentials
-// Secret's installation-token entry: one short-lived repository-scoped GitHub
-// App installation token minted by the operator, plus the identity it is
-// bound to. It rides a Secret, never pod environment, so the token value is
-// not exposed through environment dumps.
+// Secret's installation-token entry: one short-lived GitHub App installation
+// token per pinned repository, each minted by the operator with only the
+// permissions the run needs against that one repository, plus the identity
+// they are bound to. GitHub applies an installation token's permissions to
+// every repository the token names, so a shared capability is never minted:
+// the work repository's token carries no issue or pull-request write, and
+// the base repository's token carries no contents write. The document rides a
+// Secret, never pod environment, so no token value is exposed through
+// environment dumps.
 type InstallationTokenDocument struct {
-	Version   int       `json:"version"`
-	Token     string    `json:"token"`
-	ExpiresAt time.Time `json:"expiresAt"`
-	Owner     string    `json:"owner"`
-	Endpoint  string    `json:"endpoint"`
+	Version  int                      `json:"version"`
+	Owner    string                   `json:"owner"`
+	Endpoint string                   `json:"endpoint"`
+	Entries  []InstallationTokenEntry `json:"entries"`
+}
+
+// InstallationTokenEntry is the credential minted for exactly one repository.
+// Repository is the full owner/name identity the token is scoped to; consumers
+// must compare it case-insensitively, the way GitHub treats login names.
+type InstallationTokenEntry struct {
+	Repository string    `json:"repository"`
+	Token      string    `json:"token"`
+	ExpiresAt  time.Time `json:"expiresAt"`
+}
+
+// Entry returns the entry minted for the named repository, compared
+// case-insensitively on the full owner/name identity.
+func (d InstallationTokenDocument) Entry(repository string) (InstallationTokenEntry, bool) {
+	for _, entry := range d.Entries {
+		if strings.EqualFold(entry.Repository, repository) {
+			return entry, true
+		}
+	}
+	return InstallationTokenEntry{}, false
 }
 
 // InstallationTokenSecretRef names the credentials Secret key carrying the
@@ -400,8 +424,21 @@ func GatewaySecret(run *courier.CoderRun, key []byte) (*corev1.Secret, error) {
 // only the installation-token entry. Static credential entries are deliberately
 // absent: an App-mode broker has no static credential to fall back to.
 func InstallationTokenCredentials(run *courier.CoderRun, document InstallationTokenDocument) (*corev1.Secret, error) {
-	if document.Version != InstallationTokenDocumentVersion || document.Token == "" || document.ExpiresAt.IsZero() || document.Owner == "" {
+	if document.Version != InstallationTokenDocumentVersion || document.Owner == "" || len(document.Entries) == 0 {
 		return nil, errors.New("topology: installation-token document is incomplete or unsupported")
+	}
+	seen := make(map[string]struct{}, len(document.Entries))
+	for _, entry := range document.Entries {
+		owner, name, ok := strings.Cut(entry.Repository, "/")
+		if entry.Token == "" || entry.ExpiresAt.IsZero() || !ok || owner == "" || name == "" ||
+			strings.Contains(name, "/") || !strings.EqualFold(owner, document.Owner) {
+			return nil, errors.New("topology: installation-token entry is incomplete or not owned by the document owner")
+		}
+		key := strings.ToLower(entry.Repository)
+		if _, duplicate := seen[key]; duplicate {
+			return nil, errors.New("topology: installation-token document repeats a repository")
+		}
+		seen[key] = struct{}{}
 	}
 	endpoint, err := url.Parse(document.Endpoint)
 	if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" || endpoint.Opaque != "" {

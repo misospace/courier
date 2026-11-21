@@ -340,9 +340,15 @@ func TestBrokerPodWithInstallationTokenOmitsStaticCredentialEnvironment(t *testi
 
 func TestInstallationTokenTopologyContracts(t *testing.T) {
 	run := testRun("broker-app-secret")
+	expires := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	document := InstallationTokenDocument{
-		Version: InstallationTokenDocumentVersion, Token: "secret-value",
-		ExpiresAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), Owner: "org", Endpoint: "https://api.github.com/",
+		Version:  InstallationTokenDocumentVersion,
+		Owner:    "org",
+		Endpoint: "https://api.github.com/",
+		Entries: []InstallationTokenEntry{
+			{Repository: "org/widgets", Token: "secret-value", ExpiresAt: expires},
+			{Repository: "org/gadgets", Token: "other-value", ExpiresAt: expires.Add(time.Hour)},
+		},
 	}
 	secret, err := InstallationTokenCredentials(run, document)
 	if err != nil {
@@ -358,10 +364,38 @@ func TestInstallationTokenTopologyContracts(t *testing.T) {
 	if !reflect.DeepEqual(got, document) {
 		t.Fatalf("installation token document = %+v, want %+v", got, document)
 	}
+	if entry, ok := document.Entry("ORG/Widgets"); !ok || entry.Token != "secret-value" {
+		t.Fatalf("Entry lookup is not case-insensitive on owner/name: %+v %v", entry, ok)
+	}
+	if _, ok := document.Entry("other/widgets"); ok {
+		t.Fatal("Entry matched a repository outside the document")
+	}
+	entry := InstallationTokenEntry{Repository: "org/widgets", Token: "token", ExpiresAt: expires}
 	for _, invalid := range []InstallationTokenDocument{
-		{}, {Version: 99, Token: "token", ExpiresAt: document.ExpiresAt, Owner: "org", Endpoint: document.Endpoint},
-		{Version: InstallationTokenDocumentVersion, Token: "token", ExpiresAt: document.ExpiresAt, Owner: "org", Endpoint: "http://api.github.com"},
-		{Version: InstallationTokenDocumentVersion, Token: "token", ExpiresAt: document.ExpiresAt, Owner: "org", Endpoint: "https://user@api.github.com"},
+		{},
+		{Version: 99, Owner: "org", Endpoint: document.Endpoint, Entries: []InstallationTokenEntry{entry}},
+		{Version: InstallationTokenDocumentVersion, Endpoint: document.Endpoint, Entries: []InstallationTokenEntry{entry}},
+		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: document.Endpoint},
+		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: document.Endpoint, Entries: []InstallationTokenEntry{}},
+		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: document.Endpoint, Entries: []InstallationTokenEntry{
+			{Repository: "org/widgets", ExpiresAt: expires},
+		}},
+		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: document.Endpoint, Entries: []InstallationTokenEntry{
+			{Repository: "org/widgets", Token: "token"},
+		}},
+		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: document.Endpoint, Entries: []InstallationTokenEntry{
+			{Repository: "widgets", Token: "token", ExpiresAt: expires},
+		}},
+		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: document.Endpoint, Entries: []InstallationTokenEntry{
+			{Repository: "other/widgets", Token: "token", ExpiresAt: expires},
+		}},
+		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: document.Endpoint, Entries: []InstallationTokenEntry{
+			entry, {Repository: "ORG/widgets", Token: "second", ExpiresAt: expires},
+		}},
+		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: "http://api.github.com", Entries: []InstallationTokenEntry{entry}},
+		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: "https://user@api.github.com", Entries: []InstallationTokenEntry{entry}},
+		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: "https://api.github.com/?scope=repo", Entries: []InstallationTokenEntry{entry}},
+		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: "https://api.github.com/#frag", Entries: []InstallationTokenEntry{entry}},
 	} {
 		if _, err := InstallationTokenCredentials(run, invalid); err == nil {
 			t.Fatalf("accepted invalid installation-token document: %+v", invalid)

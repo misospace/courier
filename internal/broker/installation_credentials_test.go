@@ -11,6 +11,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/misospace/courier/internal/topology"
@@ -18,16 +19,20 @@ import (
 
 const sentinelInstallationToken = "ghs_SENTINEL_DO_NOT_LEAK"
 
-type installationTokenSourceFunc func(context.Context) (string, time.Time, error)
+type installationTokenSourceFunc func(context.Context, string) (string, time.Time, error)
 
-func (f installationTokenSourceFunc) InstallationToken(ctx context.Context) (string, time.Time, error) {
-	return f(ctx)
+func (f installationTokenSourceFunc) InstallationToken(ctx context.Context, repository string) (string, time.Time, error) {
+	return f(ctx, repository)
 }
 
 func installationDocument(now time.Time) topology.InstallationTokenDocument {
 	return topology.InstallationTokenDocument{
-		Version: topology.InstallationTokenDocumentVersion, Token: sentinelInstallationToken,
-		ExpiresAt: now.Add(time.Hour), Owner: "ExampleOrg", Endpoint: "https://api.github.com/",
+		Version:  topology.InstallationTokenDocumentVersion,
+		Owner:    "ExampleOrg",
+		Endpoint: "https://api.github.com/",
+		Entries: []topology.InstallationTokenEntry{
+			{Repository: "ExampleOrg/Repo", Token: sentinelInstallationToken, ExpiresAt: now.Add(time.Hour)},
+		},
 	}
 }
 
@@ -47,6 +52,15 @@ func installationSecretReader(t *testing.T, document topology.InstallationTokenD
 	})
 }
 
+func newSourceForTest(t *testing.T, reader ctrlclient.Reader, expectedOwner string, now func() time.Time) *SecretInstallationTokenSource {
+	t.Helper()
+	source, err := NewSecretInstallationTokenSource(reader, "runs", "run-credentials", topology.CredKeyInstallationToken, expectedOwner, "https://api.github.com", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return source
+}
+
 func TestSecretInstallationTokenSourceValidation(t *testing.T) {
 	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	valid := installationDocument(now)
@@ -57,30 +71,33 @@ func TestSecretInstallationTokenSourceValidation(t *testing.T) {
 	}{
 		{name: "valid", wantOK: true},
 		{name: "wrong version", edit: func(d *topology.InstallationTokenDocument) { d.Version++ }},
-		{name: "empty token", edit: func(d *topology.InstallationTokenDocument) { d.Token = "" }},
+		{name: "empty token", edit: func(d *topology.InstallationTokenDocument) { d.Entries[0].Token = "" }},
 		{name: "owner mismatch", edit: func(d *topology.InstallationTokenDocument) { d.Owner = "other" }},
 		{name: "endpoint mismatch", edit: func(d *topology.InstallationTokenDocument) { d.Endpoint = "https://evil.invalid/" }},
 		{name: "insecure endpoint", edit: func(d *topology.InstallationTokenDocument) { d.Endpoint = "http://api.github.com/" }},
 		{name: "userinfo endpoint", edit: func(d *topology.InstallationTokenDocument) { d.Endpoint = "https://user@api.github.com/" }},
 		{name: "query endpoint", edit: func(d *topology.InstallationTokenDocument) { d.Endpoint = "https://api.github.com/?token=x" }},
 		{name: "fragment endpoint", edit: func(d *topology.InstallationTokenDocument) { d.Endpoint = "https://api.github.com/#x" }},
-		{name: "expired", edit: func(d *topology.InstallationTokenDocument) { d.ExpiresAt = now }},
-		{name: "inside expiry margin", edit: func(d *topology.InstallationTokenDocument) { d.ExpiresAt = now.Add(2*time.Minute - time.Second) }},
+		{name: "expired", edit: func(d *topology.InstallationTokenDocument) { d.Entries[0].ExpiresAt = now }},
+		{name: "inside expiry margin", edit: func(d *topology.InstallationTokenDocument) {
+			d.Entries[0].ExpiresAt = now.Add(2*time.Minute - time.Second)
+		}},
+		{name: "entry for another repository only", edit: func(d *topology.InstallationTokenDocument) {
+			d.Entries = []topology.InstallationTokenEntry{{Repository: "ExampleOrg/Other", Token: "other-" + sentinelInstallationToken, ExpiresAt: now.Add(time.Hour)}}
+		}},
+		{name: "no entries", edit: func(d *topology.InstallationTokenDocument) { d.Entries = nil }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			doc := valid
+			doc.Entries = append([]topology.InstallationTokenEntry(nil), valid.Entries...)
 			if tt.edit != nil {
 				tt.edit(&doc)
 			}
-			reader := installationSecretReader(t, doc).Build()
-			source, err := NewSecretInstallationTokenSource(reader, "runs", "run-credentials", topology.CredKeyInstallationToken, "exampleorg", "https://api.github.com", func() time.Time { return now })
-			if err != nil {
-				t.Fatal(err)
-			}
-			got, expiry, err := source.InstallationToken(context.Background())
+			source := newSourceForTest(t, installationSecretReader(t, doc).Build(), "exampleorg", func() time.Time { return now })
+			got, expiry, err := source.InstallationToken(context.Background(), "exampleorg/repo")
 			if tt.wantOK {
-				if err != nil || got != sentinelInstallationToken || !expiry.Equal(doc.ExpiresAt) {
+				if err != nil || got != sentinelInstallationToken || !expiry.Equal(doc.Entries[0].ExpiresAt) {
 					t.Fatalf("InstallationToken() = %q, %v, %v", got, expiry, err)
 				}
 				return
@@ -102,10 +119,12 @@ func TestSecretInstallationTokenSourceRejectsUnknownShapes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	base := string(data)
 	shapes := map[string]string{
-		"unknown field":    strings.TrimSuffix(string(data), "}") + `,"futureField":"x"}`,
-		"trailing bytes":   string(data) + `{"version":1}`,
-		"trailing bracket": string(data) + "}",
+		"unknown field":       strings.TrimSuffix(base, "}") + `,"futureField":"x"}`,
+		"unknown entry field": strings.Replace(base, `"token"`, `"futureField":"x","token"`, 1),
+		"trailing bytes":      base + `{"version":1}`,
+		"trailing bracket":    base + "}",
 	}
 	for name, content := range shapes {
 		t.Run(name, func(t *testing.T) {
@@ -117,11 +136,8 @@ func TestSecretInstallationTokenSourceRejectsUnknownShapes(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Namespace: "runs", Name: "run-credentials"},
 				Data:       map[string][]byte{topology.CredKeyInstallationToken: []byte(content)},
 			}).Build()
-			source, err := NewSecretInstallationTokenSource(reader, "runs", "run-credentials", topology.CredKeyInstallationToken, "ExampleOrg", "https://api.github.com", func() time.Time { return now })
-			if err != nil {
-				t.Fatal(err)
-			}
-			got, expiry, err := source.InstallationToken(context.Background())
+			source := newSourceForTest(t, reader, "ExampleOrg", func() time.Time { return now })
+			got, expiry, err := source.InstallationToken(context.Background(), "exampleorg/repo")
 			if err == nil || got != "" || expiry != (time.Time{}) {
 				t.Fatalf("%s document returned %q, %v, %v", name, got, expiry, err)
 			}
@@ -145,38 +161,116 @@ func TestSecretInstallationTokenSourceConstructorAndUnavailableSecret(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, err = source.InstallationToken(context.Background())
+	_, _, err = source.InstallationToken(context.Background(), "owner/repo")
 	if err == nil || strings.Contains(err.Error(), sentinelInstallationToken) {
 		t.Fatalf("missing secret error = %v", err)
+	}
+	if _, _, err := source.InstallationToken(context.Background(), ""); err == nil {
+		t.Fatal("empty repository accepted")
 	}
 }
 
 func TestSecretInstallationTokenSourceCacheAndRefresh(t *testing.T) {
 	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	doc := installationDocument(now)
-	reader := installationSecretReader(t, doc).Build()
-	source, err := NewSecretInstallationTokenSource(reader, "runs", "run-credentials", topology.CredKeyInstallationToken, "ExampleOrg", "https://api.github.com", func() time.Time { return now })
-	if err != nil {
-		t.Fatal(err)
-	}
+	source := newSourceForTest(t, installationSecretReader(t, doc).Build(), "ExampleOrg", func() time.Time { return now })
 	for i := 0; i < 2; i++ {
-		got, _, err := source.InstallationToken(context.Background())
+		got, _, err := source.InstallationToken(context.Background(), "exampleorg/repo")
 		if err != nil || got != sentinelInstallationToken {
 			t.Fatalf("cached token = %q, %v", got, err)
 		}
 	}
-	now = doc.ExpiresAt.Add(-2 * time.Minute)
-	if _, _, err := source.InstallationToken(context.Background()); err == nil {
+	now = doc.Entries[0].ExpiresAt.Add(-2 * time.Minute)
+	if _, _, err := source.InstallationToken(context.Background(), "exampleorg/repo"); err == nil {
 		t.Fatal("used cached token at its expiry safety boundary")
 	} else if strings.Contains(err.Error(), sentinelInstallationToken) {
 		t.Fatal("refresh error leaked installation token")
 	}
 }
 
+func TestSecretInstallationTokenSourceServesOnlyTheRequestedRepositoryToken(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	doc := topology.InstallationTokenDocument{
+		Version:  topology.InstallationTokenDocumentVersion,
+		Owner:    "acme",
+		Endpoint: "https://api.github.com/",
+		Entries: []topology.InstallationTokenEntry{
+			{Repository: "acme/demo", Token: "base-token", ExpiresAt: now.Add(2 * time.Hour)},
+			{Repository: "acme/demo-work", Token: "work-token", ExpiresAt: now.Add(90 * time.Minute)},
+		},
+	}
+	source := newSourceForTest(t, installationSecretReader(t, doc).Build(), "ACME", func() time.Time { return now })
+	if got, expiry, err := source.InstallationToken(context.Background(), "acme/demo"); err != nil || got != "base-token" || !expiry.Equal(doc.Entries[0].ExpiresAt) {
+		t.Fatalf("base ask = %q, %v, %v; want the base entry only", got, expiry, err)
+	}
+	if got, expiry, err := source.InstallationToken(context.Background(), "ACME/DEMO-WORK"); err != nil || got != "work-token" || !expiry.Equal(doc.Entries[1].ExpiresAt) {
+		t.Fatalf("work ask = %q, %v, %v; want the work entry only", got, expiry, err)
+	}
+	for _, repository := range []string{"acme/other", "other/demo", "acme", "demo", "acme/demo/extra"} {
+		got, expiry, err := source.InstallationToken(context.Background(), repository)
+		if err == nil || got != "" || expiry != (time.Time{}) {
+			t.Fatalf("InstallationToken(%q) = %q, %v, %v; want refusal without any token", repository, got, expiry, err)
+		}
+		if strings.Contains(err.Error(), "base-token") || strings.Contains(err.Error(), "work-token") {
+			t.Fatal("refusal leaked an installation token")
+		}
+	}
+}
+
+func TestSecretInstallationTokenSourceBindingRefusalsServeNoRepository(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	documents := map[string]topology.InstallationTokenDocument{
+		"owner mismatch": {
+			Version: topology.InstallationTokenDocumentVersion, Owner: "evil", Endpoint: "https://api.github.com",
+			Entries: []topology.InstallationTokenEntry{{Repository: "acme/demo", Token: "base-token", ExpiresAt: now.Add(time.Hour)}},
+		},
+		"endpoint mismatch": {
+			Version: topology.InstallationTokenDocumentVersion, Owner: "acme", Endpoint: "https://evil.invalid",
+			Entries: []topology.InstallationTokenEntry{{Repository: "acme/demo", Token: "base-token", ExpiresAt: now.Add(time.Hour)}},
+		},
+		"wrong version": {
+			Version: topology.InstallationTokenDocumentVersion + 1, Owner: "acme", Endpoint: "https://api.github.com",
+			Entries: []topology.InstallationTokenEntry{{Repository: "acme/demo", Token: "base-token", ExpiresAt: now.Add(time.Hour)}},
+		},
+	}
+	for name, doc := range documents {
+		t.Run(name, func(t *testing.T) {
+			source := newSourceForTest(t, installationSecretReader(t, doc).Build(), "acme", func() time.Time { return now })
+			for _, repository := range []string{"acme/demo", "acme/demo-work"} {
+				if got, expiry, err := source.InstallationToken(context.Background(), repository); err == nil || got != "" || expiry != (time.Time{}) {
+					t.Fatalf("%s document served %q = %q, %v, %v", name, repository, got, expiry, err)
+				}
+			}
+		})
+	}
+}
+
+func TestSecretInstallationTokenSourceNearExpiryRefusesOnlyThatRepository(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	doc := topology.InstallationTokenDocument{
+		Version:  topology.InstallationTokenDocumentVersion,
+		Owner:    "acme",
+		Endpoint: "https://api.github.com",
+		Entries: []topology.InstallationTokenEntry{
+			{Repository: "acme/demo", Token: "base-token", ExpiresAt: now.Add(time.Minute)},
+			{Repository: "acme/demo-work", Token: "work-token", ExpiresAt: now.Add(2 * time.Hour)},
+		},
+	}
+	source := newSourceForTest(t, installationSecretReader(t, doc).Build(), "acme", func() time.Time { return now })
+	if got, expiry, err := source.InstallationToken(context.Background(), "acme/demo"); err == nil || got != "" || expiry != (time.Time{}) {
+		t.Fatalf("near-expiry base entry served %q, %v, %v", got, expiry, err)
+	}
+	if got, _, err := source.InstallationToken(context.Background(), "acme/demo-work"); err != nil || got != "work-token" {
+		t.Fatalf("healthy work entry = %q, %v; want its own token despite the stale base entry", got, err)
+	}
+}
+
 func TestInstallationGitCredentialsUsesSourceEveryCall(t *testing.T) {
 	calls := 0
-	source := installationTokenSourceFunc(func(context.Context) (string, time.Time, error) {
+	var asked []string
+	source := installationTokenSourceFunc(func(_ context.Context, repository string) (string, time.Time, error) {
 		calls++
+		asked = append(asked, repository)
 		return "rotated-token", time.Now().Add(time.Hour), nil
 	})
 	credentials := NewInstallationGitCredentials(source, []string{"org/repo"})
@@ -189,17 +283,37 @@ func TestInstallationGitCredentialsUsesSourceEveryCall(t *testing.T) {
 	if calls != 2 {
 		t.Fatalf("source calls = %d, want 2", calls)
 	}
+	for _, repository := range asked {
+		if repository != "org/repo" {
+			t.Fatalf("source asked with %q, want the canonical pinned identity org/repo", repository)
+		}
+	}
 }
 
 func TestInstallationGitCredentialsServesOnlyBoundRepositories(t *testing.T) {
-	source := installationTokenSourceFunc(func(context.Context) (string, time.Time, error) {
-		return sentinelInstallationToken, time.Now().Add(time.Hour), nil
+	tokens := map[string]string{"org/base": "base-token", "Org/Work": "work-token"}
+	var asked []string
+	source := installationTokenSourceFunc(func(_ context.Context, repository string) (string, time.Time, error) {
+		asked = append(asked, repository)
+		token, ok := tokens[repository]
+		if !ok {
+			return "", time.Time{}, errors.New("source asked for an identity it never minted: " + repository)
+		}
+		return token, time.Now().Add(time.Hour), nil
 	})
 	credentials := NewInstallationGitCredentials(source, []string{"org/base", "", "Org/Work"})
-	for _, repository := range []string{"org/base", "org/work", "ORG/WORK"} {
-		got, err := credentials.Credentials(context.Background(), repository)
-		if err != nil || got.Token != sentinelInstallationToken || got.Username != topology.DefaultGitUsername {
-			t.Fatalf("Credentials(%q) = %+v, %v", repository, got, err)
+	for _, tt := range []struct{ asked, wantToken, wantIdentity string }{
+		{asked: "org/base", wantToken: "base-token", wantIdentity: "org/base"},
+		{asked: "ORG/BASE", wantToken: "base-token", wantIdentity: "org/base"},
+		{asked: "org/work", wantToken: "work-token", wantIdentity: "Org/Work"},
+		{asked: "ORG/WORK", wantToken: "work-token", wantIdentity: "Org/Work"},
+	} {
+		got, err := credentials.Credentials(context.Background(), tt.asked)
+		if err != nil || got.Token != tt.wantToken || got.Username != topology.DefaultGitUsername {
+			t.Fatalf("Credentials(%q) = %+v, %v", tt.asked, got, err)
+		}
+		if asked[len(asked)-1] != tt.wantIdentity {
+			t.Fatalf("Credentials(%q) asked the source for %q, want the canonical pinned identity %q", tt.asked, asked[len(asked)-1], tt.wantIdentity)
 		}
 	}
 }
@@ -219,7 +333,7 @@ func TestInstallationGitCredentialsRefusesUnboundRepositories(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			calls := 0
-			credentials := NewInstallationGitCredentials(installationTokenSourceFunc(func(context.Context) (string, time.Time, error) {
+			credentials := NewInstallationGitCredentials(installationTokenSourceFunc(func(_ context.Context, _ string) (string, time.Time, error) {
 				calls++
 				return sentinelInstallationToken, time.Now().Add(time.Hour), nil
 			}), tt.bound)
@@ -235,7 +349,7 @@ func TestInstallationGitCredentialsRefusesUnboundRepositories(t *testing.T) {
 }
 
 func TestInstallationGitCredentialsDoesNotLeakFailures(t *testing.T) {
-	credentialSource := NewInstallationGitCredentials(installationTokenSourceFunc(func(context.Context) (string, time.Time, error) {
+	credentialSource := NewInstallationGitCredentials(installationTokenSourceFunc(func(_ context.Context, _ string) (string, time.Time, error) {
 		return "", time.Time{}, errors.New("failed with " + sentinelInstallationToken)
 	}), []string{"org/repo"})
 	_, err := credentialSource.Credentials(context.Background(), "org/repo")

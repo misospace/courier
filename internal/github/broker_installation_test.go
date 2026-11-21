@@ -12,13 +12,15 @@ import (
 )
 
 type testInstallationSource struct {
-	calls int
-	token string
-	err   error
+	calls        int
+	token        string
+	err          error
+	repositories []string
 }
 
-func (s *testInstallationSource) InstallationToken(context.Context) (string, time.Time, error) {
+func (s *testInstallationSource) InstallationToken(_ context.Context, repository string) (string, time.Time, error) {
 	s.calls++
+	s.repositories = append(s.repositories, repository)
 	return s.token, time.Now().Add(time.Hour), s.err
 }
 
@@ -137,7 +139,7 @@ func TestBrokerInstallationClientPassesMethodsAndFetchesCurrentToken(t *testing.
 
 type changingSource struct{ calls int }
 
-func (s *changingSource) InstallationToken(context.Context) (string, time.Time, error) {
+func (s *changingSource) InstallationToken(_ context.Context, _ string) (string, time.Time, error) {
 	s.calls++
 	return "token-" + string(rune('0'+s.calls)), time.Now().Add(time.Hour), nil
 }
@@ -226,16 +228,17 @@ func TestBrokerInstallationClientPinsRepositories(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
-		name        string
-		method      string
-		path        string
-		wantRefused bool
+		name         string
+		method       string
+		path         string
+		wantIdentity string
+		wantRefused  bool
 	}{
-		{"pinned repo passes", http.MethodGet, "/repos/acme/widgets/pulls", false},
-		{"unpinned same-owner repo refused", http.MethodGet, "/repos/acme/other/pulls", true},
-		{"case-insensitive pin", http.MethodGet, "/repos/ACME/Widgets/issues", false},
-		{"patch write passes", http.MethodPatch, "/repos/acme/widgets/pulls/1", false},
-		{"put write passes", http.MethodPut, "/repos/acme/widgets/labels", false},
+		{"pinned repo passes", http.MethodGet, "/repos/acme/widgets/pulls", "acme/widgets", false},
+		{"unpinned same-owner repo refused", http.MethodGet, "/repos/acme/other/pulls", "", true},
+		{"case-insensitive pin", http.MethodGet, "/repos/ACME/Widgets/issues", "ACME/Widgets", false},
+		{"patch write passes", http.MethodPatch, "/repos/acme/widgets/pulls/1", "acme/widgets", false},
+		{"put write passes", http.MethodPut, "/repos/acme/widgets/labels", "acme/widgets", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			before := source.calls
@@ -261,6 +264,9 @@ func TestBrokerInstallationClientPinsRepositories(t *testing.T) {
 			}
 			if served != tc.path {
 				t.Fatalf("server path = %q, want %q", served, tc.path)
+			}
+			if source.calls != before+1 || source.repositories[len(source.repositories)-1] != tc.wantIdentity {
+				t.Fatalf("source was asked %v, want exactly the request's full owner/name identity %q", source.repositories, tc.wantIdentity)
 			}
 		})
 	}
@@ -296,4 +302,120 @@ func TestBrokerInstallationClientOwnerOnlyWithoutPins(t *testing.T) {
 	if _, err := client.httpClient.Do(request); err != nil {
 		t.Fatalf("owner-only request refused: %v", err)
 	}
+}
+
+type scopedInstallationTokenSource struct {
+	tokens map[string]string
+	asked  []string
+}
+
+func (s *scopedInstallationTokenSource) InstallationToken(_ context.Context, repository string) (string, time.Time, error) {
+	s.asked = append(s.asked, repository)
+	token, ok := s.tokens[strings.ToLower(repository)]
+	if !ok {
+		return "", time.Time{}, errors.New("no installation token is minted for this repository")
+	}
+	return token, time.Now().Add(time.Hour), nil
+}
+
+// TestBrokerInstallationClientCarriesScopedPerRepositoryTokens proves, at the
+// Authorization header, that every authorized request carries exactly the
+// token minted for its own repository: base-repository issue create, update,
+// and comment requests present the base token, a work-repository read presents
+// the work token, and a same-owner repository outside the run's pin set is
+// refused before any token is issued or reaches the API.
+func TestBrokerInstallationClientCarriesScopedPerRepositoryTokens(t *testing.T) {
+	type observed struct {
+		method        string
+		path          string
+		authorization string
+	}
+	var requests []observed
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, observed{r.Method, r.URL.Path, r.Header.Get("Authorization")})
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	source := &scopedInstallationTokenSource{tokens: map[string]string{
+		"acme/demo":      "base-token",
+		"acme/demo-work": "work-token",
+	}}
+	client, err := NewBrokerInstallationClient(BrokerInstallationAuth{
+		Owner:        "acme",
+		Repositories: []string{"acme/demo", "acme/demo-work"},
+		Endpoint:     server.URL,
+		HTTPClient:   server.Client(),
+	}, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		method    string
+		path      string
+		wantToken string
+	}{
+		{http.MethodPost, "/repos/acme/demo/issues", "base-token"},
+		{http.MethodPatch, "/repos/acme/demo/issues/1", "base-token"},
+		{http.MethodPost, "/repos/acme/demo/issues/1/comments", "base-token"},
+		{http.MethodGet, "/repos/acme/demo-work/contents/main.go", "work-token"},
+		{http.MethodGet, "/repos/ACME/Demo/actions", "base-token"},
+	} {
+		request, err := http.NewRequest(tc.method, server.URL+tc.path, strings.NewReader("{}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.httpClient.Do(request); err != nil {
+			t.Fatalf("%s %s: %v", tc.method, tc.path, err)
+		}
+	}
+
+	wantRequests := []observed{
+		{http.MethodPost, "/repos/acme/demo/issues", "Bearer base-token"},
+		{http.MethodPatch, "/repos/acme/demo/issues/1", "Bearer base-token"},
+		{http.MethodPost, "/repos/acme/demo/issues/1/comments", "Bearer base-token"},
+		{http.MethodGet, "/repos/acme/demo-work/contents/main.go", "Bearer work-token"},
+		{http.MethodGet, "/repos/ACME/Demo/actions", "Bearer base-token"},
+	}
+	if len(requests) != len(wantRequests) {
+		t.Fatalf("API saw %d requests, want %d: %v", len(requests), len(wantRequests), requests)
+	}
+	for i, want := range wantRequests {
+		if requests[i] != want {
+			t.Fatalf("request %d = %+v, want %+v", i, requests[i], want)
+		}
+	}
+	wantAsked := []string{"acme/demo", "acme/demo", "acme/demo", "acme/demo-work", "ACME/Demo"}
+	if len(source.asked) != len(wantAsked) {
+		t.Fatalf("token source asked %v, want %v", source.asked, wantAsked)
+	}
+	for i, want := range wantAsked {
+		if source.asked[i] != want {
+			t.Fatalf("source asked %d = %q, want %q", i, source.asked[i], want)
+		}
+	}
+
+	askedBefore := len(source.asked)
+	if _, err := client.httpClient.Do(mustGet(t, server.URL+"/repos/acme/other/issues")); err == nil {
+		t.Fatal("unpinned repository accepted")
+	} else if strings.Contains(err.Error(), "base-token") || strings.Contains(err.Error(), "work-token") {
+		t.Fatalf("refusal leaked a token: %v", err)
+	}
+	if len(source.asked) != askedBefore {
+		t.Fatalf("token issued for unpinned repository: %v", source.asked[askedBefore:])
+	}
+	for _, request := range requests {
+		if request.path == "/repos/acme/other/issues" {
+			t.Fatal("unpinned repository reached the API")
+		}
+	}
+}
+
+func mustGet(t *testing.T, url string) *http.Request {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return request
 }

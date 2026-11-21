@@ -17,12 +17,15 @@ import (
 )
 
 // SecretInstallationTokenSource reads the run's InstallationTokenDocument from
-// the per-run credentials Secret through a live API reader and supplies the
-// current token until just before its forge-reported expiry. The token lives
-// only in process memory: it never appears in logs, error strings, or pod
-// environment. Any unreadable, malformed, stale-versioned, mismatched, or
-// expired document is a refusal — App-mode brokers have no static credential
-// to fall back to.
+// the per-run credentials Secret through a live API reader and supplies, per
+// named repository, the current token minted for that repository until just
+// before its forge-reported expiry. The operator mints one token per pinned
+// repository with only that repository's permissions, so a request against
+// one repository can never carry a token scoped to another: a repository
+// with no entry in the document is a refusal. The tokens live only in process
+// memory: they never appear in logs, error strings, or pod environment. Any
+// unreadable, malformed, stale-versioned, mismatched, or expired document is
+// a refusal — App-mode brokers have no static credential to fall back to.
 type SecretInstallationTokenSource struct {
 	reader           ctrlclient.Reader
 	namespace        string
@@ -32,7 +35,11 @@ type SecretInstallationTokenSource struct {
 	expectedEndpoint string
 	now              func() time.Time
 
-	mu          sync.Mutex
+	mu      sync.Mutex
+	entries map[string]cachedInstallationToken
+}
+
+type cachedInstallationToken struct {
 	token       string
 	expiresAt   time.Time
 	usableUntil time.Time
@@ -52,17 +59,25 @@ func NewSecretInstallationTokenSource(reader ctrlclient.Reader, namespace, secre
 		reader: reader, namespace: namespace, secretName: secretName,
 		documentKey: documentKey, expectedOwner: expectedOwner,
 		expectedEndpoint: expectedEndpoint, now: now,
+		entries: make(map[string]cachedInstallationToken),
 	}, nil
 }
 
-// InstallationToken returns the cached token while it remains usable, and
-// otherwise re-reads the Secret, parses the document, and validates its binding.
-func (s *SecretInstallationTokenSource) InstallationToken(ctx context.Context) (string, time.Time, error) {
+// InstallationToken returns the cached token for the named repository while it
+// remains usable, and otherwise re-reads the Secret, parses the document, and
+// validates its binding. A repository with no entry in the document is a
+// refusal, never a fall-back to another entry.
+func (s *SecretInstallationTokenSource) InstallationToken(ctx context.Context, repository string) (string, time.Time, error) {
+	if repository == "" {
+		return "", time.Time{}, errors.New("broker installation token document is unusable")
+	}
+	key := strings.ToLower(repository)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
-	if s.token != "" && now.Before(s.usableUntil) {
-		return s.token, s.expiresAt, nil
+	if cached, ok := s.entries[key]; ok && now.Before(cached.usableUntil) {
+		return cached.token, cached.expiresAt, nil
 	}
 
 	secret := &corev1.Secret{}
@@ -79,15 +94,18 @@ func (s *SecretInstallationTokenSource) InstallationToken(ctx context.Context) (
 	if err := decoder.Decode(&document); err != nil || !documentStreamComplete(decoder) {
 		return "", time.Time{}, errors.New("broker installation token document is unusable")
 	}
-	if document.Version != topology.InstallationTokenDocumentVersion || document.Token == "" ||
-		!strings.EqualFold(document.Owner, s.expectedOwner) || !sameInstallationEndpoint(document.Endpoint, s.expectedEndpoint) ||
-		!document.ExpiresAt.After(now.Add(2*time.Minute)) {
+	if document.Version != topology.InstallationTokenDocumentVersion ||
+		!strings.EqualFold(document.Owner, s.expectedOwner) || !sameInstallationEndpoint(document.Endpoint, s.expectedEndpoint) {
 		return "", time.Time{}, errors.New("broker installation token document is unusable")
 	}
-	s.token = document.Token
-	s.expiresAt = document.ExpiresAt
-	s.usableUntil = document.ExpiresAt.Add(-2 * time.Minute)
-	return s.token, s.expiresAt, nil
+	entry, ok := document.Entry(repository)
+	if !ok || entry.Token == "" || !entry.ExpiresAt.After(now.Add(2*time.Minute)) {
+		return "", time.Time{}, errors.New("broker installation token document is unusable")
+	}
+	s.entries[key] = cachedInstallationToken{
+		token: entry.Token, expiresAt: entry.ExpiresAt, usableUntil: entry.ExpiresAt.Add(-2 * time.Minute),
+	}
+	return entry.Token, entry.ExpiresAt, nil
 }
 
 // documentStreamComplete reports that the decoder consumed exactly one JSON
@@ -117,19 +135,21 @@ func sameInstallationEndpoint(actual, expected string) bool {
 	return actualURL.Scheme == expectedURL.Scheme && actualURL.Host == expectedURL.Host && actualURL.Path == expectedURL.Path
 }
 
-// installationTokenSource supplies the current installation token, re-read on
-// demand so operator rotation flows through without a broker restart.
+// installationTokenSource supplies the installation token minted for one
+// named repository, re-read on demand so operator rotation flows through
+// without a broker restart.
 type installationTokenSource interface {
-	InstallationToken(ctx context.Context) (token string, expiresAt time.Time, err error)
+	InstallationToken(ctx context.Context, repository string) (token string, expiresAt time.Time, err error)
 }
 
 // InstallationGitCredentials serves git fetch and push credentials from the
-// same token source: username x-access-token, token re-read from the source
-// per call so operator rotation flows through without a broker restart.
-// Credentials are served only for the repositories the provider was bound to
-// at startup — the run's pinned base and work set; any other identity is
-// refused before the token source is consulted, so a token scoped to the run
-// can never accompany a request asked for under a different name.
+// same token source: username x-access-token, the token minted for exactly
+// the repository being asked for, re-read from the source per call so
+// operator rotation flows through without a broker restart. Credentials are
+// served only for the repositories the provider was bound to at startup — the
+// run's pinned base and work set; any other identity is refused before the
+// token source is consulted, so a token scoped to one repository can never
+// accompany a fetch or push asked for under a different name.
 type InstallationGitCredentials struct {
 	source       installationTokenSource
 	repositories []string
@@ -146,19 +166,19 @@ func NewInstallationGitCredentials(source installationTokenSource, repositories 
 }
 
 func (c InstallationGitCredentials) Credentials(ctx context.Context, repository string) (GitCredentials, error) {
-	pinned := false
+	pinned := ""
 	if c.source != nil && repository != "" {
 		for _, bound := range c.repositories {
 			if strings.EqualFold(repository, bound) {
-				pinned = true
+				pinned = bound
 				break
 			}
 		}
 	}
-	if !pinned {
+	if pinned == "" {
 		return GitCredentials{}, errors.New("broker installation git credentials are unavailable")
 	}
-	token, _, err := c.source.InstallationToken(ctx)
+	token, _, err := c.source.InstallationToken(ctx, pinned)
 	if err != nil || token == "" {
 		return GitCredentials{}, errors.New("broker installation git credentials are unavailable")
 	}

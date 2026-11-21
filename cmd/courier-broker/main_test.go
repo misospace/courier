@@ -20,25 +20,38 @@ import (
 	"github.com/misospace/courier/internal/topology"
 )
 
-type installationSourceFunc func(context.Context) (string, time.Time, error)
+type installationSourceFunc func(context.Context, string) (string, time.Time, error)
 
-func (f installationSourceFunc) InstallationToken(ctx context.Context) (string, time.Time, error) {
-	return f(ctx)
+func (f installationSourceFunc) InstallationToken(ctx context.Context, repository string) (string, time.Time, error) {
+	return f(ctx, repository)
 }
 
 func TestGitCredentialsForModeBindsPinnedRepositories(t *testing.T) {
-	source := installationSourceFunc(func(context.Context) (string, time.Time, error) {
+	var asked []string
+	source := installationSourceFunc(func(_ context.Context, repository string) (string, time.Time, error) {
+		asked = append(asked, repository)
 		return "installation-token", time.Now().Add(time.Hour), nil
 	})
-	credentials := gitCredentialsForMode(true, source, []string{"org/base", "org/work"}, &brokerEnv{})
-	for _, repository := range []string{"org/base", "Org/Work"} {
-		got, err := credentials.Credentials(context.Background(), repository)
+	credentials := gitCredentialsForMode(true, source, []string{"org/base", "Org/Work"}, &brokerEnv{})
+	for _, tc := range []struct{ asked, wantIdentity string }{
+		{"org/base", "org/base"},
+		{"Org/Work", "Org/Work"},
+		{"ORG/BASE", "org/base"},
+		{"org/work", "Org/Work"},
+	} {
+		got, err := credentials.Credentials(context.Background(), tc.asked)
 		if err != nil || got.Username != topology.DefaultGitUsername || got.Token != "installation-token" {
-			t.Fatalf("installation Credentials(%q) = %+v, %v", repository, got, err)
+			t.Fatalf("installation Credentials(%q) = %+v, %v", tc.asked, got, err)
+		}
+		if asked[len(asked)-1] != tc.wantIdentity {
+			t.Fatalf("Credentials(%q) asked the source for %q, want the canonical pinned identity %q", tc.asked, asked[len(asked)-1], tc.wantIdentity)
 		}
 	}
 	if _, err := credentials.Credentials(context.Background(), "other/project"); err == nil {
 		t.Fatal("installation git credentials served a repository outside the pinned set")
+	}
+	if len(asked) != 4 {
+		t.Fatalf("unpinned ask reached the source: %v", asked)
 	}
 	static := gitCredentialsForMode(false, nil, []string{"org/base"}, &brokerEnv{gitUsername: "deployment-user", gitToken: "static-token"})
 	got, err := static.Credentials(context.Background(), "anything/at")

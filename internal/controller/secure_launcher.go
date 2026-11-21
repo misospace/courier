@@ -38,18 +38,30 @@ const installationTokenRefreshLead = 25 * time.Minute
 // would refuse the very credential the operator just wrote.
 const installationTokenBrokerMargin = 2 * time.Minute
 
-// The broker needs administration reads for branch protection, read access to
-// checks, statuses, and metadata, and write access to publication surfaces. No
-// merge permission is requested.
-var brokerInstallationTokenPermissions = map[string]string{
-	"administration": "read",
-	"checks":         "read",
-	"contents":       "write",
-	"issues":         "write",
-	"metadata":       "read",
-	"pull_requests":  "write",
-	"statuses":       "read",
-}
+// GitHub applies an installation token's permissions to every repository the
+// token names, so the operator mints one token per pinned repository with
+// only the permissions the run's broker needs against that repository. The
+// base repository carries the publication surfaces (issue and pull-request
+// writes) and the reads that gate them; no contents write, because Courier's
+// git policy never pushes to the base. The work repository carries only what
+// a git fetch and push need; no issue or pull-request write, because
+// publication mutations belong to the base. No merge permission is requested
+// on either.
+var (
+	baseRepoInstallationTokenPermissions = map[string]string{
+		"administration": "read",
+		"checks":         "read",
+		"contents":       "read",
+		"issues":         "write",
+		"metadata":       "read",
+		"pull_requests":  "write",
+		"statuses":       "read",
+	}
+	workRepoInstallationTokenPermissions = map[string]string{
+		"contents": "write",
+		"metadata": "read",
+	}
+)
 
 // brokerVerdictGrace bounds how long a young control pod is spared the
 // broken-topology fence after its broker dies (#680). The broker's death is
@@ -312,20 +324,30 @@ func (s *SecureControl) EnsureInstallationToken(ctx context.Context, run *courie
 }
 
 // InstallationTokenRequeueDelay returns how long the reconciler should wait
-// before the pass that refreshes the token: the moment the current document
-// enters its refresh window, or the churn delay when no usable document exists
-// yet. This is expiry-driven rotation, not a run timeout.
+// before the pass that refreshes the tokens: the moment the earliest current
+// document entry enters its refresh window, or the churn delay when no usable
+// document exists yet. This is expiry-driven rotation, not a run timeout.
 func (s *SecureControl) InstallationTokenRequeueDelay(ctx context.Context, run *courier.CoderRun) time.Duration {
 	secret := &corev1.Secret{}
 	if err := s.reader().Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.CredentialsSecretName(run.Name)}, secret); err != nil {
 		return secureRequeueDelay
 	}
 	var document topology.InstallationTokenDocument
-	if err := json.Unmarshal(secret.Data[topology.CredKeyInstallationToken], &document); err != nil {
+	if err := json.Unmarshal(secret.Data[topology.CredKeyInstallationToken], &document); err != nil ||
+		document.Version != topology.InstallationTokenDocumentVersion || len(document.Entries) == 0 {
 		return secureRequeueDelay
 	}
-	delay := document.ExpiresAt.Add(-installationTokenRefreshLead).Sub(s.now())
-	if delay <= 0 {
+	delay := time.Duration(0)
+	for _, entry := range document.Entries {
+		entryDelay := entry.ExpiresAt.Add(-installationTokenRefreshLead).Sub(s.now())
+		if entryDelay <= 0 {
+			return secureRequeueDelay
+		}
+		if delay == 0 || entryDelay < delay {
+			delay = entryDelay
+		}
+	}
+	if delay == 0 {
 		return secureRequeueDelay
 	}
 	return delay
@@ -1128,47 +1150,144 @@ func (s *SecureControl) ensureInstallationTokenCredential(ctx context.Context, r
 	}
 	now := s.now()
 	if err == nil {
-		var current topology.InstallationTokenDocument
-		if json.Unmarshal(existing.Data[topology.CredKeyInstallationToken], &current) == nil &&
-			current.Version == topology.InstallationTokenDocumentVersion && current.Token != "" &&
-			current.ExpiresAt.After(now.Add(installationTokenRefreshLead)) {
+		// A deterministic name is only trusted once proven controlled by this
+		// exact run incarnation: a foreign or stale-owner object is never read
+		// for its credential and never overwritten, so a name collision cannot
+		// turn into a credential write to an object the run does not own.
+		if !metav1.IsControlledBy(existing, run) {
+			return secureNeedsHuman("InstallationTokenOwnership",
+				"the credentials Secret %q is not controlled by this run; refusing to read or overwrite its installation token", key.Name)
+		}
+		if installationDocumentFresh(existing.Data[topology.CredKeyInstallationToken], policy, baseOwner, registration.Endpoint, now) {
 			return nil
 		}
 	}
 
-	repositories := []string{policy.BaseRepo}
-	if policy.WorkRepo != policy.BaseRepo {
-		repositories = append(repositories, policy.WorkRepo)
+	// One mint per pinned repository, each with only that repository's
+	// permissions. A same-repository run (work == base) is the one case where
+	// both capability classes genuinely target a single repository, and its
+	// mint carries the merge of the two profiles.
+	type credentialCapability struct {
+		repository  string
+		permissions map[string]string
 	}
-	token, expiresAt, err := s.Config.InstallationTokenMinter.Mint(ctx, repositories, brokerInstallationTokenPermissions)
-	if err != nil {
-		return fmt.Errorf("secure topology: mint installation token: %w", err)
+	capabilities := []credentialCapability{{repository: policy.BaseRepo, permissions: cloneInstallationTokenPermissions(baseRepoInstallationTokenPermissions)}}
+	if !strings.EqualFold(policy.WorkRepo, policy.BaseRepo) {
+		capabilities = append(capabilities, credentialCapability{repository: policy.WorkRepo, permissions: cloneInstallationTokenPermissions(workRepoInstallationTokenPermissions)})
+	} else {
+		for permission, level := range workRepoInstallationTokenPermissions {
+			if level == "write" || capabilities[0].permissions[permission] == "" {
+				capabilities[0].permissions[permission] = level
+			}
+		}
 	}
-	// A credential that cannot outlive the refresh window turns every pass
-	// into a mint: reject it rather than write a token the broker will
-	// refuse, and let the retry backoff pace the next attempt.
-	if token == "" || !expiresAt.After(now.Add(installationTokenRefreshLead+installationTokenBrokerMargin)) {
-		return errors.New("secure topology: installation token mint returned a credential shorter than the refresh window")
+	entries := make([]topology.InstallationTokenEntry, 0, len(capabilities))
+	for _, capability := range capabilities {
+		token, expiresAt, err := s.Config.InstallationTokenMinter.Mint(ctx, []string{capability.repository}, capability.permissions)
+		if err != nil {
+			return fmt.Errorf("secure topology: mint installation token for %s: %w", capability.repository, err)
+		}
+		// A credential that cannot outlive the refresh window turns every pass
+		// into a mint: reject it rather than write a token the broker will
+		// refuse, and let the retry backoff pace the next attempt.
+		if token == "" || !expiresAt.After(now.Add(installationTokenRefreshLead+installationTokenBrokerMargin)) {
+			return fmt.Errorf("secure topology: installation token mint for %s returned a credential shorter than the refresh window", capability.repository)
+		}
+		entries = append(entries, topology.InstallationTokenEntry{Repository: capability.repository, Token: token, ExpiresAt: expiresAt})
 	}
 	document := topology.InstallationTokenDocument{
-		Version: topology.InstallationTokenDocumentVersion,
-		Token:   token, ExpiresAt: expiresAt, Owner: baseOwner, Endpoint: registration.Endpoint,
+		Version:  topology.InstallationTokenDocumentVersion,
+		Owner:    baseOwner,
+		Endpoint: registration.Endpoint,
+		Entries:  entries,
 	}
 	secret, err := topology.InstallationTokenCredentials(run, document)
 	if err != nil {
 		return fmt.Errorf("secure topology: render installation-token credentials: %w", err)
 	}
 	if missing {
-		if err := s.Client.Create(ctx, secret); err != nil && !apierrors.IsAlreadyExists(err) {
-			return fmt.Errorf("secure topology: create installation-token credentials: %w", err)
+		if err := s.Client.Create(ctx, secret); err != nil {
+			if !apierrors.IsAlreadyExists(err) {
+				return fmt.Errorf("secure topology: create installation-token credentials: %w", err)
+			}
+			// The create race is only settled once the winner is proven to be
+			// this run's own object carrying a document for this run's
+			// identity: a foreign winner fails closed, and a winner whose
+			// document still needs attention is refreshed by the next pass.
+			winner := &corev1.Secret{}
+			if err := s.reader().Get(ctx, key, winner); err != nil {
+				return fmt.Errorf("secure topology: read installation-token credentials winner: %w", err)
+			}
+			if !metav1.IsControlledBy(winner, run) {
+				return secureNeedsHuman("InstallationTokenOwnership",
+					"the credentials Secret %q created under this run's name is not controlled by this run; refusing to trust it", key.Name)
+			}
+			var winnerDocument topology.InstallationTokenDocument
+			if err := json.Unmarshal(winner.Data[topology.CredKeyInstallationToken], &winnerDocument); err != nil ||
+				winnerDocument.Version != topology.InstallationTokenDocumentVersion ||
+				!strings.EqualFold(winnerDocument.Owner, baseOwner) ||
+				!installationEndpointMatches(winnerDocument.Endpoint, registration.Endpoint) ||
+				!installationDocumentCoversRepositories(winnerDocument, policy) {
+				return errors.New("secure topology: installation-token credentials winner carries a document for a different identity")
+			}
+			return nil
 		}
 		return nil
 	}
+	// Ownership is proven above, so the update replaces the credential whole
+	// and converges the owner references to the rendered object rather than
+	// preserving anything a previous writer left behind.
 	existing.Data = secret.Data
+	existing.OwnerReferences = secret.OwnerReferences
 	if err := s.Client.Update(ctx, existing); err != nil {
 		return fmt.Errorf("secure topology: update installation-token credentials: %w", err)
 	}
 	return nil
+}
+
+// installationDocumentFresh reports that the stored document is the supported
+// version bound to this run's owner, endpoint, and pinned repositories, and
+// that every entry outlives the refresh window. Owner and endpoint are
+// re-checked on the fast path so a document that drifted away from the run's
+// identity is refreshed rather than served.
+func installationDocumentFresh(raw []byte, policy *courier.PublicationPolicy, owner, endpoint string, now time.Time) bool {
+	var document topology.InstallationTokenDocument
+	if err := json.Unmarshal(raw, &document); err != nil {
+		return false
+	}
+	if document.Version != topology.InstallationTokenDocumentVersion ||
+		!strings.EqualFold(document.Owner, owner) || !installationEndpointMatches(document.Endpoint, endpoint) {
+		return false
+	}
+	for _, repository := range []string{policy.BaseRepo, policy.WorkRepo} {
+		entry, ok := document.Entry(repository)
+		if !ok || entry.Token == "" || !entry.ExpiresAt.After(now.Add(installationTokenRefreshLead)) {
+			return false
+		}
+	}
+	return true
+}
+
+// installationDocumentCoversRepositories reports that the document carries a
+// non-empty entry for every pinned repository, ignoring expiry. The create
+// race uses it so a winner owned by this run but missing a pinned repository
+// is refused rather than trusted until some later pass happens to notice.
+func installationDocumentCoversRepositories(document topology.InstallationTokenDocument, policy *courier.PublicationPolicy) bool {
+	for _, repository := range []string{policy.BaseRepo, policy.WorkRepo} {
+		entry, ok := document.Entry(repository)
+		if !ok || entry.Token == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func cloneInstallationTokenPermissions(permissions map[string]string) map[string]string {
+	clone := make(map[string]string, len(permissions)+2)
+	for permission, level := range permissions {
+		clone[permission] = level
+	}
+	return clone
 }
 
 func brokerRoleForRun(s *SecureControl, run *courier.CoderRun) *rbacv1.Role {
