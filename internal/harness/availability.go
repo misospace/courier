@@ -340,12 +340,25 @@ func normalizeProviderSignalText(value string) string {
 
 // parseRetryAfter reads the standard Retry-After header as either a number of
 // seconds or an HTTP date. An unparseable or negative value yields zero: the
-// harness never invents a reset time.
+// harness never invents a reset time. A header repeated with conflicting
+// values arrives comma-joined and therefore parses as ambiguous → zero.
 func parseRetryAfter(header http.Header) time.Duration {
 	if header == nil {
 		return 0
 	}
-	raw := strings.TrimSpace(header.Get("Retry-After"))
+	return parseRetryAfterValue(header.Get(retryAfterHeader))
+}
+
+// retryAfterHeader is the authoritative reset/retry hint header the harness
+// honors, named once so the live-header and serialized-header paths agree on
+// exactly which header carries it.
+const retryAfterHeader = "Retry-After"
+
+// parseRetryAfterValue interprets one Retry-After value: a non-negative number
+// of seconds or an HTTP date. Anything else — malformed, negative, already
+// elapsed — yields zero.
+func parseRetryAfterValue(raw string) time.Duration {
+	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return 0
 	}
@@ -370,6 +383,32 @@ func boundRetryAfter(d time.Duration) time.Duration {
 		return maxRetryAfter
 	}
 	return d
+}
+
+// RetryAfterFromHeaders reads the authoritative Retry-After hint from a
+// response-header map serialized by a runtime — the shape an OpenCode APIError
+// event carries on the legacy executor path, where Courier never sees the live
+// HTTP response. Keys match case-insensitively and the value is bounded
+// exactly like the live-header path (seconds or HTTP date, capped at the 24h
+// horizon). Zero is returned when the hint is absent, malformed, non-positive,
+// or carried more than once with conflicting values: an ambiguous duplicate is
+// not a reset time the harness may guess.
+func RetryAfterFromHeaders(headers map[string]string) time.Duration {
+	value, found := "", false
+	for key, candidate := range headers {
+		if !strings.EqualFold(strings.TrimSpace(key), retryAfterHeader) {
+			continue
+		}
+		candidate = strings.TrimSpace(candidate)
+		if found && candidate != value {
+			return 0
+		}
+		value, found = candidate, true
+	}
+	if !found {
+		return 0
+	}
+	return parseRetryAfterValue(value)
 }
 
 // classifyStreamSignal classifies a provider error object that arrived inside

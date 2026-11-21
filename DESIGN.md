@@ -782,8 +782,10 @@ exhaustion persists a default 15-minute cooldown on LaneProfile status. Source
 discovery and admission pause only for that identity; already-running work and
 unrelated pools continue. The interval is an anti-hammering floor, not a
 provider reset estimate — but a confirmed-exhaustion handoff may carry the
-provider's own reset: the native harness renders the authoritative
-`Retry-After` it parsed at the gateway as a bounded
+provider's own reset: every `COURIER_TERMINATION` producer renders the
+authoritative `Retry-After` it observed — the native harness reads it from the
+gateway response, the legacy executor from the response headers the runtime
+serializes into its structured error event — as a bounded
 `provider_reset_after_seconds` on the termination handoff, and the operator
 persists it on the capacity-exhaustion diagnostic as `providerResetAt` only
 when it is validated (positive, within a 24-hour horizon) on a handoff whose

@@ -22,11 +22,21 @@ func parseExhaustionSignals(codes, types string) exhaustionSignals {
 	return harness.ParseExhaustionSignals(codes, types)
 }
 
+// providerExhaustion is the bounded verdict of one structured
+// allowance-exhaustion event: the allowlisted class and code tokens, plus the
+// provider's own quota-reset hint when its response carried one (#866). It
+// never carries provider response text.
+type providerExhaustion struct {
+	class      string
+	code       string
+	resetAfter time.Duration
+}
+
 // OpenCode v1.18.31 run.ts emits serialized NamedError objects. Only APIError
 // responseBody is provider evidence; data.message, text parts and stderr are not.
-func classifyProviderExhaustion(line []byte, signals exhaustionSignals) (bool, string, string) {
+func classifyProviderExhaustion(line []byte, signals exhaustionSignals) (providerExhaustion, bool) {
 	if len(line) > tapMaxLine {
-		return false, "", ""
+		return providerExhaustion{}, false
 	}
 	var event struct {
 		Type      string `json:"type"`
@@ -34,31 +44,37 @@ func classifyProviderExhaustion(line []byte, signals exhaustionSignals) (bool, s
 		Error     struct {
 			Name string `json:"name"`
 			Data struct {
-				StatusCode   int    `json:"statusCode"`
-				ResponseBody string `json:"responseBody"`
+				StatusCode      int               `json:"statusCode"`
+				ResponseHeaders map[string]string `json:"responseHeaders"`
+				ResponseBody    string            `json:"responseBody"`
 			} `json:"data"`
 		} `json:"error"`
 	}
 	if json.Unmarshal(line, &event) != nil || event.Type != "error" || event.SessionID == "" || event.Error.Name != "APIError" {
-		return false, "", ""
+		return providerExhaustion{}, false
 	}
 	data := event.Error.Data
 	if len(data.ResponseBody) == 0 || len(data.ResponseBody) > 64<<10 {
-		return false, "", ""
+		return providerExhaustion{}, false
 	}
+	// The runtime serializes the provider's response headers with the error, so
+	// the authoritative Retry-After hint survives the child-process boundary
+	// (#866). It is read only for a verdict this same line confirms as
+	// exhaustion, and only as a bounded duration — never as retained text.
+	resetAfter := harness.RetryAfterFromHeaders(data.ResponseHeaders)
 	classified := harness.ClassifyProviderError(data.StatusCode, nil, []byte(data.ResponseBody), signals)
 	// A quota verdict must be carried by the body's structured signal, never
 	// by status code alone: the harness treats bare 402 as allowance-shaped,
 	// but the stop path kills a working child and ends the run as exhausted,
 	// which #327 reserves for authoritative evidence.
 	if classified.Availability == harness.ProviderAllowanceExhausted && classified.Code != "" {
-		return true, string(classified.Availability), classified.Code
+		return providerExhaustion{class: string(classified.Availability), code: classified.Code, resetAfter: resetAfter}, true
 	}
 	// Some Anthropic-compatible responses expose their numeric plan code only as
 	// a suffix of error.message. Require the typed provider envelope, HTTP 429,
 	// and an explicit deployment-configured code; never read the runtime summary.
 	if data.StatusCode != 429 {
-		return false, "", ""
+		return providerExhaustion{}, false
 	}
 	var body struct {
 		Error struct {
@@ -67,31 +83,31 @@ func classifyProviderExhaustion(line []byte, signals exhaustionSignals) (bool, s
 		} `json:"error"`
 	}
 	if json.Unmarshal([]byte(data.ResponseBody), &body) != nil || body.Error.Type != "rate_limit_error" {
-		return false, "", ""
+		return providerExhaustion{}, false
 	}
 	message := strings.TrimSpace(body.Error.Message)
 	if len(message) > 4096 || !strings.HasSuffix(message, ")") {
-		return false, "", ""
+		return providerExhaustion{}, false
 	}
 	start := strings.LastIndexByte(message, '(')
 	if start < 0 {
-		return false, "", ""
+		return providerExhaustion{}, false
 	}
 	code := message[start+1 : len(message)-1]
 	if len(code) == 0 || len(code) > 9 {
-		return false, "", ""
+		return providerExhaustion{}, false
 	}
 	for _, c := range code {
 		if c < '0' || c > '9' {
-			return false, "", ""
+			return providerExhaustion{}, false
 		}
 	}
 	for _, configured := range signals.Codes {
 		if code == configured {
-			return true, string(harness.ProviderAllowanceExhausted), code
+			return providerExhaustion{class: string(harness.ProviderAllowanceExhausted), code: code, resetAfter: resetAfter}, true
 		}
 	}
-	return false, "", ""
+	return providerExhaustion{}, false
 }
 
 // capacityExhaustionReason renders the bounded, allowlisted exhaustion
@@ -108,19 +124,23 @@ func capacityExhaustionReason(class, code string) string {
 // capacityExhaustedTermination builds the recoverable capacity-handoff
 // ending (#320/#327): exit 2 keeps the handoff vocabulary valid, the
 // outcome routes the operator to the fenced capacity-recovery path, the
-// category is the durable diagnostic, and the workspace snapshot is the
-// executor's own git-verified evidence.
-func (r reporter) capacityExhaustedTermination(ctx context.Context, workspace *git.Workspace, cfg config, startCommit, class, code string) termination {
+// category is the durable diagnostic, the workspace snapshot is the
+// executor's own git-verified evidence, and `resetAfter` is the exhausted
+// provider's own quota-reset hint (#866) rendered through the shared
+// producer bound — absent when the provider gave none, so the operator keeps
+// its plain cooldown window.
+func (r reporter) capacityExhaustedTermination(ctx context.Context, workspace *git.Workspace, cfg config, startCommit, class, code string, resetAfter time.Duration) termination {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	return termination{
-		Phase:           "NeedsHuman",
-		Result:          "needs-human",
-		ExitCode:        exitNeedsHuman,
-		Reason:          capacityExhaustionReason(class, code),
-		Outcome:         string(executor.OutcomeCapacityExhausted),
-		Category:        terminalCategoryCapacityExhaustion,
-		WorkspaceSafety: capacityWorkspaceSafety(ctx, workspace, cfg.RemoteURL, cfg.Branch, startCommit),
+		Phase:                     "NeedsHuman",
+		Result:                    "needs-human",
+		ExitCode:                  exitNeedsHuman,
+		Reason:                    capacityExhaustionReason(class, code),
+		Outcome:                   string(executor.OutcomeCapacityExhausted),
+		Category:                  terminalCategoryCapacityExhaustion,
+		WorkspaceSafety:           capacityWorkspaceSafety(ctx, workspace, cfg.RemoteURL, cfg.Branch, startCommit),
+		ProviderResetAfterSeconds: executor.ProviderResetSeconds(resetAfter),
 	}
 }
 

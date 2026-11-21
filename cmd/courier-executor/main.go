@@ -145,6 +145,10 @@ type termination struct {
 	// Legacy observations are not authority: the controller keeps recovery held
 	// until an independent trusted observer can validate them.
 	WorkspaceSafety *courierv1alpha1.WorkspaceSafetyEvidence `json:"workspace_safety,omitempty"`
+	// ProviderResetAfterSeconds is the bounded authoritative provider reset
+	// hint in seconds (#866), capacity-exhaustion endings only; 0/absent means
+	// the provider gave no hint, so the operator keeps its default cooldown.
+	ProviderResetAfterSeconds int64 `json:"provider_reset_after_seconds,omitempty"`
 }
 
 func main() {

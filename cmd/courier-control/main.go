@@ -83,11 +83,6 @@ var probeRetryDelay = 10 * time.Second
 // still cut by the shared line fit (#210).
 const maxTerminationReasonBytes = 1200
 
-// maxTerminationResetSeconds clamps the rendered provider reset hint to the
-// 24h horizon: a hint beyond one day is not a cooldown the lane waits out,
-// and the operator must never see a reset window past its planning bound.
-const maxTerminationResetSeconds = int64((24 * time.Hour) / time.Second)
-
 // boundReason bounds the reason to maxTerminationReasonBytes, splitting only
 // on a rune boundary so the trusted reason remains valid UTF-8. It reuses the
 // shared executor.TerminationTruncationSuffix marker so every COURIER_TERMINATION
@@ -991,19 +986,15 @@ func terminationFor(result executor.HarnessResult) termination {
 }
 
 // providerResetSeconds renders the provider reset hint for a confirmed
-// capacity-exhaustion ending as whole seconds, rounded up so a sub-second
-// remainder never collapses to no-hint, and clamped to the 24h horizon. Any
-// other ending — including a transient rate limit — is hint-free: only the
-// authoritative exhaustion signal may extend the lane capacity cooldown.
+// capacity-exhaustion ending through the shared producer bound (whole seconds,
+// rounded up, clamped to the 24h horizon). Any other ending — including a
+// transient rate limit — is hint-free: only the authoritative exhaustion
+// signal may extend the lane capacity cooldown.
 func providerResetSeconds(result executor.HarnessResult) int64 {
-	if result.Outcome != executor.OutcomeCapacityExhausted || result.CapacityResetAfter <= 0 {
+	if result.Outcome != executor.OutcomeCapacityExhausted {
 		return 0
 	}
-	seconds := int64((result.CapacityResetAfter + time.Second - 1) / time.Second)
-	if seconds > maxTerminationResetSeconds {
-		return maxTerminationResetSeconds
-	}
-	return seconds
+	return executor.ProviderResetSeconds(result.CapacityResetAfter)
 }
 
 // handoff writes the structured termination payload to stdout and the

@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/source"
 )
 
@@ -34,11 +35,12 @@ import (
 const defaultCapacityCooldownWindow = 15 * time.Minute
 
 // capacityProviderResetHorizon bounds how far a validated provider reset
-// hint (#866) may extend a cooldown deadline. The capture path rejects hints
-// past it, and the cooldown fold re-checks it defensively against durable
-// evidence, so no value — crafted, drifted, or clock-skewed — can hold a
-// capacity identity past the horizon.
-const capacityProviderResetHorizon = 24 * time.Hour
+// hint (#866) may extend a cooldown deadline. It is the shared producer-side
+// bound, so a rendered hint and the operator's check cannot drift: the
+// capture path rejects hints past it, and the cooldown fold re-checks it
+// defensively against durable evidence, so no value — crafted, drifted, or
+// clock-skewed — can hold a capacity identity past the horizon.
+const capacityProviderResetHorizon = executor.ProviderResetHorizon
 
 // Capacity-recovery condition reasons written on CoderRun.Status.Conditions
 // under ConditionCapacityRecovery. Settled is the only success; Unsupported,

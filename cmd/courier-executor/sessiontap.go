@@ -62,12 +62,12 @@ type sessionTap struct {
 	exhaustion *tapExhaustion
 }
 
-// tapExhaustion is one classified exhaustion event: the bounded class and
-// code tokens only — never provider response text.
+// tapExhaustion is one classified exhaustion event: the bounded class and code
+// tokens and the provider's bounded reset hint only — never provider response
+// text.
 type tapExhaustion struct {
-	seq   int
-	class string
-	code  string
+	seq      int
+	evidence providerExhaustion
 }
 
 func newSessionTap(w io.Writer, signals exhaustionSignals) *sessionTap {
@@ -176,8 +176,8 @@ func (t *sessionTap) scan(line []byte) {
 	if event.Part != nil && event.Part.Type == "text" {
 		t.lastText = truncatedRunes(event.Part.Text, tapLastTextLimit)
 	}
-	if exhausted, class, code := classifyProviderExhaustion(line, t.signals); exhausted {
-		t.exhaustion = &tapExhaustion{seq: t.seq, class: class, code: code}
+	if evidence, exhausted := classifyProviderExhaustion(line, t.signals); exhausted {
+		t.exhaustion = &tapExhaustion{seq: t.seq, evidence: evidence}
 		if t.kill != nil {
 			t.kill()
 		}
@@ -187,22 +187,22 @@ func (t *sessionTap) scan(line []byte) {
 // confirmedExhaustion reports whether the classified event is the final line.
 // The stop path retains the first classification even when already-buffered
 // output drains after SIGKILL; those bytes cannot restart the stopped child.
-func (t *sessionTap) confirmedExhaustion() (class, code string, ok bool) {
+func (t *sessionTap) confirmedExhaustion() (providerExhaustion, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.exhaustion == nil || t.exhaustion.seq != t.seq {
-		return "", "", false
+		return providerExhaustion{}, false
 	}
-	return t.exhaustion.class, t.exhaustion.code, true
+	return t.exhaustion.evidence, true
 }
 
-func (t *sessionTap) lastExhaustion() (class, code string, ok bool) {
+func (t *sessionTap) lastExhaustion() (providerExhaustion, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.exhaustion == nil {
-		return "", "", false
+		return providerExhaustion{}, false
 	}
-	return t.exhaustion.class, t.exhaustion.code, true
+	return t.exhaustion.evidence, true
 }
 
 // session returns the first session id served by any attempt, used to resume
