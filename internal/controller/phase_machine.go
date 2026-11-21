@@ -67,7 +67,11 @@ func (r *SourceRegistry) Register(name string, adapter source.Adapter) {
 // serves. The list is sorted and deduplicated, and nil when no key carries a
 // usable base name: it is an inventory of configured
 // source names, not of adapters, so several bindings under one source name
-// contribute one entry.
+// contribute one entry. Built-in adapters registered unconditionally are
+// always in the inventory: their source names resolve in every deployment, so
+// an Empty read model entry for one states "configured, no runs yet", never
+// "unused configuration" — the inventory describes what the process can
+// serve, not what has run.
 func (r *SourceRegistry) ConfiguredSourceNames() []string {
 	if r == nil {
 		return nil
