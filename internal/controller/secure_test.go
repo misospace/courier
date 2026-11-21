@@ -207,7 +207,14 @@ func secureForge() *fakeAdmissionForge {
 	}
 }
 
-func secureControl(t *testing.T, objects ...client.Object) (*SecureControl, client.Client) {
+// secureControlBase builds the control and client every secure-launch test
+// shares: the scheme, the lane every test run names, and a fake client whose
+// Create interceptor stands in for the API server — it assigns UIDs, rejects
+// the known-bad dry-run specs the preflight uses to prove restricted
+// admission, and records every object it lets through, in order. A non-nil
+// onCreate returning an error replaces a create with that failure; tests
+// read the recorded order through the returned slice.
+func secureControlBase(t *testing.T, objects []client.Object, onCreate func(client.Object) error) (*SecureControl, client.Client, *[]client.Object) {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	for _, add := range []func(*runtime.Scheme) error{courier.AddToScheme, corev1.AddToScheme, rbacv1.AddToScheme, networkingv1.AddToScheme} {
@@ -227,6 +234,7 @@ func secureControl(t *testing.T, objects ...client.Object) (*SecureControl, clie
 		},
 	}
 	objects = append([]client.Object{lane}, objects...)
+	var created []client.Object
 	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&courier.CoderRun{}).
 		WithObjects(objects...).
 		WithInterceptorFuncs(interceptor.Funcs{
@@ -240,6 +248,12 @@ func secureControl(t *testing.T, objects ...client.Object) (*SecureControl, clie
 				if strings.Contains(obj.GetName(), "-bad-dryrun") {
 					return errors.New("admission denied: known-bad pod spec")
 				}
+				if onCreate != nil {
+					if err := onCreate(obj); err != nil {
+						return err
+					}
+				}
+				created = append(created, obj.DeepCopyObject().(client.Object))
 				return c.Create(ctx, obj, opts...)
 			},
 		}).
@@ -263,6 +277,11 @@ func secureControl(t *testing.T, objects ...client.Object) (*SecureControl, clie
 			Now:               func() time.Time { return time.Now() },
 		},
 	}
+	return control, c, &created
+}
+
+func secureControl(t *testing.T, objects ...client.Object) (*SecureControl, client.Client) {
+	control, c, _ := secureControlBase(t, objects, nil)
 	return control, c
 }
 
@@ -1272,60 +1291,11 @@ func TestLaunchSecureProvisionsTopology(t *testing.T) {
 	}
 }
 
-// secureControlRecordingCreates builds the same control as secureControl and
-// records every object the launch path creates, in order, once onCreate
-// passes. A non-nil onCreate returning an error replaces the create with that
-// failure. It exists for the launch-order and fail-closed tests, which need
-// create visibility the shared fixture does not expose.
+// secureControlRecordingCreates exposes the create recording
+// secureControlBase always performs, for the launch-order and fail-closed
+// tests, which need create visibility plain secureControl does not surface.
 func secureControlRecordingCreates(t *testing.T, onCreate func(client.Object) error) (*SecureControl, client.Client, *[]client.Object) {
-	t.Helper()
-	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{courier.AddToScheme, corev1.AddToScheme, rbacv1.AddToScheme, networkingv1.AddToScheme} {
-		if err := add(scheme); err != nil {
-			t.Fatal(err)
-		}
-	}
-	lane := &courier.LaneProfile{
-		ObjectMeta: metav1.ObjectMeta{Namespace: secureTestNamespace, Name: "local"},
-		Spec:       courier.LaneProfileSpec{Roles: map[string]string{"coordinator": "test/coordinator", "coder": "test/coder"}},
-	}
-	var created []client.Object
-	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&courier.CoderRun{}).
-		WithObjects(lane).
-		WithInterceptorFuncs(interceptor.Funcs{
-			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-				if obj.GetUID() == "" {
-					obj.SetUID(types.UID("generated-" + obj.GetName()))
-				}
-				if strings.Contains(obj.GetName(), "-bad-dryrun") {
-					return errors.New("admission denied: known-bad pod spec")
-				}
-				if onCreate != nil {
-					if err := onCreate(obj); err != nil {
-						return err
-					}
-				}
-				created = append(created, obj.DeepCopyObject().(client.Object))
-				return c.Create(ctx, obj, opts...)
-			},
-		}).Build()
-	control := &SecureControl{
-		Client:  c,
-		Patcher: &CoderRunReconciler{Client: c, StatusWriter: fakeStatusWriter{client: c}},
-		Sources: NewSourceRegistry(map[string]source.Adapter{adhoc.SourceName: adhoc.New(c, c), "manual": manual.New(nil)}),
-		Config: SecureConfig{
-			RunNamespace:      secureTestNamespace,
-			Registry:          secureRegistry(),
-			HarnessImage:      "harness:test",
-			ProbeImage:        "busybox:test",
-			LiveProbes:        false,
-			OperatorNamespace: "courier-system",
-			Providers:         fakeProviderFactory(secureForge()),
-			Kubernetes:        fakeAccessReviews(),
-			Now:               func() time.Time { return time.Now() },
-		},
-	}
-	return control, c, &created
+	return secureControlBase(t, nil, onCreate)
 }
 
 // seedLaunchTopology creates the claimed run, the restricted run namespace,
