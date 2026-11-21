@@ -9,7 +9,7 @@
 ARG BINARIES=builder
 
 # Build the manager and executor binaries.
-FROM golang:1.27.4@sha256:5e8afd493a7124a8586e134d9b532731161d4b9becf9dee5a5956b107426f93d AS builder
+FROM golang:1.27.4@sha256:205c7636d74e0ffbe3d007162df7d74f859f5a8c8322dfb9f907977686c126cf AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -31,7 +31,8 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 	go build -o courier-control ./cmd/courier-control && \
 	go build -o courier-worker ./cmd/courier-worker && \
 	go build -o courier-broker ./cmd/courier-broker && \
-	go build -o courier-dependency-cache ./cmd/courier-dependency-cache
+	go build -o courier-dependency-cache ./cmd/courier-dependency-cache && \
+	go build -o courier-console ./cmd/courier-console
 
 FROM builder AS binaries-builder
 
@@ -42,7 +43,7 @@ COPY dist/ /workspace/
 
 FROM binaries-${BINARIES} AS binaries
 
-FROM golang:1.27.4@sha256:5e8afd493a7124a8586e134d9b532731161d4b9becf9dee5a5956b107426f93d AS toolchain
+FROM golang:1.27.4@sha256:205c7636d74e0ffbe3d007162df7d74f859f5a8c8322dfb9f907977686c126cf AS toolchain
 ARG CONTROLLER_TOOLS_VERSION=v0.16.5
 ARG HELM_VERSION=v3.18.6
 
@@ -166,7 +167,13 @@ RUN set -eux; \
 	printf 'controller-gen %s\nsetup-envtest %s\n' "$cg_pin" "$se_pin" > /usr/local/share/courier/tools/.tool-pins && \
 	XDG_DATA_HOME=/usr/local/share/courier/envtest-store /usr/local/share/courier/tools/bin/setup-envtest use "${k8s}" && \
 	chmod -R a+rX /usr/local/share/courier && \
-	rm -rf /tmp/courier-toolchain /root/.cache /root/.local /courier-toolchain-cache/go-mod /courier-toolchain-cache/go-build /usr/local/share/courier/mise-data/downloads
+	rm -rf /tmp/courier-toolchain /root/.cache /root/.local /home/courier/.local/state /courier-toolchain-cache/go-mod /courier-toolchain-cache/go-build /usr/local/share/courier/mise-data/downloads
+# The bake's mise install runs as root with the task user's HOME, so its
+# state tree (trusted-configs registry included) lands root-owned under
+# /home/courier/.local/state — a task user's later trust write is refused
+# EACCES and the whole bootstrap dies behind an opaque exit 1. Removing the
+# tree lets mise recreate it under the runtime uid at first use; the devenv
+# wiring also redirects XDG_STATE_HOME for defense in depth.
 
 USER 65532:65532
 
@@ -196,13 +203,15 @@ COPY --from=binaries /workspace/courier-broker /usr/local/bin/courier-broker
 USER 65532:65532
 
 # Manager image: distroless, the manager binary plus the read-only
-# dependency cache server (courier-dependency-cache) — the deployment-level
-# trusted infrastructure binaries. Kept last so a bare `docker build .`
+# dependency cache server (courier-dependency-cache) and the standalone
+# operator console (courier-console) — the deployment-level trusted
+# infrastructure binaries. Kept last so a bare `docker build .`
 # produces the operator image; build paths still pass --target explicitly.
 FROM gcr.io/distroless/static:nonroot@sha256:aafe993665bf6200db38a02c11a9351e782a84b6a45e7f33b6695638c88e3931 AS manager
 WORKDIR /
 COPY --from=binaries /workspace/manager .
 COPY --from=binaries /workspace/courier-dependency-cache /usr/local/bin/courier-dependency-cache
+COPY --from=binaries /workspace/courier-console /usr/local/bin/courier-console
 USER 65532:65532
 
 ENTRYPOINT ["/manager"]

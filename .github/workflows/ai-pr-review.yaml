@@ -60,7 +60,7 @@ jobs:
       - name: Generate bot token
         if: github.event_name != 'issue_comment' || steps.prctx.outputs.eligible == 'true'
         id: app-token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
           client-id: ${{ secrets.BOT_CLIENT_ID }}
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
@@ -68,7 +68,7 @@ jobs:
       - name: Review PR
         if: github.event_name == 'pull_request' || (github.event_name == 'issue_comment' && steps.prctx.outputs.eligible == 'true')
         id: review
-        uses: misospace/pr-reviewer-action@0a2d2732f7358e509e6a85e11160eb25cc5b1b80 # v3.8.0
+        uses: misospace/pr-reviewer-action@25dae600b49c50c18d9b05cc8812943a1f5412ec # v3.9.0
         env:
           PR_REVIEWER_GATE_HEAD_SHA: ${{ steps.prctx.outputs.head_sha }}
         with:
@@ -77,6 +77,8 @@ jobs:
           ai-anthropic-effort-support: 'true'
           ai-specialist-anthropic-effort-support: 'true'
           ai-base-url: ${{ vars.LITELLM_URL }}
+          ai-extra-headers: |
+            x-litellm-session-id: prreview-${{ github.run_id }}-${{ github.run_attempt }}
           ai-api-format: ${{ vars.PRIMARY_FORMAT }}
           ai-model: ${{ vars.PRIMARY_MODEL }}
           ai-primary-reasoning-effort: ${{ vars.PRIMARY_REASONING_EFFORT }}

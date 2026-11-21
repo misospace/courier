@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"errors"
 	"fmt"
 	"io"
@@ -58,6 +60,28 @@ func TestExistingPRHeadResolver(t *testing.T) {
 	}
 	if got := existingPRHeadResolver(nil); got != nil {
 		t.Fatal("existingPRHeadResolver(nil) returned a resolver")
+	}
+}
+
+func TestObserverDisabled(t *testing.T) {
+	if !observerDisabled(nil) {
+		t.Fatal("observerDisabled(nil) = false, want disabled")
+	}
+	if observerDisabled(observerWithHeadResolver{}) {
+		t.Fatal("observerDisabled() = true for an enabled non-GitHub observer")
+	}
+	if !observerDisabled((*couriergithub.Observer)(nil)) {
+		t.Fatal("observerDisabled() = false for a typed-nil GitHub observer")
+	}
+	if !observerDisabled(couriergithub.Observer{}) {
+		t.Fatal("observerDisabled() = false for a clientless GitHub observer")
+	}
+	client, err := couriergithub.New("test-token")
+	if err != nil {
+		t.Fatalf("build GitHub client: %v", err)
+	}
+	if observerDisabled(couriergithub.Observer{Client: client}) {
+		t.Fatal("observerDisabled() = true for a wired GitHub observer")
 	}
 }
 
@@ -560,6 +584,65 @@ func TestBuildSecureControlRejectsTaintedCredential(t *testing.T) {
 	}
 }
 
+func TestBuildSecureControlAcceptsObserverWithoutDuplicateAppIsolationCheck(t *testing.T) {
+	registryFile := filepath.Join(t.TempDir(), "providers.json")
+	providers := `{"providers":[{"name":"github","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"forge-creds","key":"token"}},"serves":["*"]}]}`
+	if err := os.WriteFile(registryFile, []byte(providers), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	observerClient, err := couriergithub.NewClient("https://api.github.com/", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = buildSecureControl(secureConfig{
+		providersFile:     registryFile,
+		runNamespace:      "runs",
+		harnessImage:      "harness:test",
+		probeImage:        "probe:test",
+		observer:          couriergithub.Observer{Client: observerClient},
+		observerSecret:    "app-key",
+		restConfig:        &rest.Config{Host: "https://kubernetes.default.svc"},
+		legacyGitSecret:   "app-key",
+		legacyAPISecret:   "app-key",
+		executorEnvSecret: "app-key",
+		gatewayKeySecret:  "app-key",
+		operatorNS:        "courier-system",
+	})
+	if err == nil || !strings.Contains(err.Error(), "observer credential Secret") {
+		t.Fatalf("static observer identity must remain isolated, got %v", err)
+	}
+}
+
+func TestBuildSecureControlAcceptsInstallationBoundObserver(t *testing.T) {
+	registryFile := filepath.Join(t.TempDir(), "providers.json")
+	providers := `{"providers":[{"name":"github","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"forge-creds","key":"token"}},"serves":["*"]}]}`
+	if err := os.WriteFile(registryFile, []byte(providers), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appClient, err := couriergithub.NewInstallationClient(couriergithub.InstallationAuth{AppID: 1, InstallationID: 2, Owner: "acme", PrivateKey: privateKey, Endpoint: "https://api.github.com/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	control, err := buildSecureControl(secureConfig{
+		providersFile: registryFile,
+		runNamespace:  "runs",
+		harnessImage:  "harness:test",
+		probeImage:    "probe:test",
+		observer:      couriergithub.Observer{Client: appClient},
+		restConfig:    &rest.Config{Host: "https://kubernetes.default.svc"},
+	})
+	if err != nil {
+		t.Fatalf("GitHub App observer should satisfy secure admission identity: %v", err)
+	}
+	if control == nil {
+		t.Fatal("buildSecureControl returned nil control")
+	}
+}
+
 func TestBuildSecureControlRequiresObserverCredential(t *testing.T) {
 	registryFile := filepath.Join(t.TempDir(), "providers.json")
 	providers := `{"providers":[{"name":"github","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"forge-creds","key":"token"}},"serves":["*"]}]}`
@@ -571,6 +654,48 @@ func TestBuildSecureControlRequiresObserverCredential(t *testing.T) {
 		runNamespace:  "runs",
 	}); err == nil || !strings.Contains(err.Error(), "observer") {
 		t.Fatalf("secure mode without an admission-read identity must fail startup, got %v", err)
+	}
+}
+
+func mustTestRSAKey(t *testing.T) *rsa.PrivateKey {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
+}
+
+func TestValidateGitHubAppSecretIsolation(t *testing.T) {
+	registry, err := forge.Load([]byte(`{"providers":[{"name":"github","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"broker-secret","key":"token"}},"serves":["*"]}]}`), "github")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name      string
+		configure func() error
+	}{
+		{name: "git pod secret", configure: func() error {
+			return validateGitHubAppSecretIsolation(couriergithub.InstallationAuth{PrivateKeySecret: "app-key"}, "", "", "app-key", "", "", "", "", "", "", registry, "courier-system")
+		}},
+		{name: "broker reference", configure: func() error {
+			return validateGitHubAppSecretIsolation(couriergithub.InstallationAuth{PrivateKeySecret: "broker-secret"}, "", "", "", "", "", "", "", "", "", registry, "courier-system")
+		}},
+		{name: "commenter secret", configure: func() error {
+			return validateGitHubAppSecretIsolation(couriergithub.InstallationAuth{PrivateKeySecret: "app-key"}, "", "", "", "", "", "app-key", "", "", "", registry, "courier-system")
+		}},
+		{name: "legacy API secret", configure: func() error {
+			return validateGitHubAppSecretIsolation(couriergithub.InstallationAuth{PrivateKeySecret: "app-key"}, "", "app-key", "", "", "", "", "", "", "", registry, "courier-system")
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.configure(); err == nil {
+				t.Fatal("overlapping Secret accepted")
+			}
+		})
+	}
+	if err := validateGitHubAppSecretIsolation(couriergithub.InstallationAuth{PrivateKeySecret: "app-key"}, "", "api-secret", "git-secret", "env-secret", "gateway-secret", "comment-secret", "evidence-secret", "admission-secret", "read-secret", registry, "courier-system"); err != nil {
+		t.Fatalf("isolated App Secret rejected: %v", err)
 	}
 }
 

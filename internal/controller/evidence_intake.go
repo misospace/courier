@@ -45,6 +45,7 @@ import (
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/evidence"
 	"github.com/misospace/courier/internal/executor"
+	"github.com/misospace/courier/internal/topology"
 )
 
 // EvidenceLabelKey selects a run's evidence Secret. The label value is the
@@ -1189,41 +1190,12 @@ func evidenceSecretName(runName string, nonce []byte) string {
 	return prefix + base + "-" + nonceHex
 }
 
-// evidenceLabelValue builds the evidence label value: the run's name, sanitized
-// to a DNS-label-safe form. It is truncated and hash-sufficed when long so two
-// runs sharing a prefix do not collide in the label, which keeps the label
-// selector a correct run selector.
+// evidenceLabelValue builds the evidence label value: the run's name in the
+// same sanitized, digest-bounded form the topology writes its run label with,
+// so one run's evidence Secrets are selected exactly like the run's own
+// topology objects.
 func evidenceLabelValue(runName string) string {
-	sanitized := sanitizeLabelValue(runName)
-	const max = 63
-	if len(sanitized) <= max {
-		return sanitized
-	}
-	digest := sha256.Sum256([]byte(runName))
-	hash := hex.EncodeToString(digest[:])[:8]
-	cut := max - len(hash) - 1
-	return strings.TrimRight(sanitized[:cut], "-_.") + "-" + hash
-}
-
-// sanitizeLabelValue lowercases a value and replaces any character outside the
-// allowed DNS-label set with a hyphen, trimming the ends. It returns "unknown"
-// for an empty result.
-func sanitizeLabelValue(value string) string {
-	value = strings.ToLower(strings.TrimSpace(value))
-	var b strings.Builder
-	for _, char := range value {
-		switch {
-		case (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') || char == '-' || char == '_' || char == '.':
-			b.WriteRune(char)
-		default:
-			b.WriteByte('-')
-		}
-	}
-	value = strings.Trim(b.String(), "-_.")
-	if value == "" {
-		return "unknown"
-	}
-	return value
+	return topology.RunLabelValue(runName)
 }
 
 // writeIntakeError writes a JSON error response with the given status code.

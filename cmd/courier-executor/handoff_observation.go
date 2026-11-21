@@ -10,16 +10,6 @@ import (
 	"strings"
 )
 
-// splitOwnerRepo splits an owner/name repository identity on the final "/".
-func splitOwnerRepo(value string) (owner, name string, ok bool) {
-	value = strings.TrimSpace(value)
-	idx := strings.LastIndex(value, "/")
-	if idx <= 0 || idx == len(value)-1 {
-		return "", "", false
-	}
-	return value[:idx], value[idx+1:], true
-}
-
 // prLinkageObservation is one PR observed for the run branch during
 // the legacy executor's authoritative-linkage check. It carries the
 // fields the legacy path needs without exposing the full GitHub
