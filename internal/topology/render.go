@@ -187,7 +187,6 @@ func ServiceAccounts(run *courier.CoderRun) []*corev1.ServiceAccount {
 }
 
 // BrokerRole renders the run-scoped Role for the broker's service account:
-// BrokerRole renders the run-scoped Role for the broker's service account:
 // named reads and status patches on exactly this CoderRun and namespace pod
 // reads for current-incarnation checks. TokenReview creation is
 // cluster-scoped and granted through BrokerTokenReviewBinding.
