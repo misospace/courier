@@ -3046,13 +3046,27 @@ mirroring the lane-profiles transport.
 
 The operator console (`internal/console`, served by the standalone
 `courier-console` binary and enabled by `operatorConsole.enabled` in the
-chart) is a server-rendered scaffold for authenticated operators:
-placeholder pages today, the operator read API's UI later. It is
-deliberately independent of the manager and of the Kubernetes API — it
-imports only the standard library, never talks to a cluster, and can only
-probe the read API's `/healthz` path when `--backend-url` is configured.
-Secrets travel as file paths read from mounted Secrets, never environment
-values.
+chart) is a server-rendered UI for authenticated operators. It is
+deliberately independent of the manager and of the Kubernetes API: it imports
+only the standard library, never talks to a cluster, and reaches the operator
+read API only over a fixed allowlist of GET paths. The run explorer reads the
+read API's paginated run projection (`/v1/runs`, issue #825) and renders it
+server-side, with no client-side JavaScript, so filters and pagination are GET
+query state and every view is a shareable URL. The overview and run-detail
+pages stay scaffold; the console still probes the read API's `/healthz` path
+for the overview's backend note when `--backend-url` is configured.
+
+The console decodes each projection into its own view types rather than
+importing `internal/readapi`, so the standard-library-only boundary holds and
+a projected field reaches a browser only through that decode. The read API
+bearer token (`operatorConsole.readAPITokenSecret`, mounted as a file and
+passed as `--readapi-token-file`) is optional: with no token the console still
+serves its pages and the unauthenticated health probe, and the explorer states
+that it is not configured rather than sending an unauthenticated projection
+request. The backend path is a constant allowlist entry and only its query
+string varies, so a filter value can never redirect the request to another
+path or host. Secrets, including that token, travel as file paths read from
+mounted Secrets, never environment values.
 
 One authorization model: every authenticated identity is an operator, and
 `IsOperator` in `internal/console/auth.go` is the single seam where a
