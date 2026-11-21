@@ -3565,6 +3565,17 @@ reservation, an unsafe-workspace hold, a source whose forge or provider
 read failed, and a source with no recent activity without reading the API
 objects.
 
+The source inventory is process configuration, not cluster state: there is no
+Source object to list. The wiring hands the listener the operator's own
+source-adapter registry names (the base name of each registry key, which is
+exactly the `spec.source` value that adapter can stamp), so a configured
+source adapter with zero runs reads `Empty` on `/v1/sources` instead of being
+absent, and the overview counts the same set the sources list serves. A
+source adapter's discovery state (its last successful poll) lives only in
+process metrics, so freshness stays derived from run activity: an idle
+configured source reads freshness unknown, which names the absence of
+observation and never asserts a discovery failure.
+
 ### Rebase lane
 
 A Dispatch-classified `REBASE` followup materializes as a CoderRun with

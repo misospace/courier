@@ -135,6 +135,41 @@ func TestSourceRegistryQualifiedIdentityFailsClosedAndLegacyRemainsBare(t *testi
 	}
 }
 
+func TestSourceRegistryConfiguredSourceNames(t *testing.T) {
+	registry := NewSourceRegistry(map[string]source.Adapter{
+		"manual":                 &admissionSource{},
+		"adhoc":                  &admissionSource{},
+		"dispatch":               &admissionSource{},
+		"dispatch:courier-local": &admissionSource{},
+		"cron:batch":             &admissionSource{},
+		"cron:nightly":           &admissionSource{},
+	})
+	want := []string{"adhoc", "cron", "dispatch", "manual"}
+	if got := registry.ConfiguredSourceNames(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("ConfiguredSourceNames() = %#v, want %#v", got, want)
+	}
+	// A compound key contributes only the base name a run's spec.source can
+	// carry, so the inventory never names an adapter identity no run has.
+	for _, name := range registry.ConfiguredSourceNames() {
+		if strings.Contains(name, ":") {
+			t.Fatalf("inventory carries a compound key %q", name)
+		}
+	}
+	var nilRegistry *SourceRegistry
+	if got := nilRegistry.ConfiguredSourceNames(); got != nil {
+		t.Fatalf("nil registry = %#v, want nil", got)
+	}
+	// A key whose base is empty carries no stampable source name and
+	// contributes nothing; an empty registry answers nil, like the nil one.
+	registry = NewSourceRegistry(map[string]source.Adapter{":orphan": &admissionSource{}})
+	if got := registry.ConfiguredSourceNames(); len(got) != 0 {
+		t.Fatalf("empty-base key = %#v, want no names", got)
+	}
+	if got := NewSourceRegistry(nil).ConfiguredSourceNames(); got != nil {
+		t.Fatalf("empty registry = %#v, want nil", got)
+	}
+}
+
 func TestOperatorStatusPatchesPreserveHarnessFields(t *testing.T) {
 	run := admissionRun("run", "local", courierv1alpha1.PhasePending)
 	run.Status.Checkpoint = &courierv1alpha1.Checkpoint{Plan: "keep this plan"}

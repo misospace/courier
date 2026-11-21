@@ -108,7 +108,12 @@ type CooldownHealth struct {
 }
 
 // SourceHealth is one source adapter's projected state for GET sources and
-// overview aggregation.
+// overview aggregation. A configured source with zero runs appears with
+// availability Empty. Freshness is derived from the source's run activity
+// only: a source adapter's discovery state (its last successful poll) lives
+// in process metrics, not cluster state, so the read model cannot surface it.
+// An Empty source therefore reads freshness unknown — never a discovery
+// failure, and never proof that discovery is healthy.
 type SourceHealth struct {
 	Name                 string         `json:"name"`
 	Availability         Availability   `json:"availability"`

@@ -24,8 +24,21 @@ const testToken = "test-read-token"
 
 // serverFixture builds a disabled-bind server over a fake client holding
 // objs, and returns the server and its authenticated handler for
-// httptest-driven requests without a listener.
+// httptest-driven requests without a listener. The server carries no
+// KnownSources provider at all.
 func serverFixture(t *testing.T, objs ...ctrlclient.Object) (*Server, http.Handler) {
+	t.Helper()
+	return serverFixtureWithProvider(t, nil, objs...)
+}
+
+// serverFixtureWithSources is serverFixture with a configured source-name
+// inventory wired through ServerConfig.KnownSources.
+func serverFixtureWithSources(t *testing.T, knownSources []string, objs ...ctrlclient.Object) (*Server, http.Handler) {
+	t.Helper()
+	return serverFixtureWithProvider(t, func() []string { return knownSources }, objs...)
+}
+
+func serverFixtureWithProvider(t *testing.T, knownSources func() []string, objs ...ctrlclient.Object) (*Server, http.Handler) {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := courierv1alpha1.AddToScheme(scheme); err != nil {
@@ -33,10 +46,11 @@ func serverFixture(t *testing.T, objs ...ctrlclient.Object) (*Server, http.Handl
 	}
 	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 	server, err := NewServer(ServerConfig{
-		Reader:    reader,
-		Token:     testToken,
-		Bind:      ":0",
-		Namespace: "courier",
+		Reader:       reader,
+		Token:        testToken,
+		Bind:         ":0",
+		Namespace:    "courier",
+		KnownSources: knownSources,
 	})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
@@ -545,34 +559,91 @@ func TestServerSourcesRoute(t *testing.T) {
 	}
 }
 
-// TestServerConfiguredIdleSourceNotListed pins the current source-inventory
-// limitation: source healths derive from runs observed in the served
-// namespace, so a configured source with zero CoderRuns is absent from the
-// HTTP sources view and the overview counts even though the projection layer
-// can render a known-source Empty entry when handed its name. Surfacing
-// configured idle sources over HTTP needs a source inventory the read path
-// does not have today; that capability is tracked separately (#839) and must
-// not be mistaken for a server bug here.
-func TestServerConfiguredIdleSourceNotListed(t *testing.T) {
+// TestServerConfiguredIdleSourceProjectedEmpty pins #839: with the wiring's
+// source inventory, a configured source adapter with zero CoderRuns appears
+// on GET /v1/sources as Empty instead of being absent, and the overview's
+// source counts describe the same set. Freshness for an idle source is
+// unknown: its absence of observation is named, never a silent zero, and
+// discovery state is not cluster state the read model can surface.
+func TestServerConfiguredIdleSourceProjectedEmpty(t *testing.T) {
 	observed := runFixture("observed", "github-label", "local", courierv1alpha1.PhaseDone, testNow.Add(-time.Minute))
-	_, handler := serverFixture(t, &observed)
+	known := []string{"dispatch", "github-label", "idle-configured-source", "manual"}
+	_, handler := serverFixtureWithSources(t, known, &observed)
 
-	for _, path := range []string{PathSources, PathOverview} {
-		rec := get(handler, path)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("%s status = %d, want 200", path, rec.Code)
-		}
-		if body := rec.Body.String(); strings.Contains(body, "idle-configured-source") {
-			t.Errorf("%s lists the configured but run-less source; the HTTP surface derives sources from observed runs only", path)
-		}
+	rec := get(handler, PathSources)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	envelope, _ := envelopeOf(t, get(handler, PathSources))
+	envelope, _ := envelopeOf(t, rec)
 	var list SourceHealthList
 	if err := json.Unmarshal(envelope.Payload, &list); err != nil {
 		t.Fatalf("payload: %v", err)
 	}
-	if len(list.Items) != 1 || list.Items[0].Name != "github-label" {
-		t.Errorf("sources = %+v, want only the run-observed github-label", list.Items)
+	if len(list.Items) != 4 || list.Pagination.Total != 4 {
+		t.Fatalf("sources = %+v, want 4 entries", list.Items)
+	}
+	wantNames := []string{"dispatch", "github-label", "idle-configured-source", "manual"}
+	for i, want := range wantNames {
+		if list.Items[i].Name != want {
+			t.Fatalf("source %d = %q, want %q (sorted)", i, list.Items[i].Name, want)
+		}
+	}
+	for _, item := range list.Items {
+		switch item.Name {
+		case "github-label":
+			if item.TotalRuns != 1 || item.Availability != AvailabilityHealthy {
+				t.Errorf("observed source = %+v, want 1 run and Healthy", item)
+			}
+		default:
+			if item.Availability != AvailabilityEmpty {
+				t.Errorf("idle source %q availability = %q, want Empty", item.Name, item.Availability)
+			}
+			if item.TotalRuns != 0 || item.ObservedAt != nil || item.Freshness != FreshnessUnknown {
+				t.Errorf("idle source %q = %+v, want zero runs, no observation, unknown freshness", item.Name, item)
+			}
+		}
+	}
+
+	// The overview counts the same source set, so the two views agree.
+	envelope, _ = envelopeOf(t, get(handler, PathOverview))
+	var overview Overview
+	if err := json.Unmarshal(envelope.Payload, &overview); err != nil {
+		t.Fatalf("overview payload: %v", err)
+	}
+	if overview.Sources.Count != 4 || overview.Sources.Healthy != 1 || overview.Sources.Empty != 3 {
+		t.Errorf("overview sources = %+v, want count 4, healthy 1, empty 3", overview.Sources)
+	}
+}
+
+// TestServerWithoutInventoryStaysRunObserved pins the degradation path: a
+// server wired without a source inventory — either no KnownSources provider
+// at all, or one that returns nothing — keeps the run-observed view, and a
+// source name that no run carries stays absent from both source views.
+func TestServerWithoutInventoryStaysRunObserved(t *testing.T) {
+	observed := runFixture("observed", "github-label", "local", courierv1alpha1.PhaseDone, testNow.Add(-time.Minute))
+	_, noProvider := serverFixture(t, &observed)
+	_, emptyProvider := serverFixtureWithSources(t, nil, &observed)
+	for name, handler := range map[string]http.Handler{
+		"no provider":       noProvider,
+		"provider is empty": emptyProvider,
+	} {
+		for _, path := range []string{PathSources, PathOverview} {
+			rec := get(handler, path)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("%s [%s] status = %d, want 200", name, path, rec.Code)
+			}
+			if body := rec.Body.String(); strings.Contains(body, "idle-configured-source") {
+				t.Errorf("%s [%s] lists a source no run carries without an inventory: %s", name, path, body)
+			}
+		}
+		envelope, _ := envelopeOf(t, get(handler, PathSources))
+		var list SourceHealthList
+		if err := json.Unmarshal(envelope.Payload, &list); err != nil {
+			t.Fatalf("%s payload: %v", name, err)
+		}
+		if len(list.Items) != 1 || list.Items[0].Name != "github-label" {
+			t.Errorf("%s sources = %+v, want only the run-observed github-label", name, list.Items)
+		}
 	}
 }
 
