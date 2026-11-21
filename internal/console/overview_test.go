@@ -190,6 +190,21 @@ func TestOverviewRendersAllSixFixtureStates(t *testing.T) {
 		t.Fatalf("reserved-superset note missing:\n%s", body)
 	}
 
+	// The summary-level lane and source state renders even though the detail
+	// tables carry the per-row detail.
+	if !strings.Contains(body, "4 lane(s) projected") ||
+		!strings.Contains(body, "At least one lane is saturated") ||
+		!strings.Contains(body, "At least one lane is capacity-paused") ||
+		!strings.Contains(body, "At least one lane is in provider cooldown") ||
+		!strings.Contains(body, "3 lane(s) are not Healthy or Empty") {
+		t.Fatalf("summary lane state missing:\n%s", body)
+	}
+	if !strings.Contains(body, "4 source(s) projected") ||
+		!strings.Contains(body, "1 unavailable") ||
+		!strings.Contains(body, "1 blocked") {
+		t.Fatalf("summary source state missing:\n%s", body)
+	}
+
 	// A healthy page refreshes on the bounded interval.
 	if !strings.Contains(body, `http-equiv="refresh" content="60"`) {
 		t.Fatalf("healthy overview must auto-refresh:\n%s", body)
@@ -255,6 +270,85 @@ func TestOverviewPartialSectionFailure(t *testing.T) {
 	}
 	if strings.Contains(body, "No lane profiles configured") {
 		t.Fatalf("a failed lanes read must not render as zero lanes:\n%s", body)
+	}
+	// A wedged detail route slows the whole page down; it must not keep the
+	// fast interval.
+	if !strings.Contains(body, `http-equiv="refresh" content="300"`) {
+		t.Fatalf("a partial failure must back the page off to the slow refresh:\n%s", body)
+	}
+}
+
+// TestOverviewStaticConfigStatesStopPolling pins that a missing bearer token
+// is a static configuration state, like a missing backend URL: the page says
+// what is missing and never polls.
+func TestOverviewStaticConfigStatesStopPolling(t *testing.T) {
+	secrets := newTestSecrets(t)
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("no request may leave without a token, got %s", r.URL.Path)
+	}))
+	defer stub.Close()
+	_, base := newTestServerWithToken(t, secrets, stub.URL, "")
+	client := login(t, base, secrets.token)
+	_, body := get(t, client, base+"/")
+	if !strings.Contains(body, "needs a read API bearer token") {
+		t.Fatalf("missing-token state missing:\n%s", body)
+	}
+	if strings.Contains(body, `http-equiv="refresh"`) {
+		t.Fatalf("a static configuration state must not poll:\n%s", body)
+	}
+}
+
+// TestOverviewTransportFailureStates pins the unreachable and timeout page
+// states: each names its own failure, keeps the slow refresh, and echoes no
+// backend detail.
+func TestOverviewTransportFailureStates(t *testing.T) {
+	t.Run("unreachable", func(t *testing.T) {
+		dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		deadURL := dead.URL
+		dead.Close()
+		secrets := newTestSecrets(t)
+		_, base := newTestServerWithToken(t, secrets, deadURL, "tok")
+		client := login(t, base, secrets.token)
+		_, body := get(t, client, base+"/")
+		if !strings.Contains(body, "could not be reached") {
+			t.Fatalf("unreachable state missing:\n%s", body)
+		}
+		if !strings.Contains(body, `http-equiv="refresh" content="300"`) {
+			t.Fatalf("an unreachable backend must back off:\n%s", body)
+		}
+	})
+	t.Run("timeout", func(t *testing.T) {
+		// The test console's backend timeout is one second.
+		slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			<-r.Context().Done()
+		}))
+		defer slow.Close()
+		secrets := newTestSecrets(t)
+		_, base := newTestServerWithToken(t, secrets, slow.URL, "tok")
+		client := login(t, base, secrets.token)
+		_, body := get(t, client, base+"/")
+		if !strings.Contains(body, "timed out before it answered") {
+			t.Fatalf("timeout state missing:\n%s", body)
+		}
+	})
+}
+
+// TestOverviewSectionTruncationIsStated pins that a truncated lane or source
+// scan is displayed per section, so a windowed list never reads as complete.
+func TestOverviewSectionTruncationIsStated(t *testing.T) {
+	base, client := fixtureServer(t, map[string]string{
+		"/v1/overview": fixtureOverviewJSON,
+		"/v1/lanes": `{"apiVersion":"courier.misospace.dev/v1","kind":"LaneHealthList","payload":{"items":[
+			{"name":"ci","availability":"Healthy","freshness":"Unknown","configuredConcurrency":1}],"pagination":{"page":0,"pageSize":1,"total":1,"more":false,"truncated":true}}}`,
+		"/v1/sources": `{"apiVersion":"courier.misospace.dev/v1","kind":"SourceHealthList","payload":{"items":[
+			{"name":"github","availability":"Healthy","freshness":"Fresh","totalRuns":1}],"pagination":{"page":0,"pageSize":1,"total":1,"more":false,"truncated":true}}}`,
+	}, nil)
+	_, body := get(t, client, base+"/")
+	if !strings.Contains(body, "lane counts cover a truncated window") {
+		t.Fatalf("lane truncation must be stated:\n%s", body)
+	}
+	if !strings.Contains(body, "source counts cover a truncated window") {
+		t.Fatalf("source truncation must be stated:\n%s", body)
 	}
 }
 
@@ -330,6 +424,7 @@ func TestOverviewUnexpectedResponseIsNotEmpty(t *testing.T) {
 		"not json":        `<html>proxied</html>` + marker,
 		"json error body": `{"error":"boom"}`,
 		"json null":       `null`,
+		"null payload":    `{"apiVersion":"courier.misospace.dev/v1","kind":"Overview","payload":null}`,
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {

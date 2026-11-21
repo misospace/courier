@@ -40,9 +40,17 @@
 
 <section aria-label="Lanes">
   <h2>Lanes</h2>
+  <p class="state-note">
+    {{.Overview.LaneCount}} lane(s) projected.
+    {{if .Overview.LanesSaturated}}At least one lane is saturated. {{end}}
+    {{if .Overview.LanesSuspended}}At least one lane is capacity-paused. {{end}}
+    {{if .Overview.LanesCooldown}}At least one lane is in provider cooldown. {{end}}
+    {{if gt .Overview.LanesUnhealthy 0}}{{.Overview.LanesUnhealthy}} lane(s) are not Healthy or Empty.{{end}}
+  </p>
   {{if .LanesErr}}
   <p class="state state-error">{{.LanesErr}}</p>
   {{else if .Lanes}}
+  {{if .LanesTruncated}}<p class="state state-warn">The lane counts cover a truncated window: the read API's run scan stopped at its fetch cap.</p>{{end}}
   <table class="runs">
     <thead>
       <tr>
@@ -99,9 +107,18 @@
 
 <section aria-label="Sources">
   <h2>Sources</h2>
+  <p class="state-note">
+    {{.Overview.SourceCount}} source(s) projected:
+    {{.Overview.SourcesHealthy}} healthy,
+    {{.Overview.SourcesEmpty}} empty,
+    {{.Overview.SourcesStale}} stale,
+    {{.Overview.SourcesUnavail}} unavailable,
+    {{.Overview.SourcesBlocked}} blocked.
+  </p>
   {{if .SourcesErr}}
   <p class="state state-error">{{.SourcesErr}}</p>
   {{else if .Sources}}
+  {{if .SourcesTruncated}}<p class="state state-warn">The source counts cover a truncated window: the read API's run scan stopped at its fetch cap.</p>{{end}}
   <table class="runs">
     <thead>
       <tr>

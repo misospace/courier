@@ -114,11 +114,13 @@ type Backend interface {
 	// as Runs applies.
 	Overview(ctx context.Context) (*OverviewResult, error)
 	// Lanes fetches the per-lane health list. The same error contract as
-	// Runs applies.
-	Lanes(ctx context.Context) ([]LaneRow, error)
+	// Runs applies. Truncated reports that the run scan behind the health
+	// counts stopped at the read API's fetch cap, so the counts describe a
+	// bounded window, not the whole namespace.
+	Lanes(ctx context.Context) (*LaneListResult, error)
 	// Sources fetches the per-source health list. The same error contract as
-	// Runs applies.
-	Sources(ctx context.Context) ([]SourceRow, error)
+	// Runs applies, and Truncated carries the same window caveat as Lanes.
+	Sources(ctx context.Context) (*SourceListResult, error)
 }
 
 // RunsFilter is one validated run-list request. The console bounds and
@@ -187,6 +189,22 @@ type OverviewResult struct {
 	SourcesUnavail int
 	SourcesBlocked int
 	ConditionRuns  map[string]int
+}
+
+// LaneListResult is the decoded GET /v1/lanes payload. Truncated reports that
+// the bounded run scan behind the counts stopped at the read API's fetch cap:
+// the counts then describe a window, not the whole namespace, and the page
+// says so instead of presenting a partial list as complete.
+type LaneListResult struct {
+	Items     []LaneRow
+	Truncated bool
+}
+
+// SourceListResult is the decoded GET /v1/sources payload, with the same
+// truncation contract as LaneListResult.
+type SourceListResult struct {
+	Items     []SourceRow
+	Truncated bool
 }
 
 // LaneRow is one lane's decoded health from GET /v1/lanes. Admitted counts
@@ -282,10 +300,16 @@ type (
 		ConditionRuns map[string]int `json:"conditionRuns"`
 	}
 	laneListPage struct {
-		Items []LaneRow `json:"items"`
+		Items      []LaneRow `json:"items"`
+		Pagination struct {
+			Truncated bool `json:"truncated"`
+		} `json:"pagination"`
 	}
 	sourceListPage struct {
-		Items []SourceRow `json:"items"`
+		Items      []SourceRow `json:"items"`
+		Pagination struct {
+			Truncated bool `json:"truncated"`
+		} `json:"pagination"`
 	}
 )
 
@@ -397,10 +421,15 @@ func (b *HTTPBackend) projection(ctx context.Context, path, rawQuery, wantKind s
 		// null), is an unexpected response, never an empty list.
 		return fmt.Errorf("%w: got kind %q", ErrBackendUnexpectedResponse, env.Kind)
 	}
-	if len(env.Payload) > 0 {
-		if err := json.Unmarshal(env.Payload, out); err != nil {
-			return fmt.Errorf("%w: %v", ErrBackendUnexpectedResponse, err)
-		}
+	// A correct kind with a null or missing payload is also an unexpected
+	// response: the read API always sends an object payload, and decoding
+	// null over a fresh value would silently render an outage as an empty
+	// namespace.
+	if len(env.Payload) == 0 || string(env.Payload) == "null" {
+		return fmt.Errorf("%w: got a null payload", ErrBackendUnexpectedResponse)
+	}
+	if err := json.Unmarshal(env.Payload, out); err != nil {
+		return fmt.Errorf("%w: %v", ErrBackendUnexpectedResponse, err)
 	}
 	return nil
 }
@@ -470,19 +499,19 @@ func (b *HTTPBackend) Overview(ctx context.Context) (*OverviewResult, error) {
 }
 
 // Lanes GETs the allowlisted per-lane health list.
-func (b *HTTPBackend) Lanes(ctx context.Context) ([]LaneRow, error) {
+func (b *HTTPBackend) Lanes(ctx context.Context) (*LaneListResult, error) {
 	var page laneListPage
 	if err := b.projection(ctx, backendLanesPath, "", kindLaneList, &page); err != nil {
 		return nil, err
 	}
-	return page.Items, nil
+	return &LaneListResult{Items: page.Items, Truncated: page.Pagination.Truncated}, nil
 }
 
 // Sources GETs the allowlisted per-source health list.
-func (b *HTTPBackend) Sources(ctx context.Context) ([]SourceRow, error) {
+func (b *HTTPBackend) Sources(ctx context.Context) (*SourceListResult, error) {
 	var page sourceListPage
 	if err := b.projection(ctx, backendSourcesPath, "", kindSourceList, &page); err != nil {
 		return nil, err
 	}
-	return page.Items, nil
+	return &SourceListResult{Items: page.Items, Truncated: page.Pagination.Truncated}, nil
 }

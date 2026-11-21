@@ -62,12 +62,12 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	overview, err := s.backend.Overview(ctx)
 	if err != nil {
 		data.OverviewErr = overviewErrorMessage(err)
-		if !errors.Is(err, ErrBackendUnavailable) {
-			// A configured backend that failed: back off, but keep polling.
+		// A missing backend URL or bearer token is a static configuration
+		// state the page cannot fix by retrying: stop polling. Any other
+		// failure is transient enough to retry, but slowly.
+		if !errors.Is(err, ErrBackendUnavailable) && !errors.Is(err, ErrBackendTokenMissing) {
 			data.RefreshSeconds = overviewRefreshBackoffSeconds
 		}
-		// ErrBackendUnavailable is a static configuration state, not a
-		// transient failure: the page stops polling entirely.
 		s.render(w, http.StatusOK, "overview", data)
 		return
 	}
@@ -75,22 +75,28 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	data.Overview = overview
 	data.PhaseRows = phaseRows(overview.RunsByPhase)
 	data.ConditionRows = conditionRows(overview.ConditionRuns)
+	data.RefreshSeconds = overviewRefreshSeconds
 
 	lanes, err := s.backend.Lanes(ctx)
 	if err != nil {
 		data.LanesErr = overviewErrorMessage(err)
+		// One projection failing is still a failing backend: back the whole
+		// page off instead of hammering the wedged route every interval.
+		data.RefreshSeconds = overviewRefreshBackoffSeconds
 	} else {
-		data.Lanes = lanes
+		data.Lanes = lanes.Items
+		data.LanesTruncated = lanes.Truncated
 	}
 
 	sources, err := s.backend.Sources(ctx)
 	if err != nil {
 		data.SourcesErr = overviewErrorMessage(err)
+		data.RefreshSeconds = overviewRefreshBackoffSeconds
 	} else {
-		data.Sources = sources
+		data.Sources = sources.Items
+		data.SourcesTruncated = sources.Truncated
 	}
 
-	data.RefreshSeconds = overviewRefreshSeconds
 	s.render(w, http.StatusOK, "overview", data)
 }
 

@@ -126,8 +126,9 @@ summary (`GET /v1/overview`), the lane health list (`GET /v1/lanes`), and the
 source health list (`GET /v1/sources`). It renders them as a run summary with
 per-phase links, a lane table, and a source table. There is no JavaScript and
 no Kubernetes watch. The page reloads itself with a meta-refresh tag: every
-60 seconds when the read API answers, every 300 seconds when it fails, and
-never when the console has no configured read API.
+60 seconds when the read API answers, every 300 seconds when any projection
+call fails, and never when the console has no configured read API URL or
+token.
 
 Every state carries its own label and color. Stale, unavailable, blocked, and
 unknown readings never look green. A source with no runs reads Empty, which

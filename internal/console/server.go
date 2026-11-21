@@ -288,12 +288,16 @@ type pageData struct {
 	// the namespace summary could not be read: an outage never renders as
 	// an empty namespace.
 	OverviewErr string
-	// Lanes / Sources are the per-entity health rows; LanesErr / SourcesErr
-	// replace only their own section when that one list could not be read.
-	Lanes      []LaneRow
-	LanesErr   string
-	Sources    []SourceRow
-	SourcesErr string
+	// Lanes / Sources are the per-entity health rows and LanesTruncated /
+	// SourcesTruncated state that the scan behind them hit the read API's
+	// fetch cap; LanesErr / SourcesErr replace only their own section when
+	// that one list could not be read.
+	Lanes            []LaneRow
+	LanesTruncated   bool
+	LanesErr         string
+	Sources          []SourceRow
+	SourcesTruncated bool
+	SourcesErr       string
 	// PhaseRows are the run-phase chips in lifecycle order; ConditionRows
 	// list the allowlisted condition backlog.
 	PhaseRows     []PhaseCount
