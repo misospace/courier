@@ -95,6 +95,35 @@ func TestSecretInstallationTokenSourceValidation(t *testing.T) {
 	}
 }
 
+func TestSecretInstallationTokenSourceRejectsUnknownShapes(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	document := installationDocument(now)
+	data, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknown := strings.TrimSuffix(string(data), "}") + `,"futureField":"x"}`
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "runs", Name: "run-credentials"},
+		Data:       map[string][]byte{topology.CredKeyInstallationToken: []byte(unknown)},
+	}).Build()
+	source, err := NewSecretInstallationTokenSource(reader, "runs", "run-credentials", topology.CredKeyInstallationToken, "ExampleOrg", "https://api.github.com", func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, expiry, err := source.InstallationToken(context.Background())
+	if err == nil || got != "" || expiry != (time.Time{}) {
+		t.Fatalf("unknown-field document returned %q, %v, %v", got, expiry, err)
+	}
+	if strings.Contains(err.Error(), sentinelInstallationToken) {
+		t.Fatal("parse error leaked installation token")
+	}
+}
+
 func TestSecretInstallationTokenSourceConstructorAndUnavailableSecret(t *testing.T) {
 	if _, err := NewSecretInstallationTokenSource(nil, "runs", "secret", "key", "owner", "https://api.github.com", nil); err == nil {
 		t.Fatal("accepted nil reader")
@@ -142,9 +171,9 @@ func TestInstallationGitCredentialsUsesSourceEveryCall(t *testing.T) {
 		calls++
 		return "rotated-token", time.Now().Add(time.Hour), nil
 	})
-	credentials := NewInstallationGitCredentials(source)
+	credentials := NewInstallationGitCredentials(source, "org/repo")
 	for range 2 {
-		got, err := credentials.Credentials(context.Background(), "ignored/repo")
+		got, err := credentials.Credentials(context.Background(), "Org/Repo")
 		if err != nil || got.Username != topology.DefaultGitUsername || got.Token != "rotated-token" {
 			t.Fatalf("Credentials() = %+v, %v", got, err)
 		}
@@ -154,10 +183,35 @@ func TestInstallationGitCredentialsUsesSourceEveryCall(t *testing.T) {
 	}
 }
 
+func TestInstallationGitCredentialsServesOnlyBoundRepository(t *testing.T) {
+	for _, tt := range []struct{ name, bound, asked string }{
+		{name: "other owner", bound: "org/repo", asked: "other/repo"},
+		{name: "other name", bound: "org/repo", asked: "org/other"},
+		{name: "path extension", bound: "org/repo", asked: "org/repo/extra"},
+		{name: "unbound provider", bound: "", asked: "org/repo"},
+		{name: "empty ask", bound: "org/repo", asked: ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := 0
+			credentials := NewInstallationGitCredentials(installationTokenSourceFunc(func(context.Context) (string, time.Time, error) {
+				calls++
+				return sentinelInstallationToken, time.Now().Add(time.Hour), nil
+			}), tt.bound)
+			got, err := credentials.Credentials(context.Background(), tt.asked)
+			if err == nil || got != (GitCredentials{}) || calls != 0 {
+				t.Fatalf("Credentials(%q) bound to %q returned %+v, %v (source calls %d)", tt.asked, tt.bound, got, err, calls)
+			}
+			if strings.Contains(err.Error(), sentinelInstallationToken) {
+				t.Fatal("refusal leaked installation token")
+			}
+		})
+	}
+}
+
 func TestInstallationGitCredentialsDoesNotLeakFailures(t *testing.T) {
 	credentialSource := NewInstallationGitCredentials(installationTokenSourceFunc(func(context.Context) (string, time.Time, error) {
 		return "", time.Time{}, errors.New("failed with " + sentinelInstallationToken)
-	}))
+	}), "org/repo")
 	_, err := credentialSource.Credentials(context.Background(), "org/repo")
 	if err == nil || strings.Contains(err.Error(), sentinelInstallationToken) {
 		t.Fatalf("credential error = %v", err)

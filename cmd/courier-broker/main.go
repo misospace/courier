@@ -162,7 +162,7 @@ func run(ctx context.Context, config runConfig) error {
 		Policy:      policy,
 		Git:         gitBroker,
 		Resolver:    newPinnedResolver(policy, document.Provider),
-		Credentials: gitCredentialsForMode(appMode, tokenSource, env),
+		Credentials: gitCredentialsForMode(appMode, tokenSource, policy.WorkRepo, env),
 	})
 	if err != nil {
 		return fmt.Errorf("courier-broker: git transport rejected the pinned policy: %w", err)
@@ -494,9 +494,14 @@ func repositoryOwner(repository string) string {
 	return owner
 }
 
-func gitCredentialsForMode(appMode bool, source couriergithub.InstallationTokenSource, env *brokerEnv) broker.GitCredentialProvider {
+// gitCredentialsForMode binds the git push credential provider to the mode the
+// policy document selects. Installation mode serves the run's short-lived
+// installation token only for the pinned work repository — the only push
+// destination the transport allows. Static mode serves the projected static
+// credential, whose ACL the deployment owns.
+func gitCredentialsForMode(appMode bool, source couriergithub.InstallationTokenSource, workRepository string, env *brokerEnv) broker.GitCredentialProvider {
 	if appMode {
-		return broker.NewInstallationGitCredentials(source)
+		return broker.NewInstallationGitCredentials(source, workRepository)
 	}
 	return staticCredentials{username: env.gitUsername, token: env.gitToken}
 }

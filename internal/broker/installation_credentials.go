@@ -73,7 +73,9 @@ func (s *SecretInstallationTokenSource) InstallationToken(ctx context.Context) (
 		return "", time.Time{}, errors.New("broker installation token document is unavailable")
 	}
 	var document topology.InstallationTokenDocument
-	if err := json.Unmarshal(data, &document); err != nil {
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&document); err != nil {
 		return "", time.Time{}, errors.New("broker installation token document is unusable")
 	}
 	if document.Version != topology.InstallationTokenDocumentVersion || document.Token == "" ||
@@ -103,23 +105,30 @@ func sameInstallationEndpoint(actual, expected string) bool {
 	return actualURL.Scheme == expectedURL.Scheme && actualURL.Host == expectedURL.Host && actualURL.Path == expectedURL.Path
 }
 
-// InstallationGitCredentials serves git push credentials from the same token
-// source: username x-access-token, token re-read from the source per call so
-// operator rotation flows through without a broker restart.
+// installationTokenSource supplies the current installation token, re-read on
+// demand so operator rotation flows through without a broker restart.
 type installationTokenSource interface {
 	InstallationToken(ctx context.Context) (token string, expiresAt time.Time, err error)
 }
 
+// InstallationGitCredentials serves git push credentials from the same token
+// source: username x-access-token, token re-read from the source per call so
+// operator rotation flows through without a broker restart. Credentials are
+// served only for the one repository the provider was bound to at startup;
+// any other identity is refused before the token source is consulted, so a
+// token scoped to the run's pinned work repository can never accompany a push
+// asked for under a different name.
 type InstallationGitCredentials struct {
-	source installationTokenSource
+	source     installationTokenSource
+	repository string
 }
 
-func NewInstallationGitCredentials(source installationTokenSource) GitCredentialProvider {
-	return InstallationGitCredentials{source: source}
+func NewInstallationGitCredentials(source installationTokenSource, repository string) GitCredentialProvider {
+	return InstallationGitCredentials{source: source, repository: repository}
 }
 
-func (c InstallationGitCredentials) Credentials(ctx context.Context, _ string) (GitCredentials, error) {
-	if c.source == nil {
+func (c InstallationGitCredentials) Credentials(ctx context.Context, repository string) (GitCredentials, error) {
+	if c.source == nil || c.repository == "" || !strings.EqualFold(repository, c.repository) {
 		return GitCredentials{}, errors.New("broker installation git credentials are unavailable")
 	}
 	token, _, err := c.source.InstallationToken(ctx)
