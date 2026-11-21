@@ -110,6 +110,64 @@ func TestContributePageAndSubmit(t *testing.T) {
 	if strings.Contains(page, "unsettled attempt") {
 		t.Fatal("page view after settlement still shows the unsettled-attempt notice")
 	}
+	// The settled intent cookie is gone, so the resubmission must find the
+	// key server-side: forgetting the digest mapping here would mint a new
+	// key and let the admission server admit a duplicate run.
+	resp, page = postContribution(t, client, base, csrf, contributionValues("goal"))
+	if resp.StatusCode != http.StatusOK || !strings.Contains(page, "A run was resumed") {
+		t.Fatalf("post-clearing resubmission response: %s", page)
+	}
+	mu.Lock()
+	thirdKey := bodies[3]["idempotencyKey"].(string)
+	mu.Unlock()
+	if firstKey != thirdKey {
+		t.Fatal("identical resubmission after the settled cookie was cleared did not replay the same intent key")
+	}
+}
+
+func TestContributeDefinitiveAbandonMintsFreshKey(t *testing.T) {
+	var mu sync.Mutex
+	var keys []string
+	admission := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		mu.Lock()
+		keys = append(keys, body["idempotencyKey"].(string))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"run":"run-1","namespace":"courier","workItemId":"item-1"}`))
+	}))
+	defer admission.Close()
+	_, base, client := newContributionTestServer(t, admission.URL, time.Second)
+	_, page := get(t, client, base+"/contribute")
+	csrf := findCSRFToken(t, page)
+	resp, page := postContribution(t, client, base, csrf, contributionValues("goal"))
+	if resp.StatusCode != http.StatusOK || !strings.Contains(page, "A run was created") {
+		t.Fatalf("created response: %s", page)
+	}
+	// The deliberate abandon must free even a settled digest: the retained
+	// mapping would otherwise turn an identical resubmission into a resume
+	// of the admitted run.
+	resp, err := client.PostForm(base+"/contribute/new", url.Values{"csrf": {csrf}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("new response = %d", resp.StatusCode)
+	}
+	resp, page = postContribution(t, client, base, csrf, contributionValues("goal"))
+	if resp.StatusCode != http.StatusOK || !strings.Contains(page, "A run was created") {
+		t.Fatalf("post-abandon resubmission response: %s", page)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(keys) != 2 || keys[0] == keys[1] {
+		t.Fatalf("abandon did not mint a fresh key: %v", keys)
+	}
 }
 
 func TestContributeUnconfiguredAndHeaderMode(t *testing.T) {

@@ -189,6 +189,36 @@ func (m *contributeMinter) forget(digest string) {
 	delete(m.entries, digest)
 }
 
+// remember retains the digest-to-key mapping past the two-minute in-flight
+// TTL, for the rest of the session: a definitive outcome means the admission
+// server has bound this key to this content, so an identical resubmission
+// after the settled cookie was cleared must replay the same key and let the
+// server deduplicate — never mint a new key that could admit a duplicate
+// run/branch/PR. Only the deliberate "start a new contribution" abandon
+// forgets a settled mapping.
+func (m *contributeMinter) remember(digest, key string, now time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.entries == nil {
+		m.entries = make(map[string]contributeMinterEntry)
+	}
+	for held, entry := range m.entries {
+		if !now.Before(entry.expires) {
+			delete(m.entries, held)
+		}
+	}
+	if len(m.entries) >= contributeMinterCap {
+		oldest, oldestExpires := "", time.Time{}
+		for held, entry := range m.entries {
+			if oldestExpires.IsZero() || entry.expires.Before(oldestExpires) {
+				oldest, oldestExpires = held, entry.expires
+			}
+		}
+		delete(m.entries, oldest)
+	}
+	m.entries[digest] = contributeMinterEntry{key: key, expires: now.Add(sessionTTL)}
+}
+
 // contributeSettled records attempt keys whose most recent submission
 // reached a definitive outcome, keyed by key — never by content digest, so
 // one session's settlement can never describe another session's live
@@ -202,6 +232,12 @@ type contributeSettled struct {
 }
 
 const contributeSettledCap = 4096
+
+// contributeMinterCap bounds retained digest mappings: definitive outcomes
+// extend an entry's life from the two-minute in-flight TTL to one session
+// TTL, so without a cap steady-state size would track every distinct
+// submission for up to 12 hours.
+const contributeMinterCap = 4096
 
 func (r *contributeSettled) mark(key string, now time.Time) {
 	r.mu.Lock()
@@ -465,25 +501,25 @@ func (s *Server) handleContributeSubmit(w http.ResponseWriter, r *http.Request) 
 	result := s.contribute.Submit(r.Context(), sub)
 	switch result.Outcome {
 	case outcomeCreated, outcomeResumed:
-		s.minter.forget(digest)
+		s.minter.remember(digest, key, s.auth.now())
 		s.settled.mark(key, s.auth.now())
 		data.State, data.StateClass = "success", "state-ok"
 		data.Run, data.Namespace, data.WorkItemID = result.Run, result.Namespace, result.WorkItemID
 		data.Resumed = result.Outcome == outcomeResumed
 	case outcomeRefused:
-		s.minter.forget(digest)
+		s.minter.remember(digest, key, s.auth.now())
 		s.settled.mark(key, s.auth.now())
 		data.State, data.StateClass, data.Message = "refused", "state-error", result.Message
 	case outcomeCredentialDenied:
-		s.minter.forget(digest)
+		s.minter.remember(digest, key, s.auth.now())
 		s.settled.mark(key, s.auth.now())
 		data.State, data.StateClass, data.Message = "credentialDenied", "state-error", result.Message
 	case outcomeAPIMismatch:
-		s.minter.forget(digest)
+		s.minter.remember(digest, key, s.auth.now())
 		s.settled.mark(key, s.auth.now())
 		data.State, data.StateClass, data.Message = "apiMismatch", "state-error", result.Message
 	case outcomeUnreachable:
-		s.minter.forget(digest)
+		s.minter.remember(digest, key, s.auth.now())
 		s.settled.mark(key, s.auth.now())
 		data.State, data.StateClass, data.Message = "unreachable", "state-error", "nothing was admitted; the contribution API could not be reached"
 	default:

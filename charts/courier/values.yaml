@@ -259,7 +259,7 @@ secure:
     cidr: ""
     port: 0
     # -- Model-gateway egress NetworkPolicy, rendered into
-  #    secure.runNamespace (#763): it grants the run namespace's
+    #    secure.runNamespace (#763): it grants the run namespace's
     #    control/coordinator pods egress to the model gateway's pods and to
     #    nothing else. The source selector is not configurable: the chart
     #    hardcodes the operator's coordinator label keys

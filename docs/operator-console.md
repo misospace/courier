@@ -91,8 +91,10 @@ attempt, or a settled attempt's key, the response commits and flushes the
 cookie before the admission call, so even a lost response or a console
 restart mid-submission leaves the browser holding the key. When the cookie
 holds a different still-unsettled attempt, a submission never overwrites it;
-the newest attempt's key then survives only in the console's two-minute
-minter, bounding its resubmission window. A later page view clears the cookie
+the newest attempt's key then survives only in the console's minter — for
+the two-minute in-flight TTL while its outcome stays uncertain, or one
+session TTL once its outcome is definitive — bounding its resubmission
+window. A later page view clears the cookie
 once the attempt's key is settled server-side. The cookie
 signature uses the session key, so
 rotating that key discards an unsettled attempt; a later resubmission then

@@ -3086,8 +3086,9 @@ still leaves the browser holding the key and an identical resubmission
 replays it instead of minting a new one that could duplicate an admitted run.
 When the cookie instead holds a different still-unsettled attempt, the
 submission never overwrites it — that attempt stays retryable from the
-browser — and the newest attempt's key survives only in the two-minute
-minter, bounding its resubmission window to that TTL. Settled attempt keys
+browser — and the newest attempt's key survives only in the minter — two minutes
+while its outcome stays uncertain, one session TTL once its outcome is
+definitive — bounding its resubmission window. Settled attempt keys
 are remembered server-side per key, never per content digest, for one
 session TTL, so one settlement can never describe another live attempt
 (the minter is digest-keyed, so identical content from two sessions inside
