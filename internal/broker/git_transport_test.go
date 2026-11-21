@@ -347,3 +347,80 @@ func TestValidatePinnedEndpointLocalPathSafety(t *testing.T) {
 		t.Fatalf("valid https endpoint = %q, %v", got, err)
 	}
 }
+
+type recordingGitCredentials struct{ asks []string }
+
+func (r *recordingGitCredentials) Credentials(_ context.Context, repository string) (GitCredentials, error) {
+	r.asks = append(r.asks, repository)
+	return GitCredentials{Username: "recording-user", Token: "recording-token"}, nil
+}
+
+func TestGitTransportAsksCredentialsForPinnedFetchAndPushIdentities(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "trusted.git")
+	fork := filepath.Join(root, "fork.git")
+	repo := filepath.Join(root, "source")
+	gitTransportCommand(t, "", "init", "--bare", remote)
+	gitTransportCommand(t, "", "init", "--bare", fork)
+	gitTransportCommand(t, "", "init", repo)
+	gitTransportCommand(t, repo, "config", "user.email", "test@example.invalid")
+	gitTransportCommand(t, repo, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(repo, "file"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitTransportCommand(t, repo, "add", "file")
+	gitTransportCommand(t, repo, "commit", "-m", "base")
+	gitTransportCommand(t, repo, "branch", "-M", "main")
+	base := strings.TrimSpace(string(gitTransportCommand(t, repo, "rev-parse", "HEAD")))
+	gitTransportCommand(t, repo, "push", remote, "HEAD:refs/heads/main")
+	gitTransportCommand(t, repo, "push", fork, "HEAD:refs/heads/main")
+	if err := os.WriteFile(filepath.Join(repo, "file"), []byte("proposed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitTransportCommand(t, repo, "commit", "-am", "proposed")
+	proposed := strings.TrimSpace(string(gitTransportCommand(t, repo, "rev-parse", "HEAD")))
+	bundle := filepath.Join(root, "proposal.bundle")
+	gitTransportCommand(t, repo, "bundle", "create", bundle, "HEAD")
+	gitBroker, err := couriergit.NewBroker(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(gitBroker.Directory())
+	if err := gitBroker.ImportBundle(ctx, bundle, proposed, base); err != nil {
+		t.Fatal(err)
+	}
+
+	policy := Policy{RunUID: "run", Mode: ModeContribute, Provider: "test", BaseRepo: "org/project", BaseRef: "main", BaseOID: base, WorkRepo: "fork/project", WorkRef: "courier/org/project/goal-abc12345", WorkInitiallyAbsent: true, SourceIssue: SourceIssue{Owner: "org", Name: "project", Number: 7}}
+	credentials := &recordingGitCredentials{}
+	pusher, err := NewGitPusher(ctx, GitTransportConfig{
+		Policy: policy, Git: gitBroker,
+		Resolver:    staticGitEndpoints{"org/project": remote, "fork/project": fork},
+		Credentials: credentials,
+	})
+	if err != nil {
+		t.Fatalf("NewGitPusher: %v", err)
+	}
+	if _, err := pusher.Snapshot(ctx, SnapshotRequest{BaseRepo: "org/project", BaseRef: "main", BaseOID: base}); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if err := pusher.Push(ctx, "fork/project", policy.WorkRef, proposed); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	// The snapshot fetch authenticates against the base identity and the push
+	// against the work identity: a credential provider bound only to the work
+	// repository (the installation-mode shape) must be asked for both, or the
+	// App-mode snapshot fetch fails before the transport can refuse or fetch.
+	asked := map[string]bool{}
+	for _, identity := range credentials.asks {
+		asked[identity] = true
+	}
+	if !asked["org/project"] || !asked["fork/project"] {
+		t.Fatalf("credential asks = %v, want both org/project and fork/project", credentials.asks)
+	}
+	for _, identity := range credentials.asks {
+		if identity != "org/project" && identity != "fork/project" {
+			t.Fatalf("credential asked for unpinned identity %q", identity)
+		}
+	}
+}

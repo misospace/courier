@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -79,6 +80,10 @@ func TestCheckOperatorAccessReviewScoping(t *testing.T) {
 				Registry:          secureRegistry(),
 				Kubernetes:        clientset,
 			}}
+			// The App-mode rotation proof is demanded only when the
+			// deployment configured the minter (#870); the static proof set
+			// stays exactly what static provisioning needs.
+			control.Config.InstallationTokenMinter = &fixedInstallationTokenMinter{token: "proof-token", expiresAt: time.Now().Add(time.Hour)}
 			if err := control.checkOperatorAccess(context.Background(), run); err != nil {
 				t.Fatalf("checkOperatorAccess with every grant allowed = %v, want nil", err)
 			}
@@ -87,6 +92,7 @@ func TestCheckOperatorAccessReviewScoping(t *testing.T) {
 			want := map[key]int{
 				{"", "secrets", "create", "", runNamespace}:                               1,
 				{"", "secrets", "delete", "", runNamespace}:                               1,
+				{"", "secrets", "update", "", runNamespace}:                               1,
 				{"", "serviceaccounts", "create", "", runNamespace}:                       1,
 				{"", "serviceaccounts", "delete", "", runNamespace}:                       1,
 				{"", "pods", "create", "", runNamespace}:                                  1,

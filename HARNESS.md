@@ -186,7 +186,10 @@ selected topology, not a configurable shared-broker fallback.
 - The broker has a dedicated SA and a Role limited by `resourceNames` to the
   named `CoderRun` for `get` and `patch` on `coderruns/status` (plus named run
   read), with named pod reads for current-incarnation checks; TokenReview
-  creation is cluster-scoped. It cannot write another run's status. Preflight
+  creation is cluster-scoped. In App mode the Role adds one namespaced `get`
+  on exactly the run's own credentials Secret, the rotated installation-token
+  document the broker reads over the API server (#870). It cannot write
+  another run's status. Preflight
   confirms this scope in two distinct ways. *Presence* of the required grants
   is verified with an access review (SelfSubjectAccessReview as the broker SA,
   or SubjectAccessReview): a positive answer proves the named grant exists. No
@@ -450,8 +453,11 @@ cannot read forks owned by another account. The default API endpoint is
 `https://api.github.com/`. If you set `--github-app-endpoint`, the repository's
 provider registration must use that endpoint for the operator to read it.
 
-This mode covers observation and secure admission reads. Label settlement,
-broker writes, legacy Git, and hosted GitHub MCP keep their existing credentials.
+This mode covers observation, secure admission reads, and secure brokers' forge and git credentials. Label settlement, legacy Git, and hosted GitHub MCP continue to use their existing credentials.
+
+When App mode is enabled, the operator mints one short-lived installation token for each secure run, scoped to the run's pinned base and work repositories, and stores it in the run's credentials Secret under `forge-installation-token`. The operator refreshes the token before expiry while the run is active. The broker reads the Secret through the API server; the token is never placed in pod environment variables, logs, or tool output. The App private key remains in the operator and is never mounted into a broker pod.
+
+The broker token grants read access to Administration, Checks, Metadata, and Commit statuses, and write access to Contents, Issues, and Pull requests. The broker never issues a merge, and the forge vocabulary has no merge operation; the write permissions themselves do not remove GitHub-level merge authority, which is why merging stays a human gate. A run whose pinned base and work repositories have different owners cannot launch in App mode because one installation token cannot serve repositories across owners. The operator refreshes tokens only while a run is in its running phase; if minting or token use fails, the broker fails the affected operations and never falls back to static credentials. Switching a deployment between static and App mode requires draining in-flight runs: the credential Secret shape and the broker Role change, and the switch fails closed. Static deployments without App configuration retain their existing behavior.
 
 ### Model-influenced forge operations
 
