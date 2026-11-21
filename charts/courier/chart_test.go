@@ -559,6 +559,60 @@ func TestChartRendersContributeAPIStatusReads(t *testing.T) {
 	}
 }
 
+// TestChartRendersReadAPI checks the read API chart wiring: the manager
+// flags and the ClusterIP Service appear only when readAPI.enabled is set,
+// the bearer-token Secret name is passed through, and enabling without a
+// key Secret fails the render instead of serving an unauthenticated API.
+func TestChartRendersReadAPI(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	// Off by default: no read API flags and no Service.
+	disabled := runHelm(t, chartDir, "template", "courier", ".")
+	if strings.Contains(disabled, "--readapi-") {
+		t.Fatal("default chart output unexpectedly renders read API flags")
+	}
+	if strings.Contains(disabled, "courier-read-api") {
+		t.Fatal("default chart output unexpectedly renders the read API Service")
+	}
+
+	// Enabled without a key Secret fails the render.
+	out, err := runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "readAPI.enabled=true",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template to fail without readAPI.keySecret, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "readAPI.enabled requires readAPI.keySecret") {
+		t.Fatalf("helm template failed without the expected message:\n%s", out)
+	}
+
+	// Enabled with a key Secret: the flags and the Service are rendered.
+	enabled := runHelm(t, chartDir, "template", "courier", ".",
+		"--set", "readAPI.enabled=true",
+		"--set", "readAPI.keySecret=read-token",
+	)
+	for _, want := range []string{
+		"--readapi-token-secret=read-token",
+		"--readapi-bind=:8084",
+	} {
+		if !strings.Contains(enabled, want) {
+			t.Fatalf("read API chart output is missing %q", want)
+		}
+	}
+	service := chartDoc(t, enabled, "Service", "courier-read-api")
+	for _, want := range []string{"type: ClusterIP", "port: 80", "targetPort: 8084"} {
+		if !strings.Contains(service, want) {
+			t.Errorf("read API Service is missing %q:\n%s", want, service)
+		}
+	}
+}
+
 // TestChartRendersRetentionConfiguration checks the #287 retention block is
 // rendered as the matching manager flags, and that an explicit args override
 // wins over the value.

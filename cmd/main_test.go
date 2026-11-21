@@ -2124,6 +2124,59 @@ func TestBootstrapManagedLanesTracksConfigRotation(t *testing.T) {
 	}
 }
 
+// TestReadAPINamespace pins the read API's served namespace: the operator's
+// own namespace when the ownership boundary owns it (the namespace the
+// operator materializes its runs in, and where bootstrap-managed
+// LaneProfiles live), the first owned namespace otherwise.
+func TestReadAPINamespace(t *testing.T) {
+	tests := []struct {
+		name       string
+		owned      []string
+		operator   string
+		wantServed string
+		wantErr    string
+	}{
+		{
+			name:       "no ownership boundary serves the operator namespace",
+			operator:   "courier-system",
+			wantServed: "courier-system",
+		},
+		{
+			name:       "a boundary that owns the operator namespace serves it",
+			owned:      []string{"runs-a", "courier-system"},
+			operator:   "courier-system",
+			wantServed: "courier-system",
+		},
+		{
+			name:       "a boundary that excludes the operator namespace serves the first owned one",
+			owned:      []string{"runs-a", "runs-b"},
+			operator:   "courier-system",
+			wantServed: "runs-a",
+		},
+		{
+			name:    "an unknown operator namespace fails closed",
+			wantErr: "POD_NAMESPACE is empty",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			served, err := readAPINamespace(test.owned, test.operator)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("error = %v, want one containing %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("readAPINamespace: %v", err)
+			}
+			if served != test.wantServed {
+				t.Errorf("served = %q, want %q", served, test.wantServed)
+			}
+		})
+	}
+}
+
 func TestBuildSecureControlCarriesTokenReviewClusterRole(t *testing.T) {
 	registryFile := filepath.Join(t.TempDir(), "providers.json")
 	providers := `{"providers":[{"name":"github","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"forge-creds","key":"token"}},"serves":["*"]}]}`
