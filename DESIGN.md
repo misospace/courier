@@ -2822,10 +2822,11 @@ cluster would refuse. The SelfSubjectAccessReview the operator asks about
 itself is a canary rather than a proof on a stock cluster, where the API
 server's default `system:basic-user` binding already allows that create to
 every authenticated subject. The proof covers what the secure topology's
-creation needs plus the reads the secure launch path makes on its own behalf:
-the run-namespace pod list it reads to decide whether a replacement is due,
-the run's lane profile, the run's signing secret, the credential source
-Secrets in the operator's own namespace — reviews asked in the namespace the
+creation and App-mode in-place rotation (#870) need plus the reads the secure
+launch path makes on its own behalf: the run-namespace pod list it reads to
+decide whether a replacement is due, the run's lane profile, the run's signing
+secret, the credential source Secrets in the operator's own namespace, and the
+run-namespace credentials Secret update App-mode rotation rewrites — reviews asked in the namespace the
 reads target, since a grant scoped to one namespace never authorizes a request
 in another — and the services the live probes read for their targets (the API
 server in `default`, cluster DNS in `kube-system`, and the run's broker
@@ -4171,10 +4172,7 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   registration and to the operator's own identity — instead of duplicating it
   into two, and the chart's label-source guard accepts the seam as a
   credential argument, mirroring the Go rule.
-  GitHub App authentication can replace the static identity for operator observation
-  and admission reads. The operator keeps the private key and refreshes read-only
-  tokens for individual repositories. See [HARNESS.md](./HARNESS.md) for setup and
-  limits. Label discovery and settlement still use the static credential chain.
+  GitHub App authentication can replace the static identity for operator observation and admission reads, and can supply secure brokers' forge and git credentials. The operator retains the private key, refreshes its own read-only tokens, and mints and rotates a short-lived token scoped to each secure run's pinned repositories in that run's credentials Secret. The broker reads the Secret through the API server and never sees the private key or a pod-environment credential. App mode never falls back to a static token, and a run whose pinned repositories have different owners cannot launch. See [HARNESS.md](./HARNESS.md) for setup and limits. Label discovery and settlement still use the static credential chain.
 - The gateway response is untrusted, unbounded input, and trusted control
   bounds both its shape and what it will hold: one SSE line is capped at 1 MiB,
   and per completion the buffered content deltas (8 MiB), the buffered

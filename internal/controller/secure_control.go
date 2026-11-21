@@ -130,6 +130,17 @@ func contributionContextRejection(err error) *SecureNeedsHumanError {
 	return permanent
 }
 
+// InstallationTokenMinter mints short-lived repository-scoped GitHub App
+// installation tokens on the trusted operator side. Only the operator holds
+// the App private key; runs receive tokens, never key material. Identity
+// reports the installation owner and endpoint the minter signs for, so the
+// launcher can prove a run's pinned owner and registration endpoint before
+// any token exists.
+type InstallationTokenMinter interface {
+	Mint(ctx context.Context, repositories []string, permissions map[string]string) (token string, expiresAt time.Time, err error)
+	Identity() (owner, endpoint string)
+}
+
 // ProviderFactory constructs the forge provider facets for one selected
 // registration over the operator's read identity. The operator never resolves
 // a provider credential: the factory receives the registration's references
@@ -208,6 +219,12 @@ type SecureConfig struct {
 	// enough. Empty disables the read entirely: fix-pr runs keep the
 	// unstructured feedback inspection they had before.
 	ReviewerIdentity string
+	// InstallationTokenMinter, when set, switches every secure run's broker
+	// credential to the GitHub App installation path: the launcher mints and
+	// rotates one short-lived repository-scoped token into the run's credentials
+	// Secret, the broker pod renders without static credential environment, and
+	// no static copy exists to fall back to. Nil keeps the static copy path.
+	InstallationTokenMinter InstallationTokenMinter
 	// Now supports deterministic tests.
 	Now func() time.Time
 }

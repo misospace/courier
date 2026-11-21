@@ -245,6 +245,10 @@ func (s *SecureControl) operatorAccessReviews(run *courier.CoderRun, registratio
 	reviews := []accessReview{
 		{group: core, resource: "secrets", verb: "create", namespace: runNamespace},
 		{group: core, resource: "secrets", verb: "delete", namespace: runNamespace},
+		// App-mode rotation rewrites the run's credentials Secret in place
+		// (#870): without update proof, the first refresh fails mid-run
+		// instead of at launch.
+		{group: core, resource: "secrets", verb: "update", namespace: runNamespace},
 		{group: core, resource: "serviceaccounts", verb: "create", namespace: runNamespace},
 		{group: core, resource: "serviceaccounts", verb: "delete", namespace: runNamespace},
 		{group: core, resource: "pods", verb: "create", namespace: runNamespace},
@@ -341,7 +345,7 @@ func (s *SecureControl) operatorAccessReviews(run *courier.CoderRun, registratio
 	// teardown really requests.
 	reviews = append(reviews,
 		accessReview{group: "rbac.authorization.k8s.io", resource: "roles", verb: "delete",
-			name: topology.BrokerRole(run).Name, namespace: runNamespace},
+			name: brokerRoleForRun(s, run).Name, namespace: runNamespace},
 		accessReview{group: "rbac.authorization.k8s.io", resource: "rolebindings", verb: "delete",
 			name: topology.BrokerRoleBinding(run).Name, namespace: runNamespace},
 		accessReview{group: "rbac.authorization.k8s.io", resource: "clusterrolebindings", verb: "delete",
@@ -357,7 +361,7 @@ func (s *SecureControl) operatorAccessReviews(run *courier.CoderRun, registratio
 // exist. Neither proves the absence of extra grants; that rests on the
 // namespace/RBAC boundary assumption (HARNESS.md §3).
 func (s *SecureControl) checkBrokerRBAC(ctx context.Context, run *courier.CoderRun) error {
-	role := topology.BrokerRole(run)
+	role := brokerRoleForRun(s, run)
 	live := role.DeepCopy()
 	if err := s.reader().Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: role.Name}, live); err != nil {
 		return fmt.Errorf("secure preflight: read broker Role: %w", err)
@@ -389,6 +393,9 @@ func (s *SecureControl) checkBrokerRBAC(ctx context.Context, run *courier.CoderR
 		// namespaced grant can never be credited for the cluster grant the
 		// broker needs (#644).
 		{group: "authentication.k8s.io", resource: "tokenreviews", verb: "create"},
+	}
+	if s.Config.InstallationTokenMinter != nil {
+		reviews = append(reviews, accessReview{group: "", resource: "secrets", verb: "get", name: topology.CredentialsSecretName(run.Name), namespace: run.Namespace})
 	}
 	for _, review := range reviews {
 		allowed, err := s.subjectAccessReviewAs(ctx, topology.BrokerSAName(run.Name), review)
@@ -512,7 +519,12 @@ func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun,
 		return fmt.Errorf("secure preflight: render control: %w", err)
 	}
 	pods = append(pods, control)
-	broker, err := topology.BrokerPod(run, s.Config.HarnessImage, registration.Projection(), "dry-run-sa", resources)
+	var broker *corev1.Pod
+	if s.Config.InstallationTokenMinter != nil {
+		broker, err = topology.BrokerPodWithInstallationToken(run, s.Config.HarnessImage, registration.Projection(), "dry-run-sa", resources)
+	} else {
+		broker, err = topology.BrokerPod(run, s.Config.HarnessImage, registration.Projection(), "dry-run-sa", resources)
+	}
 	if err != nil {
 		return fmt.Errorf("secure preflight: render broker: %w", err)
 	}

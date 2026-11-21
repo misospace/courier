@@ -20,6 +20,25 @@ import (
 	"github.com/misospace/courier/internal/topology"
 )
 
+func TestResolveCredentialModeInstallationToken(t *testing.T) {
+	policy := &courierv1alpha1.PublicationPolicy{BaseRepo: "Acme/widgets", WorkRepo: "acme/fork"}
+	document := &topology.BrokerPolicyDocument{
+		PublicationPolicy: policy,
+		InstallationToken: &topology.InstallationTokenSecretRef{SecretKey: topology.CredKeyInstallationToken},
+	}
+	if appMode, err := resolveCredentialMode(document, &brokerEnv{}); err != nil || !appMode {
+		t.Fatalf("resolveCredentialMode = %v, %v; want App mode", appMode, err)
+	}
+	policy.WorkRepo = "other/fork"
+	if _, err := resolveCredentialMode(document, &brokerEnv{}); err == nil || err.Error() != "courier-broker: installation token serves a single repository owner" {
+		t.Fatalf("cross-owner resolveCredentialMode error = %v", err)
+	}
+	policy.WorkRepo = "acme/fork"
+	if _, err := resolveCredentialMode(document, &brokerEnv{forgeAPIToken: "static"}); err == nil {
+		t.Fatal("App mode accepted static credentials")
+	}
+}
+
 func TestRunFailsClosedWithoutOperatorWiring(t *testing.T) {
 	if err := runArgs(nil); err == nil || !strings.Contains(err.Error(), "requires address") {
 		t.Fatalf("run() error = %v, want missing configuration", err)
@@ -137,7 +156,7 @@ func TestNewProviderUsesRegisteredEndpoint(t *testing.T) {
 			document := &topology.BrokerPolicyDocument{
 				Provider: forge.Projection{Name: "primary", Type: "github", Endpoint: test.endpoint},
 			}
-			provider, err := newProvider(env, document)
+			provider, err := newProvider(env, document, false, nil, nil)
 			if err != nil {
 				t.Fatalf("newProvider: %v", err)
 			}
@@ -166,7 +185,7 @@ func TestNewProviderUsesRegisteredEndpoint(t *testing.T) {
 
 	env := &brokerEnv{providerName: "primary", providerType: "github", providerEndpt: "not a url", forgeAPIToken: "tok"}
 	document := &topology.BrokerPolicyDocument{Provider: forge.Projection{Name: "primary", Endpoint: "not a url"}}
-	if _, err := newProvider(env, document); err == nil {
+	if _, err := newProvider(env, document, false, nil, nil); err == nil {
 		t.Fatal("a malformed registered endpoint must fail closed, not fall back to the public API")
 	}
 }
