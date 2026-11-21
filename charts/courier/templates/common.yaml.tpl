@@ -575,16 +575,38 @@ exits on its missing --trusted-header. */}}
 {{- $hasConsoleTokensFile := false }}
 {{- $hasConsoleTrustedHeader := false }}
 {{- $hasConsoleBackendURL := false }}
+{{- $hasConsoleContributeURL := false }}
+{{- /* default dict keeps a values override that omits the contribute
+block an empty map instead of nil, so field access fails closed through
+the pair guards below rather than an opaque template error. */}}
+{{- $consoleContributeValues := $operatorConsole.contribute | default (dict) }}
+{{- $effectiveContributeURL := $consoleContributeValues.url }}
+{{- $hasConsoleContributeTokenFile := false }}
+{{- $effectiveContributeToken := not (empty $consoleContributeValues.tokenSecret) }}
 {{- $hasConsoleBind := false }}
 {{- $hasConsoleCookieSecure := false }}
 {{- $effectiveMode := $operatorConsole.auth.mode }}
 {{- $effectiveTrustedHeader := $operatorConsole.auth.trustedHeader }}
-{{- range $arg := $consoleArgs }}
+{{- $consoleArgCount := len $consoleArgs }}
+{{- range $i, $arg := $consoleArgs }}
 {{- if hasPrefix "--auth-mode=" $arg }}{{- $hasConsoleAuthMode = true }}{{- $effectiveMode = trimPrefix "--auth-mode=" $arg }}{{- end }}
 {{- if hasPrefix "--trusted-header=" $arg }}{{- $hasConsoleTrustedHeader = true }}{{- $effectiveTrustedHeader = trimPrefix "--trusted-header=" $arg }}{{- end }}
 {{- if hasPrefix "--session-key-file=" $arg }}{{- $hasConsoleSessionKeyFile = true }}{{- end }}
 {{- if hasPrefix "--operator-tokens-file=" $arg }}{{- $hasConsoleTokensFile = true }}{{- end }}
 {{- if hasPrefix "--backend-url=" $arg }}{{- $hasConsoleBackendURL = true }}{{- end }}
+{{- /* the contribute flags count in both spellings: --flag=value and a
+bare --flag whose value is the next argument, the spelling the binary's
+own parser also accepts, so the pair guard below sees what it will run. */}}
+{{- if hasPrefix "--contribute-url=" $arg }}{{- $hasConsoleContributeURL = true }}{{- $effectiveContributeURL = trimPrefix "--contribute-url=" $arg }}{{- end }}
+{{- if and (eq $arg "--contribute-url") (lt (add1 $i) $consoleArgCount) (not (hasPrefix "-" (index $consoleArgs (add1 $i)))) }}
+{{- $hasConsoleContributeURL = true }}
+{{- $effectiveContributeURL = index $consoleArgs (add1 $i) }}
+{{- end }}
+{{- if hasPrefix "--contribute-token-file=" $arg }}{{- $hasConsoleContributeTokenFile = true }}{{- $effectiveContributeToken = true }}{{- end }}
+{{- if and (eq $arg "--contribute-token-file") (lt (add1 $i) $consoleArgCount) (not (hasPrefix "-" (index $consoleArgs (add1 $i)))) }}
+{{- $hasConsoleContributeTokenFile = true }}
+{{- $effectiveContributeToken = true }}
+{{- end }}
 {{- if hasPrefix "--bind=" $arg }}{{- $hasConsoleBind = true }}{{- end }}
 {{- if hasPrefix "--cookie-secure=" $arg }}{{- $hasConsoleCookieSecure = true }}{{- end }}
 {{- end }}
@@ -623,6 +645,18 @@ concurrent template rendering stays deterministic per failure class. */}}
 {{- if and $operatorConsole.backendURL (not $hasConsoleBackendURL) }}
 {{- $consoleArgs = append $consoleArgs (printf "--backend-url=%s" $operatorConsole.backendURL) }}
 {{- end }}
+{{- /* The effective contribution pair mirrors the binary's own startup
+rule: values and raw args both count, and half a pair fails the render
+instead of crash-looping the console. */}}
+{{- if ne (empty $effectiveContributeURL) (empty $effectiveContributeToken) }}
+{{- fail "operatorConsole.contribute.url and operatorConsole.contribute.tokenSecret must be set together (a raw --contribute-url or --contribute-token-file arg counts)" }}
+{{- end }}
+{{- $effectiveContribute := and (not (empty $effectiveContributeURL)) $effectiveContributeToken }}
+{{- if and $effectiveContribute (eq $effectiveMode "header") }}
+{{- fail "operatorConsole.contribute requires token mode (operatorConsole.auth.mode)" }}
+{{- end }}
+{{- if and $consoleContributeValues.url (not $hasConsoleContributeURL) }}{{- $consoleArgs = append $consoleArgs (printf "--contribute-url=%s" $consoleContributeValues.url) }}{{- end }}
+{{- if and $consoleContributeValues.tokenSecret (not $hasConsoleContributeTokenFile) }}{{- $consoleArgs = append $consoleArgs "--contribute-token-file=/etc/courier/console/contribute-token" }}{{- end }}
 {{- if not $hasConsoleBind }}{{- $consoleArgs = append $consoleArgs (printf "--bind=:%d" (int $operatorConsole.port)) }}{{- end }}
 {{- /* cookie posture is explicit in the Deployment, so a reviewer sees the
 Secure-cookie setting without reading defaults. */}}
@@ -635,6 +669,15 @@ Secure-cookie setting without reading defaults. */}}
 {{- if $probe.spec.httpGet }}{{- $_ := set $probe.spec.httpGet "port" (int $operatorConsole.port) }}{{- end }}
 {{- end }}
 {{- $_ := set $consoleContainer "probes" $consoleProbes }}
+{{- if and $effectiveContribute (eq $effectiveMode "token") $consoleContributeValues.tokenSecret }}
+{{- $persistence := deepCopy (.Values.persistence | default dict) }}
+{{- $_ := set $persistence "console-contribute-token" (dict
+  "type" "secret"
+  "name" $consoleContributeValues.tokenSecret
+  "items" (list (dict "key" $consoleContributeValues.tokenSecretKey "path" "contribute-token"))
+  "advancedMounts" (dict "console" (dict "console" (list (dict "path" "/etc/courier/console/contribute-token" "subPath" "contribute-token" "readOnly" true))))) }}
+{{- $_ := set .Values "persistence" $persistence }}
+{{- end }}
 {{- if eq $effectiveMode "token" }}
 {{- $persistence := deepCopy (.Values.persistence | default dict) }}
 {{- $_ := set $persistence "console-session-key" (dict

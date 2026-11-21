@@ -3046,13 +3046,22 @@ mirroring the lane-profiles transport.
 
 The operator console (`internal/console`, served by the standalone
 `courier-console` binary and enabled by `operatorConsole.enabled` in the
-chart) is a server-rendered scaffold for authenticated operators:
-placeholder pages today, the operator read API's UI later. It is
-deliberately independent of the manager and of the Kubernetes API — it
-imports only the standard library, never talks to a cluster, and can only
-probe the read API's `/healthz` path when `--backend-url` is configured.
-Secrets travel as file paths read from mounted Secrets, never environment
-values.
+chart) is a server-rendered interface for authenticated operators. Read pages
+remain placeholders: there is no read API client or run data, and the console
+can only probe the operator read API's `/healthz` path when `--backend-url` is
+configured. It is deliberately independent of the manager and of the
+Kubernetes API — it imports only the standard library and never talks to a
+cluster. It additionally carries a bounded contribution form, a mutating,
+credentialed outbound-HTTP surface that submits server-side through the
+operator's contribution admission API under a file-mounted bearer token. The
+form is token-mode only and uses session-bound CSRF; a per-browser signed
+intent cookie carries the idempotency key across reloads, retries, and console
+restarts, and it is bound to the submitted content, so changed content starts
+a new attempt. The cookie signature uses the session key: rotating that key
+discards an unsettled attempt. The console claims "nothing was admitted" only
+for failures proven to precede sending the request (DNS or dial phase);
+timeouts and server errors stay "may have been admitted". Secrets travel as
+file paths read from mounted Secrets, never environment values.
 
 One authorization model: every authenticated identity is an operator, and
 `IsOperator` in `internal/console/auth.go` is the single seam where a
@@ -3077,9 +3086,10 @@ wire, not network position.
 The `Secure` cookie posture is configured, never inferred: every supported
 deployment terminates TLS at a proxy whose hop to the console listener is
 plaintext HTTP, so inferring from the listener would leave the flag
-permanently off. `Secure` defaults to true on the session cookie and on the
-mirrored clearing cookie (a browser is not guaranteed to remove a cookie
-whose attributes differ from the one `Set-Cookie` replaces), and
+permanently off. `Secure` defaults to true on the session cookie, the
+contribution-intent cookie, and their mirrored clearing cookies (a browser is
+not guaranteed to remove a cookie whose attributes differ from the one
+`Set-Cookie` replaces), and
 `--cookie-secure=false` (`operatorConsole.auth.cookieSecure=false`) is the
 only opt-out; the chart renders the flag explicitly so the posture is
 visible in the Deployment. The listener is bounded by fixed
