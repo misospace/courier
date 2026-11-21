@@ -189,6 +189,65 @@ func (m *contributeMinter) forget(digest string) {
 	delete(m.entries, digest)
 }
 
+// contributeSettled records attempt keys whose most recent submission
+// reached a definitive outcome, keyed by key — never by content digest, so
+// one session's settlement can never describe another session's live
+// attempt. The submit response has already flushed its headers by then, so
+// it cannot clear the browser's retained intent cookie; a later page view
+// uses this registry to clear the cookie and drop the stale
+// unsettled-attempt notice instead.
+type contributeSettled struct {
+	mu   sync.Mutex
+	keys map[string]time.Time
+}
+
+const contributeSettledCap = 4096
+
+func (r *contributeSettled) mark(key string, now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.keys == nil {
+		r.keys = make(map[string]time.Time)
+	}
+	for held, expires := range r.keys {
+		if !now.Before(expires) {
+			delete(r.keys, held)
+		}
+	}
+	if len(r.keys) >= contributeSettledCap {
+		// Evict the entry closest to its expiry, so the victim is the one
+		// the registry would drop soonest anyway.
+		oldest, oldestExpires := "", time.Time{}
+		for held, expires := range r.keys {
+			if oldestExpires.IsZero() || expires.Before(oldestExpires) {
+				oldest, oldestExpires = held, expires
+			}
+		}
+		delete(r.keys, oldest)
+	}
+	r.keys[key] = now.Add(sessionTTL)
+}
+
+func (r *contributeSettled) clear(key string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.keys, key)
+}
+
+func (r *contributeSettled) contains(key string, now time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	expires, ok := r.keys[key]
+	if !ok {
+		return false
+	}
+	if !now.Before(expires) {
+		delete(r.keys, key)
+		return false
+	}
+	return true
+}
+
 func (m *contributeMinter) keyFor(digest string, now time.Time) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -264,6 +323,7 @@ type contributeData struct {
 	Values        contributeSubmission
 	Key           string
 	HasIntent     bool
+	SettledIntent bool
 	Run           string
 	Namespace     string
 	WorkItemID    string
@@ -281,7 +341,13 @@ func (s *Server) contributePage(r *http.Request, sessionID string) contributeDat
 	default:
 		data.State = "form"
 		if cookie, err := r.Cookie(contributeIntentCookie); err == nil {
-			data.Key, _, data.HasIntent = verifyContributeIntent(cookie.Value, s.auth.key)
+			if key, _, valid := verifyContributeIntent(cookie.Value, s.auth.key); valid {
+				if s.settled.contains(key, s.auth.now()) {
+					data.SettledIntent = true
+				} else {
+					data.Key, data.HasIntent = key, true
+				}
+			}
 		}
 	}
 	return data
@@ -306,6 +372,12 @@ func (a *Authenticator) expiredContributeIntentCookie() *http.Cookie {
 func (s *Server) handleContribute(w http.ResponseWriter, r *http.Request) {
 	sessionID, _ := s.auth.sessionAndIdentity(r)
 	data := s.contributePage(r, sessionID)
+	if data.SettledIntent {
+		// The definitive submit response had already flushed its headers, so
+		// it could not clear the cookie; clear it now that the digest is
+		// known settled.
+		http.SetCookie(w, s.auth.expiredContributeIntentCookie())
+	}
 	s.render(w, http.StatusOK, "contribute", data)
 }
 
@@ -341,11 +413,14 @@ func (s *Server) handleContributeSubmit(w http.ResponseWriter, r *http.Request) 
 	// so a definitive settlement clears only its own attempt and never an
 	// unrelated unsettled one from changed content.
 	storedDigest := ""
+	storedSettled := false
 	if cookie, err := r.Cookie(contributeIntentCookie); err == nil {
-		if storedKey, candidateDigest, valid := verifyContributeIntent(cookie.Value, s.auth.key); valid {
+		if cookieKey, candidateDigest, valid := verifyContributeIntent(cookie.Value, s.auth.key); valid {
 			storedDigest = candidateDigest
 			if storedDigest == digest {
-				key = storedKey
+				key = cookieKey
+			} else {
+				storedSettled = s.settled.contains(cookieKey, s.auth.now())
 			}
 		}
 	}
@@ -368,48 +443,62 @@ func (s *Server) handleContributeSubmit(w http.ResponseWriter, r *http.Request) 
 		s.render(w, http.StatusOK, "contribute", data)
 		return
 	}
-	// settledOwnIntent is true when the attempt that reached a definitive
-	// outcome is the one the intent cookie holds; only then may the
-	// response clear the cookie, because an uncertain attempt under other
-	// content may still have been admitted and must stay retryable.
-	settledOwnIntent := storedDigest == "" || storedDigest == digest
+	// cookieTakeover is true when the browser holds no intent, holds this
+	// attempt, or holds a settled attempt whose key no longer needs
+	// preserving; only then may this response carry the cookie, because a
+	// cookie holding a different still-unsettled attempt may not be
+	// overwritten — that attempt must stay retryable, symmetric with the
+	// definitive-outcome paths below.
+	cookieTakeover := storedDigest == "" || storedDigest == digest || storedSettled
+	// Deliver the signed intent before the admission side effect: commit and
+	// flush the response headers so a lost response or console restart cannot
+	// leave the attempt's only key in the two-minute minter, which would let
+	// an identical resubmission mint a new key and duplicate an admitted run.
+	headersCommitted := false
+	if cookieTakeover {
+		http.SetCookie(w, s.auth.contributeIntentCookie(contributeIntentValue(key, digest, s.auth.key)))
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_ = http.NewResponseController(w).Flush()
+		headersCommitted = true
+	}
 	result := s.contribute.Submit(r.Context(), sub)
 	switch result.Outcome {
 	case outcomeCreated, outcomeResumed:
 		s.minter.forget(digest)
-		if settledOwnIntent {
-			http.SetCookie(w, s.auth.expiredContributeIntentCookie())
-		}
+		s.settled.mark(key, s.auth.now())
 		data.State, data.StateClass = "success", "state-ok"
 		data.Run, data.Namespace, data.WorkItemID = result.Run, result.Namespace, result.WorkItemID
 		data.Resumed = result.Outcome == outcomeResumed
 	case outcomeRefused:
 		s.minter.forget(digest)
-		if settledOwnIntent {
-			http.SetCookie(w, s.auth.expiredContributeIntentCookie())
-		}
+		s.settled.mark(key, s.auth.now())
 		data.State, data.StateClass, data.Message = "refused", "state-error", result.Message
 	case outcomeCredentialDenied:
 		s.minter.forget(digest)
-		if settledOwnIntent {
-			http.SetCookie(w, s.auth.expiredContributeIntentCookie())
-		}
+		s.settled.mark(key, s.auth.now())
 		data.State, data.StateClass, data.Message = "credentialDenied", "state-error", result.Message
 	case outcomeAPIMismatch:
 		s.minter.forget(digest)
-		if settledOwnIntent {
-			http.SetCookie(w, s.auth.expiredContributeIntentCookie())
-		}
+		s.settled.mark(key, s.auth.now())
 		data.State, data.StateClass, data.Message = "apiMismatch", "state-error", result.Message
 	case outcomeUnreachable:
 		s.minter.forget(digest)
-		if settledOwnIntent {
-			http.SetCookie(w, s.auth.expiredContributeIntentCookie())
-		}
+		s.settled.mark(key, s.auth.now())
 		data.State, data.StateClass, data.Message = "unreachable", "state-error", "nothing was admitted; the contribution API could not be reached"
 	default:
-		http.SetCookie(w, s.auth.contributeIntentCookie(contributeIntentValue(key, digest, s.auth.key)))
+		// An uncertain attempt is not settled: an earlier settlement record
+		// for a replayed key no longer describes it, and a later page view
+		// must keep the retry key, not clear it.
+		s.settled.clear(key)
+		// The intent cookie was already delivered before Submit when this
+		// attempt owns the cookie; when it does not, the other attempt's
+		// cookie stays untouched and this key remains minter-held.
 		data.State, data.StateClass, data.Message = "uncertain", "state-error", "may have been admitted — resubmitting retries the same idempotency key ("+key+"). Changing the form and resubmitting starts a new attempt; the earlier one may still have been admitted."
+	}
+	if headersCommitted {
+		s.renderBody(w, "contribute", data)
+		return
 	}
 	s.render(w, http.StatusOK, "contribute", data)
 }
@@ -447,8 +536,9 @@ func (s *Server) handleContributeNew(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if cookie, err := r.Cookie(contributeIntentCookie); err == nil {
-		if _, digest, valid := verifyContributeIntent(cookie.Value, s.auth.key); valid {
+		if key, digest, valid := verifyContributeIntent(cookie.Value, s.auth.key); valid {
 			s.minter.forget(digest)
+			s.settled.clear(key)
 		}
 	}
 	http.SetCookie(w, s.auth.expiredContributeIntentCookie())

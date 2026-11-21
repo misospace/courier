@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -749,12 +750,16 @@ func TestBackendHealthAllowlist(t *testing.T) {
 }
 
 // singleCookieJar is the minimal cookie jar the tests need: one fixed
-// cookie on every request.
+// cookie on every request. The mutex keeps it safe when a test polls the
+// jar while the client is still writing a response's cookies.
 type singleCookieJar struct {
+	mu      sync.Mutex
 	cookies map[string]*http.Cookie
 }
 
 func (j *singleCookieJar) Cookies(u *url.URL) []*http.Cookie {
+	j.mu.Lock()
+	defer j.mu.Unlock()
 	cookies := make([]*http.Cookie, 0, len(j.cookies))
 	for _, cookie := range j.cookies {
 		if cookie.MaxAge >= 0 {
@@ -766,6 +771,8 @@ func (j *singleCookieJar) Cookies(u *url.URL) []*http.Cookie {
 }
 
 func (j *singleCookieJar) SetCookies(_ *url.URL, cookies []*http.Cookie) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
 	if j.cookies == nil {
 		j.cookies = make(map[string]*http.Cookie)
 	}
@@ -786,7 +793,7 @@ func applyCookie(t *testing.T, client *http.Client, request *http.Request) {
 	if !ok || jar == nil {
 		t.Fatal("client carries no session cookie")
 	}
-	for _, cookie := range jar.cookies {
+	for _, cookie := range jar.Cookies(nil) {
 		request.AddCookie(cookie)
 	}
 }

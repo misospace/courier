@@ -3079,10 +3079,26 @@ contribution admission API under a file-mounted bearer token. The form is
 token-mode only and uses session-bound CSRF; a per-browser signed intent
 cookie carries the idempotency key across reloads, retries, and console
 restarts, and it is bound to the submitted content, so changed content starts
-a new attempt. The cookie signature uses the session key: rotating that key
-discards an unsettled attempt. The console claims "nothing was admitted" only
-for failures proven to precede sending the request (DNS or dial phase);
-timeouts and server errors stay "may have been admitted".
+a new attempt. When the browser holds no intent, holds this attempt, or holds
+a settled attempt's key, the response commits and flushes the signed intent
+before the admission call, so a lost response or a restart mid-submission
+still leaves the browser holding the key and an identical resubmission
+replays it instead of minting a new one that could duplicate an admitted run.
+When the cookie instead holds a different still-unsettled attempt, the
+submission never overwrites it — that attempt stays retryable from the
+browser — and the newest attempt's key survives only in the two-minute
+minter, bounding its resubmission window to that TTL. Settled attempt keys
+are remembered server-side per key, never per content digest, for one
+session TTL, so one settlement can never describe another live attempt
+(the minter is digest-keyed, so identical content from two sessions inside
+the TTL shares one key and is the same attempt); a later page view uses that record to clear the retained cookie
+and drop the stale unsettled-attempt notice, the definitive response having
+already flushed its headers, and an uncertain outcome clears the record so a
+replayed key stays retryable. The cookie signature uses the
+session key: rotating that key discards an unsettled attempt. The console
+claims "nothing was admitted" only for failures proven to precede sending the
+request (DNS or dial phase); timeouts and server errors stay "may have been
+admitted".
 
 The console decodes each projection into its own view types rather than
 importing `internal/readapi`, so the standard-library-only boundary holds and

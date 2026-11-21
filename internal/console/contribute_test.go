@@ -95,11 +95,20 @@ func TestContributePageAndSubmit(t *testing.T) {
 	mu.Lock()
 	secondKey := bodies[2]["idempotencyKey"].(string)
 	mu.Unlock()
-	if firstKey == secondKey {
-		t.Fatal("definitive outcome did not clear the intent")
+	if firstKey != secondKey {
+		t.Fatal("identical resubmission of a settled attempt did not replay the same intent key")
 	}
+	if intentCookie(client) == nil {
+		t.Fatal("submit response lost the intent cookie delivered before the admission call")
+	}
+	// A later page view clears the retained cookie now that the attempt
+	// settled, and drops the stale unsettled-attempt notice.
+	_, page = get(t, client, base+"/contribute")
 	if intentCookie(client) != nil {
-		t.Fatal("intent cookie remained after success")
+		t.Fatal("page view after settlement did not clear the retained intent cookie")
+	}
+	if strings.Contains(page, "unsettled attempt") {
+		t.Fatal("page view after settlement still shows the unsettled-attempt notice")
 	}
 }
 
@@ -182,9 +191,12 @@ func TestContributeOutcomeRetryAndCSRF(t *testing.T) {
 	if len(keys) != 3 || keys[2] == keys[1] {
 		t.Fatalf("changed-content key = %v; want a new attempt", keys)
 	}
+	// The changed-content attempt is uncertain, so it must not overwrite the
+	// earlier still-unsettled attempt's cookie; its key survives in the
+	// two-minute minter only.
 	intentParts := strings.Split(intentCookie(client).Value, ".")
-	if len(intentParts) != 3 || intentParts[0] != keys[2] || intentParts[1] != contributeDigest(contributeSubmission{Lane: "default", BaseRepo: "owner/base", BaseRef: "main", WorkRepo: "owner/fork", Goal: "changed goal"}) {
-		t.Fatalf("changed-content intent cookie = %v", intentParts)
+	if len(intentParts) != 3 || intentParts[0] != keys[0] || intentParts[1] != contributeDigest(contributeSubmission{Lane: "default", BaseRepo: "owner/base", BaseRef: "main", WorkRepo: "owner/fork", Goal: "goal"}) {
+		t.Fatalf("changed-content attempt overwrote the earlier unsettled intent cookie: %v", intentParts)
 	}
 	status = http.StatusBadRequest
 	_, page = postContribution(t, client, base, csrf, contributionValues("goal"))
@@ -312,8 +324,14 @@ func TestContributeCredentialAndMismatchOutcomes(t *testing.T) {
 			if !strings.Contains(page, tc.wantText) {
 				t.Fatalf("outcome state missing from page: %s", page)
 			}
+			if intentCookie(client) == nil {
+				t.Fatal("definitive outcome lost the intent cookie delivered before the admission call")
+			}
+			// A later page view clears the retained cookie now that the
+			// attempt settled.
+			get(t, client, base+"/contribute")
 			if intentCookie(client) != nil {
-				t.Fatal("definitive outcome retained the intent cookie")
+				t.Fatal("page view after definitive outcome did not clear the retained intent cookie")
 			}
 		})
 	}
@@ -330,8 +348,12 @@ func TestContributeUnreachableAndDeadline(t *testing.T) {
 	if !strings.Contains(page, "could not be reached") {
 		t.Fatalf("unreachable state missing: %s", page)
 	}
+	if intentCookie(client) == nil {
+		t.Fatal("unreachable outcome lost the intent cookie delivered before the admission call")
+	}
+	get(t, client, base+"/contribute")
 	if intentCookie(client) != nil {
-		t.Fatal("unreachable outcome retained the intent cookie")
+		t.Fatal("page view after unreachable outcome did not clear the retained intent cookie")
 	}
 
 	// A server that accepts the connection and never answers maps to the
@@ -356,6 +378,222 @@ func TestContributeUnreachableAndDeadline(t *testing.T) {
 	}
 	if intentCookie(hangingClient) == nil {
 		t.Fatal("uncertain outcome dropped the retry intent cookie")
+	}
+}
+
+func TestContributeIntentDeliveredBeforeAdmissionResult(t *testing.T) {
+	var mu sync.Mutex
+	var keys []string
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			IdempotencyKey string `json:"idempotencyKey"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		keys = append(keys, body.IdempotencyKey)
+		first := len(keys) == 1
+		mu.Unlock()
+		if first {
+			// Hang until the test client abandons the request, so its
+			// response is lost exactly as a dead console or dropped
+			// connection would lose it.
+			<-r.Context().Done()
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"busy"}`))
+	}))
+	defer api.Close()
+	server, base, client := newContributionTestServer(t, api.URL, 5*time.Second)
+	_, page := get(t, client, base+"/contribute")
+	csrf := findCSRFToken(t, page)
+	values := contributionValues("goal")
+	values.Set("csrf", csrf)
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/contribute", strings.NewReader(values.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	done := make(chan error, 1)
+	go func() {
+		resp, err := client.Do(req)
+		if resp != nil {
+			resp.Body.Close()
+		}
+		done <- err
+	}()
+	// Wait for the handler's pre-admission flush to reach the jar: that is
+	// the durable-delivery point this test pins down.
+	deadline := time.Now().Add(5 * time.Second)
+	for intentCookie(client) == nil && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	// Whether the client saw a transport error or an empty truncated page,
+	// the response is lost from the operator's perspective; the signed
+	// intent must already be durable in the browser: resubmitting replays
+	// the same key instead of minting a new one that could duplicate an
+	// admitted run.
+	cookie := intentCookie(client)
+	if cookie == nil {
+		t.Fatal("lost response orphaned the attempt: intent cookie was never delivered")
+	}
+	storedKey, digest, ok := verifyContributeIntent(cookie.Value, server.auth.key)
+	mu.Lock()
+	firstKey, keyCount := "", len(keys)
+	if keyCount > 0 {
+		firstKey = keys[0]
+	}
+	mu.Unlock()
+	if keyCount == 0 {
+		t.Fatal("admission API never saw the abandoned submission")
+	}
+	if !ok || storedKey != firstKey || digest != contributeDigest(contributeSubmission{Lane: "default", BaseRepo: "owner/base", BaseRef: "main", WorkRepo: "owner/fork", Goal: "goal"}) {
+		t.Fatalf("delivered intent invalid: key=%q digest=%q ok=%v", storedKey, digest, ok)
+	}
+	_, page = get(t, client, base+"/contribute")
+	csrf = findCSRFToken(t, page)
+	_, page = postContribution(t, client, base, csrf, contributionValues("goal"))
+	if !strings.Contains(page, "may have been admitted") {
+		t.Fatalf("retry state missing: %s", page)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(keys) != 2 || keys[1] != storedKey {
+		t.Fatalf("retry keys = %v, want the delivered key replayed", keys)
+	}
+}
+
+func TestContributeUncertainReplayKeepsSettledKeyRetryable(t *testing.T) {
+	var mu sync.Mutex
+	var keys []string
+	status := http.StatusCreated
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			IdempotencyKey string `json:"idempotencyKey"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		keys = append(keys, body.IdempotencyKey)
+		current := status
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(current)
+		if current == http.StatusCreated {
+			_, _ = w.Write([]byte(`{"run":"run-1","namespace":"courier","workItemId":"item-1"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"error":"busy"}`))
+	}))
+	defer api.Close()
+	_, base, client := newContributionTestServer(t, api.URL, time.Second)
+	_, page := get(t, client, base+"/contribute")
+	csrf := findCSRFToken(t, page)
+	_, page = postContribution(t, client, base, csrf, contributionValues("goal"))
+	if !strings.Contains(page, "A run was created") {
+		t.Fatalf("created state missing: %s", page)
+	}
+	mu.Lock()
+	status = http.StatusServiceUnavailable
+	mu.Unlock()
+	// An identical resubmission replays the settled key and turns uncertain:
+	// the attempt is no longer settled, so a later page view must keep the
+	// cookie and its retry key, not clear them.
+	_, page = postContribution(t, client, base, csrf, contributionValues("goal"))
+	if !strings.Contains(page, "may have been admitted") {
+		t.Fatalf("uncertain state missing: %s", page)
+	}
+	_, page = get(t, client, base+"/contribute")
+	if intentCookie(client) == nil {
+		t.Fatal("page view after an uncertain replay cleared the retry intent cookie")
+	}
+	if !strings.Contains(page, "unsettled attempt") {
+		t.Fatal("page view after an uncertain replay lost the unsettled notice")
+	}
+	_, page = postContribution(t, client, base, csrf, contributionValues("goal"))
+	if !strings.Contains(page, "may have been admitted") {
+		t.Fatalf("second retry state missing: %s", page)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(keys) != 3 || keys[1] != keys[0] || keys[2] != keys[0] {
+		t.Fatalf("keys = %v, want one key replayed throughout", keys)
+	}
+}
+
+func TestContributeCrossSessionSettlementKeepsUnsettledIntent(t *testing.T) {
+	var mu sync.Mutex
+	var keys []string
+	status := http.StatusServiceUnavailable
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			IdempotencyKey string `json:"idempotencyKey"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		keys = append(keys, body.IdempotencyKey)
+		current := status
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(current)
+		if current == http.StatusCreated {
+			_, _ = w.Write([]byte(`{"run":"run-1","namespace":"courier","workItemId":"item-1"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"error":"busy"}`))
+	}))
+	defer api.Close()
+	secrets := newTestSecrets(t)
+	server, err := NewServer(Config{Mode: AuthModeToken, SessionKey: []byte(secrets.sessionKey), OperatorTokens: [][]byte{[]byte(secrets.token)}, ContributeURL: api.URL, ContributeToken: []byte("admission-secret"), ContributeTimeout: time.Second, InsecureCookies: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+	clientA := login(t, httpServer.URL, secrets.token)
+	_, page := get(t, clientA, httpServer.URL+"/contribute")
+	csrfA := findCSRFToken(t, page)
+	_, page = postContribution(t, clientA, httpServer.URL, csrfA, contributionValues("goal"))
+	if !strings.Contains(page, "may have been admitted") {
+		t.Fatalf("session A uncertain state missing: %s", page)
+	}
+	cookieA := intentCookie(clientA)
+	if cookieA == nil {
+		t.Fatal("session A uncertain outcome wrote no intent cookie")
+	}
+	// Let A's minter entry lapse, as the two-minute TTL eventually does, so
+	// B's identical content mints its own key instead of replaying A's.
+	server.minter.forget(contributeDigest(contributeSubmission{Lane: "default", BaseRepo: "owner/base", BaseRef: "main", WorkRepo: "owner/fork", Goal: "goal"}))
+	// Session B settles the same content with its own key.
+	clientB := login(t, httpServer.URL, secrets.token)
+	_, page = get(t, clientB, httpServer.URL+"/contribute")
+	csrfB := findCSRFToken(t, page)
+	mu.Lock()
+	status = http.StatusCreated
+	mu.Unlock()
+	_, page = postContribution(t, clientB, httpServer.URL, csrfB, contributionValues("goal"))
+	if !strings.Contains(page, "A run was created") {
+		t.Fatalf("session B created state missing: %s", page)
+	}
+	// Session A starts a different attempt: B's settlement of the shared
+	// content must not authorize overwriting A's still-unsettled cookie.
+	mu.Lock()
+	status = http.StatusServiceUnavailable
+	mu.Unlock()
+	_, _ = postContribution(t, clientA, httpServer.URL, csrfA, contributionValues("goal two"))
+	if got := intentCookie(clientA); got == nil || got.Value != cookieA.Value {
+		t.Fatal("another session's settlement let a submission overwrite this session's unsettled intent cookie")
+	}
+	_, page = postContribution(t, clientA, httpServer.URL, csrfA, contributionValues("goal"))
+	if !strings.Contains(page, "may have been admitted") {
+		t.Fatalf("session A retry state missing: %s", page)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(keys) != 4 || keys[3] != keys[0] {
+		t.Fatalf("keys = %v, want the cross-session unsettled key replayed", keys)
 	}
 }
 
@@ -389,7 +627,14 @@ func postContribution(t *testing.T, client *http.Client, base, csrf string, valu
 
 func intentCookie(client *http.Client) *http.Cookie {
 	jar := client.Jar.(*singleCookieJar)
-	return jar.cookies[contributeIntentCookie]
+	jar.mu.Lock()
+	defer jar.mu.Unlock()
+	cookie := jar.cookies[contributeIntentCookie]
+	if cookie == nil {
+		return nil
+	}
+	copy := *cookie
+	return &copy
 }
 
 func TestContributeIntentCookieVerification(t *testing.T) {

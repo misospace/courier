@@ -86,12 +86,21 @@ the browser. The console uses no JavaScript.
 
 A signed intent cookie carries the idempotency key per browser, bound to the
 submitted content, across reloads, retries, and console restarts until the
-attempt is definitively settled. The cookie signature uses the session key, so
+attempt is definitively settled. When the browser holds no intent, this
+attempt, or a settled attempt's key, the response commits and flushes the
+cookie before the admission call, so even a lost response or a console
+restart mid-submission leaves the browser holding the key. When the cookie
+holds a different still-unsettled attempt, a submission never overwrites it;
+the newest attempt's key then survives only in the console's two-minute
+minter, bounding its resubmission window. A later page view clears the cookie
+once the attempt's key is settled server-side. The cookie
+signature uses the session key, so
 rotating that key discards an unsettled attempt; a later resubmission then
 starts a new attempt and the earlier one may still have been admitted. A
 timeout or server error has an uncertain outcome and is shown as "may have been
-admitted"; resubmitting identical content retries with the same key, so it
-cannot create a duplicate run. Changing the content starts a new attempt. A
+admitted"; while the key survives, resubmitting identical content retries with
+the same key, so it cannot create a duplicate run. Changing the content starts
+a new attempt. A
 deliberate new contribution is the separate explicit "start a new contribution"
 action. A submission the console cannot encode under its own 32 KiB request
 bound is refused locally, before any network contact.

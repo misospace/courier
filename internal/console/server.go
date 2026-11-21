@@ -85,6 +85,7 @@ type Server struct {
 	backend    Backend
 	contribute *httpContributeClient
 	minter     contributeMinter
+	settled    contributeSettled
 	pages      map[string]*template.Template
 	mux        *http.ServeMux
 }
@@ -369,6 +370,14 @@ func (s *Server) pageData(r *http.Request, title, active string) pageData {
 func (s *Server) render(w http.ResponseWriter, status int, page string, data any) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
+	s.renderBody(w, page, data)
+}
+
+// renderBody executes the page template against the response body. Callers
+// use it directly only after they already committed the status line and
+// headers: the contribution submit path flushes the intent cookie before the
+// admission call so a lost response cannot orphan the attempt's key.
+func (s *Server) renderBody(w http.ResponseWriter, page string, data any) {
 	if err := s.pages[page].ExecuteTemplate(w, "layout", data); err != nil {
 		// Headers are already sent; the partial response is the best a
 		// server-rendered page can do. The write error surfaces on the
