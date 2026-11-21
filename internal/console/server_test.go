@@ -54,11 +54,20 @@ func newTestSecrets(t *testing.T) *testSecrets {
 // and returns its base URL.
 func newTestServer(t *testing.T, secrets *testSecrets, backendURL string) (*Server, string) {
 	t.Helper()
+	return newTestServerWithToken(t, secrets, backendURL, "")
+}
+
+// newTestServerWithToken builds a token-mode console that also carries a read
+// API bearer token, so its run explorer authenticates to the backend. An empty
+// token leaves the explorer unable to authenticate (its not-configured state).
+func newTestServerWithToken(t *testing.T, secrets *testSecrets, backendURL, readAPIToken string) (*Server, string) {
+	t.Helper()
 	server, err := NewServer(Config{
 		Mode:           AuthModeToken,
 		SessionKey:     []byte(secrets.sessionKey),
 		OperatorTokens: [][]byte{[]byte(secrets.token), []byte(secrets.secondaryToken)},
 		BackendURL:     backendURL,
+		BackendToken:   []byte(readAPIToken),
 		BackendTimeout: time.Second,
 	})
 	if err != nil {
@@ -241,37 +250,52 @@ func TestHeaderModeIdentity(t *testing.T) {
 	}
 }
 
-// TestBackendUnavailableRendersEmptyState covers (e): pages stay 200 with a
-// visible empty state or the probe's error text.
+// TestBackendUnavailableRendersEmptyState covers (e): with no backend the
+// overview still renders its scaffold note and the run explorer states that
+// it is not configured; with a failing backend the overview surfaces the probe
+// error and the explorer surfaces an outage (never an empty namespace).
 func TestBackendUnavailableRendersEmptyState(t *testing.T) {
 	secrets := newTestSecrets(t)
-	// No backend URL at all: the plain empty state.
+	// No backend URL at all.
 	_, base := newTestServer(t, secrets, "")
 	client := login(t, base, secrets.token)
-	for _, path := range []string{"/", "/runs"} {
-		resp, body := get(t, client, base+path)
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("GET %s status = %d, want 200", path, resp.StatusCode)
-		}
-		if !strings.Contains(body, "the operator read API is not available yet") {
-			t.Fatalf("GET %s body is missing the empty state", path)
-		}
+
+	resp, body := get(t, client, base+"/")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET / status = %d, want 200", resp.StatusCode)
+	}
+	if !strings.Contains(body, "run explorer is live") {
+		t.Fatalf("GET / body is missing the overview scaffold note:\n%s", body)
 	}
 
-	// A failing backend: the error text is visible on the page.
+	resp, body = get(t, client, base+"/runs")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /runs status = %d, want 200", resp.StatusCode)
+	}
+	if !strings.Contains(body, "not configured for this console") {
+		t.Fatalf("GET /runs body is missing the not-configured state:\n%s", body)
+	}
+
+	// A backend whose every route answers 500.
 	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "backend down", http.StatusInternalServerError)
 	}))
 	defer failing.Close()
 	secretsFailing := newTestSecrets(t)
-	_, failingBase := newTestServer(t, secretsFailing, failing.URL)
+	_, failingBase := newTestServerWithToken(t, secretsFailing, failing.URL, "read-api-token")
 	failingClient := login(t, failingBase, secretsFailing.token)
-	resp, body := get(t, failingClient, failingBase+"/")
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET / with a failing backend status = %d, want 200", resp.StatusCode)
-	}
+
+	_, body = get(t, failingClient, failingBase+"/")
 	if !strings.Contains(body, "backend health check returned status 500") {
 		t.Fatalf("GET / with a failing backend is missing the probe error text:\n%s", body)
+	}
+
+	resp, body = get(t, failingClient, failingBase+"/runs")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /runs with a failing backend status = %d, want 200", resp.StatusCode)
+	}
+	if !strings.Contains(body, "unexpected status (500)") {
+		t.Fatalf("GET /runs with a failing backend should state the outage, not an empty namespace:\n%s", body)
 	}
 }
 
@@ -711,7 +735,7 @@ func TestBackendHealthAllowlist(t *testing.T) {
 		fmt.Fprint(w, "ok")
 	}))
 	defer healthy.Close()
-	backend := NewBackend(healthy.URL, time.Second)
+	backend := NewBackend(healthy.URL, nil, time.Second)
 	if err := backend.Health(context.Background()); err != nil {
 		t.Fatalf("Health on a healthy backend: %v", err)
 	}
@@ -719,7 +743,7 @@ func TestBackendHealthAllowlist(t *testing.T) {
 		t.Fatalf("backend probe reached %s %s, want GET /healthz", gotMethod, gotPath)
 	}
 
-	if err := NewBackend("", time.Second).Health(context.Background()); !errors.Is(err, ErrBackendUnavailable) {
+	if err := NewBackend("", nil, time.Second).Health(context.Background()); !errors.Is(err, ErrBackendUnavailable) {
 		t.Fatalf("Health without a backend URL = %v, want ErrBackendUnavailable", err)
 	}
 }

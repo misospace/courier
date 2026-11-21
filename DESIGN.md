@@ -780,9 +780,24 @@ unsafe workspace still retains ownership.
 capacity identity; otherwise the lane name is the identity. Confirmed
 exhaustion persists a default 15-minute cooldown on LaneProfile status. Source
 discovery and admission pause only for that identity; already-running work and
-unrelated pools continue. The interval is an anti-hammering window, not a
-provider reset estimate. Operators may inspect the `CapacityRecovery`
-condition and LaneProfile `capacityCooldown` status.
+unrelated pools continue. The interval is an anti-hammering floor, not a
+provider reset estimate — but a confirmed-exhaustion handoff may carry the
+provider's own reset: every `COURIER_TERMINATION` producer renders the
+authoritative `Retry-After` it observed — the native harness reads it from the
+gateway response, the legacy executor from the response headers the runtime
+serializes into its structured error event — as a bounded
+`provider_reset_after_seconds` on the termination handoff, and the operator
+persists it on the capacity-exhaustion diagnostic as `providerResetAt` only
+when it is validated (positive, within a 24-hour horizon) on a handoff whose
+declared outcome is capacity exhaustion (#866). The cooldown deadline is then
+the maximum deadline across the contributing exhaustions — each event's
+`max(window end, providerResetAt)` — so a lane is not re-admitted into
+capacity the provider itself says is still spent;
+a missing, malformed, or out-of-bounds hint falls back to the plain window,
+and the deadline is recomputed from durable per-run evidence, so it survives
+controller restarts. A transient rate limit never carries the hint — its
+`Retry-After` belongs to in-process retry policy. Operators may inspect the
+`CapacityRecovery` condition and LaneProfile `capacityCooldown` status.
 
 Before settlement, the controller reads run pods through the uncached API
 reader and fails closed if any topology writer is running, pending, unknown, or
@@ -1830,7 +1845,10 @@ unknown, not guessed.
 **Recovery ending.** A **deferred** failure — a confirmed exhaustion, or a
 transient rate limit (unhinted, hinted beyond the in-process bound, or
 persistent through the retries a short hint allowed) — ends the
-run as `blocked_external`. The operator already maps exit 2 plus the
+run as `blocked_external`. A confirmed exhaustion whose provider supplied an
+authoritative `Retry-After` also carries that hint through the capacity
+outcome to the lane cooldown, which honors the provider's reset instead of
+its default window (#866); a transient rate limit never carries it. The operator already maps exit 2 plus the
 `blocked_external` outcome to `PhaseBlockedExternal`, which reports the
 source-neutral `blocked-external` lifecycle result (Dispatch `waiting-external`
 plus the generation-fenced `WAITING_EXTERNAL` mark); that path is recoverable,
@@ -3046,22 +3064,37 @@ mirroring the lane-profiles transport.
 
 The operator console (`internal/console`, served by the standalone
 `courier-console` binary and enabled by `operatorConsole.enabled` in the
-chart) is a server-rendered interface for authenticated operators. Read pages
-remain placeholders: there is no read API client or run data, and the console
-can only probe the operator read API's `/healthz` path when `--backend-url` is
-configured. It is deliberately independent of the manager and of the
-Kubernetes API — it imports only the standard library and never talks to a
-cluster. It additionally carries a bounded contribution form, a mutating,
-credentialed outbound-HTTP surface that submits server-side through the
-operator's contribution admission API under a file-mounted bearer token. The
-form is token-mode only and uses session-bound CSRF; a per-browser signed
-intent cookie carries the idempotency key across reloads, retries, and console
+chart) is a server-rendered interface for authenticated operators. It is
+deliberately independent of the manager and of the Kubernetes API: it imports
+only the standard library, never talks to a cluster, and reaches the operator
+read API only over a fixed allowlist of GET paths. The run explorer reads the
+read API's paginated run projection (`/v1/runs`, issue #825) and renders it
+server-side, with no client-side JavaScript, so filters and pagination are GET
+query state and every view is a shareable URL. The overview and run-detail
+pages stay scaffold; the console still probes the read API's `/healthz` path
+for the overview's backend note when `--backend-url` is configured. It
+additionally carries a bounded contribution form, a mutating, credentialed
+outbound-HTTP surface that submits server-side through the operator's
+contribution admission API under a file-mounted bearer token. The form is
+token-mode only and uses session-bound CSRF; a per-browser signed intent
+cookie carries the idempotency key across reloads, retries, and console
 restarts, and it is bound to the submitted content, so changed content starts
 a new attempt. The cookie signature uses the session key: rotating that key
 discards an unsettled attempt. The console claims "nothing was admitted" only
 for failures proven to precede sending the request (DNS or dial phase);
-timeouts and server errors stay "may have been admitted". Secrets travel as
-file paths read from mounted Secrets, never environment values.
+timeouts and server errors stay "may have been admitted".
+
+The console decodes each projection into its own view types rather than
+importing `internal/readapi`, so the standard-library-only boundary holds and
+a projected field reaches a browser only through that decode. The read API
+bearer token (`operatorConsole.readAPITokenSecret`, mounted as a file and
+passed as `--readapi-token-file`) is optional: with no token the console still
+serves its pages and the unauthenticated health probe, and the explorer states
+that it is not configured rather than sending an unauthenticated projection
+request. The backend path is a constant allowlist entry and only its query
+string varies, so a filter value can never redirect the request to another
+path or host. Secrets, including the contribution and read API tokens, travel
+as file paths read from mounted Secrets, never environment values.
 
 One authorization model: every authenticated identity is an operator, and
 `IsOperator` in `internal/console/auth.go` is the single seam where a
@@ -3575,6 +3608,17 @@ reservation, an unsafe-workspace hold, a source whose forge or provider
 read failed, and a source with no recent activity without reading the API
 objects.
 
+The source inventory is process configuration, not cluster state: there is no
+Source object to list. The wiring hands the listener the operator's own
+source-adapter registry names (the base name of each registry key, which is
+exactly the `spec.source` value that adapter can stamp), so a configured
+source adapter with zero runs reads `Empty` on `/v1/sources` instead of being
+absent, and the overview counts the same set the sources list serves. A
+source adapter's discovery state (its last successful poll) lives only in
+process metrics, so freshness stays derived from run activity: an idle
+configured source reads freshness unknown, which names the absence of
+observation and never asserts a discovery failure.
+
 ### Rebase lane
 
 A Dispatch-classified `REBASE` followup materializes as a CoderRun with
@@ -3727,8 +3771,10 @@ that mechanism, recovery fails closed and does not release ownership. Cooldown
 belongs to the exhausted capacity profile, so unrelated profiles remain
 eligible. Namespace-wide discovery and admission consult all profiles sharing
 `capacityGroup`; unrelated capacity remains eligible. The default cooldown is
-15 minutes, a retry-control window rather than a claimed provider reset time.
-Retries of the same exhaustion do not extend its deadline. Successfully settled
+15 minutes, a retry-control floor rather than a claimed provider reset time; a
+validated provider reset hint on the exhaustion diagnostic extends the
+deadline to that reset when it is later (#866). Retries of the same exhaustion
+do not extend its deadline. Successfully settled
 exhaustion history permits rediscovery with a fresh opaque source attempt ID;
 the successor name incorporates the settled predecessor UID, and the old run
 is retained for diagnostics. Source-issued ownership is reacquired before launch.

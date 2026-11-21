@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/source"
 )
 
@@ -25,10 +26,21 @@ import (
 // identity pauses new discovery and admission after a confirmed exhaustion
 // (#327). It is a bounded re-claim control, not a provider reset time: the
 // real reset belongs to the provider and Courier never invents one, so the
-// window only guarantees the exhausted capacity stops hammering while
-// unrelated capacity keeps working, and a still-dead pool simply re-enters
-// the window on its next confirmed exhaustion.
+// window is the floor when no reliable hint exists — it only guarantees the
+// exhausted capacity stops hammering while unrelated capacity keeps working,
+// and a still-dead pool simply re-enters the window on its next confirmed
+// exhaustion. A validated provider reset hint on the exhaustion handoff
+// extends the deadline past this floor (#866); the window itself remains
+// anti-hammering, never an invented reset.
 const defaultCapacityCooldownWindow = 15 * time.Minute
+
+// capacityProviderResetHorizon bounds how far a validated provider reset
+// hint (#866) may extend a cooldown deadline. It is the shared producer-side
+// bound, so a rendered hint and the operator's check cannot drift: the
+// capture path rejects hints past it, and the cooldown fold re-checks it
+// defensively against durable evidence, so no value — crafted, drifted, or
+// clock-skewed — can hold a capacity identity past the horizon.
+const capacityProviderResetHorizon = executor.ProviderResetHorizon
 
 // Capacity-recovery condition reasons written on CoderRun.Status.Conditions
 // under ConditionCapacityRecovery. Settled is the only success; Unsupported,
@@ -279,10 +291,12 @@ func (r *CoderRunReconciler) recordCapacityCooldownLane(ctx context.Context, run
 	if !foundCurrent {
 		runs.Items = append(runs.Items, *run.DeepCopy())
 	}
-	windowStart := r.clock().UTC().Add(-r.capacityCooldownWindow())
+	now := r.clock().UTC()
+	window := r.capacityCooldownWindow()
 	count := 0
 	var latest time.Time
 	latestRun := ""
+	var eligible time.Time
 	for i := range runs.Items {
 		event := &runs.Items[i]
 		if !isCapacityExhaustionRun(event) || event.Spec.Lane == "" {
@@ -293,13 +307,33 @@ func (r *CoderRunReconciler) recordCapacityCooldownLane(ctx context.Context, run
 			continue
 		}
 		marker := apimeta.FindStatusCondition(event.Status.Conditions, conditionCapacityCooldownRecorded)
-		if marker == nil || marker.Status != metav1.ConditionTrue || marker.LastTransitionTime.Time.Before(windowStart) {
+		if marker == nil || marker.Status != metav1.ConditionTrue {
+			continue
+		}
+		// Each qualifying event contributes a deadline: the window end from
+		// its marker, extended by the durable provider reset hint when the
+		// event's own confirmed-exhaustion diagnostic carries one and it is
+		// later (#866). The horizon re-check is defensive — capture bounded
+		// the hint already, but durable state must never hold a lane past it.
+		deadline := marker.LastTransitionTime.Time.Add(window)
+		if diagnostic := event.Status.TerminalDiagnostic; diagnostic != nil &&
+			diagnostic.Category == courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion &&
+			diagnostic.ProviderResetAt != nil {
+			if reset := diagnostic.ProviderResetAt.Time; reset.After(deadline) &&
+				!reset.After(marker.LastTransitionTime.Time.Add(capacityProviderResetHorizon)) {
+				deadline = reset
+			}
+		}
+		if !deadline.After(now) {
 			continue
 		}
 		count++
 		if marker.LastTransitionTime.Time.After(latest) || (marker.LastTransitionTime.Time.Equal(latest) && event.Name > latestRun) {
 			latest = marker.LastTransitionTime.Time
 			latestRun = event.Name
+		}
+		if deadline.After(eligible) {
+			eligible = deadline
 		}
 	}
 	before := lane.DeepCopy()
@@ -313,7 +347,7 @@ func (r *CoderRunReconciler) recordCapacityCooldownLane(ctx context.Context, run
 			Reason:           fmt.Sprintf("run %s reported a recoverable capacity handoff", latestRun),
 			LastExhaustedRun: latestRun,
 			ExhaustionCount:  count,
-			NextEligibleAt:   metav1.NewTime(latest.Add(r.capacityCooldownWindow())),
+			NextEligibleAt:   metav1.NewTime(eligible),
 		}
 	}
 	if equality.Semantic.DeepEqual(before.Status.CapacityCooldown, lane.Status.CapacityCooldown) {

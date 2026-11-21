@@ -1,9 +1,13 @@
 // Package console implements the Courier operator console: a small,
 // server-rendered interface for authenticated operators. It is deliberately
 // independent of the operator binary and of the Kubernetes API — it imports
-// only the standard library and never talks to a cluster. Read pages are
-// placeholders until the operator read API exists; contributions submit
-// through the operator's HTTP admission API (#829).
+// only the standard library and never talks to a cluster. The run explorer
+// renders the operator read API's allowlisted projections over a fixed
+// allowlist of GET paths; the read API client lives in backend.go and decodes
+// the projection JSON into its own view types rather than importing the read
+// API package, so the standard-library-only invariant holds. Contributions
+// submit through the operator's HTTP admission API (#829). Other pages are
+// still scaffold.
 package console
 
 import (
@@ -48,10 +52,16 @@ type Config struct {
 	// TrustedHeader names the header the upstream proxy sets to the
 	// operator identity. Required in header mode.
 	TrustedHeader string
-	// BackendURL is the base URL of the (future) operator read API. Empty
-	// renders the backend-unavailable states.
+	// BackendURL is the base URL of the operator read API. Empty renders the
+	// backend-unavailable states and disables the run explorer.
 	BackendURL string
-	// BackendTimeout bounds each backend probe. Defaults to 5s.
+	// BackendToken is the bearer token the console presents to the read
+	// API's projection routes. Secrets reach it as bytes read from a mounted
+	// file by the caller, never from an environment value. Empty disables
+	// the run explorer (which needs the token) while leaving the
+	// unauthenticated health probe working.
+	BackendToken []byte
+	// BackendTimeout bounds each backend request. Defaults to 5s.
 	BackendTimeout time.Duration
 	// ContributeURL is the base URL of the contribution admission API.
 	ContributeURL string
@@ -114,7 +124,7 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 	s := &Server{
 		auth:       auth,
-		backend:    NewBackend(cfg.BackendURL, cfg.BackendTimeout),
+		backend:    NewBackend(cfg.BackendURL, cfg.BackendToken, cfg.BackendTimeout),
 		contribute: contribute,
 		pages:      pages,
 	}
@@ -144,11 +154,12 @@ func (s *Server) Handler() http.Handler {
 
 // parsePages parses every page template against the shared layout. Each page
 // is parsed into its own template set so the per-page "content" definition
-// never collides with another page's.
+// never collides with another page's. The shared funcs are attached to each
+// set so page templates may call them.
 func parsePages(fsys fs.FS) (map[string]*template.Template, error) {
 	pages := make(map[string]*template.Template, len(pageTemplates))
 	for _, name := range pageTemplates {
-		tmpl, err := template.ParseFS(fsys, "templates/layout.html", "templates/"+name+".html")
+		tmpl, err := template.New(name).Funcs(pageFuncs).ParseFS(fsys, "templates/layout.html", "templates/"+name+".html")
 		if err != nil {
 			return nil, err
 		}
@@ -183,16 +194,12 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	s.render(w, http.StatusOK, "overview", data)
 }
 
-// handleRuns renders the runs list placeholder. It deliberately shows no
-// table: the read API does not exist yet.
-func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
-	data := s.pageData(r, "Runs", "runs")
-	data.BackendErr = s.backendError(r)
-	s.render(w, http.StatusOK, "runs", data)
-}
+// handleRuns renders the searchable, paginated CoderRun explorer. It lives
+// in runs.go.
 
 // handleRun renders the run detail placeholder for the requested run name.
-// html/template escapes the name before it can reach the response.
+// The run detail page is a separate concern (issue #826); the explorer links
+// to it. html/template escapes the name before it can reach the response.
 func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if name == "" {
@@ -308,6 +315,41 @@ type pageData struct {
 	BackendErr string
 	// RunName is the requested run name on the detail page.
 	RunName string
+
+	// Run explorer view. Only the runs page populates these; every other
+	// page leaves them at their zero value, which the runs template is the
+	// only one that reads.
+
+	// Runs are the current page's rows (may be empty — an empty page is a
+	// valid result, distinct from RunsErr, which means no data could be
+	// shown).
+	Runs []RunRow
+	// RunsErr is a non-empty operator-facing state message that replaces
+	// the table: the explorer is unconfigured, the read API is unreachable
+	// or refused the token, or the submitted filters are invalid.
+	RunsErr string
+	// Filter echoes the current (validated) filter back into the form.
+	Filter RunsFilter
+	// PhaseOptions is the phase dropdown; PageSizes is the page-size
+	// dropdown, always including the active page size.
+	PhaseOptions []string
+	PageSizes    []int
+	// PageSize is the page size actually in effect, for the dropdown.
+	PageSize int
+	// PageNumber is the 1-based page number shown to the operator.
+	PageNumber int
+	// Total is the cheap count from the read API (a floor once filtered,
+	// a window when Truncated).
+	Total     int
+	More      bool
+	Truncated bool
+	// Filtered is true when any filter is active (drives a clear-filters
+	// affordance and the "matching filters" note).
+	Filtered bool
+	// PrevURL / NextURL are pre-built, filter-preserving pagination links.
+	// Empty means no such page.
+	PrevURL string
+	NextURL string
 }
 
 // pageData builds the view for a page, resolving the authenticated state for

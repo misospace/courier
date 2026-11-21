@@ -161,7 +161,7 @@ func TestWorkItemIDNeverProjected(t *testing.T) {
 	summary := ProjectRunSummary(&run, testOptions())
 	detail := ProjectRunDetail(&run, testOptions())
 	list := ProjectRunSummaries([]courierv1alpha1.CoderRun{run}, 1, DefaultPageSize, testOptions())
-	overview := ProjectOverview("courier", []courierv1alpha1.CoderRun{run}, nil, testOptions())
+	overview := ProjectOverview("courier", []courierv1alpha1.CoderRun{run}, nil, nil, testOptions())
 
 	for name, payload := range map[string]any{
 		"summary":  summary,
@@ -354,7 +354,7 @@ func TestLaneSourceScenarios(t *testing.T) {
 				t.Errorf("projected sources %v, want exactly %v", gotSources, tc.wantSource)
 			}
 
-			overview := ProjectOverview("courier", tc.runs, tc.lanes, opts)
+			overview := ProjectOverview("courier", tc.runs, tc.lanes, nil, opts)
 			if overview.Freshness != FreshnessFresh || overview.GeneratedAt == nil {
 				t.Errorf("overview must carry a fresh generatedAt, got %+v", overview)
 			}
@@ -880,7 +880,7 @@ func TestProjectOverviewConditionCounts(t *testing.T) {
 	run.Status.Conditions = []metav1.Condition{
 		{Type: courierv1alpha1.ConditionPullRequestClosedUnmerged, Status: metav1.ConditionTrue, LastTransitionTime: metav1.NewTime(testNow)},
 	}
-	overview := ProjectOverview("courier", []courierv1alpha1.CoderRun{run}, nil, testOptions())
+	overview := ProjectOverview("courier", []courierv1alpha1.CoderRun{run}, nil, nil, testOptions())
 	if overview.ConditionRuns[courierv1alpha1.ConditionPullRequestClosedUnmerged] != 1 {
 		t.Errorf("conditionRuns = %+v", overview.ConditionRuns)
 	}
@@ -924,9 +924,36 @@ func TestPagination(t *testing.T) {
 	}
 }
 
+// TestOverviewKnownSourcesMatchSourceList pins issue #839's consistency rule:
+// the overview's source counts are computed over the same source set
+// ProjectSourceHealths serves for GET /v1/sources, so a configured idle
+// source is counted Empty and the two views never disagree about which
+// sources exist.
+func TestOverviewKnownSourcesMatchSourceList(t *testing.T) {
+	run := runFixture("run", "github-label", "local", courierv1alpha1.PhaseDone, testNow.Add(-time.Minute))
+	known := []string{"dispatch", "github-label", "manual"}
+	overview := ProjectOverview("courier", []courierv1alpha1.CoderRun{run}, nil, known, testOptions())
+	healths := ProjectSourceHealths([]courierv1alpha1.CoderRun{run}, known, testOptions())
+
+	if overview.Sources.Count != len(healths) || overview.Sources.Count != 3 {
+		t.Fatalf("overview source count = %d, healths = %d, want both 3", overview.Sources.Count, len(healths))
+	}
+	if overview.Sources.Healthy != 1 || overview.Sources.Empty != 2 {
+		t.Errorf("overview sources = %+v, want 1 healthy and 2 empty", overview.Sources)
+	}
+	for _, health := range healths {
+		if health.Name != "github-label" && health.Availability != AvailabilityEmpty {
+			t.Errorf("idle source %q = %q, want Empty", health.Name, health.Availability)
+		}
+		if health.Name != "github-label" && health.Freshness != FreshnessUnknown {
+			t.Errorf("idle source %q freshness = %q, want unknown", health.Name, health.Freshness)
+		}
+	}
+}
+
 // TestEnvelopeRoundTrip pins the version envelope.
 func TestEnvelopeRoundTrip(t *testing.T) {
-	overview := ProjectOverview("courier", nil, nil, testOptions())
+	overview := ProjectOverview("courier", nil, nil, nil, testOptions())
 	env := NewEnvelope(KindOverview, overview)
 	raw, err := json.Marshal(env)
 	if err != nil {

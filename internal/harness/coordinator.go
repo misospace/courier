@@ -568,6 +568,13 @@ func availabilityEnding(err error) (executor.HarnessResult, bool) {
 		kind = courierv1alpha1.NativeResultCapacityExhausted
 	}
 	result := executor.HarnessResult{Outcome: outcome, Kind: kind, Reason: providerAvailabilityReason(classification)}
+	if classification.Availability == ProviderAllowanceExhausted && classification.RetryAfter > 0 {
+		// The provider's own reset hint is the only authoritative capacity
+		// clock: it rides the ending so the operator can extend the lane
+		// capacity cooldown instead of guessing. A transient rate limit
+		// never carries it — its hint is in-process retry policy.
+		result.CapacityResetAfter = classification.RetryAfter
+	}
 	return result, true
 }
 

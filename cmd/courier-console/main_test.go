@@ -161,3 +161,46 @@ func TestParseFlagsCookiePosture(t *testing.T) {
 		t.Fatal("--cookie-secure=false did not opt out of the Secure posture")
 	}
 }
+
+// TestParseFlagsReadAPITokenFile pins the explorer-enablement plumbing:
+// without --readapi-token-file the explorer stays off, with one the token is
+// read trimmed, and a configured-but-unreadable file fails the parse
+// (fail-closed) rather than silently leaving the explorer off.
+func TestParseFlagsReadAPITokenFile(t *testing.T) {
+	dir := t.TempDir()
+	sessionKeyFile := filepath.Join(dir, "session-key")
+	tokensFile := filepath.Join(dir, "tokens")
+	if err := os.WriteFile(sessionKeyFile, []byte("key-material\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tokensFile, []byte("token-material\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	readAPITokenFile := filepath.Join(dir, "readapi-token")
+	if err := os.WriteFile(readAPITokenFile, []byte("read-api-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base := []string{"--session-key-file=" + sessionKeyFile, "--operator-tokens-file=" + tokensFile}
+
+	_, cfg, err := parseFlags(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.BackendToken) != 0 {
+		t.Fatalf("default BackendToken = %q, want empty (explorer off)", cfg.BackendToken)
+	}
+
+	_, cfg, err = parseFlags(append(base, "--readapi-token-file="+readAPITokenFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(cfg.BackendToken) != "read-api-secret" {
+		t.Fatalf("BackendToken = %q, want %q (trailing whitespace trimmed)", cfg.BackendToken, "read-api-secret")
+	}
+
+	if _, _, err := parseFlags(append(base, "--readapi-token-file="+filepath.Join(dir, "absent"))); err == nil {
+		t.Fatal("parseFlags with a missing read API token file = nil, want an error")
+	} else if !strings.Contains(err.Error(), "read") {
+		t.Fatalf("parseFlags error = %v, want it to name \"read\"", err)
+	}
+}
