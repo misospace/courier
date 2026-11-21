@@ -75,3 +75,87 @@ footer {
   font-size: 0.85rem;
   border-top: 1px solid #d0d7de;
 }
+
+/* Run explorer: filter bar, results table, and pagination. No JavaScript —
+   filters and pagination are GET query state, so every view is a link. */
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem;
+  margin-bottom: 1rem;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  background: #ffffff;
+}
+.filters label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+  color: #57606a;
+}
+.filters input, .filters select {
+  padding: 0.3rem 0.45rem;
+  border: 1px solid #d0d7de;
+  border-radius: 4px;
+  font: inherit;
+  color: #1c2128;
+}
+.filters button {
+  padding: 0.35rem 0.9rem;
+  border: 1px solid #d0d7de;
+  border-radius: 4px;
+  background: #f6f8fa;
+  cursor: pointer;
+}
+.filters button:hover { background: #eef1f4; }
+.filters .clear { color: #0969da; align-self: center; }
+.state-note {
+  margin: 0 0 0.75rem;
+  color: #57606a;
+  font-size: 0.85rem;
+}
+table.runs {
+  width: 100%;
+  border-collapse: collapse;
+  background: #ffffff;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  overflow: hidden;
+  font-size: 0.9rem;
+}
+table.runs th, table.runs td {
+  text-align: left;
+  padding: 0.45rem 0.7rem;
+  border-bottom: 1px solid #eaeef2;
+  vertical-align: top;
+}
+table.runs th {
+  background: #f6f8fa;
+  color: #57606a;
+  font-weight: 600;
+  white-space: nowrap;
+}
+table.runs tbody tr:last-child td { border-bottom: none; }
+table.runs td a { color: #0969da; text-decoration: none; }
+table.runs td a:hover { text-decoration: underline; }
+.muted { color: #8c959f; }
+.tag {
+  margin-left: 0.4rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  border: 1px solid #d0d7de;
+  color: #57606a;
+  background: #f6f8fa;
+}
+.tag-terminal { color: #57606a; }
+.pager {
+  display: flex;
+  gap: 1rem;
+  margin-top: 1rem;
+}
+.pager a { color: #0969da; text-decoration: none; }
+.pager a:hover { text-decoration: underline; }

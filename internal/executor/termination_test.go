@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -218,4 +219,27 @@ func TestShrinkTerminationReason(t *testing.T) {
 			t.Fatalf("ShrinkTerminationReason() double-appended the marker: %q", got)
 		}
 	})
+}
+
+func TestProviderResetSeconds(t *testing.T) {
+	horizon := int64(ProviderResetHorizon / time.Second)
+	for _, tc := range []struct {
+		name       string
+		resetAfter time.Duration
+		want       int64
+	}{
+		{name: "no hint", resetAfter: 0},
+		{name: "negative hint", resetAfter: -time.Minute},
+		{name: "sub-second rounds up", resetAfter: time.Millisecond, want: 1},
+		{name: "whole seconds", resetAfter: 40 * time.Minute, want: 2400},
+		{name: "remainder rounds up", resetAfter: 90*time.Second + time.Millisecond, want: 91},
+		{name: "horizon boundary", resetAfter: ProviderResetHorizon, want: horizon},
+		{name: "beyond the horizon clamps", resetAfter: 48 * time.Hour, want: horizon},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ProviderResetSeconds(tc.resetAfter); got != tc.want {
+				t.Fatalf("ProviderResetSeconds(%v) = %d, want %d", tc.resetAfter, got, tc.want)
+			}
+		})
+	}
 }

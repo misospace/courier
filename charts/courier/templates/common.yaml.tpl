@@ -575,6 +575,7 @@ exits on its missing --trusted-header. */}}
 {{- $hasConsoleTokensFile := false }}
 {{- $hasConsoleTrustedHeader := false }}
 {{- $hasConsoleBackendURL := false }}
+{{- $hasConsoleReadAPITokenFile := false }}
 {{- $hasConsoleBind := false }}
 {{- $hasConsoleCookieSecure := false }}
 {{- $effectiveMode := $operatorConsole.auth.mode }}
@@ -585,6 +586,7 @@ exits on its missing --trusted-header. */}}
 {{- if hasPrefix "--session-key-file=" $arg }}{{- $hasConsoleSessionKeyFile = true }}{{- end }}
 {{- if hasPrefix "--operator-tokens-file=" $arg }}{{- $hasConsoleTokensFile = true }}{{- end }}
 {{- if hasPrefix "--backend-url=" $arg }}{{- $hasConsoleBackendURL = true }}{{- end }}
+{{- if hasPrefix "--readapi-token-file=" $arg }}{{- $hasConsoleReadAPITokenFile = true }}{{- end }}
 {{- if hasPrefix "--bind=" $arg }}{{- $hasConsoleBind = true }}{{- end }}
 {{- if hasPrefix "--cookie-secure=" $arg }}{{- $hasConsoleCookieSecure = true }}{{- end }}
 {{- end }}
@@ -623,6 +625,9 @@ concurrent template rendering stays deterministic per failure class. */}}
 {{- if and $operatorConsole.backendURL (not $hasConsoleBackendURL) }}
 {{- $consoleArgs = append $consoleArgs (printf "--backend-url=%s" $operatorConsole.backendURL) }}
 {{- end }}
+{{- if and $operatorConsole.readAPITokenSecret (not $hasConsoleReadAPITokenFile) }}
+{{- $consoleArgs = append $consoleArgs "--readapi-token-file=/etc/courier/console/readapi-token" }}
+{{- end }}
 {{- if not $hasConsoleBind }}{{- $consoleArgs = append $consoleArgs (printf "--bind=:%d" (int $operatorConsole.port)) }}{{- end }}
 {{- /* cookie posture is explicit in the Deployment, so a reviewer sees the
 Secure-cookie setting without reading defaults. */}}
@@ -635,8 +640,12 @@ Secure-cookie setting without reading defaults. */}}
 {{- if $probe.spec.httpGet }}{{- $_ := set $probe.spec.httpGet "port" (int $operatorConsole.port) }}{{- end }}
 {{- end }}
 {{- $_ := set $consoleContainer "probes" $consoleProbes }}
-{{- if eq $effectiveMode "token" }}
+{{- $needsConsolePersistence := false }}
+{{- if eq $effectiveMode "token" }}{{- $needsConsolePersistence = true }}{{- end }}
+{{- if $operatorConsole.readAPITokenSecret }}{{- $needsConsolePersistence = true }}{{- end }}
+{{- if $needsConsolePersistence }}
 {{- $persistence := deepCopy (.Values.persistence | default dict) }}
+{{- if eq $effectiveMode "token" }}
 {{- $_ := set $persistence "console-session-key" (dict
   "type" "secret"
   "name" $operatorConsole.auth.sessionKeySecret
@@ -647,6 +656,14 @@ Secure-cookie setting without reading defaults. */}}
   "name" $operatorConsole.auth.operatorTokensSecret
   "items" (list (dict "key" $operatorConsole.auth.operatorTokensSecretKey "path" "tokens"))
   "advancedMounts" (dict "console" (dict "console" (list (dict "path" "/etc/courier/console/tokens" "subPath" "tokens" "readOnly" true))))) }}
+{{- end }}
+{{- if $operatorConsole.readAPITokenSecret }}
+{{- $_ := set $persistence "console-readapi-token" (dict
+  "type" "secret"
+  "name" $operatorConsole.readAPITokenSecret
+  "items" (list (dict "key" $operatorConsole.readAPITokenSecretKey "path" "readapi-token"))
+  "advancedMounts" (dict "console" (dict "console" (list (dict "path" "/etc/courier/console/readapi-token" "subPath" "readapi-token" "readOnly" true))))) }}
+{{- end }}
 {{- $_ := set .Values "persistence" $persistence }}
 {{- end }}
 {{- $_ := set $console "enabled" true }}

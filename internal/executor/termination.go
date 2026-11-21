@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"reflect"
 	"strings"
+	"time"
 )
 
 // The COURIER_TERMINATION handoff travels through the kubelet's pod
@@ -30,6 +31,32 @@ const (
 	// the reason sees an obvious "this was truncated" marker.
 	TerminationTruncationSuffix = "... [truncated]"
 )
+
+// ProviderResetHorizon bounds how far an authoritative provider quota-reset
+// hint (#866) may extend a lane capacity cooldown. Every producer renders a
+// hint within it and the operator re-checks it against durable evidence, so
+// no crafted, drifted, or clock-skewed value can hold a capacity identity
+// past the horizon.
+const ProviderResetHorizon = 24 * time.Hour
+
+// ProviderResetSeconds renders a confirmed capacity-exhaustion ending's
+// provider reset hint for the shared `provider_reset_after_seconds` payload
+// field: whole seconds, rounded up so a sub-second remainder never collapses
+// to no-hint, and clamped to ProviderResetHorizon. A non-positive hint
+// renders zero, which the payload omits, so an unhinted ending stays
+// hint-free and the operator keeps its plain cooldown window. Both producers
+// call this so the field cannot drift between them.
+func ProviderResetSeconds(resetAfter time.Duration) int64 {
+	if resetAfter <= 0 {
+		return 0
+	}
+	horizon := int64(ProviderResetHorizon / time.Second)
+	seconds := int64((resetAfter + time.Second - 1) / time.Second)
+	if seconds > horizon {
+		return horizon
+	}
+	return seconds
+}
 
 // MarshalTerminationLine renders payload as the COURIER_TERMINATION
 // handoff line: the fixed prefix, the marshaled JSON body, and a trailing

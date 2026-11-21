@@ -1507,7 +1507,20 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 			if hasTrusted {
 				trustedKind = trusted.Kind
 			}
-			intent.diagnostic = buildTerminalDiagnostic(r.clock(), &exit, "", terminationOutcome, handoffCategory, k8sFailure, pod, trustedKind)
+			// One capture clock: the hint deadline is stamped against the same
+			// instant as the diagnostic's ObservedAt, so the two durable
+			// timestamps cannot disagree.
+			capturedAt := r.clock()
+			intent.diagnostic = buildTerminalDiagnostic(capturedAt, &exit, "", terminationOutcome, handoffCategory, k8sFailure, pod, trustedKind)
+			// A validated capacity-exhaustion handoff may carry the provider's
+			// own quota-reset hint (#866). Only the confirmed exhaustion
+			// category persists it, and only as an absolute deadline derived
+			// from the operator's capture clock.
+			if intent.diagnostic.Category == courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion {
+				if reset, ok := providerResetDeadline(capturedAt, pod); ok {
+					intent.diagnostic.ProviderResetAt = reset
+				}
+			}
 		}
 		result, err := r.transitionTerminal(ctx, run, phase, "", intent, terminationSummary)
 		if err == nil && noChangeHold {
@@ -2728,6 +2741,11 @@ type terminationMessage struct {
 	Category        string                                   `json:"category,omitempty"`
 	Summary         *courierv1alpha1.RunTelemetry            `json:"summary"`
 	WorkspaceSafety *courierv1alpha1.WorkspaceSafetyEvidence `json:"workspace_safety,omitempty"`
+	// ProviderResetAfterSeconds is the producer-bounded (#866) quota-reset
+	// hint on a capacity_exhausted ending: seconds from the validated handoff
+	// until the exhausted allowance may return. Absent on every other ending,
+	// where it carries no meaning.
+	ProviderResetAfterSeconds int64 `json:"provider_reset_after_seconds,omitempty"`
 }
 
 func boundedWorkspaceSafety(in *courierv1alpha1.WorkspaceSafetyEvidence) *courierv1alpha1.WorkspaceSafetyEvidence {
@@ -2817,6 +2835,26 @@ func coordinatorHandoffCategory(pod *corev1.Pod) string {
 func coordinatorHandoffValid(pod *corev1.Pod) bool {
 	_, valid := parseCoordinatorTermination(pod)
 	return valid
+}
+
+// providerResetDeadline turns the validated capacity-exhaustion handoff's
+// quota-reset hint (#866) into an absolute deadline stamped with the
+// operator's clock. The direction of trust is one-way and conservative: an
+// overlong-but-bounded host hint only ever delays re-claim up to the 24h
+// horizon, so a slow host cannot hammer; a missing, malformed, zero,
+// negative, or beyond-horizon value never invents a reset time, and the
+// cooldown falls back to the plain window. Only a validated handoff whose
+// declared outcome is capacity exhaustion is read at all.
+func providerResetDeadline(now time.Time, pod *corev1.Pod) (*metav1.Time, bool) {
+	message, valid := parseCoordinatorTermination(pod)
+	if !valid || message.Outcome != string(executor.OutcomeCapacityExhausted) {
+		return nil, false
+	}
+	seconds := message.ProviderResetAfterSeconds
+	if seconds <= 0 || seconds > int64(capacityProviderResetHorizon/time.Second) {
+		return nil, false
+	}
+	return &metav1.Time{Time: now.UTC().Add(time.Duration(seconds) * time.Second)}, true
 }
 
 func coordinatorTermination(pod *corev1.Pod) (int32, string, string, *courierv1alpha1.RunTelemetry, bool) {

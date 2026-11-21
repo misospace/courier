@@ -555,6 +555,13 @@ func main() {
 		}
 	}
 
+	// The source-adapter registry is the inventory of configured source
+	// names the read API serves. It is declared here and built below with
+	// the adapters: the listener closes over this variable and reads the
+	// registry per request, after startup has registered every configured
+	// adapter.
+	var sources *controller.SourceRegistry
+
 	// The read-only HTTP API is the operator's own in-process projection of
 	// CoderRun and LaneProfile state for non-kubectl consumers: redacted,
 	// namespace-scoped, GET-only, and bearer-token authenticated. It is
@@ -595,6 +602,9 @@ func main() {
 			Token:     token,
 			Bind:      readBind,
 			Namespace: servedNamespace,
+			KnownSources: func() []string {
+				return sources.ConfiguredSourceNames()
+			},
 		})
 		if err != nil {
 			setupLog.Error(err, "unable to configure the read API")
@@ -724,7 +734,7 @@ func main() {
 	// adapter emits into them nil-safely via the shared instance.
 	discoveryMetrics := source.NewDiscoveryMetrics(crmetrics.Registry)
 
-	sources := controller.NewSourceRegistry(map[string]source.Adapter{
+	sources = controller.NewSourceRegistry(map[string]source.Adapter{
 		"manual": manual.New(diagnostics),
 		"adhoc":  adhoc.New(mgr.GetClient(), mgr.GetAPIReader()),
 	})

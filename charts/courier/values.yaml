@@ -347,10 +347,12 @@ readAPI:
   #    the rendered Service routes port 80 to it.
   port: 8084
 
-# -- Operator console scaffold (#821). Disabled by default: enabling it
+# -- Operator console (#821). Disabled by default: enabling it
 #    renders a second controller running the standalone courier-console
-#    binary behind a ClusterIP-only Service. It renders placeholder pages
-#    only — no read API, no tables, no mutating controls — and never talks
+#    binary behind a ClusterIP-only Service. The run explorer (#825) reads
+#    the read API when operatorConsole.backendURL and
+#    operatorConsole.readAPITokenSecret are set; overview and run detail stay
+#    placeholder, and there are no mutating controls. The console never talks
 #    to the Kubernetes API. No Ingress is rendered; exposing it is a
 #    deployment concern (docs/operator-console.md).
 operatorConsole:
@@ -388,9 +390,15 @@ operatorConsole:
     #    plaintext the operator controls; the token flow is not meant to
     #    run over untrusted plaintext.
     cookieSecure: true
-  # -- Base URL of the (future) operator read API; empty renders the
-  #    backend-unavailable empty states.
+  # -- Base URL of the operator read API; empty renders the
+  #    backend-unavailable states and leaves the run explorer off.
   backendURL: ""
+  # -- Name of a Secret in the release namespace holding the bearer token the
+  #    console presents to the read API, enabling the run explorer; empty
+  #    renders the explorer's not-configured state. The entry key defaults to
+  #    "token", matching readAPI.keySecret.
+  readAPITokenSecret: ""
+  readAPITokenSecretKey: token
 
 retention:
   # -- Terminal CoderRun retention (#287). The controller deletes terminal runs
