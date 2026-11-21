@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
@@ -56,6 +57,40 @@ func (r *SourceRegistry) Register(name string, adapter source.Adapter) {
 		r.Adapters = make(map[string]source.Adapter)
 	}
 	r.Adapters[name] = adapter
+}
+
+// ConfiguredSourceNames returns the distinct source names an adapter in this
+// registry can stamp onto a run's spec.source. A registry key is either a bare
+// source name or a "source:agent" compound (dispatch and cron bind one adapter
+// per agent or lane), and lookupRun resolves a run through exactly that pair,
+// so the base name before the first ':' is the spec.source value the key
+// serves. The list is sorted and deduplicated, and nil when no key carries a
+// usable base name: it is an inventory of configured
+// source names, not of adapters, so several bindings under one source name
+// contribute one entry. Built-in adapters registered unconditionally are
+// always in the inventory: their source names resolve in every deployment, so
+// an Empty read model entry for one states "configured, no runs yet", never
+// "unused configuration" — the inventory describes what the process can
+// serve, not what has run.
+func (r *SourceRegistry) ConfiguredSourceNames() []string {
+	if r == nil {
+		return nil
+	}
+	seen := make(map[string]bool, len(r.Adapters))
+	names := make([]string, 0, len(r.Adapters))
+	for key := range r.Adapters {
+		base, _, _ := strings.Cut(key, ":")
+		if base == "" || seen[base] {
+			continue
+		}
+		seen[base] = true
+		names = append(names, base)
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	sort.Strings(names)
+	return names
 }
 
 func (r *SourceRegistry) lookup(name string) (source.Adapter, error) {

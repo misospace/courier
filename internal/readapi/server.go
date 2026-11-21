@@ -102,11 +102,22 @@ type ServerConfig struct {
 	// the operator resolves a run's lane profile in the run's own namespace
 	// and a profile from anywhere else governs nothing.
 	Namespace string
+	// KnownSources is the optional inventory of configured source names —
+	// exactly the values a configured source adapter can stamp onto a run's
+	// spec.source. It is process configuration the wiring supplies (the
+	// operator's source-adapter registry), not cluster state: there is no
+	// Source object to list. When set, a configured source with zero runs
+	// still appears in the source views as Empty instead of being absent.
+	// The function is called per request and must be safe to call at any
+	// time; a nil result means no inventory beyond observed runs.
+	KnownSources func() []string
 }
 
 // Server serves the read-only HTTP projection API over CoderRun and
-// LaneProfile objects. It is a thin transport layer: authentication, query
-// parsing, bounding, and error mapping happen here; every state judgment is
+// LaneProfile objects, widened by the wiring's configured source-name
+// inventory so an idle configured source still reads Empty. It is a thin
+// transport layer: authentication, query parsing, bounding, and error
+// mapping happen here; every state judgment is
 // the projection layer's. Namespace scans are bounded every way they can
 // be: each List round trip asks for at most ListPageSize items and follows
 // the continuation token, one pass fetches at most MaxListItems objects
@@ -120,12 +131,13 @@ type ServerConfig struct {
 // operator resolves a run's lane profile in the run's own namespace, so a
 // profile elsewhere governs nothing.
 type Server struct {
-	reader    ctrlclient.Reader
-	token     string
-	bind      string
-	namespace string
-	readSlots chan struct{}
-	disabled  bool
+	reader       ctrlclient.Reader
+	token        string
+	bind         string
+	namespace    string
+	knownSources func() []string
+	readSlots    chan struct{}
+	disabled     bool
 }
 
 // NewServer builds the server. An empty Bind disables it: the constructor
@@ -145,11 +157,12 @@ func NewServer(config ServerConfig) (*Server, error) {
 		return nil, errors.New("readapi: server requires a namespace")
 	}
 	return &Server{
-		reader:    config.Reader,
-		token:     config.Token,
-		bind:      strings.TrimSpace(config.Bind),
-		namespace: strings.TrimSpace(config.Namespace),
-		readSlots: make(chan struct{}, MaxConcurrentReads),
+		reader:       config.Reader,
+		token:        config.Token,
+		bind:         strings.TrimSpace(config.Bind),
+		namespace:    strings.TrimSpace(config.Namespace),
+		knownSources: config.KnownSources,
+		readSlots:    make(chan struct{}, MaxConcurrentReads),
 	}, nil
 }
 
@@ -252,7 +265,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 		writeClusterError(w, ctx, err)
 		return
 	}
-	overview := ProjectOverview(s.namespace, runs, lanes, s.options())
+	overview := ProjectOverview(s.namespace, runs, lanes, s.sourceInventory(), s.options())
 	overview.Truncated = runsTruncated || lanesTruncated
 	writeJSON(w, http.StatusOK, NewEnvelope(KindOverview, overview))
 }
@@ -294,8 +307,10 @@ func (s *Server) handleLanes(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSources serves GET /v1/sources: one health entry per source visible
-// in the served namespace's runs. Sources are a small, name-keyed set, so the
-// list is served in one unpaginated page; the run scan behind it is the same
+// in the served namespace's runs plus every configured source named by the
+// wiring's inventory, so a configured source with zero runs reads Empty
+// instead of being absent. Sources are a small, name-keyed set, so the list
+// is served in one unpaginated page; the run scan behind it is the same
 // bounded pass the run list uses, and a truncated scan is stated in the page.
 func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 	if !s.acquireReadSlot() {
@@ -310,7 +325,7 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 		writeClusterError(w, ctx, err)
 		return
 	}
-	healths := ProjectSourceHealths(runs, nil, s.options())
+	healths := ProjectSourceHealths(runs, s.sourceInventory(), s.options())
 	list := SourceHealthList{
 		Items: healths,
 		Pagination: Pagination{
@@ -547,6 +562,17 @@ func (s *Server) releaseReadSlot() {
 
 func (s *Server) options() Options {
 	return Options{Now: time.Now()}
+}
+
+// sourceInventory returns the configured source-name inventory, nil when the
+// wiring supplied none. A nil result degrades to the run-observed view: the
+// inventory only adds Empty entries for idle configured sources, and losing
+// it loses no run state.
+func (s *Server) sourceInventory() []string {
+	if s.knownSources == nil {
+		return nil
+	}
+	return s.knownSources()
 }
 
 // bearerToken extracts the bearer token from the Authorization header, the

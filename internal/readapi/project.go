@@ -602,8 +602,11 @@ func ProjectSourceHealths(runs []courierv1alpha1.CoderRun, knownSources []string
 	return healths
 }
 
-// ProjectOverview projects the single-namespace snapshot.
-func ProjectOverview(namespace string, runs []courierv1alpha1.CoderRun, lanes []courierv1alpha1.LaneProfile, opts Options) Overview {
+// ProjectOverview projects the single-namespace snapshot. knownSources is the
+// configured source-name inventory (see ProjectSourceHealths); the overview's
+// source counts always describe the same source set GET /v1/sources serves,
+// so the two views can never disagree about which sources exist.
+func ProjectOverview(namespace string, runs []courierv1alpha1.CoderRun, lanes []courierv1alpha1.LaneProfile, knownSources []string, opts Options) Overview {
 	overview := Overview{
 		Namespace:     namespace,
 		ConditionRuns: map[string]int{},
@@ -646,7 +649,7 @@ func ProjectOverview(namespace string, runs []courierv1alpha1.CoderRun, lanes []
 		}
 	}
 
-	sourceHealths := ProjectSourceHealths(runs, nil, opts)
+	sourceHealths := ProjectSourceHealths(runs, knownSources, opts)
 	overview.Sources.Count = len(sourceHealths)
 	for _, s := range sourceHealths {
 		switch s.Availability {
