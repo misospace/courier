@@ -20,9 +20,13 @@ import (
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 )
 
-// The routes the read API serves, all under /v1. The run-detail route is a
-// ServeMux pattern; its {name} segment is read with r.PathValue.
+// The routes the read API serves. The /v1 routes are the projections, all
+// behind the bearer token; the run-detail route is a ServeMux pattern whose
+// {name} segment is read with r.PathValue. /healthz is unauthenticated
+// liveness for probes that carry no credentials (the operator console's
+// backend probe): it serves no data, so it must never sit behind the token.
 const (
+	PathHealthz  = "/healthz"
 	PathOverview = "/v1/overview"
 	PathLanes    = "/v1/lanes"
 	PathSources  = "/v1/sources"
@@ -194,25 +198,39 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 }
 
-// Handler returns the server's HTTP handler. Authentication wraps the mux,
-// so it answers before any routing: an unauthenticated caller learns
-// nothing about which routes exist. One constant message covers missing,
-// malformed, and wrong tokens alike.
+// Handler returns the server's HTTP handler. Authentication wraps the
+// projection routes, so it answers before any routing: an unauthenticated
+// caller learns nothing about which routes exist. One constant message
+// covers missing, malformed, and wrong tokens alike. /healthz sits outside
+// the token: it is liveness for credential-less probes and serves no data.
 func (s *Server) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET "+PathOverview, s.handleOverview)
-	mux.HandleFunc("GET "+PathLanes, s.handleLanes)
-	mux.HandleFunc("GET "+PathSources, s.handleSources)
-	mux.HandleFunc("GET "+PathRuns, s.handleRuns)
-	mux.HandleFunc("GET "+PathRun, s.handleRun)
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	projections := http.NewServeMux()
+	projections.HandleFunc("GET "+PathOverview, s.handleOverview)
+	projections.HandleFunc("GET "+PathLanes, s.handleLanes)
+	projections.HandleFunc("GET "+PathSources, s.handleSources)
+	projections.HandleFunc("GET "+PathRuns, s.handleRuns)
+	projections.HandleFunc("GET "+PathRun, s.handleRun)
+	authed := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token, ok := bearerToken(r)
 		if !ok || subtle.ConstantTimeCompare([]byte(token), []byte(s.token)) != 1 {
 			writeError(w, http.StatusUnauthorized, unauthorizedMessage)
 			return
 		}
-		mux.ServeHTTP(w, r)
+		projections.ServeHTTP(w, r)
 	})
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET "+PathHealthz, s.handleHealthz)
+	mux.Handle("/", authed)
+	return mux
+}
+
+// handleHealthz serves GET /healthz: unauthenticated liveness. It carries no
+// state — not the served namespace, not counts, not the token's presence —
+// so a probe without credentials learns only that the listener is up.
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok\n"))
 }
 
 // handleOverview serves GET /v1/overview: the single-namespace snapshot.

@@ -94,6 +94,35 @@ func TestServerUnauthorized(t *testing.T) {
 	}
 }
 
+// TestServerHealthzUnauthenticated pins the console-facing liveness route:
+// GET /healthz answers 200 without credentials and carries no data — no
+// envelope, no namespace, no counts — while every projection route behind
+// the same handler still demands the token.
+func TestServerHealthzUnauthenticated(t *testing.T) {
+	run := runFixture("run", "github-label", "local", courierv1alpha1.PhaseRunning, testNow)
+	_, handler := serverFixture(t, &run)
+
+	for name, token := range map[string]string{
+		"missing": "",
+		"wrong":   "Bearer not-the-token",
+		"valid":   "Bearer " + testToken,
+	} {
+		req := httptest.NewRequest(http.MethodGet, PathHealthz, nil)
+		if token != "" {
+			req.Header.Set("Authorization", token)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("/healthz with %s token = %d, want 200", name, rec.Code)
+		}
+		body := rec.Body.String()
+		if strings.Contains(body, "courier.misospace.dev") || strings.Contains(body, testToken) || strings.Contains(body, "courier") {
+			t.Errorf("/healthz leaked state: %s", body)
+		}
+	}
+}
+
 // TestServerDisabled pins the bind-empty path: the constructor returns a
 // no-op that never listens.
 func TestServerDisabled(t *testing.T) {

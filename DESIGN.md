@@ -3496,7 +3496,9 @@ frontend contract is documented in
 
 A non-kubectl frontend reads the operator's own view of its work through one
 authenticated HTTP endpoint (#820): `GET /v1/overview`, `/v1/lanes`,
-`/v1/sources`, `/v1/runs`, and `/v1/runs/{name}`, served by the operator's
+`/v1/sources`, `/v1/runs`, and `/v1/runs/{name}`, plus an unauthenticated
+`GET /healthz` liveness probe (the operator console's backend probe) that
+serves no data. All are served by the operator's
 own in-process listener (`internal/readapi`), wired like the other listeners
 — every replica, no leader election, chart-rendered ClusterIP Service under
 the `readAPI:` values. It is a read model, never a second state machine: it
