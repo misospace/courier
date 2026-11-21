@@ -2,11 +2,12 @@
 
 The operator console (`courier-console`) is a small, server-rendered web UI
 for authenticated operators. It is a standalone Go binary, separate from the
-manager. It is a scaffold: every page is a placeholder until the operator
-read API exists. There is no read API, no data table, and no mutating
-control yet. The console never talks to the Kubernetes API. It can only
-probe the operator read API's `/healthz` path, and only when
-`--backend-url` is configured.
+manager. The run explorer lists CoderRuns from the operator read API with
+server-side search and pagination. The overview and run-detail pages are
+still placeholders, and there are no mutating controls. The console never
+talks to the Kubernetes API. It reads the operator read API over a fixed
+allowlist of GET paths: the `/healthz` probe, and the run-list projection when
+`--backend-url` and a read API token are both configured.
 
 ## Authentication modes
 
@@ -110,11 +111,64 @@ proxy. A proxy that runs with hostNetwork cannot be a NetworkPolicy peer,
 because NetworkPolicy cannot select node-traffic sources. Run that proxy as
 pods, or add an ipBlock policy beside the chart's.
 
-Secrets are read from files only — the binary takes
-`--session-key-file` and `--operator-tokens-file` paths, never environment
-values. Rotate a session key by replacing the Secret and rolling the console
-pod; rotating the tokens file signs nobody out (sessions are independent of
-tokens).
+Secrets are read from files only. The binary takes `--session-key-file`,
+`--operator-tokens-file`, and (for the explorer) `--readapi-token-file` paths,
+never environment values. Rotate a session key by replacing the Secret and
+rolling the console pod; rotating the tokens file signs nobody out (sessions
+are independent of tokens).
+
+## Run explorer
+
+The Run page lists CoderRuns from the operator read API. It reads the read
+API's run projection (`GET /v1/runs`) on the server and renders it. There is
+no JavaScript, so the filters (lane, source, phase) and the page number live
+in the URL. Every view is a link an operator can share.
+
+To turn the explorer on, point the console at the read API and give it the
+read API's bearer token. The token Secret holds the same bearer token the read
+API uses; its entry key defaults to `token`.
+
+```sh
+helm upgrade --install courier charts/courier \
+  --namespace courier-console-ns \
+  --set operatorConsole.enabled=true \
+  --set operatorConsole.auth.sessionKeySecret=courier-console-session \
+  --set operatorConsole.auth.operatorTokensSecret=courier-console-tokens \
+  --set operatorConsole.backendURL=http://courier-read-api \
+  --set operatorConsole.readAPITokenSecret=courier-read-api-token
+```
+
+The token Secret is optional. With no token, or with no `--backend-url`, the
+Run page says the explorer is not configured, and the console sends no
+unauthenticated projection request. The token reaches the console only as a
+file path read from a mounted Secret, and it never travels to the browser.
+
+Rotate the read API token by replacing the Secret and rolling the console pod.
+The console reads the token once at startup and mounts it with `subPath`, which
+Kubernetes does not refresh in a running pod, so a rotated token takes effect
+only after the pod restarts. Until then the Run page reports that the read API
+refused the token.
+
+A read API that is down, busy, or that rejects the token shows its own message.
+An operator never reads an outage as an empty namespace.
+
+Each row links to that run's detail page (a separate view) and shows the run's
+phase, source, lane, age, pull-request number, and restart count. The console
+escapes every value the read API returns, including a name or label that a
+repository or model authored. It shows the pull request as a number, not a
+link, because the run projection carries no repository URL to trust.
+
+The console reads only a fixed set of GET paths on the configured backend:
+`GET /healthz` and `GET /v1/runs`. The path never comes from the browser, so a
+filter value cannot steer the request to another path or host. Only the query
+string varies, and the console bounds it before it leaves.
+
+The console reaches the read API inside the cluster, so the read API Service
+must accept traffic from the console pod. The chart's own NetworkPolicies do
+not block this (the console policy is ingress-only, so the console's egress
+stays open). If you restrict read API ingress with a NetworkPolicy of your own,
+allow the console pod as a source, or the explorer reports that the read API
+could not be reached.
 
 ## Headless Courier is preserved
 
@@ -126,7 +180,6 @@ change nothing.
 
 ## Non-goals
 
-The console deliberately does not include, yet: a read API client, run
-tables or detail data, contribution-admission UI, mutating controls, any
-JavaScript, or an Ingress. It is the scaffold those features will land on,
-not an early version of them.
+The console does not include, yet: run-detail data, a contribution form,
+mutating controls, any JavaScript, or an Ingress. The run explorer reads the
+read API but changes nothing; the other features grow alongside it.

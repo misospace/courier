@@ -3241,3 +3241,78 @@ func TestChartOperatorConsolePortOverride(t *testing.T) {
 		t.Fatalf("console liveness probe did not follow the port override:\n%s", deployment)
 	}
 }
+
+// TestChartOperatorConsoleReadAPIToken covers the read API bearer-token
+// wiring (#825): operatorConsole.readAPITokenSecret injects
+// --readapi-token-file and mounts the Secret in BOTH auth modes — the run
+// explorer is mode-independent — renders nothing without it, and yields the
+// flag to a raw args override.
+func TestChartOperatorConsoleReadAPIToken(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	tokenMode := runHelm(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.readAPITokenSecret=courier-readapi-token",
+	)...)
+	for _, want := range []string{
+		"--readapi-token-file=/etc/courier/console/readapi-token",
+		"secretName: courier-readapi-token",
+		"path: readapi-token",
+	} {
+		if !strings.Contains(tokenMode, want) {
+			t.Fatalf("token-mode render with readAPITokenSecret is missing %q", want)
+		}
+	}
+
+	// The explorer flag and its Secret mount follow the value, not the auth
+	// mode: header mode gets the token file but none of the token-mode
+	// session/tokens wiring.
+	headerMode := runHelm(t, chartDir, operatorConsoleHeaderRenderArgs(
+		"--set", "operatorConsole.readAPITokenSecret=courier-readapi-token",
+	)...)
+	for _, want := range []string{
+		"--readapi-token-file=/etc/courier/console/readapi-token",
+		"secretName: courier-readapi-token",
+	} {
+		if !strings.Contains(headerMode, want) {
+			t.Fatalf("header-mode render with readAPITokenSecret is missing %q", want)
+		}
+	}
+	for _, unwanted := range []string{
+		"--session-key-file",
+		"--operator-tokens-file",
+		"secretName: courier-console-session",
+		"secretName: courier-console-tokens",
+	} {
+		if strings.Contains(headerMode, unwanted) {
+			t.Fatalf("header-mode render with readAPITokenSecret unexpectedly contains %q", unwanted)
+		}
+	}
+
+	// No value, no wiring: the explorer stays off.
+	plain := runHelm(t, chartDir, operatorConsoleRenderArgs()...)
+	for _, unwanted := range []string{"--readapi-token-file", "secretName: courier-readapi-token"} {
+		if strings.Contains(plain, unwanted) {
+			t.Fatalf("readAPITokenSecret-less render unexpectedly contains %q", unwanted)
+		}
+	}
+
+	// A raw --readapi-token-file override wins over the default injection:
+	// the flag is never appended when one is already present. (The Secret
+	// volume itself stays mounted — it is driven by the value, not the args.)
+	overridden := runHelm(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.readAPITokenSecret=courier-readapi-token",
+		"--set", "controllers.console.containers.console.args[0]=--readapi-token-file=/custom/path",
+	)...)
+	if !strings.Contains(overridden, "--readapi-token-file=/custom/path") {
+		t.Fatal("raw --readapi-token-file override is missing from the render")
+	}
+	if strings.Contains(overridden, "--readapi-token-file=/etc/courier/console/readapi-token") {
+		t.Fatal("default --readapi-token-file was injected despite a raw override")
+	}
+}
