@@ -142,9 +142,9 @@ func TestInstallationGitCredentialsUsesSourceEveryCall(t *testing.T) {
 		calls++
 		return "rotated-token", time.Now().Add(time.Hour), nil
 	})
-	credentials := NewInstallationGitCredentials(source)
+	credentials := NewInstallationGitCredentials(source, []string{"Org/repo", "org/base"})
 	for range 2 {
-		got, err := credentials.Credentials(context.Background(), "ignored/repo")
+		got, err := credentials.Credentials(context.Background(), "org/repo")
 		if err != nil || got.Username != topology.DefaultGitUsername || got.Token != "rotated-token" {
 			t.Fatalf("Credentials() = %+v, %v", got, err)
 		}
@@ -154,10 +154,50 @@ func TestInstallationGitCredentialsUsesSourceEveryCall(t *testing.T) {
 	}
 }
 
+func TestInstallationGitCredentialsRefusesUnpinnedRepository(t *testing.T) {
+	calls := 0
+	source := installationTokenSourceFunc(func(context.Context) (string, time.Time, error) {
+		calls++
+		return "rotated-token", time.Now().Add(time.Hour), nil
+	})
+	credentials := NewInstallationGitCredentials(source, []string{"org/repo", "org/base"})
+	for _, repository := range []string{"org/other", "other/repo", "org/repo/extra", ""} {
+		got, err := credentials.Credentials(context.Background(), repository)
+		if err == nil || got != (GitCredentials{}) {
+			t.Fatalf("Credentials(%q) = %+v, %v; want refusal", repository, got, err)
+		}
+		if strings.Contains(err.Error(), "rotated-token") {
+			t.Fatalf("refusal leaked token: %v", err)
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("refused repositories touched the token source %d times, want 0", calls)
+	}
+	// Case-insensitive identity match is the same rule the minter boundary
+	// applies to owner names.
+	if _, err := credentials.Credentials(context.Background(), "ORG/REPO"); err != nil {
+		t.Fatalf("case-variant pinned repository refused: %v", err)
+	}
+}
+
+func TestInstallationGitCredentialsWithoutPinsRefusesEverything(t *testing.T) {
+	source := installationTokenSourceFunc(func(context.Context) (string, time.Time, error) {
+		return "rotated-token", time.Now().Add(time.Hour), nil
+	})
+	credentials := NewInstallationGitCredentials(source, nil)
+	if _, err := credentials.Credentials(context.Background(), "org/repo"); err == nil {
+		t.Fatal("empty pinned set served credentials")
+	}
+	credentials = NewInstallationGitCredentials(source, []string{""})
+	if _, err := credentials.Credentials(context.Background(), "org/repo"); err == nil {
+		t.Fatal("blank pinned entries served credentials")
+	}
+}
+
 func TestInstallationGitCredentialsDoesNotLeakFailures(t *testing.T) {
 	credentialSource := NewInstallationGitCredentials(installationTokenSourceFunc(func(context.Context) (string, time.Time, error) {
 		return "", time.Time{}, errors.New("failed with " + sentinelInstallationToken)
-	}))
+	}), []string{"org/repo"})
 	_, err := credentialSource.Credentials(context.Background(), "org/repo")
 	if err == nil || strings.Contains(err.Error(), sentinelInstallationToken) {
 		t.Fatalf("credential error = %v", err)

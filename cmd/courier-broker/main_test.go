@@ -39,6 +39,34 @@ func TestResolveCredentialModeInstallationToken(t *testing.T) {
 	}
 }
 
+func TestGitCredentialsForMode(t *testing.T) {
+	pins := []string{"acme/widgets", "acme/fork"}
+	app := gitCredentialsForMode(true, fixedInstallationTokenSource(func(context.Context) (string, time.Time, error) {
+		return "token", time.Now().Add(time.Hour), nil
+	}), &brokerEnv{}, pins)
+	installation, ok := app.(broker.InstallationGitCredentials)
+	if !ok {
+		t.Fatalf("App mode credential provider type = %T", app)
+	}
+	if _, err := installation.Credentials(context.Background(), "acme/widgets"); err != nil {
+		t.Fatalf("pinned repository credentials = %v", err)
+	}
+	if _, err := installation.Credentials(context.Background(), "acme/other"); err == nil {
+		t.Fatal("unpinned repository served installation credentials")
+	}
+	static := gitCredentialsForMode(false, nil, &brokerEnv{gitUsername: "git-user", gitToken: "static-token"}, pins)
+	got, err := static.Credentials(context.Background(), "anything/at-all")
+	if err != nil || got.Username != "git-user" || got.Token != "static-token" {
+		t.Fatalf("static credentials = %+v, %v", got, err)
+	}
+}
+
+type fixedInstallationTokenSource func(context.Context) (string, time.Time, error)
+
+func (f fixedInstallationTokenSource) InstallationToken(ctx context.Context) (string, time.Time, error) {
+	return f(ctx)
+}
+
 func TestRunFailsClosedWithoutOperatorWiring(t *testing.T) {
 	if err := runArgs(nil); err == nil || !strings.Contains(err.Error(), "requires address") {
 		t.Fatalf("run() error = %v, want missing configuration", err)

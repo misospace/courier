@@ -162,7 +162,7 @@ func run(ctx context.Context, config runConfig) error {
 		Policy:      policy,
 		Git:         gitBroker,
 		Resolver:    newPinnedResolver(policy, document.Provider),
-		Credentials: gitCredentialsForMode(appMode, tokenSource, env),
+		Credentials: gitCredentialsForMode(appMode, tokenSource, env, pinnedRepositories),
 	})
 	if err != nil {
 		return fmt.Errorf("courier-broker: git transport rejected the pinned policy: %w", err)
@@ -494,9 +494,9 @@ func repositoryOwner(repository string) string {
 	return owner
 }
 
-func gitCredentialsForMode(appMode bool, source couriergithub.InstallationTokenSource, env *brokerEnv) broker.GitCredentialProvider {
+func gitCredentialsForMode(appMode bool, source couriergithub.InstallationTokenSource, env *brokerEnv, pinnedRepositories []string) broker.GitCredentialProvider {
 	if appMode {
-		return broker.NewInstallationGitCredentials(source)
+		return broker.NewInstallationGitCredentials(source, pinnedRepositories)
 	}
 	return staticCredentials{username: env.gitUsername, token: env.gitToken}
 }

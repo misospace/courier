@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -370,17 +371,18 @@ func TestInstallationTokenMinterMint(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
-	var verified, minted bool
+	var verified, minted int
+	var mintedNames []string
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v3/app/installations/42":
-			verified = true
+			verified++
 			if r.Method != http.MethodGet || !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
 				t.Errorf("installation verification request: %s %q", r.Method, r.Header.Get("Authorization"))
 			}
 			_, _ = io.WriteString(w, `{"account":{"login":"acme"}}`)
 		case "/api/v3/app/installations/42/access_tokens":
-			minted = true
+			minted++
 			if r.Method != http.MethodPost || !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") || r.Header.Get("Accept") != "application/vnd.github+json" {
 				t.Errorf("mint request: %s headers=%v", r.Method, r.Header)
 			}
@@ -391,9 +393,10 @@ func TestInstallationTokenMinterMint(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Errorf("decode request: %v", err)
 			}
-			if len(body.Repositories) != 1 || body.Repositories[0] != "acme/demo" || body.Permissions["contents"] != "write" || body.Permissions["issues"] != "read" {
+			if body.Permissions["contents"] != "write" || body.Permissions["issues"] != "read" {
 				t.Errorf("mint request body = %#v", body)
 			}
+			mintedNames = body.Repositories
 			_, _ = io.WriteString(w, `{"token":"minted-token","expires_at":"2026-11-20T13:00:00Z","permissions":{"contents":"write","issues":"read"}}`)
 		default:
 			http.NotFound(w, r)
@@ -404,9 +407,26 @@ func TestInstallationTokenMinterMint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	token, expiry, err := minter.Mint(context.Background(), []string{"acme/demo"}, map[string]string{"contents": "write", "issues": "read"})
-	if err != nil || token != "minted-token" || !expiry.Equal(now.Add(time.Hour)) || !verified || !minted {
-		t.Fatalf("Mint = %q, %v, %v; verified=%v minted=%v", token, expiry, err, verified, minted)
+	// GitHub's repositories field takes bare repository names, never the
+	// owner/name identities the minter boundary validates.
+	for _, tc := range []struct {
+		identities, wantNames []string
+	}{
+		{[]string{"acme/demo"}, []string{"demo"}},
+		{[]string{"acme/demo", "acme/base"}, []string{"demo", "base"}},
+	} {
+		token, expiry, err := minter.Mint(context.Background(), tc.identities, map[string]string{"contents": "write", "issues": "read"})
+		if err != nil || token != "minted-token" || !expiry.Equal(now.Add(time.Hour)) {
+			t.Fatalf("Mint(%v) = %q, %v, %v", tc.identities, token, expiry, err)
+		}
+		if !reflect.DeepEqual(mintedNames, tc.wantNames) {
+			t.Fatalf("Mint(%v) wire repositories = %#v, want %#v", tc.identities, mintedNames, tc.wantNames)
+		}
+	}
+	// The second mint reuses the installation verification cached by the
+	// first, so only one lookup runs while both mints exchange a token.
+	if verified != 1 || minted != 2 {
+		t.Fatalf("verified=%d minted=%d, want verified=1 minted=2", verified, minted)
 	}
 }
 

@@ -105,21 +105,30 @@ func sameInstallationEndpoint(actual, expected string) bool {
 
 // InstallationGitCredentials serves git push credentials from the same token
 // source: username x-access-token, token re-read from the source per call so
-// operator rotation flows through without a broker restart.
+// operator rotation flows through without a broker restart. Credentials are
+// served only for the pinned repositories handed to the constructor; any
+// other identity is refused before the token source is touched.
 type installationTokenSource interface {
 	InstallationToken(ctx context.Context) (token string, expiresAt time.Time, err error)
 }
 
 type InstallationGitCredentials struct {
-	source installationTokenSource
+	source       installationTokenSource
+	repositories []string
 }
 
-func NewInstallationGitCredentials(source installationTokenSource) GitCredentialProvider {
-	return InstallationGitCredentials{source: source}
+func NewInstallationGitCredentials(source installationTokenSource, repositories []string) GitCredentialProvider {
+	pinned := make([]string, 0, len(repositories))
+	for _, repository := range repositories {
+		if trimmed := strings.TrimSpace(repository); trimmed != "" {
+			pinned = append(pinned, trimmed)
+		}
+	}
+	return InstallationGitCredentials{source: source, repositories: pinned}
 }
 
-func (c InstallationGitCredentials) Credentials(ctx context.Context, _ string) (GitCredentials, error) {
-	if c.source == nil {
+func (c InstallationGitCredentials) Credentials(ctx context.Context, repository string) (GitCredentials, error) {
+	if c.source == nil || !c.pins(repository) {
 		return GitCredentials{}, errors.New("broker installation git credentials are unavailable")
 	}
 	token, _, err := c.source.InstallationToken(ctx)
@@ -127,6 +136,15 @@ func (c InstallationGitCredentials) Credentials(ctx context.Context, _ string) (
 		return GitCredentials{}, errors.New("broker installation git credentials are unavailable")
 	}
 	return GitCredentials{Username: topology.DefaultGitUsername, Token: token}, nil
+}
+
+func (c InstallationGitCredentials) pins(repository string) bool {
+	for _, pinned := range c.repositories {
+		if strings.EqualFold(pinned, repository) {
+			return true
+		}
+	}
+	return false
 }
 
 var _ installationTokenSource = (*SecretInstallationTokenSource)(nil)
