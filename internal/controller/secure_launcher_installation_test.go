@@ -219,7 +219,7 @@ func TestEnsureInstallationTokenMintsPerRepository(t *testing.T) {
 		"administration": "read", "checks": "read", "contents": "read",
 		"issues": "write", "metadata": "read", "pull_requests": "write", "statuses": "read",
 	}
-	wantWork := map[string]string{"contents": "write", "metadata": "read"}
+	wantWork := map[string]string{"administration": "read", "contents": "write", "metadata": "read"}
 	if !reflect.DeepEqual(minter.mints[0].repositories, []string{"Acme/Widgets"}) ||
 		!reflect.DeepEqual(minter.mints[0].permissions, wantBase) {
 		t.Fatalf("base mint = %+v, want repositories [Acme/Widgets] permissions %+v", minter.mints[0], wantBase)

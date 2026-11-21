@@ -43,10 +43,11 @@ const installationTokenBrokerMargin = 2 * time.Minute
 // only the permissions the run's broker needs against that repository. The
 // base repository carries the publication surfaces (issue and pull-request
 // writes) and the reads that gate them; no contents write, because Courier's
-// git policy never pushes to the base. The work repository carries only what
-// a git fetch and push need; no issue or pull-request write, because
-// publication mutations belong to the base. No merge permission is requested
-// on either.
+// git policy never pushes to the base. The work repository carries what a git
+// fetch and push need plus administration read, which the broker's startup
+// preflight requires to establish the work ref's effective protection before
+// it serves a push; no issue or pull-request write, because publication
+// mutations belong to the base. No merge permission is requested on either.
 var (
 	baseRepoInstallationTokenPermissions = map[string]string{
 		"administration": "read",
@@ -58,8 +59,9 @@ var (
 		"statuses":       "read",
 	}
 	workRepoInstallationTokenPermissions = map[string]string{
-		"contents": "write",
-		"metadata": "read",
+		"administration": "read",
+		"contents":       "write",
+		"metadata":       "read",
 	}
 )
 
