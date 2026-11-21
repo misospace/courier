@@ -887,6 +887,52 @@ func TestAvailabilityEndingClassifiesRecoverableKinds(t *testing.T) {
 	}
 }
 
+// TestAvailabilityEndingCarriesResetHint proves the authoritative provider
+// reset hint rides only the capacity-exhausted ending: an exhaustion with a
+// Retry-After carries it, an unhinted exhaustion stays at zero, and a
+// transient rate limit never carries its hint — that belongs to in-process
+// retry policy, not to lane capacity cooldown.
+func TestAvailabilityEndingCarriesResetHint(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		wantHint time.Duration
+	}{
+		{
+			name:     "exhausted with hint",
+			err:      &GatewayError{Availability: ProviderAllowanceExhausted, RetryAfter: 9 * time.Hour},
+			wantHint: 9 * time.Hour,
+		},
+		{
+			name:     "exhausted without hint",
+			err:      &GatewayError{Availability: ProviderAllowanceExhausted},
+			wantHint: 0,
+		},
+		{
+			name:     "transient rate limit with hint stays hint-free",
+			err:      &GatewayError{Availability: ProviderTransientRateLimit, Retryable: true, RetryAfter: 9 * time.Hour},
+			wantHint: 0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, ok := availabilityEnding(tt.err)
+			if !ok {
+				t.Fatalf("no availability ending for %v", tt.err)
+			}
+			if result.CapacityResetAfter != tt.wantHint {
+				t.Fatalf("reset hint = %v, want %v (result %+v)", result.CapacityResetAfter, tt.wantHint, result)
+			}
+		})
+	}
+	if result, _ := availabilityEnding(&GatewayError{Availability: ProviderAllowanceExhausted, RetryAfter: time.Hour}); result.Outcome != executor.OutcomeCapacityExhausted {
+		t.Fatalf("hinted exhaustion outcome = %q, want capacity exhausted", result.Outcome)
+	}
+	if result, _ := availabilityEnding(&GatewayError{Availability: ProviderTransientRateLimit, Retryable: true, RetryAfter: time.Hour}); result.Outcome != executor.OutcomeBlockedExternal {
+		t.Fatalf("hinted transient outcome = %q, want blocked external", result.Outcome)
+	}
+}
+
 // TestStatusReporterModelSurfacePersistsBeforeModelExecution proves the
 // model-surface provenance digest (#730) rides the same identity-fenced
 // status path: the reporter stamps the authenticated control UID and its own

@@ -282,19 +282,21 @@ func (s *sessionRun) attempt() error {
 // after an attempt whose kill callback fired. The callback fires on the
 // structured error event itself, causing the command context to kill the
 // whole process group; any later output from that killed turn is ignored
-// and cannot trigger a continuation.
+// and cannot trigger a continuation. The classified event's provider
+// quota-reset hint (#866) rides the handoff so the operator can extend the
+// lane capacity cooldown past its anti-hammering window.
 func (s *sessionRun) exhaustionTermination() (termination, bool) {
 	if s.ctx.Err() != nil || !s.exhaustion.Load() {
 		return termination{}, false
 	}
-	class, code, exhausted := s.tap.confirmedExhaustion()
+	evidence, exhausted := s.tap.confirmedExhaustion()
 	if !exhausted {
-		class, code, exhausted = s.tap.lastExhaustion()
+		evidence, exhausted = s.tap.lastExhaustion()
 	}
 	if !exhausted {
 		return termination{}, false
 	}
-	return s.report.capacityExhaustedTermination(s.ctx, s.workspace, s.cfg, s.startCommit, class, code), true
+	return s.report.capacityExhaustedTermination(s.ctx, s.workspace, s.cfg, s.startCommit, evidence.class, evidence.code, evidence.resetAfter), true
 }
 
 // recoverAttemptFailure applies the shared recovery path to a failed child
