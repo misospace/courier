@@ -2,11 +2,8 @@
 
 The operator console (`courier-console`) is a small, server-rendered web UI
 for authenticated operators. It is a standalone Go binary, separate from the
-manager. It is a scaffold: every page is a placeholder until the operator
-read API exists. There is no read API, no data table, and no mutating
-control yet. The console never talks to the Kubernetes API. It can only
-probe the operator read API's `/healthz` path, and only when
-`--backend-url` is configured.
+manager. The console never talks to the Kubernetes API. It can only probe the
+operator read API's `/healthz` path, and only when `--backend-url` is configured.
 
 ## Authentication modes
 
@@ -58,6 +55,59 @@ frame-ancestors 'none'; form-action 'self'; base-uri 'self'`,
 `Referrer-Policy: no-referrer`; authenticated pages are
 `Cache-Control: no-store`. There is no JavaScript, no external CDN
 reference, and no font download.
+
+## Submitting contributions (#829)
+
+Token-mode consoles can render a bounded server-side form for approved one-off
+contributions. The console submits `POST /v1/contributions` to the operator's
+contribution admission API (#708). It does no authority validation; the same
+server-side admission path used by `courierctl contribute` decides everything.
+
+The form fields are lane, base repository (`owner/name`), base ref, approved
+head/fork repository (`owner/name`), natural-language goal, and an optional
+upstream issue URL or number as untrusted context. Supplying an issue is not an
+ownership claim and never mutates the upstream issue. The form does not expose
+target host, git or API credentials, namespace, or fresh/debug idempotency
+escapes.
+
+The form is available only in token mode. Header mode renders an unavailable
+state because the form needs the session-bound CSRF token that only token mode
+has. All state-changing requests are CSRF-verified. The bearer token is a
+file-mounted Secret read only by the console process; it is never rendered or
+proxied to the browser. The console uses no JavaScript.
+
+The console mints one idempotency key per submission attempt and reuses it
+across reloads and retries until the attempt is definitively settled. A timeout
+or server error has an uncertain outcome and is shown as "may have been
+admitted"; resubmitting retries with the same key, so it cannot create a
+duplicate run, branch, or PR. A deliberate new contribution is the separate
+explicit "start a new contribution" action.
+
+Outcomes stay distinct: created (`201`), resumed (`200`), policy or validation
+refusal (`400`, `403`, or `409`, with the server's message), rejected
+credentials (`401`), unreachable contribution API (nothing admitted), and
+uncertain (may have been admitted). Admission is never presented as PR success.
+The result links to the run's status view at `/runs/<run>`.
+
+Enable the manager's `contributeAPI.enabled` with its `keySecret`, then set
+`operatorConsole.contribute.url` and `tokenSecret` together. The chart render
+fails if only one is set. The form is off by default.
+
+```sh
+kubectl create secret generic courier-contribute-token \
+  --from-literal=token="$(head -c 32 /dev/urandom | base64)" \
+  --namespace courier-console-ns
+
+helm upgrade --install courier charts/courier \
+  --namespace courier-console-ns \
+  --set contributeAPI.enabled=true \
+  --set contributeAPI.keySecret=courier-contribute-api \
+  --set operatorConsole.enabled=true \
+  --set operatorConsole.auth.sessionKeySecret=courier-console-session \
+  --set operatorConsole.auth.operatorTokensSecret=courier-console-tokens \
+  --set operatorConsole.contribute.url=http://courier-contribute-api \
+  --set operatorConsole.contribute.tokenSecret=courier-contribute-token
+```
 
 ## Enabling via Helm
 
@@ -126,7 +176,5 @@ change nothing.
 
 ## Non-goals
 
-The console deliberately does not include, yet: a read API client, run
-tables or detail data, contribution-admission UI, mutating controls, any
-JavaScript, or an Ingress. It is the scaffold those features will land on,
-not an early version of them.
+The console does not include a read API client, run tables or detail data,
+mutating controls beyond the contribution form, JavaScript, or an Ingress.

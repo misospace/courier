@@ -3241,3 +3241,57 @@ func TestChartOperatorConsolePortOverride(t *testing.T) {
 		t.Fatalf("console liveness probe did not follow the port override:\n%s", deployment)
 	}
 }
+
+func TestChartRendersConsoleContributeForm(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	disabled := runHelm(t, chartDir, "template", "courier", ".")
+	for _, unwanted := range []string{"--contribute-url", "--contribute-token-file"} {
+		if strings.Contains(disabled, unwanted) {
+			t.Fatalf("default chart output unexpectedly contains %q", unwanted)
+		}
+	}
+
+	configured := []string{
+		"--set", "operatorConsole.contribute.url=http://courier-contribute-api",
+		"--set", "operatorConsole.contribute.tokenSecret=contribute-token",
+	}
+	enabled := runHelm(t, chartDir, operatorConsoleRenderArgs(configured...)...)
+	for _, want := range []string{
+		"--contribute-url=http://courier-contribute-api",
+		"--contribute-token-file=/etc/courier/console/contribute-token",
+		"mountPath: /etc/courier/console/contribute-token",
+		"secretName: contribute-token",
+	} {
+		if !strings.Contains(enabled, want) {
+			t.Fatalf("contribution form chart output is missing %q:\n%s", want, enabled)
+		}
+	}
+
+	overridden := runHelm(t, chartDir, operatorConsoleRenderArgs(append(configured,
+		"--set-string", "controllers.console.containers.console.args[0]=--contribute-url=http://operator-override")...)...)
+	if !strings.Contains(overridden, "--contribute-url=http://operator-override") {
+		t.Fatal("console output is missing the operator-supplied contribution URL")
+	}
+	if strings.Contains(overridden, "--contribute-url=http://courier-contribute-api") {
+		t.Fatal("operator-supplied contribution URL did not override the values-derived flag")
+	}
+
+	out, err := runHelmOutput(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.contribute.url=http://courier-contribute-api",
+	)...)
+	if err == nil {
+		t.Fatalf("expected helm template to fail without operatorConsole.contribute.tokenSecret, but it succeeded:\n%s", out)
+	}
+	for _, want := range []string{"operatorConsole.contribute.url", "operatorConsole.contribute.tokenSecret"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("contribution form guard message is missing %q:\n%s", want, out)
+		}
+	}
+}

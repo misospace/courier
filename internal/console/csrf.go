@@ -12,9 +12,8 @@ import (
 // is bound to exactly one session and never doubles as a session signature.
 const csrfScopeSuffix = ":csrf"
 
-// csrfToken derives the per-session CSRF token. This is groundwork for the
-// future mutating controls: every form the console renders embeds the token
-// and every state-changing POST verifies it.
+// csrfToken derives the per-session CSRF token. Every mutating form embeds
+// the token, and every state-changing POST verifies it.
 func csrfToken(key []byte, sessionID string) string {
 	mac := hmac.New(sha256.New, key)
 	mac.Write([]byte(sessionID + csrfScopeSuffix))

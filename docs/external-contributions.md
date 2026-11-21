@@ -286,7 +286,9 @@ human merge, exactly as for resolve-issue runs:
   identity-only responses (201 created, 200 resumed). It consumes the same
   adapter and the same server-side validation, adds no authority, and adds
   no second contribution state machine. The chart renders its Service under
-  the `contributeAPI:` values. UI/MCP/Dispatch frontends likewise stay thin.
+  the `contributeAPI:` values. The operator console ships the first-party
+  authenticated form frontend (#829) against this contract; MCP/Dispatch
+  frontends remain future/optional and equally thin.
 
 ### Status reads (#819)
 

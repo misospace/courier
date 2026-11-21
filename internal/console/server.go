@@ -1,10 +1,9 @@
 // Package console implements the Courier operator console: a small,
-// server-rendered scaffold for authenticated operators. It is deliberately
+// server-rendered interface for authenticated operators. It is deliberately
 // independent of the operator binary and of the Kubernetes API — it imports
-// only the standard library and never talks to a cluster. Pages are
-// placeholders until the operator read API exists; the package carries the
-// authentication, CSRF, and backend-probe groundwork that scaffold will grow
-// into.
+// only the standard library and never talks to a cluster. Read pages are
+// placeholders until the operator read API exists; contributions submit
+// through the operator's HTTP admission API (#829).
 package console
 
 import (
@@ -54,6 +53,12 @@ type Config struct {
 	BackendURL string
 	// BackendTimeout bounds each backend probe. Defaults to 5s.
 	BackendTimeout time.Duration
+	// ContributeURL is the base URL of the contribution admission API.
+	ContributeURL string
+	// ContributeToken authenticates requests to the contribution admission API.
+	ContributeToken []byte
+	// ContributeTimeout bounds each contribution request. Defaults to 20s.
+	ContributeTimeout time.Duration
 	// InsecureCookies opts out of the Secure session-cookie posture. The
 	// default (false) sets Secure on every session cookie, because the
 	// supported Helm deployment terminates TLS at a proxy and the hop that
@@ -66,15 +71,17 @@ type Config struct {
 // Server is the console's HTTP server. Construct it with NewServer and serve
 // Handler.
 type Server struct {
-	auth    *Authenticator
-	backend Backend
-	pages   map[string]*template.Template
-	mux     *http.ServeMux
+	auth       *Authenticator
+	backend    Backend
+	contribute *httpContributeClient
+	intents    intentStore
+	pages      map[string]*template.Template
+	mux        *http.ServeMux
 }
 
 // pageTemplates are the rendered pages; each is parsed together with the
 // shared layout so {{define "content"}} stays page-local.
-var pageTemplates = []string{"overview", "runs", "run", "login", "forbidden"}
+var pageTemplates = []string{"overview", "runs", "run", "login", "forbidden", "contribute"}
 
 // NewServer validates the configuration fail-closed and returns a console
 // server. An invalid configuration is a construction error, never a runtime
@@ -87,14 +94,29 @@ func NewServer(cfg Config) (*Server, error) {
 	if cfg.BackendTimeout == 0 {
 		cfg.BackendTimeout = 5 * time.Second
 	}
+	if (cfg.ContributeURL == "") != (len(cfg.ContributeToken) == 0) {
+		return nil, errors.New("console: contribution admission requires both ContributeURL and ContributeToken")
+	}
+	var contribute *httpContributeClient
+	if cfg.ContributeURL != "" {
+		if cfg.ContributeTimeout <= 0 {
+			cfg.ContributeTimeout = 20 * time.Second
+		}
+		var err error
+		contribute, err = newHTTPContributeClient(cfg.ContributeURL, cfg.ContributeToken, cfg.ContributeTimeout)
+		if err != nil {
+			return nil, err
+		}
+	}
 	pages, err := parsePages(content)
 	if err != nil {
 		return nil, fmt.Errorf("parse console templates: %w", err)
 	}
 	s := &Server{
-		auth:    auth,
-		backend: NewBackend(cfg.BackendURL, cfg.BackendTimeout),
-		pages:   pages,
+		auth:       auth,
+		backend:    NewBackend(cfg.BackendURL, cfg.BackendTimeout),
+		contribute: contribute,
+		pages:      pages,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealth)
@@ -108,6 +130,9 @@ func NewServer(cfg Config) (*Server, error) {
 	mux.HandleFunc("GET /{$}", s.requireOperator(s.handleOverview))
 	mux.HandleFunc("GET /runs", s.requireOperator(s.handleRuns))
 	mux.HandleFunc("GET /runs/{name}", s.requireOperator(s.handleRun))
+	mux.HandleFunc("GET /contribute", s.requireOperator(s.handleContribute))
+	mux.HandleFunc("POST /contribute", s.requireOperator(s.handleContributeSubmit))
+	mux.HandleFunc("POST /contribute/new", s.requireOperator(s.handleContributeNew))
 	return s, nil
 }
 
@@ -246,6 +271,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.auth.Logout(sessionID)
+	s.intents.clear(sessionID)
 	http.SetCookie(w, s.auth.expiredCookie())
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
@@ -298,7 +324,7 @@ func (s *Server) pageData(r *http.Request, title, active string) pageData {
 }
 
 // render executes the page through the shared layout.
-func (s *Server) render(w http.ResponseWriter, status int, page string, data pageData) {
+func (s *Server) render(w http.ResponseWriter, status int, page string, data any) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
 	if err := s.pages[page].ExecuteTemplate(w, "layout", data); err != nil {

@@ -392,6 +392,23 @@ operatorConsole:
   #    backend-unavailable empty states.
   backendURL: ""
 
+  contribute:
+    # -- Authenticated contribution form (#829). Disabled by default. When
+    #    url and tokenSecret are both set the console renders a bounded
+    #    new-contribution form that POSTs server-side to the operator's
+    #    contribution admission API (contributeAPI); the browser never sees
+    #    the credential, API URL, namespace field, or fresh/debug escapes.
+    #    Requires contributeAPI.enabled on the manager. Header-auth consoles
+    #    render the unavailable state because only token mode has a
+    #    session-bound CSRF token.
+    url: ""
+    # -- Name of a Secret in the release namespace whose tokenSecretKey entry
+    #    holds the admission bearer token. Required with contribute.url; both
+    #    must be set or rendering fails (the binary also fails startup on a
+    #    half-configured contribution form).
+    tokenSecret: ""
+    tokenSecretKey: token
+
 retention:
   # -- Terminal CoderRun retention (#287). The controller deletes terminal runs
   #    after these windows and always keeps the most recent `auditKeep` terminal
