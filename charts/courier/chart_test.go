@@ -3283,15 +3283,44 @@ func TestChartRendersConsoleContributeForm(t *testing.T) {
 		t.Fatal("operator-supplied contribution URL did not override the values-derived flag")
 	}
 
+	rawURLWithValuesToken := runHelm(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.contribute.tokenSecret=contribute-token",
+		"--set-string", "controllers.console.containers.console.args[0]=--contribute-url=http://operator-override",
+	)...)
+	if !strings.Contains(rawURLWithValuesToken, "--contribute-url=http://operator-override") || strings.Contains(rawURLWithValuesToken, "--contribute-url=http://courier-contribute-api") {
+		t.Fatal("raw contribution URL plus values token did not render as a complete effective pair")
+	}
+	if !strings.Contains(findDocument(t, rawURLWithValuesToken, "kind: Deployment", "name: courier-console"), "mountPath: /etc/courier/console/contribute-token") {
+		t.Fatal("raw URL plus values token omitted the values-derived token mount")
+	}
+
 	out, err := runHelmOutput(t, chartDir, operatorConsoleRenderArgs(
 		"--set", "operatorConsole.contribute.url=http://courier-contribute-api",
 	)...)
 	if err == nil {
 		t.Fatalf("expected helm template to fail without operatorConsole.contribute.tokenSecret, but it succeeded:\n%s", out)
 	}
-	for _, want := range []string{"operatorConsole.contribute.url", "operatorConsole.contribute.tokenSecret"} {
+	for _, want := range []string{"operatorConsole.contribute.url", "operatorConsole.contribute.tokenSecret", "raw --contribute-url"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("contribution form guard message is missing %q:\n%s", want, out)
 		}
+	}
+
+	out, err = runHelmOutput(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.contribute.url=http://courier-contribute-api",
+		"--set", "operatorConsole.contribute.tokenSecret=contribute-token",
+		"--set", "operatorConsole.auth.mode=header",
+		"--set", "operatorConsole.auth.trustedHeader=X-Operator",
+		"--set-json", `operatorConsole.auth.headerAllowedPeers=[{"podSelector":{"app":"proxy"}}]`,
+	)...)
+	if err == nil || !strings.Contains(out, "operatorConsole.contribute requires token mode") {
+		t.Fatalf("header-mode contribution render error = %v, want token-mode message:\n%s", err, out)
+	}
+
+	out, err = runHelmOutput(t, chartDir, operatorConsoleRenderArgs(
+		"--set-string", "controllers.console.containers.console.args[0]=--contribute-url=http://operator-override",
+	)...)
+	if err == nil || !strings.Contains(out, "operatorConsole.contribute.url") || !strings.Contains(out, "raw --contribute-url") {
+		t.Fatalf("raw URL without effective token error = %v, want effective-pair message:\n%s", err, out)
 	}
 }

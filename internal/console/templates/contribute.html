@@ -8,15 +8,11 @@
 {{if .HasIntent}}
 <p class="state">An unsettled attempt uses idempotency key <code>{{.Key}}</code>. Resubmission reuses this key.</p>
 {{end}}
+{{if .Message}}<p class="state {{.StateClass}}">{{.Message}}</p>{{end}}
 {{if eq .State "success"}}
 <p class="state state-ok">{{if .Resumed}}A run was resumed{{else}}A run was created{{end}} — admitted; this is not a pull request. The run publishes one only when it succeeds.</p>
 <p>Run: <a href="/runs/{{.Run}}">{{.Run}}</a><br>Namespace: {{.Namespace}}<br>Work item: {{.WorkItemID}}</p>
-<form method="post" action="/contribute/new" class="contribute-new">
-  <input type="hidden" name="csrf" value="{{.CSRF}}">
-  <button type="submit">Start a new contribution</button>
-</form>
 {{else}}
-{{if .Message}}<p class="state {{.StateClass}}">{{.Message}}</p>{{end}}
 <form method="post" action="/contribute" class="contribute">
   <input type="hidden" name="csrf" value="{{.CSRF}}">
   <label for="lane">Lane</label>
@@ -34,5 +30,9 @@
   <button type="submit">Submit contribution</button>
 </form>
 {{end}}
+<form method="post" action="/contribute/new" class="contribute-new">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <button type="submit">Start a new contribution</button>
+</form>
 {{end}}
 {{end}}

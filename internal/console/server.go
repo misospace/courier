@@ -74,7 +74,7 @@ type Server struct {
 	auth       *Authenticator
 	backend    Backend
 	contribute *httpContributeClient
-	intents    intentStore
+	minter     contributeMinter
 	pages      map[string]*template.Template
 	mux        *http.ServeMux
 }
@@ -271,8 +271,8 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.auth.Logout(sessionID)
-	s.intents.clear(sessionID)
 	http.SetCookie(w, s.auth.expiredCookie())
+	http.SetCookie(w, s.auth.expiredContributeIntentCookie())
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 

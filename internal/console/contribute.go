@@ -3,7 +3,10 @@ package console
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -21,7 +24,10 @@ import (
 const (
 	defaultContributeTimeout = 20 * time.Second
 	maxContributeResponse    = 64 * 1024
+	maxContributeBodyBytes   = 32 * 1024 // Stay below the admission server's 64 KiB request-body cap.
 	contributeErrorFallback  = "the admission API refused the contribution"
+	contributeIntentCookie   = "courier_console_contribute_intent"
+	contributeIntentTTL      = 2 * time.Minute
 )
 
 type contributeSubmission struct {
@@ -72,7 +78,7 @@ type httpContributeClient struct {
 
 func newHTTPContributeClient(base string, token []byte, timeout time.Duration) (*httpContributeClient, error) {
 	u, err := url.Parse(base)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || strings.Contains(base, "#") {
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Contains(base, "#") {
 		return nil, errors.New("console: invalid contribution admission URL")
 	}
 	if timeout <= 0 {
@@ -137,6 +143,10 @@ func classifyContributeResponse(status int, body []byte) contributeResult {
 		return contributeResult{Outcome: outcomeRefused, Message: message}
 	case status == http.StatusUnauthorized:
 		return contributeResult{Outcome: outcomeCredentialDenied, Message: "the console's contribution credential was not accepted by the admission API"}
+	case status == http.StatusRequestEntityTooLarge:
+		return contributeResult{Outcome: outcomeRefused, Message: "the admission API rejected the submission body as too large"}
+	case status == http.StatusUnsupportedMediaType:
+		return contributeResult{Outcome: outcomeRefused, Message: "the admission API rejected the request media type"}
 	case status >= 400 && status < 500:
 		return contributeResult{Outcome: outcomeAPIMismatch, Message: "the configured contribution API URL does not serve the expected admission API"}
 	default:
@@ -152,58 +162,81 @@ func classifyContributeError(err error) contributeResult {
 }
 
 func provablyUnreached(err error) bool {
-	var opErr *net.OpError
-	if errors.As(err, &opErr) && opErr.Op == "dial" {
-		return true
-	}
-	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH) {
-		return true
-	}
 	var dnsErr *net.DNSError
-	return errors.As(err, &dnsErr)
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	var opErr *net.OpError
+	if !errors.As(err, &opErr) || opErr.Op != "dial" {
+		return false
+	}
+	return errors.Is(opErr.Err, syscall.ECONNREFUSED) || errors.Is(opErr.Err, syscall.EHOSTUNREACH) || errors.Is(opErr.Err, syscall.ENETUNREACH)
 }
 
-type intentEntry struct {
+type contributeMinterEntry struct {
 	key     string
 	expires time.Time
 }
-type intentStore struct {
+
+type contributeMinter struct {
 	mu      sync.Mutex
-	entries map[string]intentEntry
+	entries map[string]contributeMinterEntry
 }
 
-func (s *intentStore) set(sessionID, key string, now time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.entries == nil {
-		s.entries = make(map[string]intentEntry)
+func (m *contributeMinter) forget(digest string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.entries, digest)
+}
+
+func (m *contributeMinter) keyFor(digest string, now time.Time) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.entries == nil {
+		m.entries = make(map[string]contributeMinterEntry)
 	}
-	for id, entry := range s.entries {
-		if now.After(entry.expires) {
-			delete(s.entries, id)
+	for held, entry := range m.entries {
+		if !now.Before(entry.expires) {
+			delete(m.entries, held)
 		}
 	}
-	s.entries[sessionID] = intentEntry{key: key, expires: now.Add(sessionTTL)}
+	if entry, ok := m.entries[digest]; ok {
+		return entry.key, nil
+	}
+	key, err := mintContributeKey()
+	if err != nil {
+		return "", err
+	}
+	m.entries[digest] = contributeMinterEntry{key: key, expires: now.Add(contributeIntentTTL)}
+	return key, nil
 }
 
-func (s *intentStore) get(sessionID string, now time.Time) (string, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	entry, ok := s.entries[sessionID]
-	if !ok {
-		return "", false
-	}
-	if now.After(entry.expires) {
-		delete(s.entries, sessionID)
-		return "", false
-	}
-	return entry.key, true
+func contributeDigest(sub contributeSubmission) string {
+	fields := []string{sub.Lane, sub.BaseRepo, sub.BaseRef, sub.WorkRepo, sub.Goal, sub.UpstreamIssue}
+	sum := sha256.Sum256([]byte(strings.Join(fields, "\x00")))
+	return hex.EncodeToString(sum[:])[:16]
 }
 
-func (s *intentStore) clear(sessionID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.entries, sessionID)
+func contributeIntentValue(key, digest string, sessionKey []byte) string {
+	mac := hmac.New(sha256.New, sessionKey)
+	mac.Write([]byte("contribute-intent:" + key + "." + digest))
+	return key + "." + digest + "." + hex.EncodeToString(mac.Sum(nil))
+}
+
+func verifyContributeIntent(value string, sessionKey []byte) (key, digest string, ok bool) {
+	if len(sessionKey) == 0 {
+		return "", "", false
+	}
+	parts := strings.Split(value, ".")
+	if len(parts) != 3 || !strings.HasPrefix(parts[0], "adhoc-console-") || len(parts[0]) != len("adhoc-console-")+16 || len(parts[1]) != 16 || parts[2] == "" {
+		return "", "", false
+	}
+	expected := contributeIntentValue(parts[0], parts[1], sessionKey)
+	_, expectedSig, _ := strings.Cut(expected, parts[0]+"."+parts[1]+".")
+	if subtle.ConstantTimeCompare([]byte(expectedSig), []byte(parts[2])) != 1 {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
 }
 
 func mintContributeKey() (string, error) {
@@ -241,9 +274,27 @@ func (s *Server) contributePage(r *http.Request, sessionID string) contributeDat
 		data.State = "not configured"
 	default:
 		data.State = "form"
-		data.Key, data.HasIntent = s.intents.get(sessionID, s.auth.now())
+		if cookie, err := r.Cookie(contributeIntentCookie); err == nil {
+			data.Key, _, data.HasIntent = verifyContributeIntent(cookie.Value, s.auth.key)
+		}
 	}
 	return data
+}
+
+func (a *Authenticator) contributeIntentCookie(value string) *http.Cookie {
+	cookie := a.sessionCookie()
+	cookie.Name = contributeIntentCookie
+	cookie.Value = value
+	cookie.MaxAge = int(sessionTTL.Seconds())
+	cookie.Expires = a.now().Add(sessionTTL)
+	return cookie
+}
+
+func (a *Authenticator) expiredContributeIntentCookie() *http.Cookie {
+	cookie := a.contributeIntentCookie("")
+	cookie.Expires = a.now().Add(-time.Hour)
+	cookie.MaxAge = -1
+	return cookie
 }
 
 func (s *Server) handleContribute(w http.ResponseWriter, r *http.Request) {
@@ -255,6 +306,7 @@ func (s *Server) handleContribute(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleContributeSubmit(w http.ResponseWriter, r *http.Request) {
 	sessionID, _ := s.auth.sessionAndIdentity(r)
 	data := s.contributePage(r, sessionID)
+	data.HasIntent = false
 	if data.State != "form" {
 		s.render(w, http.StatusOK, "contribute", data)
 		return
@@ -277,42 +329,59 @@ func (s *Server) handleContributeSubmit(w http.ResponseWriter, r *http.Request) 
 		s.render(w, http.StatusOK, "contribute", data)
 		return
 	}
-	key, ok := s.intents.get(sessionID, s.auth.now())
-	if !ok {
+	digest := contributeDigest(sub)
+	key := ""
+	if cookie, err := r.Cookie(contributeIntentCookie); err == nil {
+		if storedKey, storedDigest, valid := verifyContributeIntent(cookie.Value, s.auth.key); valid && storedDigest == digest {
+			key = storedKey
+		}
+	}
+	if key == "" {
 		var err error
-		key, err = mintContributeKey()
+		key, err = s.minter.keyFor(digest, s.auth.now())
 		if err != nil {
 			http.Error(w, "could not prepare contribution", http.StatusInternalServerError)
 			return
 		}
-		s.intents.set(sessionID, key, s.auth.now())
 	}
 	sub.IdempotencyKey = key
+	body, err := json.Marshal(sub)
+	if err != nil {
+		http.Error(w, "could not prepare contribution", http.StatusInternalServerError)
+		return
+	}
+	if len(body) > maxContributeBodyBytes {
+		data.State, data.StateClass, data.Message = "refused", "state-error", "the submission is too large after JSON encoding for the admission API's size cap; shorten the goal or other fields"
+		s.render(w, http.StatusOK, "contribute", data)
+		return
+	}
 	result := s.contribute.Submit(r.Context(), sub)
-	data.HasIntent = false
 	switch result.Outcome {
 	case outcomeCreated, outcomeResumed:
-		s.intents.clear(sessionID)
+		s.minter.forget(digest)
+		http.SetCookie(w, s.auth.expiredContributeIntentCookie())
 		data.State, data.StateClass = "success", "state-ok"
 		data.Run, data.Namespace, data.WorkItemID = result.Run, result.Namespace, result.WorkItemID
 		data.Resumed = result.Outcome == outcomeResumed
 	case outcomeRefused:
-		s.intents.clear(sessionID)
+		s.minter.forget(digest)
+		http.SetCookie(w, s.auth.expiredContributeIntentCookie())
 		data.State, data.StateClass, data.Message = "refused", "state-error", result.Message
 	case outcomeCredentialDenied:
-		s.intents.clear(sessionID)
+		s.minter.forget(digest)
+		http.SetCookie(w, s.auth.expiredContributeIntentCookie())
 		data.State, data.StateClass, data.Message = "credentialDenied", "state-error", result.Message
 	case outcomeAPIMismatch:
-		s.intents.clear(sessionID)
+		s.minter.forget(digest)
+		http.SetCookie(w, s.auth.expiredContributeIntentCookie())
 		data.State, data.StateClass, data.Message = "apiMismatch", "state-error", result.Message
 	case outcomeUnreachable:
-		s.intents.clear(sessionID)
+		s.minter.forget(digest)
+		http.SetCookie(w, s.auth.expiredContributeIntentCookie())
 		data.State, data.StateClass, data.Message = "unreachable", "state-error", "nothing was admitted; the contribution API could not be reached"
 	default:
-		// Uncertain keeps the stored intent: the POST response's message
-		// already names the key, and the next GET shows the unsettled
-		// notice through the fresh contributePage computation.
-		data.State, data.StateClass, data.Message = "uncertain", "state-error", "may have been admitted — resubmitting retries the same idempotency key ("+sub.IdempotencyKey+"), so no duplicate run can be created"
+		http.SetCookie(w, s.auth.contributeIntentCookie(contributeIntentValue(key, digest, s.auth.key)))
+		data.State, data.StateClass, data.Message = "uncertain", "state-error", "may have been admitted — resubmitting retries the same idempotency key ("+key+"). Changing the form and resubmitting starts a new attempt; the earlier one may still have been admitted."
 	}
 	s.render(w, http.StatusOK, "contribute", data)
 }
@@ -340,6 +409,7 @@ func validateContributeSubmission(sub contributeSubmission) string {
 func (s *Server) handleContributeNew(w http.ResponseWriter, r *http.Request) {
 	sessionID, _ := s.auth.sessionAndIdentity(r)
 	data := s.contributePage(r, sessionID)
+	data.HasIntent = false
 	if data.State != "form" {
 		s.render(w, http.StatusOK, "contribute", data)
 		return
@@ -348,6 +418,11 @@ func (s *Server) handleContributeNew(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	s.intents.clear(sessionID)
+	if cookie, err := r.Cookie(contributeIntentCookie); err == nil {
+		if _, digest, valid := verifyContributeIntent(cookie.Value, s.auth.key); valid {
+			s.minter.forget(digest)
+		}
+	}
+	http.SetCookie(w, s.auth.expiredContributeIntentCookie())
 	http.Redirect(w, r, "/contribute", http.StatusSeeOther)
 }

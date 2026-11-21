@@ -67,9 +67,7 @@ func TestRunArgsFailsClosed(t *testing.T) {
 	}
 }
 
-// TestHTTPServerTimeouts pins the bounded-listener posture of the console's
-// http.Server: every listener timeout is set, and the write bound outlives
-// the default backend probe a page render may take.
+// TestContributionFlags covers contribution flag pairing and file loading.
 func TestContributionFlags(t *testing.T) {
 	dir := t.TempDir()
 	sessionKeyFile := filepath.Join(dir, "session-key")
@@ -102,6 +100,9 @@ func TestContributionFlags(t *testing.T) {
 	}
 }
 
+// TestHTTPServerTimeouts pins the bounded-listener posture of the console's
+// http.Server: every listener timeout is set, and the write bound outlives
+// the default backend probe a page render may take.
 func TestHTTPServerTimeouts(t *testing.T) {
 	srv := newHTTPServer(defaultBind, http.NewServeMux())
 	for _, tc := range []struct {

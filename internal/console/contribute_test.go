@@ -26,6 +26,11 @@ func TestContributePageAndSubmit(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Error(err)
 		}
+		for _, forbidden := range []string{"namespace", "fresh", "debug"} {
+			if _, ok := body[forbidden]; ok {
+				t.Errorf("submission unexpectedly contains %q", forbidden)
+			}
+		}
 		mu.Lock()
 		bodies = append(bodies, body)
 		current := status
@@ -45,8 +50,11 @@ func TestContributePageAndSubmit(t *testing.T) {
 		_, _ = w.Write([]byte(`{"error":"policy refused this contribution"}`))
 	}))
 	defer admission.Close()
-	server, base, client := newContributionTestServer(t, admission.URL, time.Second)
+	_, base, client := newContributionTestServer(t, admission.URL, time.Second)
 	resp, page := get(t, client, base+"/contribute")
+	if strings.Contains(page, "admission-secret") || strings.Contains(page, admission.URL) {
+		t.Fatal("configured contribution URL or bearer token appeared in the page")
+	}
 	if resp.StatusCode != http.StatusOK || !strings.Contains(page, `name="csrf"`) || !strings.Contains(page, `href="/contribute" class="active"`) {
 		t.Fatalf("configured page missing form/nav/CSRF: %s", page)
 	}
@@ -59,6 +67,9 @@ func TestContributePageAndSubmit(t *testing.T) {
 	if strings.Contains(page, "<script>") || !strings.Contains(page, "&lt;script&gt;") {
 		t.Fatalf("unescaped goal: %s", page)
 	}
+	if strings.Contains(page, "admission-secret") || strings.Contains(page, admission.URL) {
+		t.Fatal("configured contribution URL or bearer token appeared in the response")
+	}
 	status = http.StatusCreated
 	resp, page = postContribution(t, client, base, csrf, contributionValues("goal"))
 	if resp.StatusCode != http.StatusOK || !strings.Contains(page, "A run was created") || !strings.Contains(page, `href="/runs/run-1"`) {
@@ -66,6 +77,9 @@ func TestContributePageAndSubmit(t *testing.T) {
 	}
 	if strings.Contains(page, "unsettled attempt") {
 		t.Fatal("settled success page still shows the unsettled-intent notice")
+	}
+	if strings.Contains(page, "admission-secret") || strings.Contains(page, admission.URL) {
+		t.Fatal("configured contribution URL or bearer token appeared in the response")
 	}
 	mu.Lock()
 	firstKey := bodies[1]["idempotencyKey"].(string)
@@ -84,8 +98,8 @@ func TestContributePageAndSubmit(t *testing.T) {
 	if firstKey == secondKey {
 		t.Fatal("definitive outcome did not clear the intent")
 	}
-	if _, ok := server.intents.get(sessionIDFromClient(t, server, client, base), time.Now()); ok {
-		t.Fatal("intent remained after success")
+	if intentCookie(client) != nil {
+		t.Fatal("intent cookie remained after success")
 	}
 }
 
@@ -122,6 +136,17 @@ func TestContributeUnconfiguredAndHeaderMode(t *testing.T) {
 	if got := readAll(t, response); !strings.Contains(got, "requires token-mode sign-in") {
 		t.Fatalf("header-mode state missing: %s", got)
 	}
+	request, _ := http.NewRequest(http.MethodPost, headerServer.URL+"/contribute", strings.NewReader("lane=default"))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("X-Operator", "operator")
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if got := readAll(t, response); !strings.Contains(got, "requires token-mode sign-in") {
+		t.Fatalf("header-mode POST state missing: %s", got)
+	}
 }
 
 func TestContributeOutcomeRetryAndCSRF(t *testing.T) {
@@ -144,9 +169,22 @@ func TestContributeOutcomeRetryAndCSRF(t *testing.T) {
 	if !strings.Contains(page, "may have been admitted") {
 		t.Fatalf("uncertain state missing: %s", page)
 	}
+	_, page = get(t, client, base+"/contribute")
+	if !strings.Contains(page, "unsettled attempt") {
+		t.Fatalf("GET after uncertain outcome omitted unsettled notice: %s", page)
+	}
 	_, page = postContribution(t, client, base, csrf, contributionValues("goal"))
 	if len(keys) != 2 || keys[0] != keys[1] {
 		t.Fatalf("retry keys = %v", keys)
+	}
+	changed := contributionValues("changed goal")
+	_, _ = postContribution(t, client, base, csrf, changed)
+	if len(keys) != 3 || keys[2] == keys[1] {
+		t.Fatalf("changed-content key = %v; want a new attempt", keys)
+	}
+	intentParts := strings.Split(intentCookie(client).Value, ".")
+	if len(intentParts) != 3 || intentParts[0] != keys[2] || intentParts[1] != contributeDigest(contributeSubmission{Lane: "default", BaseRepo: "owner/base", BaseRef: "main", WorkRepo: "owner/fork", Goal: "changed goal"}) {
+		t.Fatalf("changed-content intent cookie = %v", intentParts)
 	}
 	status = http.StatusBadRequest
 	_, page = postContribution(t, client, base, csrf, contributionValues("goal"))
@@ -175,16 +213,23 @@ func TestContributeLocalValidationAndNewIntent(t *testing.T) {
 	if calls != 0 || !strings.Contains(page, "goal exceeds 16384 bytes") {
 		t.Fatalf("oversize reached API or did not refuse")
 	}
+	escaped := contributionValues(strings.Repeat(`"`, 16384))
+	before := calls
+	_, page = postContribution(t, client, base, csrf, escaped)
+	if calls != before || !strings.Contains(page, "too large after JSON encoding") || intentCookie(client) != nil {
+		t.Fatal("oversized encoded body reached API or wrote an intent cookie")
+	}
 	values := contributionValues("goal")
 	values.Del("lane")
+	before = calls
 	_, page = postContribution(t, client, base, csrf, values)
-	if calls != 0 || !strings.Contains(page, "lane is required") {
+	if calls != before || !strings.Contains(page, "lane is required") {
 		t.Fatalf("missing field reached API or did not refuse")
 	}
 	_, page = postContribution(t, client, base, csrf, contributionValues("goal"))
-	key, ok := server.intents.get(sessionIDFromClient(t, server, client, base), time.Now())
+	key, _, ok := verifyContributeIntent(intentCookie(client).Value, server.auth.key)
 	if !ok {
-		t.Fatal("uncertain outcome did not retain intent")
+		t.Fatal("uncertain outcome did not retain intent cookie")
 	}
 	resp, err := client.PostForm(base+"/contribute/new", url.Values{"csrf": {csrf}})
 	if err != nil {
@@ -194,10 +239,25 @@ func TestContributeLocalValidationAndNewIntent(t *testing.T) {
 	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/contribute" {
 		t.Fatalf("new response = %d %q", resp.StatusCode, resp.Header.Get("Location"))
 	}
+	if intentCookie(client) != nil {
+		t.Fatal("new-contribution action retained intent cookie")
+	}
 	_, page = postContribution(t, client, base, csrf, contributionValues("goal"))
-	fresh, ok := server.intents.get(sessionIDFromClient(t, server, client, base), time.Now())
+	fresh, _, ok := verifyContributeIntent(intentCookie(client).Value, server.auth.key)
 	if !ok || fresh == key || !strings.Contains(page, "may have been admitted") {
 		t.Fatal("new contribution did not mint a fresh retry key")
+	}
+}
+
+func TestNewHTTPContributeClientURLValidation(t *testing.T) {
+	for _, invalid := range []string{"ftp://example.test", "http://user@example.test", "http://example.test?q=1", "http://example.test#fragment", "http:///path"} {
+		if _, err := newHTTPContributeClient(invalid, nil, time.Second); err == nil {
+			t.Errorf("newHTTPContributeClient(%q) succeeded", invalid)
+		}
+	}
+	client, err := newHTTPContributeClient("https://example.test/", nil, time.Second)
+	if err != nil || client.url != "https://example.test" {
+		t.Fatalf("trailing slash URL = %q, %v", client.url, err)
 	}
 }
 
@@ -207,7 +267,7 @@ func TestContributeClassifications(t *testing.T) {
 		want   contributeOutcome
 	}{
 		{201, outcomeCreated}, {200, outcomeResumed}, {400, outcomeRefused}, {403, outcomeRefused}, {409, outcomeRefused},
-		{401, outcomeCredentialDenied}, {404, outcomeAPIMismatch}, {405, outcomeAPIMismatch}, {422, outcomeAPIMismatch}, {503, outcomeUncertain}, {500, outcomeUncertain},
+		{401, outcomeCredentialDenied}, {404, outcomeAPIMismatch}, {405, outcomeAPIMismatch}, {413, outcomeRefused}, {415, outcomeRefused}, {422, outcomeAPIMismatch}, {503, outcomeUncertain}, {500, outcomeUncertain},
 	} {
 		if got := classifyContributeResponse(tc.status, []byte(`{"run":"r","namespace":"n","workItemId":"i","error":"safe"}`)).Outcome; got != tc.want {
 			t.Errorf("status %d outcome = %s, want %s", tc.status, got, tc.want)
@@ -221,6 +281,12 @@ func TestContributeClassifications(t *testing.T) {
 	}
 	if got := classifyContributeError(&url.Error{Op: "Post", URL: "http://example.test/v1/contributions", Err: &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}}).Outcome; got != outcomeUnreachable {
 		t.Fatalf("dial classification = %s, want unreachable", got)
+	}
+	if got := classifyContributeError(&url.Error{Op: "Post", URL: "http://example.test/v1/contributions", Err: &net.OpError{Op: "write", Err: syscall.ECONNREFUSED}}).Outcome; got != outcomeUncertain {
+		t.Fatalf("write classification = %s, want uncertain", got)
+	}
+	if got := classifyContributeError(&url.Error{Op: "Post", URL: "http://example.test/v1/contributions", Err: &net.DNSError{Err: "no such host", Name: "example.test"}}).Outcome; got != outcomeUnreachable {
+		t.Fatalf("DNS classification = %s, want unreachable", got)
 	}
 }
 
@@ -239,15 +305,15 @@ func TestContributeCredentialAndMismatchOutcomes(t *testing.T) {
 				_, _ = w.Write([]byte(`{"error":"detail"}`))
 			}))
 			defer api.Close()
-			server, base, client := newContributionTestServer(t, api.URL, time.Second)
+			_, base, client := newContributionTestServer(t, api.URL, time.Second)
 			_, page := get(t, client, base+"/contribute")
 			csrf := findCSRFToken(t, page)
 			_, page = postContribution(t, client, base, csrf, contributionValues("goal"))
 			if !strings.Contains(page, tc.wantText) {
 				t.Fatalf("outcome state missing from page: %s", page)
 			}
-			if _, ok := server.intents.get(sessionIDFromClient(t, server, client, base), time.Now()); ok {
-				t.Fatal("definitive outcome retained the intent")
+			if intentCookie(client) != nil {
+				t.Fatal("definitive outcome retained the intent cookie")
 			}
 		})
 	}
@@ -257,15 +323,15 @@ func TestContributeUnreachableAndDeadline(t *testing.T) {
 	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	deadURL := dead.URL
 	dead.Close() // Nothing listens there anymore: a provably unreached dial.
-	server, base, client := newContributionTestServer(t, deadURL, time.Second)
+	_, base, client := newContributionTestServer(t, deadURL, time.Second)
 	_, page := get(t, client, base+"/contribute")
 	csrf := findCSRFToken(t, page)
 	_, page = postContribution(t, client, base, csrf, contributionValues("goal"))
 	if !strings.Contains(page, "could not be reached") {
 		t.Fatalf("unreachable state missing: %s", page)
 	}
-	if _, ok := server.intents.get(sessionIDFromClient(t, server, client, base), time.Now()); ok {
-		t.Fatal("unreachable outcome retained the intent")
+	if intentCookie(client) != nil {
+		t.Fatal("unreachable outcome retained the intent cookie")
 	}
 
 	// A server that accepts the connection and never answers maps to the
@@ -281,15 +347,15 @@ func TestContributeUnreachableAndDeadline(t *testing.T) {
 		}
 	}))
 	t.Cleanup(func() { close(release); hanging.Close() })
-	hangingServer, hangingBase, hangingClient := newContributionTestServer(t, hanging.URL, 200*time.Millisecond)
+	_, hangingBase, hangingClient := newContributionTestServer(t, hanging.URL, 200*time.Millisecond)
 	_, page = get(t, hangingClient, hangingBase+"/contribute")
 	csrf = findCSRFToken(t, page)
 	_, page = postContribution(t, hangingClient, hangingBase, csrf, contributionValues("goal"))
 	if !strings.Contains(page, "may have been admitted") {
 		t.Fatalf("uncertain state missing: %s", page)
 	}
-	if _, ok := hangingServer.intents.get(sessionIDFromClient(t, hangingServer, hangingClient, hangingBase), time.Now()); !ok {
-		t.Fatal("uncertain outcome dropped the retry intent")
+	if intentCookie(hangingClient) == nil {
+		t.Fatal("uncertain outcome dropped the retry intent cookie")
 	}
 }
 
@@ -321,13 +387,7 @@ func postContribution(t *testing.T, client *http.Client, base, csrf string, valu
 	return resp, body
 }
 
-func sessionIDFromClient(t *testing.T, server *Server, client *http.Client, base string) string {
-	t.Helper()
-	req, _ := http.NewRequest(http.MethodGet, base+"/contribute", nil)
-	applyCookie(t, client, req)
-	id, ok := server.auth.SessionFromRequest(req)
-	if !ok {
-		t.Fatal("session missing")
-	}
-	return id
+func intentCookie(client *http.Client) *http.Cookie {
+	jar := client.Jar.(*singleCookieJar)
+	return jar.cookies[contributeIntentCookie]
 }

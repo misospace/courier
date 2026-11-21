@@ -2,8 +2,9 @@
 
 The operator console (`courier-console`) is a small, server-rendered web UI
 for authenticated operators. It is a standalone Go binary, separate from the
-manager. The console never talks to the Kubernetes API. It can only probe the
-operator read API's `/healthz` path, and only when `--backend-url` is configured.
+manager. The console never talks to the Kubernetes API. It can probe the
+operator read API's `/healthz` path when `--backend-url` is configured and,
+in token mode, submit contributions to the separate admission API.
 
 ## Authentication modes
 
@@ -40,14 +41,14 @@ mutating controls must too. The first login POST carries no CSRF token yet,
 because a fresh browser session has none to present. Add login-CSRF
 protection before the console gains state a login can change.
 
-The session cookie always carries `Secure`. The console does not infer the
-flag from its own listener. In every chart-supported deployment the browser's
-TLS ends at a proxy, and the hop that reaches the console is plaintext HTTP.
-An inference from the listener would leave the flag permanently off, so the
-posture is configuration, not observation. `--cookie-secure=false`
-(`operatorConsole.auth.cookieSecure=false` in the chart) opts out explicitly.
-Do not run the console over a network you do not control without that flag
-set to its default.
+The session and contribution-intent cookies carry `Secure`. The console does
+not infer the flag from its own listener. In every chart-supported deployment
+the browser's TLS ends at a proxy, and the hop that reaches the console is
+plaintext HTTP. An inference from the listener would leave the flag permanently
+off, so the posture is configuration, not observation.
+`--cookie-secure=false` (`operatorConsole.auth.cookieSecure=false` in the chart)
+opts out explicitly. Do not run the console over a network you do not control
+without that flag set to its default.
 
 Every response carries `Content-Security-Policy: default-src 'self';
 frame-ancestors 'none'; form-action 'self'; base-uri 'self'`,
@@ -76,18 +77,23 @@ has. All state-changing requests are CSRF-verified. The bearer token is a
 file-mounted Secret read only by the console process; it is never rendered or
 proxied to the browser. The console uses no JavaScript.
 
-The console mints one idempotency key per submission attempt and reuses it
-across reloads and retries until the attempt is definitively settled. A timeout
-or server error has an uncertain outcome and is shown as "may have been
-admitted"; resubmitting retries with the same key, so it cannot create a
-duplicate run, branch, or PR. A deliberate new contribution is the separate
+A signed intent cookie carries the idempotency key per browser, bound to the
+submitted content, across reloads, retries, and console restarts until the
+attempt is definitively settled. A timeout or server error has an uncertain
+outcome and is shown as "may have been admitted"; resubmitting identical
+content retries with the same key, so it cannot create a duplicate run. Changing
+the content starts a new attempt. A deliberate new contribution is the separate
 explicit "start a new contribution" action.
 
 Outcomes stay distinct: created (`201`), resumed (`200`), policy or validation
 refusal (`400`, `403`, or `409`, with the server's message), rejected
-credentials (`401`), unreachable contribution API (nothing admitted), and
-uncertain (may have been admitted). Admission is never presented as PR success.
-The result links to the run's status view at `/runs/<run>`.
+credentials (`401`), unreachable contribution API (nothing admitted only when
+failure is proven to precede sending the request, such as DNS resolution or a
+dial-phase network failure), and uncertain (may have been admitted). Timeouts
+and server errors remain uncertain. Admission is never presented as PR success.
+The result links to the run's status view at `/runs/<run>`. The bearer hop to the
+admission API is plaintext when its configured URL uses `http`; configure a
+cluster-internal Service URL.
 
 Enable the manager's `contributeAPI.enabled` with its `keySecret`, then set
 `operatorConsole.contribute.url` and `tokenSecret` together. The chart render
