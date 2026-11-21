@@ -1,9 +1,9 @@
 // Command courier-console is the standalone Courier operator console: a
-// small, server-rendered scaffold for authenticated operators. It is
-// deliberately independent of the manager — it never talks to the Kubernetes
-// API, and it grows against the (future) operator read API instead. Secrets
-// are read from files (mounted Secret volumes), never from environment
-// values; all server logic lives in internal/console.
+// small, server-rendered UI for authenticated operators. It is deliberately
+// independent of the manager — it never talks to the Kubernetes API, and it
+// reads the operator read API for the run explorer instead. Secrets are read
+// from files (mounted Secret volumes), never from environment values; all
+// server logic lives in internal/console.
 package main
 
 import (
@@ -35,8 +35,9 @@ func main() {
 // listener without them lets slow or idle clients pin goroutines and file
 // descriptors. ReadTimeout bounds reading a whole request; WriteTimeout
 // covers the write side and stays generous around the handler's bounded
-// backend probe (backend-timeout defaults to 5s); the console's handlers
-// are small form posts and rendered pages.
+// backend requests (backend-timeout defaults to 5s and bounds both the health
+// probe and a run-explorer projection fetch); the console's handlers are small
+// form posts and rendered pages.
 const (
 	readHeaderTimeout = 5 * time.Second
 	readTimeout       = 10 * time.Second
@@ -44,8 +45,9 @@ const (
 	idleTimeout       = 90 * time.Second
 )
 
-// defaultBackendTimeout is the default bound on each backend probe. The
-// test for the write bound pins against this same constant.
+// defaultBackendTimeout is the default bound on each backend request (the
+// health probe and a run-explorer fetch). The test for the write bound pins
+// against this same constant.
 const defaultBackendTimeout = 5 * time.Second
 
 func runArgs(args []string) error {
@@ -100,6 +102,7 @@ func newHTTPServer(bind string, handler http.Handler) *http.Server {
 func parseFlags(args []string) (string, console.Config, error) {
 	flags := flag.NewFlagSet("courier-console", flag.ContinueOnError)
 	var bind, authMode, sessionKeyFile, operatorTokensFile, trustedHeader, backendURL string
+	var readAPITokenFile string
 	var backendTimeout time.Duration
 	var cookieSecure bool
 	flags.StringVar(&bind, "bind", defaultBind, "listen address")
@@ -108,7 +111,8 @@ func parseFlags(args []string) (string, console.Config, error) {
 	flags.StringVar(&operatorTokensFile, "operator-tokens-file", "", "file holding newline-separated accepted operator tokens (required in token mode)")
 	flags.StringVar(&trustedHeader, "trusted-header", "", "trusted upstream identity header (required in header mode)")
 	flags.StringVar(&backendURL, "backend-url", "", "base URL of the operator read API; empty renders the backend-unavailable states")
-	flags.DurationVar(&backendTimeout, "backend-timeout", defaultBackendTimeout, "backend probe timeout")
+	flags.StringVar(&readAPITokenFile, "readapi-token-file", "", "file holding the read API bearer token that enables the run explorer; empty leaves the explorer off")
+	flags.DurationVar(&backendTimeout, "backend-timeout", defaultBackendTimeout, "timeout for each operator read API request (the health probe and the run explorer)")
 	flags.BoolVar(&cookieSecure, "cookie-secure", true, "set the Secure attribute on session cookies; false is an explicit opt-out for a console reachable only over plaintext the operator controls")
 	if err := flags.Parse(args); err != nil {
 		return "", console.Config{}, err
@@ -141,6 +145,13 @@ func parseFlags(args []string) (string, console.Config, error) {
 		}
 	default:
 		return "", console.Config{}, fmt.Errorf("courier-console: unknown --auth-mode %q (want token or header)", authMode)
+	}
+	if readAPITokenFile != "" {
+		token, err := readTrimmedFile(readAPITokenFile)
+		if err != nil {
+			return "", console.Config{}, err
+		}
+		cfg.BackendToken = token
 	}
 	return bind, cfg, nil
 }
