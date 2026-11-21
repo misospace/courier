@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/misospace/courier/internal/executor"
 )
 
 // ProviderAvailability is the harness's bounded, backend-neutral vocabulary
@@ -58,10 +60,13 @@ const maxProviderErrorBody = 64 << 10
 // retained, so no unbounded provider string can reach a diagnostic or label.
 const maxProviderSignalLength = 64
 
-// maxRetryAfter bounds an honored Retry-After hint. A reset hint beyond this
-// horizon is not something a single coordinator incarnation can wait out; it
-// is reported (when known) and left to source re-offer, never spun on.
-const maxRetryAfter = 24 * time.Hour
+// maxRetryAfter bounds an honored Retry-After hint. It is the same 24h
+// planning horizon the capacity cooldown uses (executor.ProviderResetHorizon),
+// so a hint is never honored in-process for longer than the operator may later
+// hold a lane out of it. A reset hint beyond this horizon is not something a
+// single coordinator incarnation can wait out; it is reported (when known) and
+// left to source re-offer, never spun on.
+const maxRetryAfter = executor.ProviderResetHorizon
 
 // ExhaustionSignals names the structured provider signals that mean "this
 // allowance is spent" rather than "you are going too fast". The defaults are
@@ -340,8 +345,8 @@ func normalizeProviderSignalText(value string) string {
 
 // parseRetryAfter reads the standard Retry-After header as either a number of
 // seconds or an HTTP date. An unparseable or negative value yields zero: the
-// harness never invents a reset time. A header repeated with conflicting
-// values arrives comma-joined and therefore parses as ambiguous → zero.
+// harness never invents a reset time. A gateway that folded several values
+// into one comma-separated header is unparseable and therefore yields zero.
 func parseRetryAfter(header http.Header) time.Duration {
 	if header == nil {
 		return 0

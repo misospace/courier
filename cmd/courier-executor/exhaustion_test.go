@@ -106,14 +106,32 @@ func TestClassifyProviderExhaustionCarriesProviderResetHint(t *testing.T) {
 		}
 	})
 
-	t.Run("a transient line never carries the hint", func(t *testing.T) {
+	t.Run("a transient line ends nothing and keeps no hint", func(t *testing.T) {
 		e, _ := json.Marshal(map[string]any{"type": "error", "sessionID": "ses_fixture", "error": map[string]any{"name": "APIError", "data": map[string]any{
 			"statusCode":      429,
 			"responseHeaders": map[string]string{"retry-after": "30"},
 			"responseBody":    `{"error":{"type":"rate_limit_error","message":"slow down"}}`,
 		}}})
-		if evidence, exhausted := classifyProviderExhaustion(e, defaultExhaustionSignals()); exhausted {
-			t.Fatalf("an unhinted 429 must not end the run, got %+v", evidence)
+		if evidence, exhausted := classifyProviderExhaustion(e, defaultExhaustionSignals()); exhausted || evidence != (providerExhaustion{}) {
+			t.Fatalf("an unhinted 429 must neither end the run nor retain a hint, got %+v exhausted=%v", evidence, exhausted)
+		}
+	})
+
+	t.Run("an unexpected headers shape costs the hint, not the detection", func(t *testing.T) {
+		// A runtime build that serializes the headers differently must not be
+		// able to blind the stop path: the exhaustion verdict comes from the
+		// body, and the hint is best-effort.
+		e, _ := json.Marshal(map[string]any{"type": "error", "sessionID": "ses_fixture", "error": map[string]any{"name": "APIError", "data": map[string]any{
+			"statusCode":      429,
+			"responseHeaders": []string{"retry-after: 2400"},
+			"responseBody":    `{"error":{"code":"insufficient_quota"}}`,
+		}}})
+		evidence, exhausted := classifyProviderExhaustion(e, defaultExhaustionSignals())
+		if !exhausted || evidence.code != "insufficient_quota" {
+			t.Fatalf("exhaustion detection regressed on an unexpected shape: %+v exhausted=%v", evidence, exhausted)
+		}
+		if evidence.resetAfter != 0 {
+			t.Fatalf("unexpected shape produced a hint: %v", evidence.resetAfter)
 		}
 	})
 }

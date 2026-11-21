@@ -44,9 +44,9 @@ func classifyProviderExhaustion(line []byte, signals exhaustionSignals) (provide
 		Error     struct {
 			Name string `json:"name"`
 			Data struct {
-				StatusCode      int               `json:"statusCode"`
-				ResponseHeaders map[string]string `json:"responseHeaders"`
-				ResponseBody    string            `json:"responseBody"`
+				StatusCode      int             `json:"statusCode"`
+				ResponseHeaders json.RawMessage `json:"responseHeaders"`
+				ResponseBody    string          `json:"responseBody"`
 			} `json:"data"`
 		} `json:"error"`
 	}
@@ -57,18 +57,29 @@ func classifyProviderExhaustion(line []byte, signals exhaustionSignals) (provide
 	if len(data.ResponseBody) == 0 || len(data.ResponseBody) > 64<<10 {
 		return providerExhaustion{}, false
 	}
-	// The runtime serializes the provider's response headers with the error, so
-	// the authoritative Retry-After hint survives the child-process boundary
-	// (#866). It is read only for a verdict this same line confirms as
-	// exhaustion, and only as a bounded duration — never as retained text.
-	resetAfter := harness.RetryAfterFromHeaders(data.ResponseHeaders)
+	// The runtime serializes the provider's response headers into the same
+	// event, so the authoritative Retry-After hint survives the child-process
+	// boundary (#866). Decoding is deliberately best-effort and lazy: an
+	// unexpected header shape costs the hint but must never cost exhaustion
+	// detection this line already proved, and the hint is retained only on a
+	// returned exhaustion verdict — never as retained text.
+	providerResetHint := func() time.Duration {
+		if len(data.ResponseHeaders) == 0 {
+			return 0
+		}
+		var headers map[string]string
+		if json.Unmarshal(data.ResponseHeaders, &headers) != nil {
+			return 0
+		}
+		return harness.RetryAfterFromHeaders(headers)
+	}
 	classified := harness.ClassifyProviderError(data.StatusCode, nil, []byte(data.ResponseBody), signals)
 	// A quota verdict must be carried by the body's structured signal, never
 	// by status code alone: the harness treats bare 402 as allowance-shaped,
 	// but the stop path kills a working child and ends the run as exhausted,
 	// which #327 reserves for authoritative evidence.
 	if classified.Availability == harness.ProviderAllowanceExhausted && classified.Code != "" {
-		return providerExhaustion{class: string(classified.Availability), code: classified.Code, resetAfter: resetAfter}, true
+		return providerExhaustion{class: string(classified.Availability), code: classified.Code, resetAfter: providerResetHint()}, true
 	}
 	// Some Anthropic-compatible responses expose their numeric plan code only as
 	// a suffix of error.message. Require the typed provider envelope, HTTP 429,
@@ -104,7 +115,7 @@ func classifyProviderExhaustion(line []byte, signals exhaustionSignals) (provide
 	}
 	for _, configured := range signals.Codes {
 		if code == configured {
-			return providerExhaustion{class: string(harness.ProviderAllowanceExhausted), code: code, resetAfter: resetAfter}, true
+			return providerExhaustion{class: string(harness.ProviderAllowanceExhausted), code: code, resetAfter: providerResetHint()}, true
 		}
 	}
 	return providerExhaustion{}, false
