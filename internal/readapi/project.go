@@ -70,8 +70,8 @@ func boundTruncate(s string, max int) string {
 func bound(s string) string { return boundTruncate(s, DefaultTextBound) }
 
 // conditionAllowlist is the closed set of condition types this read model
-// projects. Reasons are bounded at projection; no condition field that can
-// carry token-shaped content is projected.
+// projects. Reasons are never projected: they are free text written along
+// reconcile paths and can carry source-controlled or token-shaped content.
 var conditionAllowlist = map[string]bool{
 	courierv1alpha1.ConditionLifecycleReported:         true,
 	courierv1alpha1.ConditionSoftStopObserved:          true,
@@ -89,16 +89,15 @@ var availabilityDiagnosticCategories = map[courierv1alpha1.TerminalDiagnosticCat
 	courierv1alpha1.TerminalDiagnosticCategoryForgeUnavailable:    true,
 }
 
-// unsafeWorkspaceStates are the WorkspaceSafety evidence states that hold work
-// as unsafe. Empty means no evidence and is not unsafe. The vocabulary is the
-// executor's: "empty", "dirty", "pushed", and "unknown" are what
-// cmd/courier-executor, internal/harness, and internal/legacyobserver write.
-// The operator's own capacity-recovery gate treats only "empty" and "pushed"
-// as safe and fails closed on anything else, so this set is that gate's exact
-// complement.
-var unsafeWorkspaceStates = map[string]bool{
-	"dirty":   true,
-	"unknown": true,
+// workspaceSafetySafeStates mirrors the operator's own capacity-recovery gate
+// (safeCapacityWorkspace in internal/controller): only "empty" and "pushed"
+// count as safe, and that gate fails closed on anything else. The read model
+// derives its unsafe flag from this safe set rather than enumerating unsafe
+// states, so an evidence state the vocabulary does not yet know can never read
+// as safe here before the gate has accepted it.
+var workspaceSafetySafeStates = map[string]bool{
+	"empty":  true,
+	"pushed": true,
 }
 
 // freshnessFor maps an optional observation time onto the freshness enum.
@@ -322,7 +321,6 @@ func ProjectRunDetail(run *courierv1alpha1.CoderRun, opts Options) RunDetail {
 		}
 		detail.LifecycleReport.ConditionPresent = true
 		detail.LifecycleReport.ConditionStatus = string(cond.Status)
-		detail.LifecycleReport.ConditionReason = bound(cond.Reason)
 		detail.LifecycleReport.ObservedAt = cond.LastTransitionTime.DeepCopy()
 		break
 	}
@@ -367,7 +365,6 @@ func ProjectRunDetail(run *courierv1alpha1.CoderRun, opts Options) RunDetail {
 		detail.Conditions = append(detail.Conditions, ConditionView{
 			Type:       cond.Type,
 			Status:     string(cond.Status),
-			Reason:     bound(cond.Reason),
 			ObservedAt: cond.LastTransitionTime.DeepCopy(),
 		})
 	}
@@ -539,7 +536,7 @@ func ProjectSourceHealth(name string, runs []courierv1alpha1.CoderRun, opts Opti
 		}
 
 		nonTerminal := !phaseIsTerminal(run.Status.Phase)
-		if nonTerminal && run.Status.WorkspaceSafety != nil && unsafeWorkspaceStates[run.Status.WorkspaceSafety.State] {
+		if nonTerminal && run.Status.WorkspaceSafety != nil && !workspaceSafetySafeStates[run.Status.WorkspaceSafety.State] {
 			health.Availability = AvailabilityBlocked
 			health.Notes = append(health.Notes, "run "+run.Name+" holds unsafe workspace evidence")
 		}

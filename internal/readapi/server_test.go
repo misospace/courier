@@ -342,6 +342,11 @@ func TestServerRedactionEndToEnd(t *testing.T) {
 	run.Status.LifecycleReportActiveRetryToken = "SECRET-ACTIVE-RETRY-TOKEN"
 	run.Status.CheckFingerprint = "SECRET-CHECK-FINGERPRINT"
 	run.Status.FailedCheckFingerprint = "SECRET-FAILED-CHECK-FINGERPRINT"
+	run.Status.Conditions = []metav1.Condition{
+		{Type: courierv1alpha1.ConditionLifecycleReported, Status: metav1.ConditionTrue, Reason: "SECRET-LIFECYCLE-REASON ghp_AAAAABBBBBCCCCCDDDDDEEEEE", LastTransitionTime: metav1.NewTime(testNow)},
+		{Type: courierv1alpha1.ConditionCapacityRecovery, Status: metav1.ConditionTrue, Reason: "SECRET-CAPACITY-REASON", LastTransitionTime: metav1.NewTime(testNow)},
+		{Type: "UnlistedCondition", Status: metav1.ConditionTrue, Reason: "SECRET-UNLISTED-REASON", LastTransitionTime: metav1.NewTime(testNow)},
+	}
 	run.Status.Heartbeat = &courierv1alpha1.Heartbeat{
 		At: metav1.NewTime(testNow), Kind: "SECRET-KIND", CoordinatorPodUID: "SECRET-POD-UID",
 	}
@@ -377,6 +382,11 @@ func TestServerRedactionEndToEnd(t *testing.T) {
 			"SECRET-CHECK-FINGERPRINT", "SECRET-FAILED-CHECK-FINGERPRINT",
 			"SECRET-KIND", "SECRET-POD-NAME", "SECRET-POD-UID", "SECRET-CONTAINER-ID",
 			"SECRET-IMAGE", "SECRET-NODE",
+			// Condition reasons are free text written along reconcile paths and
+			// never cross, whatever their condition type or content.
+			"SECRET-LIFECYCLE-REASON", "ghp_AAAAABBBBBCCCCCDDDDDEEEEE",
+			"SECRET-CAPACITY-REASON", "SECRET-UNLISTED-REASON",
+			`"conditionReason"`,
 		} {
 			if strings.Contains(body, secret) {
 				t.Errorf("redaction leak: %q appears in a response body", secret)
@@ -385,6 +395,9 @@ func TestServerRedactionEndToEnd(t *testing.T) {
 	}
 	if !strings.Contains(detailRec.Body.String(), `"terminationReason":"OOMKilled"`) {
 		t.Error("expected bounded keepers to survive the round trip")
+	}
+	if !strings.Contains(detailRec.Body.String(), `"type":"`+courierv1alpha1.ConditionLifecycleReported+`"`) {
+		t.Error("expected the allowlisted condition itself to survive the round trip")
 	}
 }
 
@@ -500,6 +513,37 @@ func TestServerSourcesRoute(t *testing.T) {
 		if item.TotalRuns != 1 {
 			t.Errorf("source %q totalRuns = %d, want 1", item.Name, item.TotalRuns)
 		}
+	}
+}
+
+// TestServerConfiguredIdleSourceNotListed pins the current source-inventory
+// limitation: source healths derive from runs observed in the served
+// namespace, so a configured source with zero CoderRuns is absent from the
+// HTTP sources view and the overview counts even though the projection layer
+// can render a known-source Empty entry when handed its name. Surfacing
+// configured idle sources over HTTP needs a source inventory the read path
+// does not have today; that capability is tracked separately (#839) and must
+// not be mistaken for a server bug here.
+func TestServerConfiguredIdleSourceNotListed(t *testing.T) {
+	observed := runFixture("observed", "github-label", "local", courierv1alpha1.PhaseDone, testNow.Add(-time.Minute))
+	_, handler := serverFixture(t, &observed)
+
+	for _, path := range []string{PathSources, PathOverview} {
+		rec := get(handler, path)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want 200", path, rec.Code)
+		}
+		if body := rec.Body.String(); strings.Contains(body, "idle-configured-source") {
+			t.Errorf("%s lists the configured but run-less source; the HTTP surface derives sources from observed runs only", path)
+		}
+	}
+	envelope, _ := envelopeOf(t, get(handler, PathSources))
+	var list SourceHealthList
+	if err := json.Unmarshal(envelope.Payload, &list); err != nil {
+		t.Fatalf("payload: %v", err)
+	}
+	if len(list.Items) != 1 || list.Items[0].Name != "github-label" {
+		t.Errorf("sources = %+v, want only the run-observed github-label", list.Items)
 	}
 }
 

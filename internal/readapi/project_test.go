@@ -595,7 +595,7 @@ func TestHostileTextBounding(t *testing.T) {
 	run.Status.Conditions = []metav1.Condition{{
 		Type:               courierv1alpha1.ConditionRetryRequest,
 		Status:             metav1.ConditionFalse,
-		Reason:             hostile,
+		Reason:             "SECRET-COND-MARKER " + hostile,
 		LastTransitionTime: metav1.NewTime(testNow),
 	}}
 	lane := laneFixture("local", 1)
@@ -632,7 +632,9 @@ func TestHostileTextBounding(t *testing.T) {
 		}
 	}
 	for _, cond := range detail.Conditions {
-		assertBounded(t, "condition.reason", cond.Reason)
+		if cond.Type != courierv1alpha1.ConditionRetryRequest {
+			t.Errorf("unexpected projected condition %q", cond.Type)
+		}
 	}
 	if laneHealth.Cooldown != nil {
 		assertBounded(t, "cooldown.reason", laneHealth.Cooldown.Reason)
@@ -646,6 +648,9 @@ func TestHostileTextBounding(t *testing.T) {
 	raw, err := json.Marshal(detail)
 	if err != nil {
 		t.Fatalf("marshal hostile detail: %v", err)
+	}
+	if strings.Contains(string(raw), "SECRET-COND-MARKER") {
+		t.Error("condition reason crossed the projection boundary; reasons are never projected")
 	}
 	var decoded RunDetail
 	if err := json.Unmarshal(raw, &decoded); err != nil {
@@ -810,8 +815,62 @@ func TestConditionAllowlist(t *testing.T) {
 			t.Errorf("condition %q is not in the allowlist", cond.Type)
 		}
 	}
-	if !detail.LifecycleReport.ConditionPresent || detail.LifecycleReport.ConditionReason != "Settled" {
+	if !detail.LifecycleReport.ConditionPresent || detail.LifecycleReport.ConditionStatus != string(metav1.ConditionTrue) {
 		t.Errorf("lifecycle report = %+v", detail.LifecycleReport)
+	}
+}
+
+// TestConditionReasonsNeverProjected pins that condition reasons — free text
+// written along reconcile paths that can carry source-controlled or
+// token-shaped content — never survive projection in any form, hostile or
+// ordinary.
+func TestConditionReasonsNeverProjected(t *testing.T) {
+	run := runFixture("run", "src", "local", courierv1alpha1.PhaseVerifying, testNow)
+	run.Status.Conditions = []metav1.Condition{
+		{Type: courierv1alpha1.ConditionLifecycleReported, Status: metav1.ConditionTrue, Reason: "SECRET-LIFECYCLE-REASON ghp_AAAAABBBBBCCCCCDDDDDEEEEE", LastTransitionTime: metav1.NewTime(testNow)},
+		{Type: courierv1alpha1.ConditionSoftStopObserved, Status: metav1.ConditionTrue, Reason: "SECRET-SOFTSTOP-REASON", LastTransitionTime: metav1.NewTime(testNow)},
+		{Type: courierv1alpha1.ConditionRetryRequest, Status: metav1.ConditionTrue, Reason: "Requeued", LastTransitionTime: metav1.NewTime(testNow)},
+		{Type: "UnlistedCondition", Status: metav1.ConditionTrue, Reason: "SECRET-UNLISTED-REASON", LastTransitionTime: metav1.NewTime(testNow)},
+	}
+	detail := ProjectRunDetail(&run, testOptions())
+	raw, err := json.Marshal(detail)
+	if err != nil {
+		t.Fatalf("marshal detail: %v", err)
+	}
+	body := string(raw)
+	for _, reason := range []string{
+		"SECRET-LIFECYCLE-REASON", "ghp_AAAAABBBBBCCCCCDDDDDEEEEE",
+		"SECRET-SOFTSTOP-REASON", "SECRET-UNLISTED-REASON",
+		"conditionReason",
+	} {
+		if strings.Contains(body, reason) {
+			t.Errorf("condition reason leak: %q appears in projected run detail", reason)
+		}
+	}
+	if !detail.LifecycleReport.ConditionPresent {
+		t.Errorf("lifecycle report must stay present: %+v", detail.LifecycleReport)
+	}
+}
+
+// TestWorkspaceSafetyFailsClosed pins the source-level unsafe flag to the
+// capacity-recovery gate's safe set: only "empty" and "pushed" read as safe,
+// and any other state — known or not — holds the source.
+func TestWorkspaceSafetyFailsClosed(t *testing.T) {
+	for state, want := range map[string]bool{
+		"empty":   false,
+		"pushed":  false,
+		"dirty":   true,
+		"unknown": true,
+		"clean":   true,
+		"":        true,
+		"mystery": true,
+	} {
+		run := runFixture("run", "src", "local", courierv1alpha1.PhaseRunning, testNow.Add(-time.Minute))
+		run.Status.WorkspaceSafety = &courierv1alpha1.WorkspaceSafetyEvidence{State: state}
+		health := ProjectSourceHealth("src", []courierv1alpha1.CoderRun{run}, testOptions())
+		if got := health.Availability == AvailabilityBlocked; got != want {
+			t.Errorf("workspace state %q: blocked = %v, want %v (availability %q)", state, got, want, health.Availability)
+		}
 	}
 }
 

@@ -223,10 +223,11 @@ type CIParkHealth struct {
 
 // LifecycleReportHealth projects the LifecycleReported condition and the retry
 // tokens as booleans only: token values are policy state, never response data.
+// The condition's reason is free text written along reconcile paths and is
+// never projected.
 type LifecycleReportHealth struct {
 	ConditionPresent    bool         `json:"conditionPresent"`
 	ConditionStatus     string       `json:"conditionStatus,omitempty"`
-	ConditionReason     string       `json:"conditionReason,omitempty"`
 	ObservedAt          *metav1.Time `json:"observedAt,omitempty"`
 	HasActiveRetryToken bool         `json:"hasActiveRetryToken"`
 	HasLastRetryToken   bool         `json:"hasLastRetryToken"`
@@ -261,11 +262,12 @@ type WorkspaceSafetyView struct {
 }
 
 // ConditionView is one allowlisted status condition. Only the condition types
-// in conditionTypeAllowlist are projected; reasons are bounded.
+// in conditionAllowlist are projected, and only their type, status, and
+// timestamp: a condition's reason is free text written along reconcile paths
+// and is never projected.
 type ConditionView struct {
 	Type       string       `json:"type"`
 	Status     string       `json:"status"`
-	Reason     string       `json:"reason,omitempty"`
 	ObservedAt *metav1.Time `json:"observedAt,omitempty"`
 }
 
