@@ -239,8 +239,9 @@ type CapacityCooldown struct {
 	CapacityID string `json:"capacityID"`
 	// Reason is the operator-written explanation of why the cooldown exists.
 	// It never carries executor freeform text; the cooldown itself runs to
-	// NextEligibleAt, the latest contributing exhaustion's window end or its
-	// validated provider reset, whichever is later (#866).
+	// NextEligibleAt, the latest deadline across the contributing exhaustions,
+	// each one its window end or its validated provider reset, whichever is
+	// later (#866).
 	// +kubebuilder:validation:MaxLength=256
 	Reason string `json:"reason"`
 	// ExhaustionCount is the number of distinct confirmed exhaustion events
@@ -256,11 +257,11 @@ type CapacityCooldown struct {
 	// +kubebuilder:validation:MaxLength=253
 	LastExhaustedRun string `json:"lastExhaustedRun,omitempty"`
 	// NextEligibleAt is when discovery and admission for this capacity
-	// identity may resume: the latest contributing exhaustion's deadline,
-	// which is its cooldown-window end or that event's validated provider
-	// reset, whichever is later (#866). The window is the operator's bounded
-	// retry floor; Courier never invents a provider reset, and only a hint
-	// validated on the exhaustion handoff can extend past the floor.
+	// identity may resume: the maximum deadline across the contributing
+	// exhaustions, each one a cooldown-window end or that event's validated
+	// provider reset, whichever is later (#866). The window is the operator's
+	// bounded retry floor; Courier never invents a provider reset, and only a
+	// hint validated on the exhaustion handoff can extend past the floor.
 	NextEligibleAt metav1.Time `json:"nextEligibleAt"`
 }
 

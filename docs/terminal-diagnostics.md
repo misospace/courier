@@ -101,16 +101,20 @@ operator turns the hint into an absolute deadline with its own capture clock
 and records it here only when the handoff was validated, its declared outcome
 is capacity exhaustion, and the hint is positive and within a 24-hour horizon.
 
-The operator never invents the field. A missing, malformed, zero, negative, or
-beyond-horizon hint leaves it absent, and so does every ending that is not a
-confirmed capacity exhaustion — a transient rate limit never carries the hint,
-because its `Retry-After` belongs to in-process retry policy.
+The operator never invents the field. A missing, malformed, zero, or negative
+hint leaves it absent, and so does every ending that is not a confirmed
+capacity exhaustion — a transient rate limit never carries the hint, because
+its `Retry-After` belongs to in-process retry policy. A provider `Retry-After`
+beyond the 24-hour horizon is clamped down to the horizon by both producers
+before the handoff, so the lane is held for the full horizon rather than
+falling back to the plain window; the operator's own horizon check is a
+defensive bound on durable state, not the normal clamp path.
 
 `providerResetAt` is the durable evidence behind the lane cooldown, not the
 cooldown itself. The `capacityCooldown.nextEligibleAt` on the `LaneProfile`
-ends at the latest contributing exhaustion's window end, or that event's
-validated `providerResetAt` when it is later, so admission does not resume into
-capacity the provider says is still spent:
+ends at the latest deadline across the contributing exhaustions — each event's
+window end, or its validated `providerResetAt` when that is later — so
+admission does not resume into capacity the provider says is still spent:
 
 ```sh
 kubectl get laneprofile <name> -n <namespace> -o jsonpath='{.status.capacityCooldown}' | jq .

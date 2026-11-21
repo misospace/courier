@@ -301,19 +301,20 @@ spec:
                   nextEligibleAt:
                     description: |-
                       NextEligibleAt is when discovery and admission for this capacity
-                      identity may resume: the latest contributing exhaustion's deadline,
-                      which is its cooldown-window end or that event's validated provider
-                      reset, whichever is later (#866). The window is the operator's bounded
-                      retry floor; Courier never invents a provider reset, and only a hint
-                      validated on the exhaustion handoff can extend past the floor.
+                      identity may resume: the maximum deadline across the contributing
+                      exhaustions, each one a cooldown-window end or that event's validated
+                      provider reset, whichever is later (#866). The window is the operator's
+                      bounded retry floor; Courier never invents a provider reset, and only a
+                      hint validated on the exhaustion handoff can extend past the floor.
                     format: date-time
                     type: string
                   reason:
                     description: |-
                       Reason is the operator-written explanation of why the cooldown exists.
                       It never carries executor freeform text; the cooldown itself runs to
-                      NextEligibleAt, the latest contributing exhaustion's window end or its
-                      validated provider reset, whichever is later (#866).
+                      NextEligibleAt, the latest deadline across the contributing exhaustions,
+                      each one its window end or its validated provider reset, whichever is
+                      later (#866).
                     maxLength: 256
                     type: string
                 required:

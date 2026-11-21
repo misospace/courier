@@ -790,8 +790,9 @@ serializes into its structured error event — as a bounded
 persists it on the capacity-exhaustion diagnostic as `providerResetAt` only
 when it is validated (positive, within a 24-hour horizon) on a handoff whose
 declared outcome is capacity exhaustion (#866). The cooldown deadline is then
-the latest contributing exhaustion's `max(window end, providerResetAt)`, so a
-lane is not re-admitted into capacity the provider itself says is still spent;
+the maximum deadline across the contributing exhaustions — each event's
+`max(window end, providerResetAt)` — so a lane is not re-admitted into
+capacity the provider itself says is still spent;
 a missing, malformed, or out-of-bounds hint falls back to the plain window,
 and the deadline is recomputed from durable per-run evidence, so it survives
 controller restarts. A transient rate limit never carries the hint — its
