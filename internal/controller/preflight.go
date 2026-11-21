@@ -245,10 +245,6 @@ func (s *SecureControl) operatorAccessReviews(run *courier.CoderRun, registratio
 	reviews := []accessReview{
 		{group: core, resource: "secrets", verb: "create", namespace: runNamespace},
 		{group: core, resource: "secrets", verb: "delete", namespace: runNamespace},
-		// App-mode rotation rewrites the run's credentials Secret in place
-		// (#870): without update proof, the first refresh fails mid-run
-		// instead of at launch.
-		{group: core, resource: "secrets", verb: "update", namespace: runNamespace},
 		{group: core, resource: "serviceaccounts", verb: "create", namespace: runNamespace},
 		{group: core, resource: "serviceaccounts", verb: "delete", namespace: runNamespace},
 		{group: core, resource: "pods", verb: "create", namespace: runNamespace},
@@ -280,6 +276,13 @@ func (s *SecureControl) operatorAccessReviews(run *courier.CoderRun, registratio
 		// preflight.go:493 reads the run's signing secret for the dry-run
 		// rendering.
 		{group: core, resource: "secrets", verb: "get", name: topology.SigningSecretName(run.Name), namespace: runNamespace},
+	}
+	// App-mode rotation rewrites the run's credentials Secret in place
+	// (#870): without update proof, the first refresh fails mid-run instead
+	// of at launch. The proof is App-mode only, so a static deployment's
+	// proven grant set stays exactly what static provisioning needs.
+	if s.Config.InstallationTokenMinter != nil {
+		reviews = append(reviews, accessReview{group: core, resource: "secrets", verb: "update", namespace: runNamespace})
 	}
 	// secure_launcher.go:866 reads the credential source Secrets in the
 	// operator's own namespace. The registration the persisted policy pins

@@ -45,8 +45,8 @@ func NewBrokerInstallationClient(auth BrokerInstallationAuth, source Installatio
 	}
 	pinned := make([]string, 0, len(auth.Repositories))
 	for _, repository := range auth.Repositories {
-		owner, _, ok := strings.Cut(repository, "/")
-		if !ok || owner == "" || strings.TrimSpace(repository) == "" || !strings.EqualFold(owner, auth.Owner) {
+		owner, name, ok := strings.Cut(repository, "/")
+		if !ok || owner == "" || name == "" || strings.Contains(name, "/") || !strings.EqualFold(owner, auth.Owner) {
 			return nil, errors.New("GitHub App credential pinned repositories must be owner/name entries of the configured account")
 		}
 		pinned = append(pinned, repository)
