@@ -59,8 +59,12 @@ func classifyProviderExhaustion(line []byte, signals exhaustionSignals) (provide
 	}
 	// The runtime serializes the provider's response headers into the same
 	// event, so the authoritative Retry-After hint survives the child-process
-	// boundary (#866). Decoding is deliberately best-effort and lazy: an
-	// unexpected header shape costs the hint but must never cost exhaustion
+	// boundary (#866). The pinned runtime (Dockerfile OPENCODE_VERSION,
+	// currently 1.18.31) declares this field as `Record<string, string>` and
+	// fills it verbatim from the provider response with lower-cased keys, so
+	// the shape decoded here is what the deployed runtime emits; the lookup
+	// stays case-insensitive. Decoding is deliberately best-effort and lazy:
+	// an unexpected header shape costs the hint but must never cost exhaustion
 	// detection this line already proved, and the hint is retained only on a
 	// returned exhaustion verdict — never as retained text.
 	providerResetHint := func() time.Duration {

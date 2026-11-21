@@ -347,6 +347,9 @@ func normalizeProviderSignalText(value string) string {
 // seconds or an HTTP date. An unparseable or negative value yields zero: the
 // harness never invents a reset time. A gateway that folded several values
 // into one comma-separated header is unparseable and therefore yields zero.
+// A live http.Header carries duplicates in transport order and Get takes the
+// first; see RetryAfterFromHeaders for why the serialized-header path instead
+// rejects conflicting duplicates.
 func parseRetryAfter(header http.Header) time.Duration {
 	if header == nil {
 		return 0
@@ -398,6 +401,13 @@ func boundRetryAfter(d time.Duration) time.Duration {
 // horizon). Zero is returned when the hint is absent, malformed, non-positive,
 // or carried more than once with conflicting values: an ambiguous duplicate is
 // not a reset time the harness may guess.
+//
+// The duplicate rule is deliberately asymmetric with the live path
+// (parseRetryAfter): a live http.Header has already folded or kept duplicates
+// in transport order, and Get takes the first, while a serialized map can
+// arrive with both duplicates and no order, so only the serialized path can
+// detect the conflict and it refuses to guess. Keep the two rules distinct on
+// purpose; do not "unify" them by making one tolerate what the other rejects.
 func RetryAfterFromHeaders(headers map[string]string) time.Duration {
 	value, found := "", false
 	for key, candidate := range headers {
