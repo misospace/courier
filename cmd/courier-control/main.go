@@ -55,6 +55,10 @@ type termination struct {
 	// fixed, code-owned strings travel here — never provider response bodies
 	// or model text.
 	Category string `json:"category,omitempty"`
+	// ProviderResetAfterSeconds is the bounded authoritative provider reset
+	// hint in seconds, capacity-exhaustion endings only; 0/absent means no
+	// hint, so the operator keeps its default cooldown.
+	ProviderResetAfterSeconds int64 `json:"provider_reset_after_seconds,omitempty"`
 }
 
 // Probe retry rounds are bounded infrastructure retries covering a
@@ -969,15 +973,28 @@ func terminationFor(result executor.HarnessResult) termination {
 		category = string(courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion)
 	}
 	return termination{
-		Phase:           phase,
-		Result:          handoffResult,
-		ExitCode:        exit,
-		Reason:          boundReason(reason),
-		Outcome:         outcome,
-		ResultKind:      resultKind,
-		Category:        category,
-		WorkspaceSafety: result.WorkspaceSafety,
+		Phase:                     phase,
+		Result:                    handoffResult,
+		ExitCode:                  exit,
+		Reason:                    boundReason(reason),
+		Outcome:                   outcome,
+		ResultKind:                resultKind,
+		Category:                  category,
+		WorkspaceSafety:           result.WorkspaceSafety,
+		ProviderResetAfterSeconds: providerResetSeconds(result),
 	}
+}
+
+// providerResetSeconds renders the provider reset hint for a confirmed
+// capacity-exhaustion ending through the shared producer bound (whole seconds,
+// rounded up, clamped to the 24h horizon). Any other ending — including a
+// transient rate limit — is hint-free: only the authoritative exhaustion
+// signal may extend the lane capacity cooldown.
+func providerResetSeconds(result executor.HarnessResult) int64 {
+	if result.Outcome != executor.OutcomeCapacityExhausted {
+		return 0
+	}
+	return executor.ProviderResetSeconds(result.CapacityResetAfter)
 }
 
 // handoff writes the structured termination payload to stdout and the

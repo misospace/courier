@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
@@ -182,6 +183,13 @@ type HarnessResult struct {
 	// status.noChange only for a resolve-issue no-change ending, and the
 	// source re-verifies every excerpt itself.
 	NoChange *courierv1alpha1.NoChangeClose
+	// CapacityResetAfter carries, for a confirmed allowance-exhaustion
+	// ending, the authoritative provider reset/retry hint (the parsed
+	// Retry-After). It is zero when the hint is absent or unparseable —
+	// the harness never invents a reset time — and is never set for a
+	// transient rate limit, whose hint belongs to in-process retry policy,
+	// not to lane capacity cooldown.
+	CapacityResetAfter time.Duration
 }
 
 // WorkspaceSafetyEvidence is trusted executor evidence, never a model claim.

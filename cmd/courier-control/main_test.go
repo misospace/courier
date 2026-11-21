@@ -89,6 +89,50 @@ func TestTerminationForMatchesOperatorSchema(t *testing.T) {
 	}
 }
 
+// TestTerminationForRendersProviderResetHint pins the handoff rendering of
+// the capacity-exhaustion reset hint: only a capacity-exhausted result with
+// a hint emits provider_reset_after_seconds, sub-second remainders round up
+// so they never collapse to no-hint, and a hint past the 24h horizon clamps.
+func TestTerminationForRendersProviderResetHint(t *testing.T) {
+	capacity := func(d time.Duration) executor.HarnessResult {
+		return executor.HarnessResult{
+			Outcome:            executor.OutcomeCapacityExhausted,
+			Kind:               courierv1alpha1.NativeResultCapacityExhausted,
+			Reason:             "provider allowance exhausted",
+			CapacityResetAfter: d,
+		}
+	}
+	tests := []struct {
+		name   string
+		result executor.HarnessResult
+		want   string
+	}{
+		{"capacity hint renders whole seconds", capacity(9 * time.Hour), `"provider_reset_after_seconds":32400`},
+		{"sub-second rounds up", capacity(time.Millisecond), `"provider_reset_after_seconds":1`},
+		{"beyond the horizon clamps", capacity(48 * time.Hour), `"provider_reset_after_seconds":86400`},
+		{"capacity without hint omits", capacity(0), ""},
+		{
+			"blocked external stays hint-free",
+			executor.HarnessResult{Outcome: executor.OutcomeBlockedExternal, Reason: "rate limited", CapacityResetAfter: time.Hour},
+			"",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			line, err := json.Marshal(terminationFor(tt.result))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Contains(string(line), "provider_reset_after_seconds"); got != (tt.want != "") {
+				t.Fatalf("line = %s, want field present = %v", line, tt.want != "")
+			}
+			if tt.want != "" && !strings.Contains(string(line), tt.want) {
+				t.Fatalf("line = %s, want %s", line, tt.want)
+			}
+		})
+	}
+}
+
 func TestBoundReason(t *testing.T) {
 	if got := boundReason("short"); got != "short" {
 		t.Fatalf("boundReason(short) = %q", got)

@@ -1247,6 +1247,14 @@ spec:
                       drove the ending (#169); empty when classified from the world alone.
                     maxLength: 64
                     type: string
+                  providerResetAt:
+                    description: |-
+                      ProviderResetAt is when the provider said the exhausted allowance may
+                      return, for a confirmed capacity-exhaustion diagnostic whose validated
+                      handoff carried an authoritative hint (#866). Absent when the hint was
+                      missing, malformed, or out of bounds; the operator never invents one.
+                    format: date-time
+                    type: string
                   reason:
                     description: Reason is a short, redacted, length-bounded explanation.
                     maxLength: 1024

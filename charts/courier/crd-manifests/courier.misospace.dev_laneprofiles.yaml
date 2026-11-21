@@ -286,8 +286,10 @@ spec:
                   exhaustionCount:
                     description: |-
                       ExhaustionCount is the number of distinct confirmed exhaustion events
-                      whose per-run markers fall in the active cooldown window. The count is
-                      recomputed from retained CoderRuns, avoiding an unbounded lane history.
+                      whose per-run markers contribute a deadline that is still in the
+                      future: each event's cooldown-window end, or its validated provider
+                      reset when that is later (#866). The count is recomputed from retained
+                      CoderRuns, avoiding an unbounded lane history.
                     minimum: 1
                     type: integer
                   lastExhaustedRun:
@@ -299,14 +301,20 @@ spec:
                   nextEligibleAt:
                     description: |-
                       NextEligibleAt is when discovery and admission for this capacity
-                      identity may resume. It is the operator's bounded retry window, not a
-                      provider-observed reset time (Courier never invents one).
+                      identity may resume: the maximum deadline across the contributing
+                      exhaustions, each one a cooldown-window end or that event's validated
+                      provider reset, whichever is later (#866). The window is the operator's
+                      bounded retry floor; Courier never invents a provider reset, and only a
+                      hint validated on the exhaustion handoff can extend past the floor.
                     format: date-time
                     type: string
                   reason:
                     description: |-
                       Reason is the operator-written explanation of why the cooldown exists.
-                      It never carries executor freeform text.
+                      It never carries executor freeform text; the cooldown itself runs to
+                      NextEligibleAt, the latest deadline across the contributing exhaustions,
+                      each one its window end or its validated provider reset, whichever is
+                      later (#866).
                     maxLength: 256
                     type: string
                 required:

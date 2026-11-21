@@ -141,6 +141,52 @@ func TestClassifyProviderErrorDefaultsWhenSignalsEmpty(t *testing.T) {
 	}
 }
 
+// TestRetryAfterFromHeaders pins the serialized-header path the legacy
+// executor uses (#866): an OpenCode APIError event carries the provider's
+// response headers as a map, and only a single unambiguous, parseable,
+// positive Retry-After becomes a reset hint. Anything else is zero, because
+// the harness never invents or guesses a reset time.
+func TestRetryAfterFromHeaders(t *testing.T) {
+	tests := []struct {
+		name    string
+		headers map[string]string
+		want    time.Duration
+	}{
+		{name: "nil headers"},
+		{name: "empty headers", headers: map[string]string{}},
+		{name: "no retry-after", headers: map[string]string{"content-type": "application/json", "x-request-id": "req-1"}},
+		{name: "canonical key", headers: map[string]string{"Retry-After": "2400"}, want: 40 * time.Minute},
+		{name: "lowercased key", headers: map[string]string{"retry-after": "90"}, want: 90 * time.Second},
+		{name: "uppercase key with padding", headers: map[string]string{"RETRY-AFTER": " 60 "}, want: time.Minute},
+		{name: "zero", headers: map[string]string{"Retry-After": "0"}},
+		{name: "negative", headers: map[string]string{"Retry-After": "-30"}},
+		{name: "non-numeric and not a date", headers: map[string]string{"Retry-After": "soon"}},
+		{name: "float seconds", headers: map[string]string{"Retry-After": "12.5"}},
+		{name: "empty value", headers: map[string]string{"Retry-After": ""}},
+		{name: "beyond the horizon clamps", headers: map[string]string{"Retry-After": "999999"}, want: maxRetryAfter},
+		{name: "conflicting casings are ambiguous", headers: map[string]string{"Retry-After": "60", "retry-after": "86400"}},
+		{name: "repeated identical value still parses", headers: map[string]string{"Retry-After": "60", "retry_AFTER": "60"}, want: time.Minute},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := RetryAfterFromHeaders(tt.headers); got != tt.want {
+				t.Fatalf("RetryAfterFromHeaders(%v) = %v, want %v", tt.headers, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRetryAfterFromHeadersHonorsHTTPDate(t *testing.T) {
+	when := time.Now().UTC().Add(30 * time.Minute).Format(http.TimeFormat)
+	got := RetryAfterFromHeaders(map[string]string{"retry-after": when})
+	if got <= 25*time.Minute || got > 30*time.Minute {
+		t.Fatalf("RetryAfterFromHeaders(%q) = %v, want about 30m", when, got)
+	}
+	if past := time.Now().UTC().Add(-time.Minute).Format(http.TimeFormat); RetryAfterFromHeaders(map[string]string{"retry-after": past}) != 0 {
+		t.Fatal("a retry-after in the past must not carry a reset hint")
+	}
+}
+
 func TestStructuredErrorSignalIsBoundedAndSafe(t *testing.T) {
 	tests := []struct {
 		name     string
