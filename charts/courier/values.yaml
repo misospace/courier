@@ -329,6 +329,24 @@ contributeAPI:
   #    the rendered Service routes port 80 to it.
   port: 8083
 
+readAPI:
+  # -- Authenticated read-only projection API (issue #820). Disabled by
+  #    default. When enabled the manager serves the namespace-scoped read API
+  #    on its bind port and the chart renders the ClusterIP Service consumers
+  #    GET projections from. The bearer token lives in a Secret you create in
+  #    the release namespace; it is never rendered into the pod spec or
+  #    logged. One namespace is served: the operator namespace when the
+  #    ownership boundary owns it — where the operator materializes its runs
+  #    and keeps its bootstrap LaneProfiles — and the first owned namespace
+  #    otherwise.
+  enabled: false
+  # -- Name of the Secret (in the release namespace) whose "token" entry
+  #    holds the bearer token the read API requires. Required when enabled.
+  keySecret: ""
+  # -- Port the read API listener binds to inside the manager container;
+  #    the rendered Service routes port 80 to it.
+  port: 8084
+
 # -- Operator console scaffold (#821). Disabled by default: enabling it
 #    renders a second controller running the standalone courier-console
 #    binary behind a ClusterIP-only Service. It renders placeholder pages
