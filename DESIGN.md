@@ -3493,6 +3493,79 @@ frontend contract is documented in
 [docs/external-contributions.md](./docs/external-contributions.md),
 "Status reads".
 
+### Read-only operator API
+
+A non-kubectl frontend reads the operator's own view of its work through one
+authenticated HTTP endpoint (#820): `GET /v1/overview`, `/v1/lanes`,
+`/v1/sources`, `/v1/runs`, and `/v1/runs/{name}`, plus an unauthenticated
+`GET /healthz` liveness probe (the operator console's backend probe) that
+serves no data. All are served by the operator's
+own in-process listener (`internal/readapi`), wired like the other listeners
+— every replica, no leader election, chart-rendered ClusterIP Service under
+the `readAPI:` values. It is a read model, never a second state machine: it
+reads CoderRun and LaneProfile objects and projects them, and it never
+writes, never calls a forge, and never computes scheduler state the
+operator does not already compute.
+
+Authentication is a deployment-configured static bearer token, loaded once
+at startup from a Secret in the release namespace (`--readapi-token-secret`,
+`readAPI.keySecret` in the chart); the listener is off unless
+`--readapi-bind` names one, and the pair fails closed at startup.
+Comparison is constant-time, and missing, malformed, and wrong tokens share
+one rejection message, so an unauthenticated caller learns nothing about
+which part failed.
+
+The surface is a redaction boundary. Projection is an allowlist: a field
+reaches a response only because the projection copies it. Source receipts,
+source context, the work-item identity `spec.workItemID` (a client-supplied
+contribution idempotency key, which can carry secret-shaped material),
+checkpoint plan and brief text, policy tokens, and pod environment never
+cross, and free-form text that can carry source or model content is bounded
+before projection. Absence is explicit everywhere it can be: a missing
+timestamp, a missing status block, and an unknown freshness judgment are
+named states, never a silent zero. The `/v1` path prefix is the contract
+version, so an incompatible change arrives as a new prefix.
+
+Reads are bounded every way they can be, because the listener runs inside
+the operator that also reconciles: each List round trip asks the API server
+for a bounded page and follows the continuation token, one scan fetches at
+most a fixed object count over a fixed round-trip count and says so
+explicitly when it stops early, a named run is a single Get rather than a
+scan, and a process-wide budget of concurrent cluster reads sheds excess
+requests with a 503 instead of queueing them. A request that outlives its
+own deadline is a 503 with a `Retry-After` hint. Reads go through the direct
+API reader, never the informer cache, so the page limit and the continuation
+walk are enforced by the API server, and every response describes cluster
+state as of the moment it was read — the overview states that moment as
+`generatedAt`.
+
+The namespace scope is deliberate. One namespace is served, and it is the
+operator's own namespace whenever the deployment's ownership boundary owns
+it: the operator materializes its own runs there — discovery sources and
+the contribution admission both place runs there — and bootstrap-managed
+LaneProfiles live there, so the run view and the lane view describe the
+same namespace the operator itself works in. A boundary that excludes the
+operator namespace leaves the operator with no runs of its own there, so the
+first owned namespace is served instead. LaneProfiles are read from the
+served namespace alone, because that is where the operator resolves a run's
+lane profile: a profile in another namespace governs nothing, so a lane
+whose profile is absent from the served namespace reads `Unsupported`,
+exactly as the operator's admission sees it.
+
+Lane occupancy is reported as two different gates, never as one number:
+`admitted` counts runs holding an execution-capacity slot (Claimed and
+Running, the controller's admission gate) and `reserved` counts runs holding
+a discovery reservation (empty phase, Pending, Claimed, and Running, the
+source runner's gate). Reserved is therefore a superset of admitted, the
+two counts are not additive, and every lane response carries the rule in
+`derivedFrom` so a consumer never applies a different one. The same
+projection carries each lane's configured concurrency, cooldown and
+suspension state, pending age, and each source's freshness, phase mix, and
+observed failure, so a frontend can distinguish a saturated lane, a wedged
+reservation, an unsafe-workspace hold, a source whose forge or provider
+read failed, and a source with no recent activity without reading the API
+objects.
+
 ### Rebase lane
 
 A Dispatch-classified `REBASE` followup materializes as a CoderRun with
