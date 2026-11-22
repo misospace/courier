@@ -207,7 +207,7 @@ USER 65532:65532
 # operator console (courier-console) — the deployment-level trusted
 # infrastructure binaries. Kept last so a bare `docker build .`
 # produces the operator image; build paths still pass --target explicitly.
-FROM gcr.io/distroless/static:nonroot@sha256:aafe993665bf6200db38a02c11a9351e782a84b6a45e7f33b6695638c88e3931 AS manager
+FROM gcr.io/distroless/static:nonroot@sha256:8ce6dd87e9823c5b48dcfb2c8604714ccb351ce59607327bcc4957448da279b5 AS manager
 WORKDIR /
 COPY --from=binaries /workspace/manager .
 COPY --from=binaries /workspace/courier-dependency-cache /usr/local/bin/courier-dependency-cache
