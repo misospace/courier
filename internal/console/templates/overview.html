@@ -1,9 +1,170 @@
 {{define "content"}}
 <h1>Overview</h1>
-{{if .BackendErr}}
-<p class="state state-error">The operator read API probe failed: {{.BackendErr}}</p>
-{{else}}
-<p class="state">The run explorer is live under <a href="/runs">Runs</a>. A namespace-wide overview is a later view.</p>
-{{end}}
-{{end}}
 
+{{if .OverviewErr}}
+<p class="state state-error">{{.OverviewErr}}</p>
+{{if eq .RefreshSeconds 0}}
+<p class="state-note">This page does not auto-refresh while the read API is not configured.</p>
+{{end}}
+{{else}}
+
+<p class="state-note">
+  Namespace {{if .Overview.Namespace}}{{.Overview.Namespace}}{{else}}<span class="muted">unknown</span>{{end}}.
+  Snapshot freshness: <span class="{{freshnessClass .Overview.Freshness}}">{{freshnessLabel .Overview.Freshness}}</span>.
+  {{if .Overview.Truncated}}This snapshot covers a truncated window: the read API stopped at its fetch cap, so the counts below are not the whole namespace.{{end}}
+</p>
+
+<section aria-label="Runs">
+  <h2>Runs</h2>
+  <p class="state-note">{{.Overview.RunsTotal}} run(s) in the namespace.</p>
+  {{if .PhaseRows}}
+  <ul class="chips">
+    {{range .PhaseRows}}
+    <li>
+      {{if .URL}}<a class="chip" href="{{.URL}}">{{.Label}}: {{.Count}}</a>{{else}}<span class="chip chip-plain">{{.Label}}: {{.Count}}</span>{{end}}
+    </li>
+    {{end}}
+  </ul>
+  {{else}}
+  <p class="state">No runs in this namespace yet.</p>
+  {{end}}
+  {{if .ConditionRows}}
+  <h3>Condition backlog</h3>
+  <ul class="chips">
+    {{range .ConditionRows}}
+    <li><span class="chip chip-plain">{{.Label}}: {{.Count}} run(s)</span></li>
+    {{end}}
+  </ul>
+  {{end}}
+</section>
+
+<section aria-label="Lanes">
+  <h2>Lanes</h2>
+  <p class="state-note">
+    {{.Overview.LaneCount}} lane(s) projected.
+    {{if .Overview.LanesSaturated}}At least one lane is saturated. {{end}}
+    {{if .Overview.LanesSuspended}}At least one lane is capacity-paused. {{end}}
+    {{if .Overview.LanesCooldown}}At least one lane is in provider cooldown. {{end}}
+    {{if gt .Overview.LanesUnhealthy 0}}{{.Overview.LanesUnhealthy}} lane(s) are not Healthy or Empty.{{end}}
+  </p>
+  {{if .LanesErr}}
+  <p class="state state-error">{{.LanesErr}}</p>
+  {{else if .Lanes}}
+  {{if .LanesTruncated}}<p class="state state-warn">The lane counts cover a truncated window: the read API's run scan stopped at its fetch cap.</p>{{end}}
+  <table class="runs">
+    <thead>
+      <tr>
+        <th scope="col">Lane</th>
+        <th scope="col">Status</th>
+        <th scope="col">Capacity</th>
+        <th scope="col">Oldest Pending</th>
+        <th scope="col">Details</th>
+        <th scope="col">Runs</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Lanes}}
+      <tr>
+        <td>{{.Name}}</td>
+        <td>
+          <span class="{{availabilityClass .Availability}}">{{availabilityLabel .Availability}}</span>
+          {{if .Saturated}}<span class="tag">saturated</span>{{end}}
+          {{if .Suspended}}<span class="tag">capacity paused</span>{{end}}
+          {{if .Cooldown}}<span class="tag">provider cooldown</span>{{end}}
+        </td>
+        <td>
+          {{if gt .ConfiguredConcurrency 0}}
+          {{.Admitted}} admitted / {{.ConfiguredConcurrency}} configured
+          {{else}}<span class="muted">capacity unknown</span>{{end}}
+          <div class="sub-note">{{.Reserved}} reserved</div>
+        </td>
+        <td>{{humanDuration .PendingOldestSeconds}}</td>
+        <td>
+          {{if .Cooldown}}
+          <div>capacity {{.Cooldown.CapacityID}}{{if .Cooldown.Reason}}: {{.Cooldown.Reason}}{{end}}</div>
+          {{if .Cooldown.ExhaustionCount}}<div class="sub-note">{{.Cooldown.ExhaustionCount}} exhaustion(s)</div>{{end}}
+          {{if .Cooldown.NextEligibleAt}}<div class="sub-note">next eligible {{.Cooldown.NextEligibleAt}}</div>{{end}}
+          {{end}}
+          {{range .Notes}}<div class="sub-note">{{.}}</div>{{end}}
+        </td>
+        <td>
+          <a href="{{runsLaneURL .Name}}">open</a>
+          {{if .PendingOldestSeconds}}<a href="{{runsLanePhaseURL .Name "Pending"}}">Pending</a>{{end}}
+        </td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  <p class="state-note">
+    "Reserved" counts runs holding a discovery reservation and includes the
+    admitted runs; never add the two counts. Counts are derived from retained
+    run state, not from a live scheduler view.
+  </p>
+  {{else}}
+  <p class="state">No lane profiles configured, and no runs reference a lane.</p>
+  {{end}}
+</section>
+
+<section aria-label="Sources">
+  <h2>Sources</h2>
+  <p class="state-note">
+    {{.Overview.SourceCount}} source(s) projected:
+    {{.Overview.SourcesHealthy}} healthy,
+    {{.Overview.SourcesEmpty}} empty,
+    {{.Overview.SourcesStale}} stale,
+    {{.Overview.SourcesUnavail}} unavailable,
+    {{.Overview.SourcesBlocked}} blocked.
+  </p>
+  {{if .SourcesErr}}
+  <p class="state state-error">{{.SourcesErr}}</p>
+  {{else if .Sources}}
+  {{if .SourcesTruncated}}<p class="state state-warn">The source counts cover a truncated window: the read API's run scan stopped at its fetch cap.</p>{{end}}
+  <table class="runs">
+    <thead>
+      <tr>
+        <th scope="col">Source</th>
+        <th scope="col">Status</th>
+        <th scope="col">Freshness</th>
+        <th scope="col">Last run activity</th>
+        <th scope="col">Last success</th>
+        <th scope="col">Last error</th>
+        <th scope="col">Runs</th>
+        <th scope="col">Oldest Pending</th>
+        <th scope="col">Details</th>
+        <th scope="col">Runs list</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Sources}}
+      <tr>
+        <td>{{.Name}}</td>
+        <td><span class="{{availabilityClass .Availability}}">{{availabilityLabel .Availability}}</span></td>
+        <td><span class="{{freshnessClass .Freshness}}">{{freshnessLabel .Freshness}}</span></td>
+        <td>{{if .ObservedAt}}{{.ObservedAt}}{{else}}<span class="muted">unknown</span>{{end}}</td>
+        <td>{{if .LastSuccessAt}}{{.LastSuccessAt}}{{else if eq .TotalRuns 0}}<span class="muted">no runs yet</span>{{else}}<span class="muted">no success recorded</span>{{end}}</td>
+        <td>{{if .LastErrorAt}}{{.LastErrorAt}}{{else if eq .TotalRuns 0}}<span class="muted">no runs yet</span>{{else}}<span class="muted">no failure recorded</span>{{end}}</td>
+        <td>{{.TotalRuns}}</td>
+        <td>{{humanDuration .OldestPendingSeconds}}</td>
+        <td>{{range .Notes}}<div class="sub-note">{{.}}</div>{{end}}</td>
+        <td><a href="{{runsSourceURL .Name}}">open</a></td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  <p class="state-note">
+    Source status, freshness, and outcomes are derived from run activity
+    only. "Last success" is the most recent Done or AlreadyDone run and
+    "Last error" the most recent Failed run; runs parked for review, waiting
+    on a human, or blocked externally are neither, and a source with no
+    recorded outcome of a kind says so instead of showing a zero. A source adapter's discovery
+    polling state lives in operator metrics, not the read API: an idle source
+    reads Freshness "Unknown" here, and that is not a discovery failure.
+    Unsupported capabilities are labeled, never shown as zero.
+  </p>
+  {{else}}
+  <p class="state">No sources configured, and no runs reference a source.</p>
+  {{end}}
+</section>
+
+{{end}}
+{{end}}

@@ -57,6 +57,11 @@ main {
   border-color: #cf222e;
   background: #fff5f5;
 }
+.state-warn {
+  border-color: #bf8700;
+  background: #fff8c5;
+  color: #7d4e00;
+}
 form.login {
   display: flex;
   flex-direction: column;
@@ -159,3 +164,48 @@ table.runs td a:hover { text-decoration: underline; }
 }
 .pager a { color: #0969da; text-decoration: none; }
 .pager a:hover { text-decoration: underline; }
+
+/* Overview: state badges, run-phase chips, and lane/source tables. Every
+   availability and freshness state has its own color and label, so a stale,
+   unavailable, or unknown reading never looks like a healthy one. */
+section { margin-bottom: 2rem; }
+section h2 { margin-bottom: 0.5rem; }
+.badge {
+  display: inline-block;
+  padding: 0.05rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  border: 1px solid #d0d7de;
+  background: #f6f8fa;
+  color: #57606a;
+  white-space: nowrap;
+}
+.badge-healthy { color: #1a7f37; border-color: #1a7f37; background: #dafbe1; }
+.badge-fresh { color: #1a7f37; border-color: #1a7f37; background: #dafbe1; }
+.badge-empty { color: #57606a; border-color: #afb8c1; background: #eef1f4; }
+.badge-stale { color: #7d4e00; border-color: #bf8700; background: #fff8c5; }
+.badge-unavailable { color: #cf222e; border-color: #cf222e; background: #ffebe9; }
+.badge-blocked { color: #cf222e; border-color: #cf222e; background: #ffebe9; }
+.badge-unsupported { color: #6639ba; border-color: #8250df; background: #fbefff; }
+.badge-unknown { color: #57606a; border-color: #afb8c1; background: #eef1f4; }
+.chips {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0 0 0.5rem;
+  padding: 0;
+}
+.chip {
+  display: inline-block;
+  padding: 0.15rem 0.6rem;
+  border: 1px solid #d0d7de;
+  border-radius: 999px;
+  background: #ffffff;
+  color: #0969da;
+  text-decoration: none;
+  font-size: 0.85rem;
+}
+.chip:hover { border-color: #0969da; }
+.chip-plain { color: #1c2128; }
+.sub-note { color: #57606a; font-size: 0.78rem; margin-top: 0.15rem; }

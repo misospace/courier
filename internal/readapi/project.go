@@ -509,7 +509,10 @@ func projectLane(name string, lane *courierv1alpha1.LaneProfile, allLanes []cour
 // ProjectSourceHealth projects one source adapter's health from its runs. The
 // source is named by CoderRun.Spec.Source; a name with zero projected runs is
 // Empty. The name is bounded like every other free-form projected string:
-// spec.source carries no length bound of its own.
+// spec.source carries no length bound of its own. The last-success and
+// last-error outcomes are the latest recorded finish among the source's
+// Done/AlreadyDone and Failed runs; runs parked in a waiting terminal phase
+// are neither, and a run whose finish was never recorded stamps nothing.
 func ProjectSourceHealth(name string, runs []courierv1alpha1.CoderRun, opts Options) SourceHealth {
 	health := SourceHealth{
 		Name:         bound(name),
@@ -518,6 +521,15 @@ func ProjectSourceHealth(name string, runs []courierv1alpha1.CoderRun, opts Opti
 	}
 	var oldestPending *courierv1alpha1.CoderRun
 	staleRun := false
+	var lastSuccess, lastError *metav1.Time
+	considerFinish := func(dst **metav1.Time, at *metav1.Time) {
+		if at == nil || at.Time.IsZero() {
+			return
+		}
+		if *dst == nil || at.Time.After((*dst).Time) {
+			*dst = at
+		}
+	}
 	for i := range runs {
 		run := &runs[i]
 		if run.Spec.Source != name {
@@ -533,6 +545,13 @@ func ProjectSourceHealth(name string, runs []courierv1alpha1.CoderRun, opts Opti
 			if health.ObservedAt == nil || activity.Time.After(health.ObservedAt.Time) {
 				health.ObservedAt = activity.DeepCopy()
 			}
+		}
+
+		switch run.Status.Phase {
+		case courierv1alpha1.PhaseDone, courierv1alpha1.PhaseAlreadyDone:
+			considerFinish(&lastSuccess, run.Status.FinishedAt)
+		case courierv1alpha1.PhaseFailed:
+			considerFinish(&lastError, run.Status.FinishedAt)
 		}
 
 		nonTerminal := !phaseIsTerminal(run.Status.Phase)
@@ -573,6 +592,12 @@ func ProjectSourceHealth(name string, runs []courierv1alpha1.CoderRun, opts Opti
 	}
 	if oldestPending != nil {
 		health.OldestPendingSeconds = secondsOf(phaseAge(oldestPending, opts))
+	}
+	if lastSuccess != nil {
+		health.LastSuccessAt = lastSuccess.DeepCopy()
+	}
+	if lastError != nil {
+		health.LastErrorAt = lastError.DeepCopy()
 	}
 	health.Freshness = freshnessFor(health.ObservedAt, opts)
 	sort.Strings(health.Notes)

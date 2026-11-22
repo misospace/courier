@@ -874,6 +874,54 @@ func TestWorkspaceSafetyFailsClosed(t *testing.T) {
 	}
 }
 
+// TestSourceHealthLastOutcomeDistinction pins the #824 last-success/error
+// distinction: LastSuccessAt is the latest recorded finish among the source's
+// Done and AlreadyDone runs, LastErrorAt is the latest recorded finish among
+// its Failed runs, a run parked in a waiting terminal phase stamps neither, a
+// run whose finish was never recorded stamps nothing, and an Empty source
+// carries neither timestamp.
+func TestSourceHealthLastOutcomeDistinction(t *testing.T) {
+	older := testNow.Add(-2 * time.Hour)
+	middle := testNow.Add(-time.Hour)
+	newer := testNow.Add(-30 * time.Minute)
+
+	done := runFixture("done-run", "src", "local", courierv1alpha1.PhaseDone, older)
+	done.Status.FinishedAt = ptrTime(metav1.NewTime(middle))
+	existing := runFixture("already-done-run", "src", "local", courierv1alpha1.PhaseAlreadyDone, older)
+	existing.Status.FinishedAt = ptrTime(metav1.NewTime(newer))
+	failed := runFixture("failed-run", "src", "local", courierv1alpha1.PhaseFailed, older)
+	failed.Status.FinishedAt = ptrTime(metav1.NewTime(middle))
+	unrecorded := runFixture("unrecorded-fail", "src", "local", courierv1alpha1.PhaseFailed, older)
+	parked := runFixture("parked-run", "src", "local", courierv1alpha1.PhaseNeedsHuman, older)
+	parked.Status.FinishedAt = ptrTime(metav1.NewTime(testNow))
+
+	health := ProjectSourceHealth("src", []courierv1alpha1.CoderRun{done, existing, failed, unrecorded, parked}, testOptions())
+	if health.LastSuccessAt == nil || !health.LastSuccessAt.Time.Equal(newer) {
+		t.Errorf("lastSuccessAt = %v, want %s (latest Done/AlreadyDone finish)", health.LastSuccessAt, newer)
+	}
+	if health.LastErrorAt == nil || !health.LastErrorAt.Time.Equal(middle) {
+		t.Errorf("lastErrorAt = %v, want %s (latest Failed finish)", health.LastErrorAt, middle)
+	}
+
+	// A Failed run whose finish was never recorded stamps nothing: the
+	// projection never invents an observation.
+	health = ProjectSourceHealth("src", []courierv1alpha1.CoderRun{unrecorded}, testOptions())
+	if health.LastErrorAt != nil || health.LastSuccessAt != nil {
+		t.Errorf("unrecorded finish = success %v error %v, want both nil", health.LastSuccessAt, health.LastErrorAt)
+	}
+	// A source parked only in a waiting terminal phase has neither outcome:
+	// NeedsHuman is not an error, and its finish is not a success.
+	health = ProjectSourceHealth("src", []courierv1alpha1.CoderRun{parked}, testOptions())
+	if health.LastErrorAt != nil || health.LastSuccessAt != nil {
+		t.Errorf("parked run = success %v error %v, want both nil", health.LastSuccessAt, health.LastErrorAt)
+	}
+	// An Empty source carries neither timestamp.
+	health = ProjectSourceHealth("src", nil, testOptions())
+	if health.LastErrorAt != nil || health.LastSuccessAt != nil {
+		t.Errorf("empty source = success %v error %v, want both nil", health.LastSuccessAt, health.LastErrorAt)
+	}
+}
+
 // TestProjectOverviewConditionCounts pins global condition counting.
 func TestProjectOverviewConditionCounts(t *testing.T) {
 	run := runFixture("run", "src", "local", courierv1alpha1.PhaseNeedsHuman, testNow)

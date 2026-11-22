@@ -2,12 +2,14 @@
 
 The operator console (`courier-console`) is a small, server-rendered web UI
 for authenticated operators. It is a standalone Go binary, separate from the
-manager. The run explorer lists CoderRuns from the operator read API with
-server-side search and pagination. The overview and run-detail pages are
-still placeholders, and there are no mutating controls. The console never
+manager. The overview page shows source health, lane capacity, and admission
+wedges from the operator read API. The run explorer lists CoderRuns from the
+operator read API with server-side search and pagination. The run-detail page
+is still a placeholder, and there are no mutating controls. The console never
 talks to the Kubernetes API. It reads the operator read API over a fixed
-allowlist of GET paths: the `/healthz` probe, and the run-list projection when
-`--backend-url` and a read API token are both configured.
+allowlist of GET paths: the `/healthz` probe, and the overview, lane, source,
+and run-list projections when `--backend-url` and a read API token are both
+configured.
 
 ## Authentication modes
 
@@ -117,6 +119,44 @@ never environment values. Rotate a session key by replacing the Secret and
 rolling the console pod; rotating the tokens file signs nobody out (sessions
 are independent of tokens).
 
+## Overview
+
+The Overview page reads three projections on the server: the namespace
+summary (`GET /v1/overview`), the lane health list (`GET /v1/lanes`), and the
+source health list (`GET /v1/sources`). It renders them as a run summary with
+per-phase links, a lane table, and a source table. There is no JavaScript and
+no Kubernetes watch. The page reloads itself with a meta-refresh tag: every
+60 seconds when the read API answers, every 300 seconds when any projection
+call fails, and never when the console has no configured read API URL or
+token.
+
+Every state carries its own label and color. Stale, unavailable, blocked, and
+unknown readings never look green. A source with no runs reads Empty, which
+is distinct from Healthy. Data the read API cannot project, such as a
+source's discovery polling state or a lane profile that does not exist, reads
+Unknown or Unsupported. The page never shows it as a zero.
+
+Each state links to the runs it covers. A phase chip opens the run explorer
+filtered to that phase. A lane row opens the explorer filtered to that lane,
+and a lane with a Pending run also links to `Pending` runs on that lane, so a
+stale reservation or admission wedge is one click from the runs that hold it.
+A source row opens the explorer filtered to that source.
+
+The lane table shows configured concurrency, admitted runs, reserved runs, and
+the age of the oldest Pending run. Reserved includes admitted, so the page
+never adds the two. Cooldown and suspension appear as their own labels with
+the cooldown detail (capacity id, reason, exhaustion count, and next eligible
+time). The source table shows status, freshness, last run activity, the last
+recorded success (most recent `Done` or `AlreadyDone` run) and the last
+recorded error (most recent `Failed` run), run count, and the oldest Pending
+run, plus the notes the projection supplies, such as a forge-unavailable
+diagnostic or an unsafe workspace hold. A source with runs but no recorded
+outcome of a kind says so in words, and the healthy-empty source reads "no
+runs yet" — a wording no source with runs gets. Success and error come from
+run outcomes only: runs parked for review, waiting on a human, or blocked
+externally are neither, and a source adapter's discovery polling state lives
+in operator metrics, not the read API.
+
 ## Run explorer
 
 The Run page lists CoderRuns from the operator read API. It reads the read
@@ -139,15 +179,15 @@ helm upgrade --install courier charts/courier \
 ```
 
 The token Secret is optional. With no token, or with no `--backend-url`, the
-Run page says the explorer is not configured, and the console sends no
-unauthenticated projection request. The token reaches the console only as a
+Overview and Run pages say their data is not configured, and the console sends
+no unauthenticated projection request. The token reaches the console only as a
 file path read from a mounted Secret, and it never travels to the browser.
 
 Rotate the read API token by replacing the Secret and rolling the console pod.
 The console reads the token once at startup and mounts it with `subPath`, which
 Kubernetes does not refresh in a running pod, so a rotated token takes effect
-only after the pod restarts. Until then the Run page reports that the read API
-refused the token.
+only after the pod restarts. Until then the Overview and Run pages report that
+the read API refused the token.
 
 A read API that is down, busy, or that rejects the token shows its own message.
 An operator never reads an outage as an empty namespace.
@@ -159,9 +199,10 @@ repository or model authored. It shows the pull request as a number, not a
 link, because the run projection carries no repository URL to trust.
 
 The console reads only a fixed set of GET paths on the configured backend:
-`GET /healthz` and `GET /v1/runs`. The path never comes from the browser, so a
-filter value cannot steer the request to another path or host. Only the query
-string varies, and the console bounds it before it leaves.
+`GET /healthz`, `GET /v1/overview`, `GET /v1/lanes`, `GET /v1/sources`, and
+`GET /v1/runs`. The path never comes from the browser, so a filter value
+cannot steer the request to another path or host. Only the query string of the
+run-list request varies, and the console bounds it before it leaves.
 
 The console reaches the read API inside the cluster, so the read API Service
 must accept traffic from the console pod. The chart's own NetworkPolicies do
