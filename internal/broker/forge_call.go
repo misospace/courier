@@ -169,9 +169,9 @@ func respondForgeRead(w http.ResponseWriter, value any, err error) {
 		http.Error(w, "operation denied", http.StatusUnprocessableEntity)
 		return
 	}
-	// The bound is enforced while encoding: the bounded buffer stops the
-	// response from materializing past the bound instead of encoding the
-	// whole value first and measuring it afterwards.
+	// The encoder marshals the value once and writes it in a single call,
+	// so the bounded buffer rejects an oversize answer before a response
+	// copy is buffered; it does not bound the encoder's own marshal.
 	body := &forgeResponseBuffer{remaining: maxForgeCallResponseBytes}
 	if err := json.NewEncoder(body).Encode(value); err != nil {
 		http.Error(w, "response unavailable", http.StatusInternalServerError)

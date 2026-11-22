@@ -8,21 +8,24 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/misospace/courier/internal/broker"
 )
 
 type fixedForgeToken struct{ value string }
 
 func (t fixedForgeToken) BrokerToken() ([]byte, error) { return []byte(t.value), nil }
 
-const brokerWriteDeadline = 30 * time.Second
-
 // TestBrokerForgeCallTimeoutFitsInsideBrokerWriteDeadline pins the client
 // timeout below the broker listener's write deadline: a call the broker can
 // no longer answer whole must fail on the client clock as a clean retryable
 // transport error, not wait out a truncated body and read it as malformed.
 func TestBrokerForgeCallTimeoutFitsInsideBrokerWriteDeadline(t *testing.T) {
-	if brokerForgeCallTimeout >= brokerWriteDeadline {
-		t.Fatalf("forge call timeout %v must stay under the broker write deadline %v", brokerForgeCallTimeout, brokerWriteDeadline)
+	if brokerForgeCallTimeout >= broker.InboundWriteTimeout {
+		t.Fatalf("forge call timeout %v must stay under the broker write deadline %v", brokerForgeCallTimeout, broker.InboundWriteTimeout)
+	}
+	if reserve := broker.InboundWriteTimeout - brokerForgeCallTimeout; reserve < 5*time.Second {
+		t.Fatalf("forge call timeout %v leaves only %v of the %v write deadline for the answer to arrive", brokerForgeCallTimeout, reserve, broker.InboundWriteTimeout)
 	}
 }
 

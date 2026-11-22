@@ -150,6 +150,36 @@ func TestForgeCallAvailabilityClassification(t *testing.T) {
 	}
 }
 
+type oversizeForgeReader struct {
+	forgeCallReader
+}
+
+func (oversizeForgeReader) WorkItem(context.Context, string, string) (forge.WorkItem, error) {
+	return forge.WorkItem{ID: "1", Repo: "org/repo", Title: strings.Repeat("x", maxForgeCallResponseBytes+1)}, nil
+}
+
+// TestForgeCallOversizeResponseBoundsEarly pins the response bound: a read
+// whose answer outgrows the bound answers a clean 500 with no partial JSON
+// body, never a truncated 200.
+func TestForgeCallOversizeResponseBoundsEarly(t *testing.T) {
+	s, _ := serverForTest(t)
+	s.forgeReader = oversizeForgeReader{}
+	req := httptest.NewRequest(http.MethodPost, PathForgeCall, strings.NewReader(`{"operation":"read-work-item","arguments":{"repo":"org/repo","id":"1"}}`))
+	req.Header.Set("Authorization", "Bearer valid-token")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+	if rec.Body.Len() > 1<<10 {
+		t.Fatalf("oversize denial leaked a large body: %d bytes", rec.Body.Len())
+	}
+	var result map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err == nil {
+		t.Fatalf("oversize denial unexpectedly returned JSON: %v", result)
+	}
+}
+
 func TestForgeCallStrictTopLevelDecode(t *testing.T) {
 	s, _ := serverForTest(t)
 	req := httptest.NewRequest(http.MethodPost, PathForgeCall, strings.NewReader(`{"operation":"read-work-item","arguments":{"repo":"org/repo","id":"1"},"extra":true}`))
