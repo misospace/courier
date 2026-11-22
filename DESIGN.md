@@ -4334,6 +4334,14 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   at launch and from the legacy run's steady settle, gated on the coordinator
   pod actually rendering the App-mode marker — a static run never gains a
   Secret behind its pod's back, and an App run whose Secret is gone re-mints.
+  A rotation also carries the credentials it replaced into the same Secret
+  under a distinct superseded key while GitHub still honors them: the evidence
+  intake registers those entries alongside the live document so a captured
+  bundle is scrubbed against every credential the pod held, and each entry is
+  dropped at the next rotation once expired. Only the launcher and the intake
+  write or read the superseded key — no credential-serving reader (broker,
+  askpass helper, observer) consults it, so a superseded token is never
+  served.
   Refusals are fail-closed with no static fallback and no retry loop of
   credentials, the rebase force-push keeps its head-SHA compare-and-set lease
   unchanged under the new credential, and no merge capability is added

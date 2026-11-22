@@ -167,6 +167,19 @@ func (l *CoordinatorLauncher) ensureLegacyInstallationTokenCredential(ctx contex
 	if err != nil {
 		return fmt.Errorf("legacy installation token: render credentials: %w", err)
 	}
+	// A superseded installation token stays valid on GitHub until its own
+	// expiry, and the coordinator pod held it while the previous document was
+	// live, so it must remain recoverable for the evidence intake's re-scan.
+	// The intake is the only reader of this key.
+	if !missing {
+		if superseded := installationSupersededEntries(existing.Data, entries, now); len(superseded) > 0 {
+			raw, err := json.Marshal(superseded)
+			if err != nil {
+				return fmt.Errorf("legacy installation token: render superseded entries: %w", err)
+			}
+			secret.Data[topology.CredKeyInstallationTokenSuperseded] = raw
+		}
+	}
 	if missing {
 		if err := l.Client.Create(ctx, secret); err != nil {
 			if !apierrors.IsAlreadyExists(err) {
@@ -205,6 +218,38 @@ func (l *CoordinatorLauncher) ensureLegacyInstallationTokenCredential(ctx contex
 		return fmt.Errorf("legacy installation token: update credentials: %w", err)
 	}
 	return nil
+}
+
+// installationSupersededEntries returns the not-yet-expired credentials the
+// stored Secret carried before this rotation — the live document's entries and
+// any already-superseded ones — deduplicated by token and excluding the
+// replacement entries. A stored value that no longer parses holds no
+// recoverable credential and contributes nothing; failing the scan on what it
+// cannot parse is the intake's job, not the rotation's.
+func installationSupersededEntries(stored map[string][]byte, replacement []topology.InstallationTokenEntry, now time.Time) []topology.InstallationTokenEntry {
+	seen := make(map[string]bool, len(replacement))
+	for _, entry := range replacement {
+		seen[entry.Token] = true
+	}
+	var superseded []topology.InstallationTokenEntry
+	collect := func(entries []topology.InstallationTokenEntry) {
+		for _, entry := range entries {
+			if entry.Token == "" || !entry.ExpiresAt.After(now) || seen[entry.Token] {
+				continue
+			}
+			seen[entry.Token] = true
+			superseded = append(superseded, entry)
+		}
+	}
+	var document topology.InstallationTokenDocument
+	if err := json.Unmarshal(stored[topology.CredKeyInstallationToken], &document); err == nil {
+		collect(document.Entries)
+	}
+	var previous []topology.InstallationTokenEntry
+	if err := json.Unmarshal(stored[topology.CredKeyInstallationTokenSuperseded], &previous); err == nil {
+		collect(previous)
+	}
+	return superseded
 }
 
 // mintLegacyInstallationEntries mints one repository-scoped token per pinned

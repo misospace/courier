@@ -401,7 +401,101 @@ func TestEnsureInstallationTokenRotation(t *testing.T) {
 		if entry, ok := rotated.Entry("Acme/Widgets"); !ok || entry.Token != "rotated-1" {
 			t.Fatalf("rotated document = %+v", rotated)
 		}
+		var superseded []topology.InstallationTokenEntry
+		if err := json.Unmarshal(secret.Data[topology.CredKeyInstallationTokenSuperseded], &superseded); err != nil {
+			t.Fatalf("superseded entries = %s: %v", secret.Data[topology.CredKeyInstallationTokenSuperseded], err)
+		}
+		if len(superseded) != 1 || superseded[0].Token != "stale-token" {
+			t.Fatalf("superseded = %+v, want the one replaced live credential", superseded)
+		}
 	})
+
+	t.Run("superseded list drops expired and replaced tokens", func(t *testing.T) {
+		run := installationLegacyRun("rotate-superseded")
+		document := topology.InstallationTokenDocument{
+			Version: topology.InstallationTokenDocumentVersion, Owner: "Acme", Endpoint: "https://api.github.com/",
+			Entries: []topology.InstallationTokenEntry{
+				{Repository: "Acme/Widgets", Token: "live-token", ExpiresAt: now.Add(10 * time.Minute)},
+			},
+		}
+		previous, err := json.Marshal([]topology.InstallationTokenEntry{
+			{Repository: "Acme/Widgets", Token: "expired-token", ExpiresAt: now.Add(-time.Minute)},
+			{Repository: "Acme/Widgets", Token: "live-token", ExpiresAt: now.Add(10 * time.Minute)},
+			{Repository: "Acme/Widgets", Token: "rotated-1", ExpiresAt: now.Add(2 * time.Hour)},
+			{Repository: "Acme/Widgets", Token: "older-but-valid", ExpiresAt: now.Add(30 * time.Minute)},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		owned := installationSecret(run, legacyDocumentRaw(t, document), controllerOwnerRef(run.Name, run.UID))
+		owned.Data[topology.CredKeyInstallationTokenSuperseded] = previous
+		c := launcherClientForAdmission(t, run, owned)
+		minter := &fixedInstallationTokenMinter{token: "rotated", expiresAt: now.Add(2 * time.Hour)}
+		launcher := installationLauncher(c, minter, now, plainExecutor{})
+		if err := launcher.EnsureInstallationToken(context.Background(), run); err != nil {
+			t.Fatalf("EnsureInstallationToken: %v", err)
+		}
+		var superseded []topology.InstallationTokenEntry
+		raw := readInstallationSecret(t, c, run).Data[topology.CredKeyInstallationTokenSuperseded]
+		if err := json.Unmarshal(raw, &superseded); err != nil {
+			t.Fatalf("superseded entries = %s: %v", raw, err)
+		}
+		if len(superseded) != 2 {
+			t.Fatalf("superseded = %+v, want the live credential plus the one still-valid carry-over", superseded)
+		}
+		tokens := map[string]bool{}
+		for _, entry := range superseded {
+			tokens[entry.Token] = true
+		}
+		if !tokens["live-token"] || !tokens["older-but-valid"] || tokens["expired-token"] || tokens["rotated-1"] {
+			t.Fatalf("superseded = %+v, want live-token and older-but-valid only", superseded)
+		}
+	})
+
+	// An all-expired rotation must leave no superseded key whatever the
+	// stored history looked like: expired entries are dropped, and a stored
+	// list that no longer parses carries no recoverable credential.
+	expiredHistory, err := json.Marshal([]topology.InstallationTokenEntry{
+		{Repository: "Acme/Widgets", Token: "dead-superseded", ExpiresAt: now.Add(-time.Hour)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, history := range []struct {
+		name string
+		raw  []byte
+	}{
+		{name: "no stored history", raw: nil},
+		{name: "expired history", raw: expiredHistory},
+		{name: "unreadable history", raw: []byte("{not json")},
+	} {
+		t.Run("all-expired rotation with "+history.name+" leaves no superseded key", func(t *testing.T) {
+			run := installationLegacyRun("rotate-all-expired")
+			document := topology.InstallationTokenDocument{
+				Version: topology.InstallationTokenDocumentVersion, Owner: "Acme", Endpoint: "https://api.github.com/",
+				Entries: []topology.InstallationTokenEntry{
+					{Repository: "Acme/Widgets", Token: "dead-token", ExpiresAt: now.Add(-time.Hour)},
+				},
+			}
+			owned := installationSecret(run, legacyDocumentRaw(t, document), controllerOwnerRef(run.Name, run.UID))
+			if history.raw != nil {
+				owned.Data[topology.CredKeyInstallationTokenSuperseded] = history.raw
+			}
+			c := launcherClientForAdmission(t, run, owned)
+			minter := &fixedInstallationTokenMinter{token: "fresh", expiresAt: now.Add(2 * time.Hour)}
+			launcher := installationLauncher(c, minter, now, plainExecutor{})
+			if err := launcher.EnsureInstallationToken(context.Background(), run); err != nil {
+				t.Fatalf("EnsureInstallationToken: %v", err)
+			}
+			if secret := readInstallationSecret(t, c, run); len(secret.Data) != 1 {
+				keys := make([]string, 0, len(secret.Data))
+				for key := range secret.Data {
+					keys = append(keys, key)
+				}
+				t.Fatalf("expired-only rotation left keys %v, want only the document key", keys)
+			}
+		})
+	}
 
 	t.Run("missing document is recreated only for an App-mode coordinator", func(t *testing.T) {
 		run := installationLegacyRun("rotate-recreate")

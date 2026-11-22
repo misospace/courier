@@ -158,6 +158,56 @@ func TestInstallationAskpassBinding(t *testing.T) {
 	}
 }
 
+// TestAskpassModeRouting pins the COURIER_ASKPASS routing: only the complete
+// absence of COURIER_GIT_INSTALLATION selects the static path; any presence —
+// empty or garbage included — selects the installation helper, which refuses
+// closed and never emits a static credential.
+func TestAskpassModeRouting(t *testing.T) {
+	const staticToken = "static-pat-should-never-appear"
+	for _, testCase := range []struct {
+		name       string
+		setFlag    bool
+		flag       string
+		wantStatic bool
+	}{
+		{name: "flag absent selects static askpass", wantStatic: true},
+		{name: "flag present but empty selects installation refusal", setFlag: true},
+		{name: "flag one selects installation helper", setFlag: true, flag: "1"},
+		{name: "flag garbage selects installation refusal", setFlag: true, flag: "yes"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			// App-mode configuration is deliberately incomplete beyond the
+			// flag: the helper must refuse on its own, before any API call.
+			env := map[string]string{
+				"COURIER_GIT_USERNAME": "octocat",
+				"COURIER_GIT_TOKEN":    staticToken,
+			}
+			if testCase.setFlag {
+				env[executor.EnvGitInstallation] = testCase.flag
+			}
+			getenv := func(name string) string { return env[name] }
+			lookupEnv := func(name string) (string, bool) { value, ok := env[name]; return value, ok }
+			var stdout, stderr strings.Builder
+			code := askpassMode(getenv, lookupEnv, passwordPrompt("https://github.com/acme/widgets.git"), &stdout, &stderr)
+			if testCase.wantStatic {
+				if code != 0 || stdout.String() != staticToken {
+					t.Fatalf("static routing: code = %d stdout = %q, want the static token", code, stdout.String())
+				}
+				return
+			}
+			if code == exitSuccess || stdout.Len() != 0 {
+				t.Fatalf("installation routing must refuse without serving a credential: code = %d stdout = %q", code, stdout.String())
+			}
+			if strings.Contains(stdout.String()+stderr.String(), staticToken) {
+				t.Fatal("static credential leaked on an installation-mode prompt")
+			}
+			if !strings.Contains(stderr.String(), installationAskpassMessage) {
+				t.Fatalf("stderr = %q, want the fixed refusal", stderr.String())
+			}
+		})
+	}
+}
+
 func TestInstallationAskpassServesPinnedWorkAndBaseTokens(t *testing.T) {
 	expires := time.Now().Add(time.Hour).UTC()
 	document := installationTestDocument(t, "acme", "https://api.github.com",

@@ -36,8 +36,8 @@ func observerMode(ctx context.Context, seed bool) error {
 		BaseBranch: os.Getenv("COURIER_BASE"), BaseRemoteURL: os.Getenv("COURIER_BASE_REPO_URL"),
 		Username: os.Getenv("COURIER_GIT_USERNAME"), Token: os.Getenv("COURIER_GIT_TOKEN"),
 	}
-	if mode := os.Getenv(executor.EnvGitInstallation); mode != "" {
-		if mode != "1" {
+	if _, ok := os.LookupEnv(executor.EnvGitInstallation); ok {
+		if os.Getenv(executor.EnvGitInstallation) != "1" {
 			return errors.New("observer: installation git credential mode is invalid")
 		}
 		provider, err := observerInstallationCredentials(os.Getenv)
