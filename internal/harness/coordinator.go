@@ -1194,7 +1194,7 @@ func checkTool() ToolDef {
 func forgeTool() ToolDef {
 	return ToolDef{
 		Name:        toolForge,
-		Description: "Perform one forge read through the run's broker under the resolved policy. The operation is one of read-work-item, read-pull-request, list-reviews, list-comments, or read-checks. Arguments are a JSON object whose repo is the run's pinned base or work repository; read-work-item also takes id (the work item's decimal ID), read-pull-request, list-reviews, and list-comments take number (the pull request number), and read-checks takes number and headSHA (a 40-hex commit hash). Any other operation is refused, and no forge write is ever available through this tool.",
+		Description: "Perform one forge read through the run's broker under the resolved policy. The operation is one of read-work-item, read-pull-request, list-reviews, list-comments, or read-checks. Arguments are a JSON object whose repo is the run's pinned base or work repository; read-work-item also takes id (the work item's decimal ID), read-pull-request, list-reviews, and list-comments take number (the pull request number), and read-checks takes number and headSHA (a 40- or 64-hex commit hash). Any other operation is refused, and no forge write is ever available through this tool.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

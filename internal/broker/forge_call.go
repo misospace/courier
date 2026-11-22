@@ -169,11 +169,33 @@ func respondForgeRead(w http.ResponseWriter, value any, err error) {
 		http.Error(w, "operation denied", http.StatusUnprocessableEntity)
 		return
 	}
-	var body bytes.Buffer
-	if err := json.NewEncoder(&body).Encode(value); err != nil || body.Len() > maxForgeCallResponseBytes {
+	// The bound is enforced while encoding: the bounded buffer stops the
+	// response from materializing past the bound instead of encoding the
+	// whole value first and measuring it afterwards.
+	body := &forgeResponseBuffer{remaining: maxForgeCallResponseBytes}
+	if err := json.NewEncoder(body).Encode(value); err != nil {
 		http.Error(w, "response unavailable", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(body.Bytes())
+}
+
+// errForgeResponseOversize stops the encoder the moment a forge read's answer
+// outgrows the response bound.
+var errForgeResponseOversize = errors.New("forge response exceeds the bound")
+
+// forgeResponseBuffer accepts encoded bytes only while they fit the bound, so
+// an oversized answer fails mid-encode instead of being fully buffered.
+type forgeResponseBuffer struct {
+	bytes.Buffer
+	remaining int64
+}
+
+func (b *forgeResponseBuffer) Write(p []byte) (int, error) {
+	if int64(len(p)) > b.remaining {
+		return 0, errForgeResponseOversize
+	}
+	b.remaining -= int64(len(p))
+	return b.Buffer.Write(p)
 }

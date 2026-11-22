@@ -18,6 +18,13 @@ import (
 
 const brokerPathForgeCall = "/v1/forge/call"
 
+// brokerForgeCallTimeout bounds one forge read below the broker listener's
+// 30s write deadline (broker.InboundWriteTimeout). A read that cannot answer
+// inside the deadline comes back truncated, so waiting past it can only
+// classify a broken body; giving up first keeps the failure a clean
+// retryable transport error.
+const brokerForgeCallTimeout = 25 * time.Second
+
 // BrokerForgeClient routes model-influenced forge reads through the trusted
 // run broker. It holds no forge credentials and delegates all policy to broker.
 type BrokerForgeClient struct {
@@ -44,7 +51,7 @@ func (b *BrokerForgeClient) transport() (*http.Client, error) {
 		return nil, &BrokerCallError{Category: "CA is unreadable"}
 	}
 	b.owned = &http.Client{
-		Timeout: 5 * time.Minute,
+		Timeout: brokerForgeCallTimeout,
 		Transport: &http.Transport{
 			TLSClientConfig:     &tls.Config{RootCAs: pool, ServerName: hostOnly(b.BaseURL), MinVersion: tls.VersionTLS13},
 			MaxIdleConns:        brokerMaxIdleConns,

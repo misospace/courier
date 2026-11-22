@@ -7,11 +7,24 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 type fixedForgeToken struct{ value string }
 
 func (t fixedForgeToken) BrokerToken() ([]byte, error) { return []byte(t.value), nil }
+
+const brokerWriteDeadline = 30 * time.Second
+
+// TestBrokerForgeCallTimeoutFitsInsideBrokerWriteDeadline pins the client
+// timeout below the broker listener's write deadline: a call the broker can
+// no longer answer whole must fail on the client clock as a clean retryable
+// transport error, not wait out a truncated body and read it as malformed.
+func TestBrokerForgeCallTimeoutFitsInsideBrokerWriteDeadline(t *testing.T) {
+	if brokerForgeCallTimeout >= brokerWriteDeadline {
+		t.Fatalf("forge call timeout %v must stay under the broker write deadline %v", brokerForgeCallTimeout, brokerWriteDeadline)
+	}
+}
 
 func TestBrokerForgeClientCall(t *testing.T) {
 	var body, authorization string
