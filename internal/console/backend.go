@@ -236,16 +236,20 @@ type CooldownRow struct {
 	NextEligibleAt  string `json:"nextEligibleAt,omitempty"`
 }
 
-// SourceRow is one source's decoded health from GET /v1/sources. ObservedAt
-// is the raw projected timestamp string, empty when the source carries no
-// run activity; the page pairs it with the freshness word so a missing
-// observation is never read as "now".
+// SourceRow is one source's decoded health from GET /v1/sources. ObservedAt,
+// LastSuccessAt, and LastErrorAt are raw projected timestamp strings, empty
+// when the source carries no run activity or no recorded success or failure;
+// the page pairs ObservedAt with the freshness word and the outcome
+// timestamps with explicit "no … recorded" wording, so absence is never read
+// as "now", as a zero, or as proof the source never failed.
 type SourceRow struct {
 	Name                 string   `json:"name"`
 	Availability         string   `json:"availability"`
 	Freshness            string   `json:"freshness"`
 	Notes                []string `json:"notes,omitempty"`
 	ObservedAt           string   `json:"observedAt,omitempty"`
+	LastSuccessAt        string   `json:"lastSuccessAt,omitempty"`
+	LastErrorAt          string   `json:"lastErrorAt,omitempty"`
 	TotalRuns            int      `json:"totalRuns"`
 	OldestPendingSeconds *int64   `json:"oldestPendingSeconds,omitempty"`
 }

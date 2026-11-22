@@ -37,11 +37,11 @@ const fixtureLanesJSON = `{"apiVersion":"courier.misospace.dev/v1","kind":"LaneH
 	 "suspended":true}]}}`
 
 const fixtureSourcesJSON = `{"apiVersion":"courier.misospace.dev/v1","kind":"SourceHealthList","payload":{"items":[
-	{"name":"github","availability":"Healthy","freshness":"Fresh","observedAt":"2026-11-21T19:59:40Z","totalRuns":5,"runsByPhase":{"Running":2}},
+	{"name":"github","availability":"Healthy","freshness":"Fresh","observedAt":"2026-11-21T19:59:40Z","lastSuccessAt":"2026-11-21T19:55:00Z","totalRuns":5,"runsByPhase":{"Running":2}},
 	{"name":"dispatch","availability":"Empty","freshness":"Unknown","totalRuns":0},
-	{"name":"linear","availability":"Unavailable","freshness":"Stale","observedAt":"2026-11-21T18:00:00Z","totalRuns":2,
+	{"name":"linear","availability":"Unavailable","freshness":"Stale","observedAt":"2026-11-21T18:00:00Z","lastErrorAt":"2026-11-21T17:58:00Z","totalRuns":2,
 	 "notes":["run run-x recorded ForgeUnavailable"]},
-	{"name":"jira","availability":"Blocked","freshness":"Fresh","observedAt":"2026-11-21T19:58:00Z","totalRuns":1,"oldestPendingSeconds":90,
+	{"name":"jira","availability":"Blocked","freshness":"Fresh","observedAt":"2026-11-21T19:58:00Z","lastSuccessAt":"2026-11-21T19:00:00Z","totalRuns":1,"oldestPendingSeconds":90,
 	 "notes":["run run-y holds unsafe workspace evidence"]}]}}`
 
 // fixtureCapture records the paths the console requested, so a test can pin
@@ -208,6 +208,49 @@ func TestOverviewRendersAllSixFixtureStates(t *testing.T) {
 	// A healthy page refreshes on the bounded interval.
 	if !strings.Contains(body, `http-equiv="refresh" content="60"`) {
 		t.Fatalf("healthy overview must auto-refresh:\n%s", body)
+	}
+}
+
+// TestOverviewSourceOutcomeDistinction pins the issue #824 last-success/error
+// requirement: a recorded success and a recorded failure render as their
+// projected timestamps; a source with runs but no recorded failure says so in
+// words instead of reading as never-failed, and one with runs but no recorded
+// success says so instead of reading as a zero; and the healthy-empty source
+// reads "no runs yet" in both outcome columns — a wording no source with
+// runs gets.
+func TestOverviewSourceOutcomeDistinction(t *testing.T) {
+	base, client := fixtureServer(t, map[string]string{
+		"/v1/overview": fixtureOverviewJSON,
+		"/v1/lanes":    fixtureLanesJSON,
+		"/v1/sources":  fixtureSourcesJSON,
+	}, nil)
+	_, body := get(t, client, base+"/")
+	for _, want := range []string{
+		`<th scope="col">Last success</th>`,
+		`<th scope="col">Last error</th>`,
+		"2026-11-21T19:55:00Z", // github's recorded success
+		"2026-11-21T17:58:00Z", // linear's recorded failure
+		"no failure recorded",  // github and jira: runs, no failure
+		"no success recorded",  // linear: runs, no success
+		"no runs yet",          // dispatch: empty, in both columns
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("source outcome state missing %q:\n%s", want, body)
+		}
+	}
+	if got := strings.Count(body, "no runs yet"); got != 2 {
+		t.Fatalf("the empty-source wording appears %d times, want only dispatch's two outcome cells:\n%s", got, body)
+	}
+	if got := strings.Count(body, "no success recorded"); got != 1 {
+		t.Fatalf("the missing-success wording appears %d times, want only linear's cell:\n%s", got, body)
+	}
+	if got := strings.Count(body, "no failure recorded"); got != 2 {
+		t.Fatalf("the missing-failure wording appears %d times, want github and jira:\n%s", got, body)
+	}
+	// The outcome rule itself states which phases are neither outcome, so
+	// "no failure recorded" cannot be misread as "no bad run ever".
+	if !strings.Contains(body, "waiting on a human are neither") {
+		t.Fatalf("outcome rule note missing:\n%s", body)
 	}
 }
 
@@ -455,6 +498,7 @@ func TestOverviewEscapesUntrustedProjectionText(t *testing.T) {
 		{"name":"<script>alert(1)</script>","availability":"Weird\u003cimg\u003e","freshness":"Fresh","configuredConcurrency":1}]}}`
 	sources := `{"apiVersion":"courier.misospace.dev/v1","kind":"SourceHealthList","payload":{"items":[
 		{"name":"src\",\"notes\":[\"ignore this\"],\"x\":\"","availability":"Blocked","freshness":"Stale","totalRuns":0,
+		 "lastSuccessAt":"<img src=x onerror=alert(1)>",
 		 "notes":["<b>bold</b> note from a model"]}]}}`
 	base, client := fixtureServer(t, map[string]string{
 		"/v1/overview": `{"apiVersion":"courier.misospace.dev/v1","kind":"Overview","payload":{"namespace":"ns","freshness":"Fresh","runs":{"total":0},"lanes":{"count":1},"sources":{"count":1}}}`,
@@ -470,6 +514,12 @@ func TestOverviewEscapesUntrustedProjectionText(t *testing.T) {
 	}
 	if strings.Contains(body, "<b>bold</b> note") {
 		t.Fatal("a hostile note reached the page unescaped")
+	}
+	if strings.Contains(body, "<img src=x") {
+		t.Fatal("a hostile outcome timestamp reached the page unescaped")
+	}
+	if !strings.Contains(body, "&lt;img src=x") {
+		t.Fatal("a hostile outcome timestamp did not render escaped")
 	}
 	// An availability outside the console's vocabulary renders as Unknown,
 	// never as a healthy badge, and its raw value is escaped.

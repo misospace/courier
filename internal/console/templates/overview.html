@@ -126,6 +126,8 @@
         <th scope="col">Status</th>
         <th scope="col">Freshness</th>
         <th scope="col">Last run activity</th>
+        <th scope="col">Last success</th>
+        <th scope="col">Last error</th>
         <th scope="col">Runs</th>
         <th scope="col">Oldest Pending</th>
         <th scope="col">Details</th>
@@ -139,6 +141,8 @@
         <td><span class="{{availabilityClass .Availability}}">{{availabilityLabel .Availability}}</span></td>
         <td><span class="{{freshnessClass .Freshness}}">{{freshnessLabel .Freshness}}</span></td>
         <td>{{if .ObservedAt}}{{.ObservedAt}}{{else}}<span class="muted">unknown</span>{{end}}</td>
+        <td>{{if .LastSuccessAt}}{{.LastSuccessAt}}{{else if eq .TotalRuns 0}}<span class="muted">no runs yet</span>{{else}}<span class="muted">no success recorded</span>{{end}}</td>
+        <td>{{if .LastErrorAt}}{{.LastErrorAt}}{{else if eq .TotalRuns 0}}<span class="muted">no runs yet</span>{{else}}<span class="muted">no failure recorded</span>{{end}}</td>
         <td>{{.TotalRuns}}</td>
         <td>{{humanDuration .OldestPendingSeconds}}</td>
         <td>{{range .Notes}}<div class="sub-note">{{.}}</div>{{end}}</td>
@@ -148,11 +152,14 @@
     </tbody>
   </table>
   <p class="state-note">
-    Source status and freshness are derived from run activity only. A source
-    adapter's discovery polling state lives in operator metrics, not the read
-    API: an idle source reads Freshness "Unknown" here, and that is not a
-    discovery failure. Unsupported capabilities are labeled, never shown as
-    zero.
+    Source status, freshness, and outcomes are derived from run activity
+    only. "Last success" is the most recent Done or AlreadyDone run and
+    "Last error" the most recent Failed run; runs parked for review or
+    waiting on a human are neither, and a source with no recorded outcome of
+    a kind says so instead of showing a zero. A source adapter's discovery
+    polling state lives in operator metrics, not the read API: an idle source
+    reads Freshness "Unknown" here, and that is not a discovery failure.
+    Unsupported capabilities are labeled, never shown as zero.
   </p>
   {{else}}
   <p class="state">No sources configured, and no runs reference a source.</p>

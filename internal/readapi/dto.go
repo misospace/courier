@@ -114,12 +114,24 @@ type CooldownHealth struct {
 // in process metrics, not cluster state, so the read model cannot surface it.
 // An Empty source therefore reads freshness unknown — never a discovery
 // failure, and never proof that discovery is healthy.
+//
+// LastSuccessAt and LastErrorAt carry the source's last recorded outcome from
+// run terminal state: LastSuccessAt is the latest FinishedAt among the
+// source's Done and AlreadyDone runs, and LastErrorAt is the latest
+// FinishedAt among its Failed runs. A run parked in a waiting terminal phase
+// (AwaitingReview, HandedOff, NeedsHuman, BlockedExternal) is neither a
+// success nor an error and stamps neither field. Nil means no such run was
+// projected (or none carried a recorded finish): a consumer must render the
+// absence explicitly and never read it as "never failed" or "never
+// succeeded".
 type SourceHealth struct {
 	Name                 string         `json:"name"`
 	Availability         Availability   `json:"availability"`
 	Freshness            Freshness      `json:"freshness"`
 	Notes                []string       `json:"notes,omitempty"`
 	ObservedAt           *metav1.Time   `json:"observedAt,omitempty"`
+	LastSuccessAt        *metav1.Time   `json:"lastSuccessAt,omitempty"`
+	LastErrorAt          *metav1.Time   `json:"lastErrorAt,omitempty"`
 	TotalRuns            int            `json:"totalRuns"`
 	RunsByPhase          map[string]int `json:"runsByPhase,omitempty"`
 	OldestPendingSeconds *int64         `json:"oldestPendingSeconds,omitempty"`

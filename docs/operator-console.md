@@ -146,9 +146,16 @@ The lane table shows configured concurrency, admitted runs, reserved runs, and
 the age of the oldest Pending run. Reserved includes admitted, so the page
 never adds the two. Cooldown and suspension appear as their own labels with
 the cooldown detail (capacity id, reason, exhaustion count, and next eligible
-time). The source table shows status, freshness, last run activity, run count,
-and the oldest Pending run, plus the notes the projection supplies, such as a
-forge-unavailable diagnostic or an unsafe workspace hold.
+time). The source table shows status, freshness, last run activity, the last
+recorded success (most recent `Done` or `AlreadyDone` run) and the last
+recorded error (most recent `Failed` run), run count, and the oldest Pending
+run, plus the notes the projection supplies, such as a forge-unavailable
+diagnostic or an unsafe workspace hold. A source with runs but no recorded
+outcome of a kind says so in words, and the healthy-empty source reads "no
+runs yet" — a wording no source with runs gets. Success and error come from
+run outcomes only: runs parked for review or waiting on a human are neither,
+and a source adapter's discovery polling state lives in operator metrics, not
+the read API.
 
 ## Run explorer
 

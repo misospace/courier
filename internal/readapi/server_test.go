@@ -601,6 +601,9 @@ func TestServerConfiguredIdleSourceProjectedEmpty(t *testing.T) {
 			if item.TotalRuns != 0 || item.ObservedAt != nil || item.Freshness != FreshnessUnknown {
 				t.Errorf("idle source %q = %+v, want zero runs, no observation, unknown freshness", item.Name, item)
 			}
+			if item.LastSuccessAt != nil || item.LastErrorAt != nil {
+				t.Errorf("idle source %q = success %v error %v, want no recorded outcome", item.Name, item.LastSuccessAt, item.LastErrorAt)
+			}
 		}
 	}
 

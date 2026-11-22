@@ -3070,9 +3070,20 @@ only the standard library, never talks to a cluster, and reaches the operator
 read API only over a fixed allowlist of GET paths. The run explorer reads the
 read API's paginated run projection (`/v1/runs`, issue #825) and renders it
 server-side, with no client-side JavaScript, so filters and pagination are GET
-query state and every view is a shareable URL. The overview and run-detail
-pages stay scaffold; the console still probes the read API's `/healthz` path
-for the overview's backend note when `--backend-url` is configured.
+query state and every view is a shareable URL. The overview page (#824)
+consumes the namespace summary, lane health, and source health projections
+(`/v1/overview`, `/v1/lanes`, `/v1/sources`) and renders run totals with
+phase drilldowns, a lane table with capacity, reservation, and cooldown
+state, and a source table that distinguishes the last recorded success
+(latest `Done`/`AlreadyDone` finish) from the last recorded failure (latest
+`Failed` finish). Degraded states never render as healthy, data the
+projection cannot supply reads Unknown, Unsupported, or an explicit
+"no … recorded", and a failed projection states itself as an outage instead
+of an empty namespace. The page reloads on a bounded meta-refresh interval —
+never through JavaScript or a Kubernetes watch — and stops polling when the
+backend is unconfigured. The run-detail page stays scaffold; the console
+still probes the read API's `/healthz` path for the page backend note when
+`--backend-url` is configured.
 
 The console decodes each projection into its own view types rather than
 importing `internal/readapi`, so the standard-library-only boundary holds and
@@ -3591,11 +3602,14 @@ source runner's gate). Reserved is therefore a superset of admitted, the
 two counts are not additive, and every lane response carries the rule in
 `derivedFrom` so a consumer never applies a different one. The same
 projection carries each lane's configured concurrency, cooldown and
-suspension state, pending age, and each source's freshness, phase mix, and
-observed failure, so a frontend can distinguish a saturated lane, a wedged
-reservation, an unsafe-workspace hold, a source whose forge or provider
-read failed, and a source with no recent activity without reading the API
-objects.
+suspension state, pending age, and each source's freshness, phase mix,
+observed failure diagnostic, and last recorded success (`Done`/`AlreadyDone`)
+and failure (`Failed`) timestamps, so a frontend can distinguish a saturated
+lane, a wedged reservation, an unsafe-workspace hold, a source whose forge or
+provider read failed, a source whose most recent run ended in failure, and a
+source with no recent activity without reading the API objects. Waiting
+terminal phases (review parks, NeedsHuman, BlockedExternal) are neither a
+success nor a failure and stamp neither timestamp.
 
 The source inventory is process configuration, not cluster state: there is no
 Source object to list. The wiring hands the listener the operator's own
