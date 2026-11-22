@@ -39,7 +39,9 @@ const (
 
 	// EnvAPITokenFile names the file holding the pod's projected
 	// ServiceAccount token for reading the credentials Secret. It shares the
-	// broker's variable name so one contract describes both readers.
+	// broker's variable name so one contract describes both readers, and is
+	// its single producer: topology.EnvAPITokenFile aliases this constant
+	// (topology imports executor), so the two readers cannot drift.
 	EnvAPITokenFile = "COURIER_API_TOKEN_FILE"
 
 	// EnvAPICertFile optionally overrides the Kubernetes API server CA

@@ -90,6 +90,23 @@ func TestInstallationAskpassBinding(t *testing.T) {
 	}{
 		{name: "exact work password", env: nil, args: passwordPrompt(remote), wantIdentity: "acme/widgets"},
 		{name: "username prompt", env: nil, args: []string{"Username for '" + remote + "':"}, wantIdentity: "acme/widgets", wantUsername: true},
+		{
+			// The path, not the label, must never decide the credential half.
+			name: "password prompt for a path containing username",
+			env: map[string]string{
+				"COURIER_REPO":     "acme/username-rotation",
+				"COURIER_REPO_URL": "https://github.com/acme/username-rotation.git",
+			},
+			args: passwordPrompt("https://github.com/acme/username-rotation.git"), wantIdentity: "acme/username-rotation",
+		},
+		{
+			name: "username prompt for a path containing Username",
+			env: map[string]string{
+				"COURIER_REPO":     "acme/username-rotation",
+				"COURIER_REPO_URL": "https://github.com/acme/username-rotation.git",
+			},
+			args: []string{"Username for 'https://github.com/acme/username-rotation.git':"}, wantIdentity: "acme/username-rotation", wantUsername: true,
+		},
 		{name: "case-insensitive host", env: nil, args: passwordPrompt("HTTPS://GitHub.COM/acme/widgets.git"), wantIdentity: "acme/widgets"},
 		{name: "no .git suffix", env: nil, args: passwordPrompt("https://github.com/acme/widgets"), wantIdentity: "acme/widgets"},
 		{name: "trailing slash", env: nil, args: passwordPrompt("https://github.com/acme/widgets.git/"), wantIdentity: "acme/widgets"},

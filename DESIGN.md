@@ -4315,15 +4315,22 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   it to the run's credentials Secret under the same document the secure broker
   reads, and provisions a run-scoped identity whose only grant is one named
   `get` on that Secret, bound to the coordinator pod's effective ServiceAccount
-  (the observer identity when the observer contract is on). The App-rendered
-  pod carries no static git credential at all: the `COURIER_GIT_*` pair is
+  (the observer identity when the observer contract is on). Before any token
+  exists the launcher proves the mint identity: the base and head repositories
+  must name one owner and the installation must sign for exactly that owner,
+  so a cross-owner fork run is refused permanently at launch — a condition a
+  requeue never clears. The App-rendered pod carries no static git credential
+  at all: the `COURIER_GIT_*` pair is
   suppressed from the shared credential enumeration even when
-  `GitCredentialSecret` is configured, so there is nothing to fall back to,
-  and every git prompt is answered by the executor binary's askpass helper
-  re-reading the document through the API with the pod's projected token —
-  which is why a rotation or an expiry takes effect on the next prompt of a
-  long run rather than at restart. The helper binds every served token to one
-  pinned repository: it serves only the two remote URLs the operator rendered
+  `GitCredentialSecret` is configured, so there is nothing to fall back to.
+  `GITHUB_TOKEN` keeps its fallback to the git Secret only in static mode:
+  the executor's forge-API reads are not the git transport this mode governs,
+  so an App-mode pod receives it solely from an explicitly configured
+  `GitHubCredentialSecret`. Every git prompt is answered by the executor
+  binary's askpass helper re-reading the document through the API with the
+  pod's projected token, so a rotation or an expiry takes effect on the next
+  prompt of a long run rather than at restart. The helper binds every served
+  token to one pinned repository: it serves only the two remote URLs the operator rendered
   (work remote → head or base repository, base remote → base repository),
   `credential.useHttpPath` is installed so git names the repository in every
   prompt, and any other URL is refused before any API call and prints nothing,

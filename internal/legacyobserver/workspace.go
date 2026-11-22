@@ -135,6 +135,9 @@ func Observe(ctx context.Context, o Options) (executor.WorkspaceSafetyEvidence, 
 	}
 	exists, err := o.remoteBranchExists(ctx, o.Scratch, o.RemoteURL, o.Branch)
 	if err != nil {
+		if errors.Is(err, errObserverCredentials) {
+			return ev, err
+		}
 		return ev, nil
 	}
 	if !exists {
@@ -149,6 +152,9 @@ func Observe(ctx context.Context, o Options) (executor.WorkspaceSafetyEvidence, 
 			baseSource = o.RemoteURL
 		}
 		if err := o.fetch(ctx, o.Scratch, baseSource, "refs/heads/"+o.BaseBranch, "refs/observer/base"); err != nil {
+			if errors.Is(err, errObserverCredentials) {
+				return ev, err
+			}
 			return ev, nil
 		}
 		base, err := refOID(ctx, o.Scratch, "refs/observer/base")
@@ -163,6 +169,9 @@ func Observe(ctx context.Context, o Options) (executor.WorkspaceSafetyEvidence, 
 		return ev, nil
 	}
 	if err := o.fetch(ctx, o.Scratch, o.RemoteURL, "refs/heads/"+o.Branch, "refs/observer/work"); err != nil {
+		if errors.Is(err, errObserverCredentials) {
+			return ev, err
+		}
 		return ev, nil
 	}
 	tip, err := refOID(ctx, o.Scratch, "refs/observer/work")

@@ -64,6 +64,81 @@ func TestSeedProviderRefusalFailsFetchWithoutStaticFallback(t *testing.T) {
 	}
 }
 
+func TestObserveProviderRefusalIsNotAMissingBranchObservation(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	remote, baseline, _ := remoteWithBranches(t, root, "mono", true, false)
+	workspace := filepath.Join(root, "workspace")
+	gitTest(t, root, "clone", "--quiet", "--branch", "main", remote, workspace)
+	gitTest(t, workspace, "config", "user.name", "test")
+	gitTest(t, workspace, "config", "user.email", "test@example.invalid")
+	gitTest(t, workspace, "checkout", "-q", "-b", "work")
+	refuse := errors.New("provider refuses this remote")
+	provider := func(_ context.Context, _ string) (string, string, error) {
+		return "", "", refuse
+	}
+	_, err := Observe(ctx, Options{
+		Workspace: workspace, Scratch: filepath.Join(root, "scratch"), RemoteURL: remote,
+		BaseRemoteURL: remote, BaseBranch: "main", Branch: "work", Baseline: baseline, Credentials: provider,
+	})
+	if !errors.Is(err, errObserverCredentials) {
+		t.Fatalf("Observe error = %v, want a credential refusal", err)
+	}
+}
+
+func TestObserveProviderRefusalPropagatesFromBaseFetch(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	remote, baseline, _ := remoteWithBranches(t, root, "mono", true, false)
+	workspace := filepath.Join(root, "workspace")
+	gitTest(t, root, "clone", "--quiet", "--branch", "main", remote, workspace)
+	gitTest(t, workspace, "config", "user.name", "test")
+	gitTest(t, workspace, "config", "user.email", "test@example.invalid")
+	gitTest(t, workspace, "checkout", "-q", "-b", "work")
+	refuse := errors.New("provider refuses after lookup")
+	calls := 0
+	provider := func(_ context.Context, _ string) (string, string, error) {
+		calls++
+		if calls > 1 {
+			return "", "", refuse
+		}
+		return "provider-user", "provider-token", nil
+	}
+	_, err := Observe(ctx, Options{
+		Workspace: workspace, Scratch: filepath.Join(root, "scratch"), RemoteURL: remote,
+		BaseRemoteURL: remote, BaseBranch: "main", Branch: "work", Baseline: baseline, Credentials: provider,
+	})
+	if !errors.Is(err, errObserverCredentials) {
+		t.Fatalf("Observe error = %v, want a credential refusal from the base fetch", err)
+	}
+}
+
+func TestObserveProviderRefusalPropagatesFromWorkFetch(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	remote, _, _ := remoteWithBranches(t, root, "mono", true, true)
+	workspace := filepath.Join(root, "workspace")
+	gitTest(t, root, "clone", "--quiet", "--branch", "work", remote, workspace)
+	gitTest(t, workspace, "config", "user.name", "test")
+	gitTest(t, workspace, "config", "user.email", "test@example.invalid")
+	refuse := errors.New("provider refuses after lookup")
+	calls := 0
+	provider := func(_ context.Context, _ string) (string, string, error) {
+		calls++
+		if calls > 1 {
+			return "", "", refuse
+		}
+		return "provider-user", "provider-token", nil
+	}
+	_, err := Observe(ctx, Options{
+		Workspace: workspace, Scratch: filepath.Join(root, "scratch"), RemoteURL: remote,
+		BaseRemoteURL: remote, BaseBranch: "main", Branch: "work", Baseline: "0000000000000000000000000000000000000000", Credentials: provider,
+	})
+	if !errors.Is(err, errObserverCredentials) {
+		t.Fatalf("Observe error = %v, want a credential refusal from the work fetch", err)
+	}
+}
+
 func TestObserveProviderResolvesEachRemoteURL(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

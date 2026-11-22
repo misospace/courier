@@ -12,6 +12,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"strings"
+
+	"github.com/misospace/courier/internal/executor"
 )
 
 const (
@@ -339,8 +341,11 @@ const (
 	EnvGitUsername   = "COURIER_GIT_USERNAME"
 	EnvGitToken      = "COURIER_GIT_TOKEN"
 
-	// EnvAPITokenFile points the broker at its projected API token.
-	EnvAPITokenFile = "COURIER_API_TOKEN_FILE"
+	// EnvAPITokenFile points the broker at its projected API token. The
+	// name has a single producer in internal/executor — which topology
+	// imports, not the reverse — so the broker and the App-mode git
+	// credential helper cannot drift apart.
+	EnvAPITokenFile = executor.EnvAPITokenFile
 
 	// Dependency cache pins (worker only). The cache is reached as an IP
 	// literal; the worker has no DNS.

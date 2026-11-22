@@ -127,11 +127,15 @@ func (r installationRemotes) identityFor(rawURL string) (string, bool) {
 // reports whether the prompt asks for a username.
 func parseAskpassPrompt(args []string) (remoteURL string, wantsUsername bool, ok bool) {
 	joined := strings.Join(args, " ")
-	wantsUsername = strings.Contains(strings.ToLower(joined), "username")
 	open := strings.IndexByte(joined, '\'')
 	if open < 0 {
-		return "", wantsUsername, false
+		return "", false, false
 	}
+	// Git prompts are "Username for '<url>':" and "Password for '<url>':";
+	// only the label before the quoted URL names the requested half.
+	// Searching the whole prompt would answer a password prompt with the
+	// username whenever the repository path itself contains "username".
+	wantsUsername = strings.Contains(strings.ToLower(joined[:open]), "username")
 	rest := joined[open+1:]
 	end := strings.IndexByte(rest, '\'')
 	if end <= 0 {
