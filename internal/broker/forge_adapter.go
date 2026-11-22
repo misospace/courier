@@ -52,12 +52,105 @@ func NewForgeAdapter(p Policy, provider forge.Provider, repositories forge.Repos
 func (a *ForgeAdapter) checkedRepository(ctx context.Context, pinned forge.Repository) (forge.Repository, error) {
 	live, err := a.policy.ResolveRepository(ctx, pinned.Canonical)
 	if err != nil {
-		return forge.Repository{}, errors.New("forge adapter: canonical repository revalidation failed")
+		return forge.Repository{}, &readFailure{op: "canonical repository revalidation", cause: err}
 	}
 	if live.ID == "" || live.Canonical != pinned.Canonical || live.ID != pinned.ID || live.DefaultRef == "" {
 		return forge.Repository{}, errors.New("forge adapter: canonical repository identity changed")
 	}
 	return live, nil
+}
+
+func (a *ForgeAdapter) readRepository(ctx context.Context, repo string, capability forge.Capability) (forge.Repository, error) {
+	pinned, ok := a.repository(repo)
+	if !ok {
+		return forge.Repository{}, errors.New("forge adapter: repository is outside pinned policy")
+	}
+	if !a.provider.Capabilities().Available(capability).Available {
+		return forge.Repository{}, forge.ErrUnsupported
+	}
+	return a.checkedRepository(ctx, pinned)
+}
+
+// readFailure collapses a provider read or repository revalidation error to a
+// fixed, credential-free message while preserving its transient-availability
+// classification: a transient failure means the world was never observed, and
+// the route layer must answer it retryably, never as a verified denial.
+type readFailure struct {
+	op    string
+	cause error
+}
+
+func (e *readFailure) Error() string { return "forge adapter: " + e.op + " read failed" }
+func (e *readFailure) Unwrap() error { return e.cause }
+
+func (e *readFailure) TransientAvailability() bool { return forge.IsTransientAvailability(e.cause) }
+
+// WorkItem reads one work item from a repository pinned to this run.
+func (a *ForgeAdapter) WorkItem(ctx context.Context, repo, id string) (forge.WorkItem, error) {
+	canonical, err := a.readRepository(ctx, repo, forge.CapabilityReadWorkItem)
+	if err != nil {
+		return forge.WorkItem{}, err
+	}
+	item, err := a.provider.ReadWorkItem(ctx, forge.WorkItemRef{Repo: canonical.Canonical, ID: id})
+	if err != nil {
+		return forge.WorkItem{}, &readFailure{op: "work item", cause: err}
+	}
+	return item, nil
+}
+
+// Reviews lists reviews on one pull request in a repository pinned to this run.
+func (a *ForgeAdapter) Reviews(ctx context.Context, repo string, number int) ([]forge.Review, error) {
+	canonical, err := a.readRepository(ctx, repo, forge.CapabilityListReviews)
+	if err != nil {
+		return nil, err
+	}
+	reviews, err := a.provider.ListReviews(ctx, forge.PullRequestRef{Repo: canonical.Canonical, Number: number})
+	if err != nil {
+		return nil, &readFailure{op: "reviews", cause: err}
+	}
+	return reviews, nil
+}
+
+// Comments lists comments on one pull request in a repository pinned to this run.
+func (a *ForgeAdapter) Comments(ctx context.Context, repo string, number int) ([]forge.Comment, error) {
+	canonical, err := a.readRepository(ctx, repo, forge.CapabilityListComments)
+	if err != nil {
+		return nil, err
+	}
+	comments, err := a.provider.ListComments(ctx, forge.PullRequestRef{Repo: canonical.Canonical, Number: number})
+	if err != nil {
+		return nil, &readFailure{op: "comments", cause: err}
+	}
+	return comments, nil
+}
+
+// Checks lists checks attached to the requested head SHA of one pull request
+// in a repository pinned to this run. Any head SHA in the pinned repository
+// may be asked about; the run's own publication heads arrive through the
+// typed publication routes, not through this read.
+func (a *ForgeAdapter) Checks(ctx context.Context, repo string, number int, headSHA string) ([]forge.Check, error) {
+	canonical, err := a.readRepository(ctx, repo, forge.CapabilityReadChecks)
+	if err != nil {
+		return nil, err
+	}
+	checks, err := a.provider.ReadChecks(ctx, forge.PullRequestRef{Repo: canonical.Canonical, Number: number}, headSHA)
+	if err != nil {
+		return nil, &readFailure{op: "checks", cause: err}
+	}
+	return checks, nil
+}
+
+// ReadPullRequest reads one pull request from a repository pinned to this run.
+func (a *ForgeAdapter) ReadPullRequest(ctx context.Context, repo string, number int) (forge.PullRequest, error) {
+	canonical, err := a.readRepository(ctx, repo, forge.CapabilityReadPullRequest)
+	if err != nil {
+		return forge.PullRequest{}, err
+	}
+	pr, err := a.provider.ReadPullRequest(ctx, forge.PullRequestRef{Repo: canonical.Canonical, Number: number})
+	if err != nil {
+		return forge.PullRequest{}, &readFailure{op: "pull request", cause: err}
+	}
+	return pr, nil
 }
 
 func (a *ForgeAdapter) Repository(ctx context.Context, repo, ref string) (RepositoryState, error) {

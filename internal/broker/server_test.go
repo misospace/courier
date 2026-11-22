@@ -106,7 +106,7 @@ func serverForTest(t *testing.T) (*Server, *testAuthenticator) {
 		t.Fatal(err)
 	}
 	auth := &testAuthenticator{}
-	s, err := NewServer(ServerConfig{Policy: engine, Authenticator: auth, Importer: &serverImporter{}, ScratchDir: t.TempDir(), TLSCertFile: cert, TLSKeyFile: key})
+	s, err := NewServer(ServerConfig{Policy: engine, Authenticator: auth, Importer: &serverImporter{}, ForgeReader: forgeCallReader{}, ScratchDir: t.TempDir(), TLSCertFile: cert, TLSKeyFile: key})
 	if err != nil {
 		t.Fatal(err)
 	}

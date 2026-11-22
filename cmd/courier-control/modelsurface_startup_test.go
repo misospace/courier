@@ -185,6 +185,27 @@ func TestSurfacePersistFailureIssuesZeroModelRequests(t *testing.T) {
 // requires: the durable surface record lands before the capability gate
 // issues its first model request, so even a gate that will not pass spends
 // its probe budget against an already-persisted identity (#730 review).
+func TestSurfaceIncludesBrokerForgeTool(t *testing.T) {
+	seq := &startupSequencer{}
+	transport := &sequencedStatusTransport{seq: seq}
+	gateway := &sequencedGateway{seq: seq}
+	deps := startupTestDeps(t, seq, transport, gateway)
+	work, _, err := prepareModelWork(deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if work == nil || work.surface == nil {
+		t.Fatalf("work = %+v, want a prepared surface", work)
+	}
+	surface, err := harness.AssembleModelSurface(deps.bindings, deps.identity.brokerForgeClient(), work.skills, harness.ModelSurfaceInputs{Mode: deps.invocation.Mode})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(surface.Encoding, []byte(`"name":"forge"`)) {
+		t.Fatalf("surface encoding does not include forge tool: %s", surface.Encoding)
+	}
+}
+
 func TestSurfacePersistPrecedesModelRequests(t *testing.T) {
 	shrinkProbeRetryDelay(t)
 	seq := &startupSequencer{}

@@ -19,7 +19,7 @@ import (
 
 // ForgeOps is the trusted seam for model-influenced forge reads. It routes
 // through the run's broker, which enforces the resolved policy; it is never
-// reachable from the worker or a brief. #125 wires the typed broker calls.
+// reachable from the worker or a brief. The broker exposes only typed read operations.
 type ForgeOps interface {
 	// Call executes one named forge operation. The operation name and
 	// arguments are model data; the implementation validates them against
@@ -1194,7 +1194,7 @@ func checkTool() ToolDef {
 func forgeTool() ToolDef {
 	return ToolDef{
 		Name:        toolForge,
-		Description: "Perform a forge read (issue, pull request, reviews, comments, checks) through the run's broker under the resolved policy.",
+		Description: "Perform one forge read through the run's broker under the resolved policy. The operation is one of read-work-item, read-pull-request, list-reviews, list-comments, or read-checks. Arguments are a JSON object whose repo is the run's pinned base or work repository; the work repository is the owner/repo embedded in this run's run branch named in the goal, and the base repository is the repository the run's assignment targets. read-work-item also takes id (the work item's decimal ID), read-pull-request, list-reviews, and list-comments take number (the pull request number), and read-checks takes number and headSHA (a 40- or 64-hex commit hash). Any other operation is refused, and no forge write is ever available through this tool.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

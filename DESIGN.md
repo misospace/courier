@@ -91,8 +91,10 @@ all workers or isolation controls are implemented or ready.
   status are #125/#126):** each run has trusted
   control, a dedicated trusted broker behind a run-specific Service, and an
   isolated untrusted worker. Control owns model calls, orchestration, integration,
-  and signed worker tasks; the broker holds credentials and enforces semantic
-  forge, git-repository, ref, and trusted-status policy. The worker has no
+  and signed worker tasks; model-facing forge reads travel over an authenticated,
+  broker-mediated route with a closed read-only vocabulary and repository pinning.
+  The broker holds credentials and enforces semantic forge, git-repository, ref,
+  and trusted-status policy. The worker has no
   credentials or workload identity and can reach only an administrator-populated
   Go module cache, without worker DNS, not the broker or forge. Secure mode requires
   enforced network policy, live deny probes, and fail-closed preflight before
@@ -1582,7 +1584,7 @@ Role/RoleBinding rendered by the chart — deliberately not added to the
 generated operator ClusterRole, whose ClusterRoleBinding would widen the
 evidence verbs cluster-wide and attach them to installs that keep evidence
 disabled. The residual: the generated ClusterRole already
-carries `create/delete/get/list` on `secrets` cluster-wide for the secure-mode
+carries `create/delete/get/list/update` on `secrets` cluster-wide for the secure-mode
 launcher, so against a shipped install the namespaced evidence grant's marginal
 verb is `patch`, which the intake uses to supersede a slot it already wrote
 (`list` is required by the condition derivation and the AwaitingReview/Done
@@ -2840,10 +2842,11 @@ cluster would refuse. The SelfSubjectAccessReview the operator asks about
 itself is a canary rather than a proof on a stock cluster, where the API
 server's default `system:basic-user` binding already allows that create to
 every authenticated subject. The proof covers what the secure topology's
-creation needs plus the reads the secure launch path makes on its own behalf:
-the run-namespace pod list it reads to decide whether a replacement is due,
-the run's lane profile, the run's signing secret, the credential source
-Secrets in the operator's own namespace — reviews asked in the namespace the
+creation and App-mode in-place rotation (#870) need plus the reads the secure
+launch path makes on its own behalf: the run-namespace pod list it reads to
+decide whether a replacement is due, the run's lane profile, the run's signing
+secret, the credential source Secrets in the operator's own namespace, and the
+run-namespace credentials Secret update App-mode rotation rewrites — reviews asked in the namespace the
 reads target, since a grant scoped to one namespace never authorizes a request
 in another — and the services the live probes read for their targets (the API
 server in `default`, cluster DNS in `kube-system`, and the run's broker
@@ -3070,10 +3073,21 @@ only the standard library, never talks to a cluster, and reaches the operator
 read API only over a fixed allowlist of GET paths. The run explorer reads the
 read API's paginated run projection (`/v1/runs`, issue #825) and renders it
 server-side, with no client-side JavaScript, so filters and pagination are GET
-query state and every view is a shareable URL. The overview and run-detail
-pages stay scaffold; the console still probes the read API's `/healthz` path
-for the overview's backend note when `--backend-url` is configured. It
-additionally carries a bounded contribution form, a mutating, credentialed
+query state and every view is a shareable URL. The overview page (#824)
+consumes the namespace summary, lane health, and source health projections
+(`/v1/overview`, `/v1/lanes`, `/v1/sources`) and renders run totals with
+phase drilldowns, a lane table with capacity, reservation, and cooldown
+state, and a source table that distinguishes the last recorded success
+(latest `Done`/`AlreadyDone` finish) from the last recorded failure (latest
+`Failed` finish). Degraded states never render as healthy, data the
+projection cannot supply reads Unknown, Unsupported, or an explicit
+"no … recorded", and a failed projection states itself as an outage instead
+of an empty namespace. The page reloads on a bounded meta-refresh interval —
+never through JavaScript or a Kubernetes watch — and stops polling when the
+backend is unconfigured. The run-detail page stays scaffold; the console
+still probes the read API's `/healthz` path for the page backend note when
+`--backend-url` is configured. The console additionally carries a bounded
+contribution form, a mutating, credentialed
 outbound-HTTP surface that submits server-side through the operator's
 contribution admission API under a file-mounted bearer token. The form is
 token-mode only and uses session-bound CSRF; a per-browser signed intent
@@ -3619,11 +3633,14 @@ source runner's gate). Reserved is therefore a superset of admitted, the
 two counts are not additive, and every lane response carries the rule in
 `derivedFrom` so a consumer never applies a different one. The same
 projection carries each lane's configured concurrency, cooldown and
-suspension state, pending age, and each source's freshness, phase mix, and
-observed failure, so a frontend can distinguish a saturated lane, a wedged
-reservation, an unsafe-workspace hold, a source whose forge or provider
-read failed, and a source with no recent activity without reading the API
-objects.
+suspension state, pending age, and each source's freshness, phase mix,
+observed failure diagnostic, and last recorded success (`Done`/`AlreadyDone`)
+and failure (`Failed`) timestamps, so a frontend can distinguish a saturated
+lane, a wedged reservation, an unsafe-workspace hold, a source whose forge or
+provider read failed, a source whose most recent run ended in failure, and a
+source with no recent activity without reading the API objects. Waiting
+terminal phases (review parks, NeedsHuman, BlockedExternal) are neither a
+success nor a failure and stamp neither timestamp.
 
 The source inventory is process configuration, not cluster state: there is no
 Source object to list. The wiring hands the listener the operator's own
@@ -4317,10 +4334,7 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   registration and to the operator's own identity — instead of duplicating it
   into two, and the chart's label-source guard accepts the seam as a
   credential argument, mirroring the Go rule.
-  GitHub App authentication can replace the static identity for operator observation
-  and admission reads. The operator keeps the private key and refreshes read-only
-  tokens for individual repositories. See [HARNESS.md](./HARNESS.md) for setup and
-  limits. Label discovery and settlement still use the static credential chain.
+   GitHub App authentication can replace the static identity for operator observation and admission reads, and can supply secure brokers' forge and git credentials. The operator retains the private key, refreshes its own read-only tokens, and mints and rotates short-lived tokens into that run's credentials Secret — one token per pinned repository, each carrying only the permissions the run needs against that repository, because GitHub applies an installation token's permissions to every repository the token names: the base repository's token carries the publication writes (issues, pull requests) and the reads that gate them but no contents write, and the work repository's token carries contents write for fetch and push plus administration read so the broker can establish the pinned work ref's effective protection before serving, but no publication write; a same-repository run is the one case whose single token legitimately carries both profiles. An existing credentials Secret is only trusted or updated once it is proven controlled by this exact run UID, its document owner and endpoint match the run's pinned identity, and a create that loses a race re-reads and re-validates the winner; a foreign or stale-owner object fails closed rather than being read or overwritten. The broker reads the Secret through the API server and never sees the private key or a pod-environment credential, and it asks for a token by full owner/name identity, so a fetch, push, or API request against one repository is never accompanied by a token minted for another. App mode never falls back to a static token, and a run whose pinned repositories have different owners cannot launch. The broker's git credential provider serves the token only for the run's pinned base and work repositories, and the broker refuses a token document whose shape it does not fully recognize. Rotation runs at launch and from the running-phase observer: a run that no observer supervises simply lets its tokens expire, and its broker then refuses every App-mode operation — fail-closed, never a silent fallback — until relaunch or the next supervised pass re-mints. See [HARNESS.md](./HARNESS.md) for setup and limits. Label discovery and settlement still use the static credential chain.
 - The gateway response is untrusted, unbounded input, and trusted control
   bounds both its shape and what it will hold: one SSE line is capped at 1 MiB,
   and per completion the buffered content deltas (8 MiB), the buffered
@@ -4362,7 +4376,7 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   ClusterRoleBinding would widen them cluster-wide and attach them to installs
   that keep evidence disabled. The authority expansion is real but bounded.
   The whole residual: the generated
-  ClusterRole already grants `create/delete/get/list` on `secrets` cluster-wide
+  ClusterRole already grants `create/delete/get/list/update` on `secrets` cluster-wide
   for the secure-mode launcher, and the chart's namespaced `credential-reader`
   Role grants the operator's service account `get` on every Secret in the run
   namespace (no `resourceNames`), so the evidence Role's marginal verb against a

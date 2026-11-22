@@ -353,17 +353,20 @@ type contributeData struct {
 	Active        string
 	Authenticated bool
 	CSRF          string
-	State         string
-	StateClass    string
-	Message       string
-	Values        contributeSubmission
-	Key           string
-	HasIntent     bool
-	SettledIntent bool
-	Run           string
-	Namespace     string
-	WorkItemID    string
-	Resumed       bool
+	// RefreshSeconds stays zero: the layout's meta-refresh only applies to
+	// the overview page, and a contribution form must never reload itself.
+	RefreshSeconds int
+	State          string
+	StateClass     string
+	Message        string
+	Values         contributeSubmission
+	Key            string
+	HasIntent      bool
+	SettledIntent  bool
+	Run            string
+	Namespace      string
+	WorkItemID     string
+	Resumed        bool
 }
 
 func (s *Server) contributePage(r *http.Request, sessionID string) contributeData {

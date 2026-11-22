@@ -532,7 +532,7 @@ func TestPreflightOperatorReadGrantsNamespaceScopedEnvtest(t *testing.T) {
 	clusterRole := &rbacv1.ClusterRole{
 		ObjectMeta: metav1.ObjectMeta{Name: run.Name + "-operator-provisioning"},
 		Rules: []rbacv1.PolicyRule{
-			{APIGroups: []string{""}, Resources: []string{"secrets", "serviceaccounts", "pods", "services"}, Verbs: []string{"create", "delete"}},
+			{APIGroups: []string{""}, Resources: []string{"secrets", "serviceaccounts", "pods", "services"}, Verbs: []string{"create", "delete", "update"}},
 			{APIGroups: []string{""}, Resources: []string{"configmaps"}, Verbs: []string{"delete"}},
 			{APIGroups: []string{"networking.k8s.io"}, Resources: []string{"networkpolicies"}, Verbs: []string{"create", "delete", "update"}},
 			{APIGroups: []string{"rbac.authorization.k8s.io"}, Resources: []string{"roles", "rolebindings", "clusterrolebindings"}, Verbs: []string{"create", "delete"}},

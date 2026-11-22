@@ -1550,6 +1550,20 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 	if coordinator := coordinatorPodOf(pods.Items, run); coordinator == nil || coordinatorPodUnrecoverable(coordinator) {
 		return r.observeMissingCoordinator(ctx, run)
 	}
+	if r.Secure != nil && r.Secure.Config.InstallationTokenMinter != nil {
+		// App-mode rotation runs last, after every supervision scan above:
+		// a mint or Secret-write failure must never silence the operator's
+		// observation of a terminating or wedged run. Its error requeues
+		// through backoff and the broker's own expiry margin fails the
+		// broker's operations closed in the meantime.
+		if err := r.Secure.EnsureInstallationToken(ctx, run); err != nil {
+			return ctrl.Result{}, err
+		}
+		// The healthy settle schedules the next rotation pass at the
+		// refresh window; every other return already requeues through its
+		// own path and re-ensures on the way back through here.
+		return ctrl.Result{RequeueAfter: r.Secure.InstallationTokenRequeueDelay(ctx, run)}, nil
+	}
 	return ctrl.Result{}, nil
 }
 

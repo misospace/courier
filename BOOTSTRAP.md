@@ -190,7 +190,7 @@ It is deliberately a namespaced Role rather than part of the generated operator
 ClusterRole, whose ClusterRoleBinding would widen the evidence verbs
 cluster-wide and tie them to an install that has evidence disabled. The
 residual is that the generated ClusterRole already grants `create`, `delete`,
-`get`, and `list` on `secrets` cluster-wide for the secure-mode launcher, so
+`get`, `list`, and `update` on `secrets` cluster-wide for the secure-mode launcher, so
 against a shipped install the evidence Role's marginal verb is `patch`, which
 the intake needs to supersede a slot it already wrote. See DESIGN.md
 § Security and boundaries for the same boundary and its residual. The chart

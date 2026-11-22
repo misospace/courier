@@ -34,8 +34,10 @@ remains the default execution path and is explicitly insecure; the resumable
 native harness (trusted control/broker/worker topology in `internal/harness/`
 and `internal/topology/`, served by `cmd/courier-control`,
 `cmd/courier-worker`, and `cmd/courier-broker`) has landed and is available as
-an opt-in deployment-level secure mode (`--secure-mode`), with the native path's
-forge reads and PR creation still unwired (#127). Liveness recovery —
+an opt-in deployment-level secure mode (`--secure-mode`); model-facing forge
+reads travel over an authenticated, broker-mediated route with a closed
+read-only vocabulary, and PR creation goes through the broker's typed
+publication route (#872, #127). Liveness recovery —
 heartbeat liveness window, crashloop ceiling, and terminal reaping
 (`internal/controller/liveness.go`, `internal/controller/reap.go`) — is
 implemented. See [BOOTSTRAP.md](./BOOTSTRAP.md) for the legacy executor

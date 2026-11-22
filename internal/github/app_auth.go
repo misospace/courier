@@ -32,6 +32,120 @@ type InstallationAuth struct {
 	Now              func() time.Time
 }
 
+// InstallationTokenMinter exchanges the operator-held GitHub App private key for short-lived repository-scoped installation tokens. It stays inside the trusted operator process; brokers receive only minted tokens, never the key or any signing capability.
+type InstallationTokenMinter struct{ credential *installationCredential }
+
+// NewInstallationTokenMinter validates auth exactly like NewInstallationClient and returns a minter over the same installation identity.
+func NewInstallationTokenMinter(auth InstallationAuth) (*InstallationTokenMinter, error) {
+	if auth.AppID <= 0 || auth.InstallationID <= 0 || auth.PrivateKey == nil || strings.TrimSpace(auth.Owner) == "" {
+		return nil, errors.New("GitHub App authentication requires positive IDs, an owner, and a private key")
+	}
+	base, err := url.Parse(strings.TrimSpace(auth.Endpoint))
+	if err != nil || base.Scheme != "https" || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" || base.Opaque != "" {
+		return nil, errors.New("GitHub App endpoint must be an absolute HTTPS URL without userinfo, query, or fragment")
+	}
+	httpClient := auth.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: defaultRequestTimeout}
+	}
+	if auth.Now == nil {
+		auth.Now = time.Now
+	}
+	return &InstallationTokenMinter{credential: &installationCredential{
+		appID: auth.AppID, installationID: auth.InstallationID, owner: strings.TrimSpace(auth.Owner), privateKey: auth.PrivateKey,
+		endpoint: base, client: httpClient, now: auth.Now,
+	}}, nil
+}
+
+// Identity reports the installation owner and API endpoint this minter signs
+// for. The launcher compares them against a run's pinned owner and
+// registration endpoint before minting, so a token is never minted for one
+// identity and presented to another.
+func (m *InstallationTokenMinter) Identity() (owner, endpoint string) {
+	return m.credential.owner, m.credential.endpoint.String()
+}
+
+// Mint exchanges an app assertion for a token restricted to the requested repositories and permissions.
+func (m *InstallationTokenMinter) Mint(ctx context.Context, repositories []string, permissions map[string]string) (string, time.Time, error) {
+	c := m.credential
+	if len(repositories) == 0 {
+		return "", time.Time{}, errors.New("GitHub App token mint requires repositories")
+	}
+	// Callers name repositories as owner/name; the create-installation-access-token
+	// contract scopes a mint by bare repository name, so the exchange request
+	// carries the validated names without their owner.
+	names := make([]string, 0, len(repositories))
+	for _, repository := range repositories {
+		parts := strings.Split(repository, "/")
+		if len(parts) != 2 || parts[0] == "" || !strings.EqualFold(parts[0], c.owner) || parts[1] == "" {
+			return "", time.Time{}, errors.New("GitHub App token mint requires repositories owned by the configured account")
+		}
+		names = append(names, parts[1])
+	}
+	if len(permissions) == 0 {
+		return "", time.Time{}, errors.New("GitHub App token mint requires permissions")
+	}
+	for _, level := range permissions {
+		if level != "read" && level != "write" {
+			return "", time.Time{}, errors.New("GitHub App token mint requires read or write permissions")
+		}
+	}
+	now := c.now()
+	if err := c.verifyInstallation(ctx, now); err != nil {
+		return "", time.Time{}, err
+	}
+	jwt, err := c.appJWT(now)
+	if err != nil {
+		return "", time.Time{}, errors.New("GitHub App authentication could not create an app assertion")
+	}
+	endpoint := *c.endpoint
+	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + "/app/installations/" + strconv.FormatInt(c.installationID, 10) + "/access_tokens"
+	endpoint.RawPath = ""
+	body, _ := json.Marshal(struct {
+		Repositories []string          `json:"repositories"`
+		Permissions  map[string]string `json:"permissions"`
+	}{names, permissions})
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(body))
+	if err != nil {
+		return "", time.Time{}, errors.New("GitHub App token mint request could not be created")
+	}
+	request.Header.Set("Accept", "application/vnd.github+json")
+	request.Header.Set("Authorization", "Bearer "+jwt)
+	request.Header.Set("Content-Type", "application/json")
+	resp, err := c.doAppRequest(request)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	defer resp.Body.Close()
+	var result struct {
+		Token       string            `json:"token"`
+		ExpiresAt   time.Time         `json:"expires_at"`
+		Permissions map[string]string `json:"permissions"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&result); err != nil || strings.TrimSpace(result.Token) == "" || !result.ExpiresAt.After(now) || result.Permissions == nil {
+		return "", time.Time{}, errors.New("GitHub App installation token mint returned an invalid response")
+	}
+	for permission, level := range result.Permissions {
+		requested, known := permissions[permission]
+		if !known {
+			if level != "read" {
+				return "", time.Time{}, errors.New("GitHub App installation token mint returned excessive permissions")
+			}
+			fmt.Fprintf(os.Stderr, "GitHub App installation token mint returned unrequested read permission %q\n", permission)
+			continue
+		}
+		if requested != level {
+			return "", time.Time{}, errors.New("GitHub App installation token mint returned insufficient permissions")
+		}
+	}
+	for permission, level := range permissions {
+		if result.Permissions[permission] != level {
+			return "", time.Time{}, errors.New("GitHub App installation token mint returned insufficient permissions")
+		}
+	}
+	return result.Token, result.ExpiresAt, nil
+}
+
 type installationCredential struct {
 	mu             sync.Mutex
 	appID          int64

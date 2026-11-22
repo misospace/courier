@@ -21,12 +21,15 @@ type adapterForge struct {
 
 func (f *adapterForge) Config() forge.ProviderConfig { return f.cfg }
 func (f *adapterForge) Capabilities() forge.Capabilities {
-	return forge.NewCapabilities(forge.CapabilityReadPullRequest, forge.CapabilityCreatePullRequest, forge.CapabilityUpdatePullRequest)
+	return forge.NewCapabilities(forge.CapabilityReadWorkItem, forge.CapabilityReadPullRequest, forge.CapabilityListReviews, forge.CapabilityListComments, forge.CapabilityReadChecks, forge.CapabilityCreatePullRequest, forge.CapabilityUpdatePullRequest)
 }
 func (f *adapterForge) ReadWorkItem(context.Context, forge.WorkItemRef) (forge.WorkItem, error) {
 	return forge.WorkItem{}, forge.ErrUnsupported
 }
 func (f *adapterForge) ReadPullRequest(_ context.Context, r forge.PullRequestRef) (forge.PullRequest, error) {
+	if f.pr.Number == 0 {
+		return forge.PullRequest{}, forge.ErrUnsupported
+	}
 	if r.Number != f.pr.Number {
 		return forge.PullRequest{}, errMissing
 	}
@@ -66,9 +69,15 @@ func (f *adapterForge) ListPullRequestsByHead(_ context.Context, base forge.Pull
 	return nil, nil
 }
 
-type adapterRepos struct{ repos map[string]forge.Repository }
+type adapterRepos struct {
+	repos map[string]forge.Repository
+	err   error
+}
 
 func (r adapterRepos) ResolveRepository(_ context.Context, name string) (forge.Repository, error) {
+	if r.err != nil {
+		return forge.Repository{}, r.err
+	}
 	got, ok := r.repos[name]
 	if !ok {
 		return forge.Repository{}, errMissing
@@ -91,6 +100,59 @@ func (adapterPusher) IsAncestor(context.Context, string, string, string) (bool, 
 	return true, nil
 }
 func (adapterPusher) Push(context.Context, string, string, string) error { return nil }
+
+func TestForgeAdapterPinnedForgeReads(t *testing.T) {
+	base := forge.Repository{ID: "1", Canonical: "org/repo", DefaultRef: "main"}
+	provider := &adapterForge{cfg: forge.ProviderConfig{Name: "test"}}
+	policy := Policy{RunUID: "uid", Mode: ModeResolveIssue, Provider: "test", BaseRepo: base.Canonical, BaseRef: "main", WorkRepo: base.Canonical, WorkRef: "branch", SourceIssue: SourceIssue{Owner: "org", Name: "repo", Number: 1}}
+	adapter, err := NewForgeAdapter(policy, provider, adapterRepos{repos: map[string]forge.Repository{base.Canonical: base}}, base, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adapter.WorkItem(context.Background(), "other/repo", "1"); err == nil {
+		t.Fatal("cross-repository work-item read succeeded")
+	}
+	if _, err := adapter.WorkItem(context.Background(), base.Canonical, "1"); err == nil {
+		t.Fatal("provider work-item failure was not returned")
+	}
+	if _, err := adapter.ReadPullRequest(context.Background(), "other/repo", 1); err == nil {
+		t.Fatal("cross-repository pull-request read succeeded")
+	}
+}
+
+// TestForgeAdapterRevalidationPreservesTransientClassification pins that a
+// transient repository revalidation failure stays retryable instead of
+// collapsing into a definite denial: every model-facing read revalidates its
+// pinned repository live, so a transient provider failure must survive to the
+// route layer's 503 classification.
+func TestForgeAdapterRevalidationPreservesTransientClassification(t *testing.T) {
+	base := forge.Repository{ID: "1", Canonical: "org/repo", DefaultRef: "main"}
+	policy := Policy{RunUID: "uid", Mode: ModeResolveIssue, Provider: "test", BaseRepo: base.Canonical, BaseRef: "main", WorkRepo: base.Canonical, WorkRef: "branch", SourceIssue: SourceIssue{Owner: "org", Name: "repo", Number: 1}}
+	cases := []struct {
+		name      string
+		err       error
+		wantRetry bool
+	}{
+		{"transient revalidation failure", transientForgeError{}, true},
+		{"definite revalidation failure", errMissing, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			provider := &adapterForge{cfg: forge.ProviderConfig{Name: "test"}}
+			adapter, err := NewForgeAdapter(policy, provider, adapterRepos{err: tc.err}, base, base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = adapter.WorkItem(context.Background(), base.Canonical, "1")
+			if err == nil {
+				t.Fatal("revalidation failure was not returned")
+			}
+			if got := forge.IsTransientAvailability(err); got != tc.wantRetry {
+				t.Fatalf("IsTransientAvailability = %v, want %v", got, tc.wantRetry)
+			}
+		})
+	}
+}
 
 func TestForgeAdapterResolveCreateAndVerifyPullRequest(t *testing.T) {
 	ctx := context.Background()

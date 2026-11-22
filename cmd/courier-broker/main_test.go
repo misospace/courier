@@ -20,6 +20,65 @@ import (
 	"github.com/misospace/courier/internal/topology"
 )
 
+type installationSourceFunc func(context.Context, string) (string, time.Time, error)
+
+func (f installationSourceFunc) InstallationToken(ctx context.Context, repository string) (string, time.Time, error) {
+	return f(ctx, repository)
+}
+
+func TestGitCredentialsForModeBindsPinnedRepositories(t *testing.T) {
+	var asked []string
+	source := installationSourceFunc(func(_ context.Context, repository string) (string, time.Time, error) {
+		asked = append(asked, repository)
+		return "installation-token", time.Now().Add(time.Hour), nil
+	})
+	credentials := gitCredentialsForMode(true, source, []string{"org/base", "Org/Work"}, &brokerEnv{})
+	for _, tc := range []struct{ asked, wantIdentity string }{
+		{"org/base", "org/base"},
+		{"Org/Work", "Org/Work"},
+		{"ORG/BASE", "org/base"},
+		{"org/work", "Org/Work"},
+	} {
+		got, err := credentials.Credentials(context.Background(), tc.asked)
+		if err != nil || got.Username != topology.DefaultGitUsername || got.Token != "installation-token" {
+			t.Fatalf("installation Credentials(%q) = %+v, %v", tc.asked, got, err)
+		}
+		if asked[len(asked)-1] != tc.wantIdentity {
+			t.Fatalf("Credentials(%q) asked the source for %q, want the canonical pinned identity %q", tc.asked, asked[len(asked)-1], tc.wantIdentity)
+		}
+	}
+	if _, err := credentials.Credentials(context.Background(), "other/project"); err == nil {
+		t.Fatal("installation git credentials served a repository outside the pinned set")
+	}
+	if len(asked) != 4 {
+		t.Fatalf("unpinned ask reached the source: %v", asked)
+	}
+	static := gitCredentialsForMode(false, nil, []string{"org/base"}, &brokerEnv{gitUsername: "deployment-user", gitToken: "static-token"})
+	got, err := static.Credentials(context.Background(), "anything/at")
+	if err != nil || got.Username != "deployment-user" || got.Token != "static-token" {
+		t.Fatalf("static Credentials() = %+v, %v", got, err)
+	}
+}
+
+func TestResolveCredentialModeInstallationToken(t *testing.T) {
+	policy := &courierv1alpha1.PublicationPolicy{BaseRepo: "Acme/widgets", WorkRepo: "acme/fork"}
+	document := &topology.BrokerPolicyDocument{
+		PublicationPolicy: policy,
+		InstallationToken: &topology.InstallationTokenSecretRef{SecretKey: topology.CredKeyInstallationToken},
+	}
+	if appMode, err := resolveCredentialMode(document, &brokerEnv{}); err != nil || !appMode {
+		t.Fatalf("resolveCredentialMode = %v, %v; want App mode", appMode, err)
+	}
+	policy.WorkRepo = "other/fork"
+	if _, err := resolveCredentialMode(document, &brokerEnv{}); err == nil || err.Error() != "courier-broker: installation token serves a single repository owner" {
+		t.Fatalf("cross-owner resolveCredentialMode error = %v", err)
+	}
+	policy.WorkRepo = "acme/fork"
+	if _, err := resolveCredentialMode(document, &brokerEnv{forgeAPIToken: "static"}); err == nil {
+		t.Fatal("App mode accepted static credentials")
+	}
+}
+
 func TestRunFailsClosedWithoutOperatorWiring(t *testing.T) {
 	if err := runArgs(nil); err == nil || !strings.Contains(err.Error(), "requires address") {
 		t.Fatalf("run() error = %v, want missing configuration", err)
@@ -137,7 +196,7 @@ func TestNewProviderUsesRegisteredEndpoint(t *testing.T) {
 			document := &topology.BrokerPolicyDocument{
 				Provider: forge.Projection{Name: "primary", Type: "github", Endpoint: test.endpoint},
 			}
-			provider, err := newProvider(env, document)
+			provider, err := newProvider(env, document, false, nil, nil)
 			if err != nil {
 				t.Fatalf("newProvider: %v", err)
 			}
@@ -166,7 +225,7 @@ func TestNewProviderUsesRegisteredEndpoint(t *testing.T) {
 
 	env := &brokerEnv{providerName: "primary", providerType: "github", providerEndpt: "not a url", forgeAPIToken: "tok"}
 	document := &topology.BrokerPolicyDocument{Provider: forge.Projection{Name: "primary", Endpoint: "not a url"}}
-	if _, err := newProvider(env, document); err == nil {
+	if _, err := newProvider(env, document, false, nil, nil); err == nil {
 		t.Fatal("a malformed registered endpoint must fail closed, not fall back to the public API")
 	}
 }
