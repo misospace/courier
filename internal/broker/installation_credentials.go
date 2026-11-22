@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -18,14 +17,19 @@ import (
 
 // SecretInstallationTokenSource reads the run's InstallationTokenDocument from
 // the per-run credentials Secret through a live API reader and supplies, per
-// named repository, the current token minted for that repository until just
-// before its forge-reported expiry. The operator mints one token per pinned
-// repository with only that repository's permissions, so a request against
-// one repository can never carry a token scoped to another: a repository
-// with no entry in the document is a refusal. The tokens live only in process
-// memory: they never appear in logs, error strings, or pod environment. Any
-// unreadable, malformed, stale-versioned, mismatched, or expired document is
-// a refusal — App-mode brokers have no static credential to fall back to.
+// named repository, the token minted for that repository. Every ask re-reads
+// the Secret and re-validates the full document binding — version, owner,
+// endpoint, an entry for exactly the requested repository, and expiry lead —
+// so an operator rotation or any credential-binding drift takes effect on the
+// next call, and no credential is ever served from a prior, unaudited read.
+// The operator mints one token per pinned repository with only that
+// repository's permissions, so a request against one repository can never
+// carry a token scoped to another: a repository with no entry in the document
+// is a refusal. The tokens live only in process memory: they never appear in
+// logs, error strings, or pod environment. Any unreadable, malformed,
+// stale-versioned, mismatched, or expired document is a refusal — App-mode
+// brokers have no static credential to fall back to. The source is immutable
+// after construction and safe for concurrent use.
 type SecretInstallationTokenSource struct {
 	reader           ctrlclient.Reader
 	namespace        string
@@ -34,15 +38,6 @@ type SecretInstallationTokenSource struct {
 	expectedOwner    string
 	expectedEndpoint string
 	now              func() time.Time
-
-	mu      sync.Mutex
-	entries map[string]cachedInstallationToken
-}
-
-type cachedInstallationToken struct {
-	token       string
-	expiresAt   time.Time
-	usableUntil time.Time
 }
 
 // NewSecretInstallationTokenSource validates expectations once (expectedOwner
@@ -59,25 +54,16 @@ func NewSecretInstallationTokenSource(reader ctrlclient.Reader, namespace, secre
 		reader: reader, namespace: namespace, secretName: secretName,
 		documentKey: documentKey, expectedOwner: expectedOwner,
 		expectedEndpoint: expectedEndpoint, now: now,
-		entries: make(map[string]cachedInstallationToken),
 	}, nil
 }
 
-// InstallationToken returns the cached token for the named repository while it
-// remains usable, and otherwise re-reads the Secret, parses the document, and
-// validates its binding. A repository with no entry in the document is a
-// refusal, never a fall-back to another entry.
+// InstallationToken re-reads the Secret, parses the document, and validates
+// its full binding on every call before returning the token for the named
+// repository. A repository with no entry in the document is a refusal, never
+// a fall-back to another entry.
 func (s *SecretInstallationTokenSource) InstallationToken(ctx context.Context, repository string) (string, time.Time, error) {
 	if repository == "" {
 		return "", time.Time{}, errors.New("broker installation token document is unusable")
-	}
-	key := strings.ToLower(repository)
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := s.now()
-	if cached, ok := s.entries[key]; ok && now.Before(cached.usableUntil) {
-		return cached.token, cached.expiresAt, nil
 	}
 
 	secret := &corev1.Secret{}
@@ -99,11 +85,9 @@ func (s *SecretInstallationTokenSource) InstallationToken(ctx context.Context, r
 		return "", time.Time{}, errors.New("broker installation token document is unusable")
 	}
 	entry, ok := document.Entry(repository)
+	now := s.now()
 	if !ok || entry.Token == "" || !entry.ExpiresAt.After(now.Add(2*time.Minute)) {
 		return "", time.Time{}, errors.New("broker installation token document is unusable")
-	}
-	s.entries[key] = cachedInstallationToken{
-		token: entry.Token, expiresAt: entry.ExpiresAt, usableUntil: entry.ExpiresAt.Add(-2 * time.Minute),
 	}
 	return entry.Token, entry.ExpiresAt, nil
 }

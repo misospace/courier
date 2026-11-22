@@ -52,6 +52,22 @@ func installationSecretReader(t *testing.T, document topology.InstallationTokenD
 	})
 }
 
+func setInstallationDocument(t *testing.T, reader ctrlclient.Client, document topology.InstallationTokenDocument) {
+	t.Helper()
+	data, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := &corev1.Secret{}
+	if err := reader.Get(context.Background(), ctrlclient.ObjectKey{Namespace: "runs", Name: "run-credentials"}, secret); err != nil {
+		t.Fatal(err)
+	}
+	secret.Data = map[string][]byte{topology.CredKeyInstallationToken: data}
+	if err := reader.Update(context.Background(), secret); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func newSourceForTest(t *testing.T, reader ctrlclient.Reader, expectedOwner string, now func() time.Time) *SecretInstallationTokenSource {
 	t.Helper()
 	source, err := NewSecretInstallationTokenSource(reader, "runs", "run-credentials", topology.CredKeyInstallationToken, expectedOwner, "https://api.github.com", now)
@@ -170,22 +186,53 @@ func TestSecretInstallationTokenSourceConstructorAndUnavailableSecret(t *testing
 	}
 }
 
-func TestSecretInstallationTokenSourceCacheAndRefresh(t *testing.T) {
+func TestSecretInstallationTokenSourceRevalidatesBindingOnEveryCall(t *testing.T) {
 	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	doc := installationDocument(now)
-	source := newSourceForTest(t, installationSecretReader(t, doc).Build(), "ExampleOrg", func() time.Time { return now })
-	for i := 0; i < 2; i++ {
-		got, _, err := source.InstallationToken(context.Background(), "exampleorg/repo")
-		if err != nil || got != sentinelInstallationToken {
-			t.Fatalf("cached token = %q, %v", got, err)
+	reader := installationSecretReader(t, doc).Build()
+	source := newSourceForTest(t, reader, "ExampleOrg", func() time.Time { return now })
+	if got, _, err := source.InstallationToken(context.Background(), "exampleorg/repo"); err != nil || got != sentinelInstallationToken {
+		t.Fatalf("first InstallationToken() = %q, %v", got, err)
+	}
+	refuses := func(what string) {
+		t.Helper()
+		got, expiry, err := source.InstallationToken(context.Background(), "exampleorg/repo")
+		if err == nil || got != "" || expiry != (time.Time{}) {
+			t.Fatalf("%s served %q, %v, %v", what, got, expiry, err)
+		}
+		if strings.Contains(err.Error(), sentinelInstallationToken) {
+			t.Fatalf("%s error leaked installation token", what)
 		}
 	}
-	now = doc.Entries[0].ExpiresAt.Add(-2 * time.Minute)
-	if _, _, err := source.InstallationToken(context.Background(), "exampleorg/repo"); err == nil {
-		t.Fatal("used cached token at its expiry safety boundary")
-	} else if strings.Contains(err.Error(), sentinelInstallationToken) {
-		t.Fatal("refresh error leaked installation token")
+
+	rotated := installationDocument(now)
+	rotated.Entries[0].Token = "rotated-" + sentinelInstallationToken
+	setInstallationDocument(t, reader, rotated)
+	if got, _, err := source.InstallationToken(context.Background(), "exampleorg/repo"); err != nil || got != "rotated-"+sentinelInstallationToken {
+		t.Fatalf("rotated InstallationToken() = %q, %v", got, err)
 	}
+
+	drifted := installationDocument(now)
+	drifted.Entries[0].Token = "drift-" + sentinelInstallationToken
+	drifted.Owner = "evil"
+	setInstallationDocument(t, reader, drifted)
+	refuses("owner drift")
+
+	drifted.Owner = "ExampleOrg"
+	drifted.Endpoint = "https://evil.invalid"
+	setInstallationDocument(t, reader, drifted)
+	refuses("endpoint drift")
+
+	drifted.Endpoint = "https://api.github.com/"
+	drifted.Entries = []topology.InstallationTokenEntry{
+		{Repository: "ExampleOrg/Elsewhere", Token: "elsewhere-" + sentinelInstallationToken, ExpiresAt: now.Add(time.Hour)},
+	}
+	setInstallationDocument(t, reader, drifted)
+	refuses("coverage drift")
+
+	setInstallationDocument(t, reader, doc)
+	now = doc.Entries[0].ExpiresAt.Add(-2 * time.Minute)
+	refuses("expiry boundary")
 }
 
 func TestSecretInstallationTokenSourceServesOnlyTheRequestedRepositoryToken(t *testing.T) {
