@@ -21,12 +21,15 @@ type adapterForge struct {
 
 func (f *adapterForge) Config() forge.ProviderConfig { return f.cfg }
 func (f *adapterForge) Capabilities() forge.Capabilities {
-	return forge.NewCapabilities(forge.CapabilityReadPullRequest, forge.CapabilityCreatePullRequest, forge.CapabilityUpdatePullRequest)
+	return forge.NewCapabilities(forge.CapabilityReadWorkItem, forge.CapabilityReadPullRequest, forge.CapabilityListReviews, forge.CapabilityListComments, forge.CapabilityReadChecks, forge.CapabilityCreatePullRequest, forge.CapabilityUpdatePullRequest)
 }
 func (f *adapterForge) ReadWorkItem(context.Context, forge.WorkItemRef) (forge.WorkItem, error) {
 	return forge.WorkItem{}, forge.ErrUnsupported
 }
 func (f *adapterForge) ReadPullRequest(_ context.Context, r forge.PullRequestRef) (forge.PullRequest, error) {
+	if f.pr.Number == 0 {
+		return forge.PullRequest{}, forge.ErrUnsupported
+	}
 	if r.Number != f.pr.Number {
 		return forge.PullRequest{}, errMissing
 	}
@@ -91,6 +94,25 @@ func (adapterPusher) IsAncestor(context.Context, string, string, string) (bool, 
 	return true, nil
 }
 func (adapterPusher) Push(context.Context, string, string, string) error { return nil }
+
+func TestForgeAdapterPinnedForgeReads(t *testing.T) {
+	base := forge.Repository{ID: "1", Canonical: "org/repo", DefaultRef: "main"}
+	provider := &adapterForge{cfg: forge.ProviderConfig{Name: "test"}}
+	policy := Policy{RunUID: "uid", Mode: ModeResolveIssue, Provider: "test", BaseRepo: base.Canonical, BaseRef: "main", WorkRepo: base.Canonical, WorkRef: "branch", SourceIssue: SourceIssue{Owner: "org", Name: "repo", Number: 1}}
+	adapter, err := NewForgeAdapter(policy, provider, adapterRepos{repos: map[string]forge.Repository{base.Canonical: base}}, base, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adapter.WorkItem(context.Background(), "other/repo", "1"); err == nil {
+		t.Fatal("cross-repository work-item read succeeded")
+	}
+	if _, err := adapter.WorkItem(context.Background(), base.Canonical, "1"); err == nil {
+		t.Fatal("provider work-item failure was not returned")
+	}
+	if _, err := adapter.ReadPullRequest(context.Background(), "other/repo", 1); err == nil {
+		t.Fatal("cross-repository pull-request read succeeded")
+	}
+}
 
 func TestForgeAdapterResolveCreateAndVerifyPullRequest(t *testing.T) {
 	ctx := context.Background()

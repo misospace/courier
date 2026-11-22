@@ -4,8 +4,7 @@ The trust and execution contract for the resumable coordinator harness (#8),
 consuming the forge capability boundary (#80) and credential/process isolation
 problem (#104). The topology it settles has landed and is available as the
 opt-in deployment-level secure mode (`--secure-mode`); §11 records what is
-still unwired, chiefly the native path's forge reads and pull-request update
-(PR creation itself landed via #843/#844) and the Go dependency cache (#136).
+still unwired, chiefly pull-request update and the Go dependency cache (#136).
 The OpenCode bootstrap remains the default,
 explicitly insecure legacy mode until a safe replacement is proven.
 
@@ -461,11 +460,13 @@ Each token carries only the permissions its repository needs: the base-repositor
 
 ### Model-influenced forge operations
 
-Expose registered semantic reads and writes (issue/PR/review/comment/check
-reads, create/update PR, comment), never merge, close, queue mutation, admin,
-raw REST, or generic MCP passthrough. Forge credentials stay in the broker.
-Model-originated intent is not authorization: the trusted control API validates
-each operation against the run's resolved policy before the broker acts.
+The model-facing forge tool sends only the closed read vocabulary — work-item,
+pull-request, review, comment, and check reads — through authenticated control-to-broker
+transport. The broker validates arguments, revalidates the requested repository
+against the run's pinned base/work identities, and checks provider capability
+before reading. Forge credentials stay in the broker. Writes remain on typed
+publication routes; the read route has no create, update, comment, merge, close,
+queue mutation, admin, raw REST, or generic MCP operation.
 
 ### Authoritative source-issue linkage (#248)
 
@@ -2431,10 +2432,11 @@ and the acceptance tests below are satisfied.
     the injected clarification teach exactly the changes shape its mode's
     parser accepts — and the finish step opens the PR through the broker after
    publication and records its identity on the status path before claiming
-   published; the create route is idempotent at the pinned head, so a
-   relaunch adopts the same PR. Forge reads (`ForgeOps`) and pull-request
-   update stay unwired, and the model client's forge tool stays unwired in
-   the meantime.
+    published; the create route is idempotent at the pinned head, so a
+    relaunch adopts the same PR. The coordinator's forge tool now routes the
+    five read operations through the authenticated broker API, where the
+    requested repository is revalidated against the pinned base/work identities;
+    forge writes beyond typed publication routes remain unavailable to the model.
 3. Settled in §5 and implemented in #125: the worker artifact contract —
    git bundle only, exact base-tip ancestry binding, fixed size/object
    bounds, exact ref-set equality, operator-resolved path scope (none is

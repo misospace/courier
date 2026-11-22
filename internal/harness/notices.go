@@ -23,7 +23,7 @@ const (
 	noticeBindingUnavailable    = "the delegated model binding is temporarily unavailable; the run ends recoverably and this brief's incomplete work is not integrated"
 	noticeCancelArgs            = "cancel_brief arguments must carry the brief ID"
 	noticeBriefCancelledDoneFmt = "brief %s is cancelled; new work under this ID is rejected"
-	noticeForgeSeamless         = "forge operations are unavailable in this build"
+	noticeForgeSeamless         = "forge operations are unavailable in this run"
 	noticeForgeArgs             = "forge arguments must be a JSON object"
 	noticeCheckArgs             = "check arguments must carry a command string"
 	noticeCheckNUL              = "a check command must not contain a NUL byte"
