@@ -1,0 +1,86 @@
+{{define "content"}}
+<h1>Contribution {{.RunName}}</h1>
+
+{{if eq .State "found"}}
+  <p class="state-note">
+    Recorded by Courier as of this read ({{.Status.ObservedAt}}).
+    {{if .PhaseAge}}In this phase for about {{.PhaseAge}}.{{end}}
+  </p>
+  <p><span class="{{.PhaseClass}}">{{.PhaseLabel}}</span></p>
+  {{if .Status.CIParked}}
+  <p class="state-note">This run waits in the CI park; verification continues when CI reports.</p>
+  {{end}}
+  {{if eq .Status.Phase "NeedsHuman"}}
+  <p class="state-note">A person needs to act on this run inside Courier.</p>
+  {{end}}
+  {{if eq .Status.Phase "BlockedExternal"}}
+  <p class="state-note">Courier is waiting on something outside the pipeline.</p>
+  {{end}}
+
+  <section>
+    <h2>Run identity</h2>
+    <table class="runs">
+      <tbody>
+        <tr><th scope="row">Run</th><td>{{.Status.Run}}</td></tr>
+        <tr><th scope="row">Namespace</th><td>{{if .Status.Namespace}}{{.Status.Namespace}}{{else}}<span class="muted">—</span>{{end}}</td></tr>
+        <tr><th scope="row">Lane</th><td>{{if .Status.Lane}}{{.Status.Lane}}{{else}}<span class="muted">—</span>{{end}}</td></tr>
+        <tr><th scope="row">Base repository</th><td>{{if .Status.BaseRepo}}{{.Status.BaseRepo}}{{else}}<span class="muted">—</span>{{end}}</td></tr>
+        <tr><th scope="row">Work repository</th><td>{{if .Status.WorkRepo}}{{.Status.WorkRepo}}{{else}}<span class="muted">—</span>{{end}}</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  {{if .HasPublished}}
+  <section>
+    <h2>Published</h2>
+    <table class="runs">
+      <tbody>
+        <tr>
+          <th scope="row">Pull request</th>
+          <td>
+            {{if .PRLink}}<a href="{{.PRLink}}" rel="noopener noreferrer nofollow">{{.Status.Publication.PR}}</a>
+            {{else if .Status.Publication.PR}}{{.Status.Publication.PR}}
+            {{else}}<span class="muted">—</span>{{end}}
+          </td>
+        </tr>
+        <tr><th scope="row">Branch</th><td>{{if .Status.Publication.Branch}}{{.Status.Publication.Branch}}{{else}}<span class="muted">—</span>{{end}}</td></tr>
+        <tr><th scope="row">Head repository</th><td>{{if .Status.Publication.HeadRepo}}{{.Status.Publication.HeadRepo}}{{else}}<span class="muted">—</span>{{end}}</td></tr>
+        <tr><th scope="row">Commit</th><td>{{if .Status.Publication.HeadSHA}}{{.Status.Publication.HeadSHA}}{{else}}<span class="muted">—</span>{{end}}</td></tr>
+      </tbody>
+    </table>
+    <p class="state-note">Published means a pull request was opened. Courier does not track whether it was merged, and a finished run is not proof of a merge.</p>
+  </section>
+  {{end}}
+
+  {{if .Status.Cause}}
+  <section>
+    <h2>Recorded cause</h2>
+    <table class="runs">
+      <tbody>
+        <tr><th scope="row">Category</th><td>{{if .Status.Cause.Category}}{{.Status.Cause.Category}}{{else}}<span class="muted">—</span>{{end}}</td></tr>
+        <tr><th scope="row">Outcome</th><td>{{if .Status.Cause.Outcome}}{{.Status.Cause.Outcome}}{{else}}<span class="muted">—</span>{{end}}</td></tr>
+      </tbody>
+    </table>
+    <p class="state-note">The controller's bounded classification, not diagnostic prose.</p>
+  </section>
+  {{end}}
+
+  <section>
+    <h2>Lifecycle</h2>
+    <table class="runs">
+      <tbody>
+        <tr><th scope="row">Admitted</th><td>{{if .Status.AdmittedAt}}{{.Status.AdmittedAt}}{{else}}<span class="muted">not recorded</span>{{end}}</td></tr>
+        <tr><th scope="row">Started</th><td>{{if .Status.StartedAt}}{{.Status.StartedAt}}{{else}}<span class="muted">not recorded</span>{{end}}</td></tr>
+        <tr><th scope="row">Current phase entered</th><td>{{if .Status.PhaseEnteredAt}}{{.Status.PhaseEnteredAt}}{{else}}<span class="muted">not recorded</span>{{end}}</td></tr>
+        <tr><th scope="row">Finished</th><td>{{if .Status.FinishedAt}}{{.Status.FinishedAt}}{{else}}<span class="muted">not recorded</span>{{end}}</td></tr>
+      </tbody>
+    </table>
+    <p class="state-note">Every timestamp is the controller's recorded value; the page shows them verbatim.</p>
+  </section>
+
+{{else}}
+  <p class="state{{if eq .State "notfound"}} state-warn{{else if ne .State "notconfigured"}} state-error{{end}}">{{.ErrorMessage}}</p>
+{{end}}
+
+<p><a href="/contributions">All contributions</a></p>
+{{end}}

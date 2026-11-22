@@ -1,12 +1,15 @@
 // Package console implements the Courier operator console: a small,
 // server-rendered interface for authenticated operators. It is deliberately
 // independent of the operator binary and of the Kubernetes API — it imports
-// only the standard library and never talks to a cluster. Its pages render the
+// only standard library and never talks cluster. pages render
 // operator read API's allowlisted projections over fixed or validated GET
-// paths; the read API client lives in backend.go and decodes the projection
-// JSON into its own view types rather than importing the read API package, so
-// the standard-library-only invariant holds. Contributions submit through the
-// operator's HTTP admission API (#829).
+// paths; read API client lives in backend.go and decodes projection
+// JSON into its own view types rather importing read API package, so
+// standard-library-only invariant holds. Contributions submit through
+// operator's HTTP admission API (#829). contribution pages read one run's
+// lifecycle status from a second backend — the contribution listener's
+// status route — over a separate status-read credential, with the same
+// fixed-path discipline (contributions.go).
 package console
 
 import (
@@ -75,6 +78,17 @@ type Config struct {
 	// inferred from r.TLS. Set true only for a console reachable solely
 	// over plaintext the operator controls.
 	InsecureCookies bool
+	// ContributeStatusURL is the base URL of the contribution status API
+	// (the manager's contribution listener serving GET
+	// /v1/contributions/<run>). Empty renders the contribution pages'
+	// not-configured state and sends no request.
+	ContributeStatusURL string
+	// ContributeStatusToken is the status-read bearer token the console
+	// presents to the contribution status API. It is a different
+	// credential than the admission token and the read API token: a
+	// status-read token cannot admit, an admission token cannot read.
+	// Secrets reach it as bytes read from a mounted file by the caller.
+	ContributeStatusToken []byte
 }
 
 // Server is the console's HTTP server. Construct it with NewServer and serve
@@ -85,13 +99,16 @@ type Server struct {
 	contribute *httpContributeClient
 	minter     contributeMinter
 	settled    contributeSettled
-	pages      map[string]*template.Template
-	mux        *http.ServeMux
+	// contributions reads one contribution's lifecycle status from the
+	// contribution listener. Nil when no status backend is configured.
+	contributions contributeStatusClient
+	pages         map[string]*template.Template
+	mux           *http.ServeMux
 }
 
 // pageTemplates are the rendered pages; each is parsed together with the
 // shared layout so {{define "content"}} stays page-local.
-var pageTemplates = []string{"overview", "runs", "run", "login", "forbidden", "contribute"}
+var pageTemplates = []string{"overview", "runs", "run", "contribute", "contributions", "contribution", "login", "forbidden"}
 
 // NewServer validates the configuration fail-closed and returns a console
 // server. An invalid configuration is a construction error, never a runtime
@@ -128,6 +145,13 @@ func NewServer(cfg Config) (*Server, error) {
 		contribute: contribute,
 		pages:      pages,
 	}
+	if cfg.ContributeStatusURL != "" {
+		contributions, err := newHTTPContributeStatusClient(cfg.ContributeStatusURL, cfg.ContributeStatusToken)
+		if err != nil {
+			return nil, err
+		}
+		s.contributions = contributions
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /static/{path}", s.handleStatic)
@@ -143,6 +167,8 @@ func NewServer(cfg Config) (*Server, error) {
 	mux.HandleFunc("GET /contribute", s.requireOperator(s.handleContribute))
 	mux.HandleFunc("POST /contribute", s.requireOperator(s.handleContributeSubmit))
 	mux.HandleFunc("POST /contribute/new", s.requireOperator(s.handleContributeNew))
+	mux.HandleFunc("GET /contributions", s.requireOperator(s.handleContributions))
+	mux.HandleFunc("GET /contributions/{run}", s.requireOperator(s.handleContribution))
 	return s, nil
 }
 
@@ -257,6 +283,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	s.auth.Logout(sessionID)
 	http.SetCookie(w, s.auth.expiredCookie())
 	http.SetCookie(w, s.auth.expiredContributeIntentCookie())
+	http.SetCookie(w, s.forgetContributeHistory())
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
@@ -278,7 +305,8 @@ func (s *Server) backendError(r *http.Request) string {
 // fields they care about.
 type pageData struct {
 	Title string
-	// Active names the highlighted nav entry: "overview" or "runs".
+	// Active names the highlighted nav entry: "overview", "runs", or
+	// "contributions".
 	Active string
 	// Authenticated reports whether the request carried a recognized
 	// operator identity; it gates the sign-out form.
@@ -373,7 +401,9 @@ func (s *Server) pageData(r *http.Request, title, active string) pageData {
 	return data
 }
 
-// render executes the page through the shared layout.
+// render executes page through shared layout. Pages carry their own
+// view struct; layout reads only fields its chrome needs (title,
+// active nav, authentication, refresh), which every page view provides.
 func (s *Server) render(w http.ResponseWriter, status int, page string, data any) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)

@@ -418,6 +418,20 @@ operatorConsole:
     tokenSecret: ""
     tokenSecretKey: token
 
+  contributeStatus:
+    # -- Points the console at the contribution status API — the same
+    #    listener as the contribution admission API, GET
+    #    /v1/contributions/<run>, served by the manager when
+    #    contributeAPI.readKeySecret is set. url and tokenSecret must be set
+    #    together; both empty leaves the status view off.
+    url: ""
+    # -- Name of a Secret in the release namespace whose tokenSecretKey entry
+    #    holds the contribution status-read bearer token; the entry is
+    #    presented server-side and the token never reaches the browser.
+    #    Required with contributeStatus.url; half a pair fails the render.
+    tokenSecret: ""
+    tokenSecretKey: token
+
 retention:
   # -- Terminal CoderRun retention (#287). The controller deletes terminal runs
   #    after these windows and always keeps the most recent `auditKeep` terminal

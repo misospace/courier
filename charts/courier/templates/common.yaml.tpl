@@ -610,6 +610,14 @@ the pair guards below rather than an opaque template error. */}}
 {{- $effectiveContributeURL := $consoleContributeValues.url }}
 {{- $hasConsoleContributeTokenFile := false }}
 {{- $effectiveContributeToken := not (empty $consoleContributeValues.tokenSecret) }}
+{{- $hasConsoleContributeStatusURL := false }}
+{{- /* default dict keeps a values override that omits the contributeStatus
+block an empty map instead of nil, so field access fails closed through
+the pair guard below rather than an opaque template error. */}}
+{{- $consoleContributeStatusValues := $operatorConsole.contributeStatus | default (dict) }}
+{{- $effectiveContributeStatusURL := $consoleContributeStatusValues.url }}
+{{- $hasConsoleContributeStatusTokenFile := false }}
+{{- $effectiveContributeStatusToken := not (empty $consoleContributeStatusValues.tokenSecret) }}
 {{- $hasConsoleReadAPITokenFile := false }}
 {{- $hasConsoleBind := false }}
 {{- $hasConsoleCookieSecure := false }}
@@ -634,6 +642,19 @@ own parser also accepts, so the pair guard below sees what it will run. */}}
 {{- if and (eq $arg "--contribute-token-file") (lt (add1 $i) $consoleArgCount) (not (hasPrefix "-" (index $consoleArgs (add1 $i)))) }}
 {{- $hasConsoleContributeTokenFile = true }}
 {{- $effectiveContributeToken = true }}
+{{- end }}
+{{- /* the contribute-status flags count in both spellings: --flag=value and a
+bare --flag whose value is the next argument, the spelling the binary's
+own parser also accepts, so the pair guard below sees what it will run. */}}
+{{- if hasPrefix "--contribute-status-url=" $arg }}{{- $hasConsoleContributeStatusURL = true }}{{- $effectiveContributeStatusURL = trimPrefix "--contribute-status-url=" $arg }}{{- end }}
+{{- if and (eq $arg "--contribute-status-url") (lt (add1 $i) $consoleArgCount) (not (hasPrefix "-" (index $consoleArgs (add1 $i)))) }}
+{{- $hasConsoleContributeStatusURL = true }}
+{{- $effectiveContributeStatusURL = index $consoleArgs (add1 $i) }}
+{{- end }}
+{{- if hasPrefix "--contribute-status-token-file=" $arg }}{{- $hasConsoleContributeStatusTokenFile = true }}{{- $effectiveContributeStatusToken = true }}{{- end }}
+{{- if and (eq $arg "--contribute-status-token-file") (lt (add1 $i) $consoleArgCount) (not (hasPrefix "-" (index $consoleArgs (add1 $i)))) }}
+{{- $hasConsoleContributeStatusTokenFile = true }}
+{{- $effectiveContributeStatusToken = true }}
 {{- end }}
 {{- if hasPrefix "--readapi-token-file=" $arg }}{{- $hasConsoleReadAPITokenFile = true }}{{- end }}
 {{- if hasPrefix "--bind=" $arg }}{{- $hasConsoleBind = true }}{{- end }}
@@ -686,6 +707,17 @@ instead of crash-looping the console. */}}
 {{- end }}
 {{- if and $consoleContributeValues.url (not $hasConsoleContributeURL) }}{{- $consoleArgs = append $consoleArgs (printf "--contribute-url=%s" $consoleContributeValues.url) }}{{- end }}
 {{- if and $consoleContributeValues.tokenSecret (not $hasConsoleContributeTokenFile) }}{{- $consoleArgs = append $consoleArgs "--contribute-token-file=/etc/courier/console/contribute-token" }}{{- end }}
+{{- /* The effective contribution-status pair mirrors the binary's own startup
+rule: values and raw args both count, and half a pair fails the render
+instead of crash-looping the console. */}}
+{{- if ne (empty $effectiveContributeStatusURL) (empty $effectiveContributeStatusToken) }}
+{{- fail "operatorConsole.contributeStatus.url and operatorConsole.contributeStatus.tokenSecret must be set together (a raw --contribute-status-url or --contribute-status-token-file arg counts)" }}
+{{- end }}
+{{- if and $consoleContributeStatusValues.tokenSecret (hasKey $consoleContributeStatusValues "tokenSecretKey") (empty $consoleContributeStatusValues.tokenSecretKey) }}
+{{- fail "operatorConsole.contributeStatus.tokenSecretKey must name a Secret entry when tokenSecret is set" }}
+{{- end }}
+{{- if and $consoleContributeStatusValues.url (not $hasConsoleContributeStatusURL) }}{{- $consoleArgs = append $consoleArgs (printf "--contribute-status-url=%s" $consoleContributeStatusValues.url) }}{{- end }}
+{{- if and $consoleContributeStatusValues.tokenSecret (not $hasConsoleContributeStatusTokenFile) }}{{- $consoleArgs = append $consoleArgs "--contribute-status-token-file=/etc/courier/console/contribute-status-token" }}{{- end }}
 {{- if and $operatorConsole.readAPITokenSecret (not $hasConsoleReadAPITokenFile) }}
 {{- $consoleArgs = append $consoleArgs "--readapi-token-file=/etc/courier/console/readapi-token" }}
 {{- end }}
@@ -705,6 +737,7 @@ Secure-cookie setting without reading defaults. */}}
 {{- if eq $effectiveMode "token" }}{{- $needsConsolePersistence = true }}{{- end }}
 {{- if $operatorConsole.readAPITokenSecret }}{{- $needsConsolePersistence = true }}{{- end }}
 {{- if and $effectiveContribute (eq $effectiveMode "token") $consoleContributeValues.tokenSecret }}{{- $needsConsolePersistence = true }}{{- end }}
+{{- if $consoleContributeStatusValues.tokenSecret }}{{- $needsConsolePersistence = true }}{{- end }}
 {{- if $needsConsolePersistence }}
 {{- $persistence := deepCopy (.Values.persistence | default dict) }}
 {{- if and $effectiveContribute (eq $effectiveMode "token") $consoleContributeValues.tokenSecret }}
@@ -732,6 +765,13 @@ Secure-cookie setting without reading defaults. */}}
   "name" $operatorConsole.readAPITokenSecret
   "items" (list (dict "key" $operatorConsole.readAPITokenSecretKey "path" "readapi-token"))
   "advancedMounts" (dict "console" (dict "console" (list (dict "path" "/etc/courier/console/readapi-token" "subPath" "readapi-token" "readOnly" true))))) }}
+{{- end }}
+{{- if $consoleContributeStatusValues.tokenSecret }}
+{{- $_ := set $persistence "console-contribute-status-token" (dict
+  "type" "secret"
+  "name" $consoleContributeStatusValues.tokenSecret
+  "items" (list (dict "key" ($consoleContributeStatusValues.tokenSecretKey | default "token") "path" "contribute-status-token"))
+  "advancedMounts" (dict "console" (dict "console" (list (dict "path" "/etc/courier/console/contribute-status-token" "subPath" "contribute-status-token" "readOnly" true))))) }}
 {{- end }}
 {{- $_ := set .Values "persistence" $persistence }}
 {{- end }}
