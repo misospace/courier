@@ -249,7 +249,7 @@ func TestOverviewSourceOutcomeDistinction(t *testing.T) {
 	}
 	// The outcome rule itself states which phases are neither outcome, so
 	// "no failure recorded" cannot be misread as "no bad run ever".
-	if !strings.Contains(body, "waiting on a human are neither") {
+	if !strings.Contains(body, "blocked externally are neither") {
 		t.Fatalf("outcome rule note missing:\n%s", body)
 	}
 }

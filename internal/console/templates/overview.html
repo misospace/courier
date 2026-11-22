@@ -154,9 +154,9 @@
   <p class="state-note">
     Source status, freshness, and outcomes are derived from run activity
     only. "Last success" is the most recent Done or AlreadyDone run and
-    "Last error" the most recent Failed run; runs parked for review or
-    waiting on a human are neither, and a source with no recorded outcome of
-    a kind says so instead of showing a zero. A source adapter's discovery
+    "Last error" the most recent Failed run; runs parked for review, waiting
+    on a human, or blocked externally are neither, and a source with no
+    recorded outcome of a kind says so instead of showing a zero. A source adapter's discovery
     polling state lives in operator metrics, not the read API: an idle source
     reads Freshness "Unknown" here, and that is not a discovery failure.
     Unsupported capabilities are labeled, never shown as zero.

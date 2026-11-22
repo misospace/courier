@@ -153,9 +153,9 @@ run, plus the notes the projection supplies, such as a forge-unavailable
 diagnostic or an unsafe workspace hold. A source with runs but no recorded
 outcome of a kind says so in words, and the healthy-empty source reads "no
 runs yet" — a wording no source with runs gets. Success and error come from
-run outcomes only: runs parked for review or waiting on a human are neither,
-and a source adapter's discovery polling state lives in operator metrics, not
-the read API.
+run outcomes only: runs parked for review, waiting on a human, or blocked
+externally are neither, and a source adapter's discovery polling state lives
+in operator metrics, not the read API.
 
 ## Run explorer
 
