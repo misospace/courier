@@ -69,9 +69,15 @@ func (f *adapterForge) ListPullRequestsByHead(_ context.Context, base forge.Pull
 	return nil, nil
 }
 
-type adapterRepos struct{ repos map[string]forge.Repository }
+type adapterRepos struct {
+	repos map[string]forge.Repository
+	err   error
+}
 
 func (r adapterRepos) ResolveRepository(_ context.Context, name string) (forge.Repository, error) {
+	if r.err != nil {
+		return forge.Repository{}, r.err
+	}
 	got, ok := r.repos[name]
 	if !ok {
 		return forge.Repository{}, errMissing
@@ -111,6 +117,40 @@ func TestForgeAdapterPinnedForgeReads(t *testing.T) {
 	}
 	if _, err := adapter.ReadPullRequest(context.Background(), "other/repo", 1); err == nil {
 		t.Fatal("cross-repository pull-request read succeeded")
+	}
+}
+
+// TestForgeAdapterRevalidationPreservesTransientClassification pins that a
+// transient repository revalidation failure stays retryable instead of
+// collapsing into a definite denial: every model-facing read revalidates its
+// pinned repository live, so a transient provider failure must survive to the
+// route layer's 503 classification.
+func TestForgeAdapterRevalidationPreservesTransientClassification(t *testing.T) {
+	base := forge.Repository{ID: "1", Canonical: "org/repo", DefaultRef: "main"}
+	policy := Policy{RunUID: "uid", Mode: ModeResolveIssue, Provider: "test", BaseRepo: base.Canonical, BaseRef: "main", WorkRepo: base.Canonical, WorkRef: "branch", SourceIssue: SourceIssue{Owner: "org", Name: "repo", Number: 1}}
+	cases := []struct {
+		name      string
+		err       error
+		wantRetry bool
+	}{
+		{"transient revalidation failure", transientForgeError{}, true},
+		{"definite revalidation failure", errMissing, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			provider := &adapterForge{cfg: forge.ProviderConfig{Name: "test"}}
+			adapter, err := NewForgeAdapter(policy, provider, adapterRepos{err: tc.err}, base, base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = adapter.WorkItem(context.Background(), base.Canonical, "1")
+			if err == nil {
+				t.Fatal("revalidation failure was not returned")
+			}
+			if got := forge.IsTransientAvailability(err); got != tc.wantRetry {
+				t.Fatalf("IsTransientAvailability = %v, want %v", got, tc.wantRetry)
+			}
+		})
 	}
 }
 

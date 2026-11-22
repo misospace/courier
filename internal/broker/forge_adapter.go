@@ -52,7 +52,7 @@ func NewForgeAdapter(p Policy, provider forge.Provider, repositories forge.Repos
 func (a *ForgeAdapter) checkedRepository(ctx context.Context, pinned forge.Repository) (forge.Repository, error) {
 	live, err := a.policy.ResolveRepository(ctx, pinned.Canonical)
 	if err != nil {
-		return forge.Repository{}, errors.New("forge adapter: canonical repository revalidation failed")
+		return forge.Repository{}, &readFailure{op: "canonical repository revalidation", cause: err}
 	}
 	if live.ID == "" || live.Canonical != pinned.Canonical || live.ID != pinned.ID || live.DefaultRef == "" {
 		return forge.Repository{}, errors.New("forge adapter: canonical repository identity changed")
@@ -71,10 +71,10 @@ func (a *ForgeAdapter) readRepository(ctx context.Context, repo string, capabili
 	return a.checkedRepository(ctx, pinned)
 }
 
-// readFailure collapses a provider read error to a fixed, credential-free
-// message while preserving its transient-availability classification: a
-// transient failure means the world was never observed, and the route layer
-// must answer it retryably, never as a verified denial.
+// readFailure collapses a provider read or repository revalidation error to a
+// fixed, credential-free message while preserving its transient-availability
+// classification: a transient failure means the world was never observed, and
+// the route layer must answer it retryably, never as a verified denial.
 type readFailure struct {
 	op    string
 	cause error

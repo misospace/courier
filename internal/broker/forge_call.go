@@ -70,7 +70,7 @@ func (s *Server) forgeCall(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid request", http.StatusBadRequest)
 			return
 		}
-		value, err := s.forgeReader.WorkItem(r.Context(), args.Repo, *args.ID)
+		value, err := s.forgeReader.WorkItem(r.Context(), args.Repo, strconv.Itoa(id))
 		respondForgeRead(w, value, err)
 	case "read-pull-request":
 		if !validForgePRArgs(args) {

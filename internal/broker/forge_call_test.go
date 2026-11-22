@@ -180,6 +180,53 @@ func TestForgeCallOversizeResponseBoundsEarly(t *testing.T) {
 	}
 }
 
+type capturingForgeReader struct {
+	forgeCallReader
+	id string
+}
+
+func (r *capturingForgeReader) WorkItem(_ context.Context, repo, id string) (forge.WorkItem, error) {
+	r.id = id
+	return forge.WorkItem{ID: id, Repo: repo}, nil
+}
+
+// TestForgeCallCanonicalizesWorkItemID pins that a syntactically valid but
+// non-canonical model-supplied id ("007", "+5") is forwarded to the reader in
+// canonical decimal form, never as the raw string.
+func TestForgeCallCanonicalizesWorkItemID(t *testing.T) {
+	s, _ := serverForTest(t)
+	reader := &capturingForgeReader{}
+	s.forgeReader = reader
+	cases := []struct{ raw, want string }{{"007", "7"}, {"+5", "5"}, {"42", "42"}}
+	for _, tc := range cases {
+		body := `{"operation":"read-work-item","arguments":{"repo":"org/repo","id":"` + tc.raw + `"}}`
+		req := httptest.NewRequest(http.MethodPost, PathForgeCall, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer valid-token")
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("id %q: status = %d, want 200; body %q", tc.raw, rec.Code, rec.Body.String())
+		}
+		if reader.id != tc.want {
+			t.Fatalf("id %q forwarded as %q, want %q", tc.raw, reader.id, tc.want)
+		}
+	}
+	for _, raw := range []string{"0", "-1", " 5", "abc"} {
+		reader.id = ""
+		body := `{"operation":"read-work-item","arguments":{"repo":"org/repo","id":"` + raw + `"}}`
+		req := httptest.NewRequest(http.MethodPost, PathForgeCall, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer valid-token")
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("id %q: status = %d, want 400; body %q", raw, rec.Code, rec.Body.String())
+		}
+		if reader.id != "" {
+			t.Fatalf("invalid id %q reached the reader as %q", raw, reader.id)
+		}
+	}
+}
+
 func TestForgeCallStrictTopLevelDecode(t *testing.T) {
 	s, _ := serverForTest(t)
 	req := httptest.NewRequest(http.MethodPost, PathForgeCall, strings.NewReader(`{"operation":"read-work-item","arguments":{"repo":"org/repo","id":"1"},"extra":true}`))
