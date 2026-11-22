@@ -3,11 +3,13 @@ package topology
 import (
 	"bytes"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/forge"
@@ -15,6 +17,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -292,6 +295,130 @@ func TestBrokerPodProjectionContract(t *testing.T) {
 	}
 	if _, ok := vols["api-token"]; !ok {
 		t.Fatal("broker must project its own API token")
+	}
+}
+
+func TestBrokerPodWithInstallationTokenOmitsStaticCredentialEnvironment(t *testing.T) {
+	run := testRun("broker-app-pod")
+	projection := registrationFixture().Projection()
+	staticPod, err := BrokerPod(run, "harness:test", projection, "sa-uid", courier.DefaultPodResources())
+	if err != nil {
+		t.Fatal(err)
+	}
+	appPod, err := BrokerPodWithInstallationToken(run, "harness:test", projection, "sa-uid", courier.DefaultPodResources())
+	if err != nil {
+		t.Fatal(err)
+	}
+	staticEnv := map[string]corev1.EnvVar{}
+	for _, env := range staticPod.Spec.Containers[0].Env {
+		staticEnv[env.Name] = env
+	}
+	appEnv := map[string]corev1.EnvVar{}
+	for _, env := range appPod.Spec.Containers[0].Env {
+		appEnv[env.Name] = env
+	}
+	for _, name := range []string{EnvForgeAPIToken, EnvGitUsername, EnvGitToken} {
+		if _, ok := staticEnv[name]; !ok {
+			t.Fatalf("static broker lacks %q", name)
+		}
+		if _, ok := appEnv[name]; ok {
+			t.Fatalf("App-mode broker carries static credential env %q", name)
+		}
+	}
+	for name, env := range staticEnv {
+		if name == EnvForgeAPIToken || name == EnvGitUsername || name == EnvGitToken {
+			continue
+		}
+		if !reflect.DeepEqual(appEnv[name], env) {
+			t.Fatalf("non-credential env %q differs between modes: app=%+v static=%+v", name, appEnv[name], env)
+		}
+	}
+	if got, want := len(appEnv), len(staticEnv)-3; got != want {
+		t.Fatalf("App-mode env count = %d, want %d", got, want)
+	}
+}
+
+func TestInstallationTokenTopologyContracts(t *testing.T) {
+	run := testRun("broker-app-secret")
+	expires := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	document := InstallationTokenDocument{
+		Version:  InstallationTokenDocumentVersion,
+		Owner:    "org",
+		Endpoint: "https://api.github.com/",
+		Entries: []InstallationTokenEntry{
+			{Repository: "org/widgets", Token: "secret-value", ExpiresAt: expires},
+			{Repository: "org/gadgets", Token: "other-value", ExpiresAt: expires.Add(time.Hour)},
+		},
+	}
+	secret, err := InstallationTokenCredentials(run, document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(secret.Data) != 1 || secret.Data[CredKeyInstallationToken] == nil {
+		t.Fatalf("installation credentials keys = %v", secret.Data)
+	}
+	var got InstallationTokenDocument
+	if err := json.Unmarshal(secret.Data[CredKeyInstallationToken], &got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, document) {
+		t.Fatalf("installation token document = %+v, want %+v", got, document)
+	}
+	if entry, ok := document.Entry("ORG/Widgets"); !ok || entry.Token != "secret-value" {
+		t.Fatalf("Entry lookup is not case-insensitive on owner/name: %+v %v", entry, ok)
+	}
+	if _, ok := document.Entry("other/widgets"); ok {
+		t.Fatal("Entry matched a repository outside the document")
+	}
+	entry := InstallationTokenEntry{Repository: "org/widgets", Token: "token", ExpiresAt: expires}
+	for _, invalid := range []InstallationTokenDocument{
+		{},
+		{Version: 99, Owner: "org", Endpoint: document.Endpoint, Entries: []InstallationTokenEntry{entry}},
+		{Version: InstallationTokenDocumentVersion, Endpoint: document.Endpoint, Entries: []InstallationTokenEntry{entry}},
+		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: document.Endpoint},
+		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: document.Endpoint, Entries: []InstallationTokenEntry{}},
+		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: document.Endpoint, Entries: []InstallationTokenEntry{
+			{Repository: "org/widgets", ExpiresAt: expires},
+		}},
+		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: document.Endpoint, Entries: []InstallationTokenEntry{
+			{Repository: "org/widgets", Token: "token"},
+		}},
+		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: document.Endpoint, Entries: []InstallationTokenEntry{
+			{Repository: "widgets", Token: "token", ExpiresAt: expires},
+		}},
+		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: document.Endpoint, Entries: []InstallationTokenEntry{
+			{Repository: "other/widgets", Token: "token", ExpiresAt: expires},
+		}},
+		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: document.Endpoint, Entries: []InstallationTokenEntry{
+			entry, {Repository: "ORG/widgets", Token: "second", ExpiresAt: expires},
+		}},
+		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: "http://api.github.com", Entries: []InstallationTokenEntry{entry}},
+		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: "https://user@api.github.com", Entries: []InstallationTokenEntry{entry}},
+		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: "https://api.github.com/?scope=repo", Entries: []InstallationTokenEntry{entry}},
+		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: "https://api.github.com/#frag", Entries: []InstallationTokenEntry{entry}},
+	} {
+		if _, err := InstallationTokenCredentials(run, invalid); err == nil {
+			t.Fatalf("accepted invalid installation-token document: %+v", invalid)
+		}
+	}
+	policy, err := PolicySecret(run, BrokerPolicyDocument{Provider: registrationFixture().Projection()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(policy.Data["policy.json"]), "installationToken") {
+		t.Fatal("static policy emitted an empty installationToken field")
+	}
+	ref := InstallationTokenSecretRef{SecretKey: CredKeyInstallationToken}
+	policy, err = PolicySecret(run, BrokerPolicyDocument{Provider: registrationFixture().Projection(), InstallationToken: &ref})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(policy.Data["policy.json"]), `"installationToken":{"secretKey":"forge-installation-token"}`) {
+		t.Fatalf("App policy omitted installation token reference: %s", policy.Data["policy.json"])
+	}
+	rule := BrokerInstallationTokenRoleRule(run)
+	if !reflect.DeepEqual(rule.Resources, []string{"secrets"}) || !reflect.DeepEqual(rule.ResourceNames, []string{CredentialsSecretName(run.Name)}) || !reflect.DeepEqual(rule.Verbs, []string{"get"}) {
+		t.Fatalf("installation token Secret RBAC rule = %+v", rule)
 	}
 }
 
@@ -582,40 +709,59 @@ func TestCoordinatorAndTopologyPodsAgreeOnTheDefault(t *testing.T) {
 
 func TestBrokerRoleIsExactlyTheNamedGrants(t *testing.T) {
 	run := testRun("rbac")
+	// The static-mode role must never gain Secret read: the credentials
+	// Secret is kubelet-injected environment, not a broker API read.
 	role := BrokerRole(run)
 	if len(role.Rules) != 4 {
-		t.Fatalf("broker role rules = %+v", role.Rules)
+		t.Fatalf("static broker role rules = %+v", role.Rules)
 	}
-	for _, rule := range role.Rules {
-		switch {
-		case contains(rule.Resources, "coderruns"):
-			if len(rule.ResourceNames) != 1 || rule.ResourceNames[0] != run.Name {
-				t.Fatalf("coderruns grant must be name-scoped: %+v", rule)
-			}
-		case contains(rule.Resources, "coderruns/status"):
-			if len(rule.ResourceNames) != 1 || rule.ResourceNames[0] != run.Name {
-				t.Fatalf("status grant must be name-scoped: %+v", rule)
-			}
-		case contains(rule.Resources, "pods") && contains(rule.Verbs, "get"):
-			// Named pod reads only: the three topology pods.
-			want := []string{ControlPodName(run.Name), WorkerPodName(run.Name), BrokerPodName(run.Name)}
-			if len(rule.ResourceNames) != 3 {
-				t.Fatalf("pod get must be name-scoped: %+v", rule)
-			}
-			for _, name := range want {
-				if !contains(rule.ResourceNames, name) {
-					t.Fatalf("pod get missing named pod %q: %+v", name, rule.ResourceNames)
+	appRole := BrokerRoleWithInstallationToken(run)
+	if len(appRole.Rules) != 5 {
+		t.Fatalf("installation broker role rules = %+v", appRole.Rules)
+	}
+	for i, rule := range appRole.Rules[:4] {
+		if !reflect.DeepEqual(rule, role.Rules[i]) {
+			t.Fatalf("installation role rule %d differs from the static role: %+v vs %+v", i, rule, role.Rules[i])
+		}
+	}
+	if !reflect.DeepEqual(appRole.Rules[4], BrokerInstallationTokenRoleRule(run)) {
+		t.Fatalf("installation credential Secret grant = %+v", appRole.Rules[4])
+	}
+	for _, current := range []struct {
+		name  string
+		rules []rbacv1.PolicyRule
+	}{{"static", role.Rules}, {"installation", appRole.Rules[:4]}} {
+		for _, rule := range current.rules {
+			switch {
+			case contains(rule.Resources, "coderruns"):
+				if len(rule.ResourceNames) != 1 || rule.ResourceNames[0] != run.Name {
+					t.Fatalf("%s coderruns grant must be name-scoped: %+v", current.name, rule)
 				}
+			case contains(rule.Resources, "coderruns/status"):
+				if len(rule.ResourceNames) != 1 || rule.ResourceNames[0] != run.Name {
+					t.Fatalf("%s status grant must be name-scoped: %+v", current.name, rule)
+				}
+			case contains(rule.Resources, "pods") && contains(rule.Verbs, "get"):
+				// Named pod reads only: the three topology pods.
+				want := []string{ControlPodName(run.Name), WorkerPodName(run.Name), BrokerPodName(run.Name)}
+				if len(rule.ResourceNames) != 3 {
+					t.Fatalf("%s pod get must be name-scoped: %+v", current.name, rule)
+				}
+				for _, name := range want {
+					if !contains(rule.ResourceNames, name) {
+						t.Fatalf("%s pod get missing named pod %q: %+v", current.name, name, rule.ResourceNames)
+					}
+				}
+			case contains(rule.Resources, "pods") && contains(rule.Verbs, "list"):
+				// The authenticator's exactly-one-live-control scan needs a
+				// namespace list; RBAC cannot name-scope it. The run namespace
+				// is dedicated, so it only ever sees this run's pods.
+				if len(rule.ResourceNames) != 0 {
+					t.Fatalf("%s pod list carries no resourceNames: %+v", current.name, rule)
+				}
+			default:
+				t.Fatalf("%s unexpected rule resource: %+v", current.name, rule.Resources)
 			}
-		case contains(rule.Resources, "pods") && contains(rule.Verbs, "list"):
-			// The authenticator's exactly-one-live-control scan needs a
-			// namespace list; RBAC cannot name-scope it. The run namespace
-			// is dedicated, so it only ever sees this run's pods.
-			if len(rule.ResourceNames) != 0 {
-				t.Fatalf("pod list carries no resourceNames: %+v", rule)
-			}
-		default:
-			t.Fatalf("unexpected rule resource: %+v", rule.Resources)
 		}
 	}
 }
