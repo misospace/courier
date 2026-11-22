@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -375,13 +374,6 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
 		}
 		filtered = append(filtered, *run)
 	}
-	sort.SliceStable(filtered, func(i, j int) bool {
-		if !filtered[i].CreationTimestamp.Time.Equal(filtered[j].CreationTimestamp.Time) {
-			return filtered[i].CreationTimestamp.Time.After(filtered[j].CreationTimestamp.Time)
-		}
-		return filtered[i].Name < filtered[j].Name
-	})
-
 	list := ProjectRunSummaries(filtered, query.page+1, query.pageSize, s.options())
 	// The HTTP contract counts pages from zero; the projector counts from
 	// one. The response echoes the page the client asked for, so the
@@ -475,58 +467,58 @@ func parseRunsQuery(r *http.Request) (runsQuery, error) {
 	return query, nil
 }
 
-// listRuns fetches the namespace's CoderRuns through a bounded, live,
-// page-walked pass: at most MaxListItems objects over at most
-// MaxListRoundTrips round trips. The boolean reports fetch truncation: the
-// pass stopped at a bound while the API server still had a continuation
-// token, so the namespace was not exhausted.
-func (s *Server) listRuns(ctx context.Context) ([]courierv1alpha1.CoderRun, bool, error) {
-	var runs []courierv1alpha1.CoderRun
+// listBounded walks a namespace-scoped list through the bounded, live,
+// page-walked pass every projection route shares: at most MaxListItems
+// objects over at most MaxListRoundTrips round trips. The boolean reports
+// fetch truncation: the pass stopped at a bound while the API server still
+// had a continuation token, so the namespace was not exhausted.
+func listBounded[T any](ctx context.Context, s *Server, resource string, page func(continueToken string) (items []T, next string, err error)) ([]T, bool, error) {
+	var out []T
 	continueToken := ""
 	for roundTrips := 1; ; roundTrips++ {
-		var page courierv1alpha1.CoderRunList
-		if err := s.listPage(ctx, &page, continueToken); err != nil {
-			return nil, false, fmt.Errorf("list CoderRuns: %w", err)
+		items, next, err := page(continueToken)
+		if err != nil {
+			return nil, false, fmt.Errorf("list %s: %w", resource, err)
 		}
-		runs = append(runs, page.Items...)
-		continueToken = page.Continue
+		out = append(out, items...)
+		continueToken = next
 		if continueToken == "" {
-			return runs, false, nil
+			return out, false, nil
 		}
-		if len(runs) >= MaxListItems || roundTrips >= MaxListRoundTrips {
-			if len(runs) > MaxListItems {
-				runs = runs[:MaxListItems]
+		if len(out) >= MaxListItems || roundTrips >= MaxListRoundTrips {
+			if len(out) > MaxListItems {
+				out = out[:MaxListItems]
 			}
-			return runs, true, nil
+			return out, true, nil
 		}
 	}
 }
 
-// listLanes fetches the namespace's LaneProfiles through the same bounded,
-// live, page-walked pass as listRuns. LaneProfiles are read from the served
-// namespace alone: the operator resolves a run's lane profile in the run's
-// own namespace, so a profile from another namespace governs nothing and
-// must not stand in for a missing one.
+// listRuns fetches the namespace's CoderRuns through the bounded pass in
+// listBounded.
+func (s *Server) listRuns(ctx context.Context) ([]courierv1alpha1.CoderRun, bool, error) {
+	return listBounded(ctx, s, "CoderRuns", func(continueToken string) ([]courierv1alpha1.CoderRun, string, error) {
+		var page courierv1alpha1.CoderRunList
+		if err := s.listPage(ctx, &page, continueToken); err != nil {
+			return nil, "", err
+		}
+		return page.Items, page.Continue, nil
+	})
+}
+
+// listLanes fetches the namespace's LaneProfiles through the bounded pass in
+// listBounded. LaneProfiles are read from the served namespace alone: the
+// operator resolves a run's lane profile in the run's own namespace, so a
+// profile from another namespace governs nothing and must not stand in for
+// a missing one.
 func (s *Server) listLanes(ctx context.Context) ([]courierv1alpha1.LaneProfile, bool, error) {
-	var lanes []courierv1alpha1.LaneProfile
-	continueToken := ""
-	for roundTrips := 1; ; roundTrips++ {
+	return listBounded(ctx, s, "LaneProfiles", func(continueToken string) ([]courierv1alpha1.LaneProfile, string, error) {
 		var page courierv1alpha1.LaneProfileList
 		if err := s.listPage(ctx, &page, continueToken); err != nil {
-			return nil, false, fmt.Errorf("list LaneProfiles: %w", err)
+			return nil, "", err
 		}
-		lanes = append(lanes, page.Items...)
-		continueToken = page.Continue
-		if continueToken == "" {
-			return lanes, false, nil
-		}
-		if len(lanes) >= MaxListItems || roundTrips >= MaxListRoundTrips {
-			if len(lanes) > MaxListItems {
-				lanes = lanes[:MaxListItems]
-			}
-			return lanes, true, nil
-		}
-	}
+		return page.Items, page.Continue, nil
+	})
 }
 
 // listPage issues one namespace-scoped List round trip: at most
