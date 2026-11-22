@@ -496,16 +496,19 @@ func TestSessionCookieFlags(t *testing.T) {
 		t.Fatalf("logout status = %d, want 303", logoutResp.StatusCode)
 	}
 	clearing := logoutResp.Cookies()
-	if len(clearing) != 2 {
-		t.Fatalf("logout set %d cookies, want session and intent clears", len(clearing))
+	// Logout clears the session, the contribution-intent cookie and the
+	// contribution-history cookie, so a shared browser carries neither the
+	// previous operator's links nor a half-submitted form.
+	if len(clearing) != 3 {
+		t.Fatalf("logout set %d cookies, want session, contribution-intent and contribution-history clears", len(clearing))
 	}
 	var cleared *http.Cookie
 	for _, candidate := range clearing {
 		if candidate.Name == sessionCookieName {
 			cleared = candidate
 		}
-		if candidate.Name == contributeIntentCookie && candidate.MaxAge != -1 {
-			t.Fatal("logout did not clear the contribution-intent cookie")
+		if (candidate.Name == contributeIntentCookie || candidate.Name == contributeHistoryCookie) && candidate.MaxAge != -1 {
+			t.Fatalf("logout did not clear the %s cookie", candidate.Name)
 		}
 	}
 	if cleared == nil {
@@ -582,27 +585,32 @@ func TestSessionCookieFlagsOverProxyHop(t *testing.T) {
 		t.Fatalf("logout status = %d, want 303", logoutResp.StatusCode)
 	}
 	cleared := logoutResp.Cookies()
-	if len(cleared) != 2 {
-		t.Fatalf("logout set %d cookies, want session and contribution-intent clearing cookies", len(cleared))
+	if len(cleared) != 3 {
+		t.Fatalf("logout set %d cookies, want session, contribution-intent and contribution-history clearing cookies", len(cleared))
 	}
-	var sessionCleared, intentCleared *http.Cookie
+	var sessionCleared, intentCleared, historyCleared *http.Cookie
 	for _, cookie := range cleared {
-		if cookie.Name == sessionCookieName {
+		switch cookie.Name {
+		case sessionCookieName:
 			sessionCleared = cookie
-		}
-		if cookie.Name == contributeIntentCookie {
+		case contributeIntentCookie:
 			intentCleared = cookie
+		case contributeHistoryCookie:
+			historyCleared = cookie
 		}
 	}
-	if sessionCleared == nil || intentCleared == nil || intentCleared.MaxAge != -1 {
-		t.Fatalf("logout did not clear both cookies: %#v", cleared)
+	if sessionCleared == nil || intentCleared == nil || historyCleared == nil ||
+		intentCleared.MaxAge != -1 || historyCleared.MaxAge != -1 {
+		t.Fatalf("logout did not clear all three cookies: %#v", cleared)
 	}
 	if !sessionCleared.Secure {
 		t.Fatal("logout clearing cookie at the default posture is not Secure")
 	}
-	if cleared[0].HttpOnly != session[0].HttpOnly || cleared[0].SameSite != session[0].SameSite {
-		t.Fatalf("logout clearing cookie flags (%v, %v) do not mirror the session cookie (%v, %v)",
-			cleared[0].HttpOnly, cleared[0].SameSite, session[0].HttpOnly, session[0].SameSite)
+	for _, cookie := range cleared {
+		if cookie.HttpOnly != session[0].HttpOnly || cookie.SameSite != session[0].SameSite {
+			t.Fatalf("logout clearing cookie flags (%v, %v) do not mirror the session cookie (%v, %v)",
+				cookie.HttpOnly, cookie.SameSite, session[0].HttpOnly, session[0].SameSite)
+		}
 	}
 }
 
@@ -666,14 +674,17 @@ func TestInsecureCookiesOptOut(t *testing.T) {
 		t.Fatalf("logout status = %d, want 303", logoutResp.StatusCode)
 	}
 	cleared := logoutResp.Cookies()
-	if len(cleared) != 2 {
-		t.Fatalf("logout set %d cookies, want session and contribution-intent clearing cookies", len(cleared))
+	if len(cleared) != 3 {
+		t.Fatalf("logout set %d cookies, want session, contribution-intent and contribution-history clearing cookies", len(cleared))
 	}
 	for _, cookie := range cleared {
 		if cookie.Name == contributeIntentCookie && cookie.MaxAge != -1 {
 			t.Fatal("logout did not clear the contribution-intent cookie")
 		}
-		if cookie.Name == sessionCookieName && cookie.Secure {
+		if cookie.Name == contributeHistoryCookie && cookie.MaxAge != -1 {
+			t.Fatal("logout did not clear the contribution-history cookie")
+		}
+		if cookie.Secure {
 			t.Fatal("logout clearing cookie mirrors a posture the opt-out turned off")
 		}
 	}
@@ -686,10 +697,11 @@ func TestResponsesNeverLeakSecretMaterial(t *testing.T) {
 	secrets := newTestSecrets(t)
 	server, base := newTestServer(t, secrets, "")
 	server.contribute, _ = newHTTPContributeClient("http://distinctive-admission.example.test", []byte("distinctive-contribution-bearer"), time.Second)
-	paths := []string{"/", "/runs", "/runs/example-run", "/contribute", "/login", "/logout", "/healthz", "/static/main.css"}
+	server.contributions, _ = newHTTPContributeStatusClient("http://distinctive-status.example.test", []byte("distinctive-status-bearer"))
+	paths := []string{"/", "/runs", "/runs/example-run", "/contribute", "/contributions", "/contributions/example-run", "/login", "/logout", "/healthz", "/static/main.css"}
 	for _, path := range paths {
 		_, body := get(t, nil, base+path)
-		for _, marker := range []string{secrets.token, secrets.secondaryToken, secrets.sessionKey, "distinctive-admission.example.test", "distinctive-contribution-bearer"} {
+		for _, marker := range []string{secrets.token, secrets.secondaryToken, secrets.sessionKey, "distinctive-admission.example.test", "distinctive-contribution-bearer", "distinctive-status.example.test", "distinctive-status-bearer"} {
 			if strings.Contains(body, marker) {
 				t.Fatalf("GET %s (unauthenticated) leaked secret material in the response body", path)
 			}
@@ -701,7 +713,7 @@ func TestResponsesNeverLeakSecretMaterial(t *testing.T) {
 		// A wrong-token 401 re-renders; a 303 carries no body worth
 		// scanning, but scan it anyway.
 		_ = resp
-		for _, marker := range []string{secrets.token, secrets.secondaryToken, secrets.sessionKey, "distinctive-admission.example.test", "distinctive-contribution-bearer"} {
+		for _, marker := range []string{secrets.token, secrets.secondaryToken, secrets.sessionKey, "distinctive-admission.example.test", "distinctive-contribution-bearer", "distinctive-status.example.test", "distinctive-status-bearer"} {
 			if strings.Contains(body, marker) {
 				t.Fatalf("GET %s (authenticated) leaked secret material in the response body", path)
 			}

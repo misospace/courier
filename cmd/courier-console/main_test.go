@@ -204,3 +204,62 @@ func TestParseFlagsReadAPITokenFile(t *testing.T) {
 		t.Fatalf("parseFlags error = %v, want it to name \"read\"", err)
 	}
 }
+
+// TestParseFlagsContributeStatus pins the contribution status wiring: both
+// flags or neither, the token file is read trimmed, and a header-mode console
+// may carry the pair too.
+func TestParseFlagsContributeStatus(t *testing.T) {
+	dir := t.TempDir()
+	sessionKeyFile := filepath.Join(dir, "session-key")
+	tokensFile := filepath.Join(dir, "tokens")
+	if err := os.WriteFile(sessionKeyFile, []byte("key-material\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tokensFile, []byte("token-material\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	statusTokenFile := filepath.Join(dir, "contribute-status-token")
+	if err := os.WriteFile(statusTokenFile, []byte("status-read-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base := []string{"--session-key-file=" + sessionKeyFile, "--operator-tokens-file=" + tokensFile}
+
+	_, cfg, err := parseFlags(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ContributeStatusURL != "" || len(cfg.ContributeStatusToken) != 0 {
+		t.Fatalf("default contribution status config = %q/%q, want both empty (pages off)", cfg.ContributeStatusURL, cfg.ContributeStatusToken)
+	}
+
+	_, cfg, err = parseFlags(append(base,
+		"--contribute-status-url=http://courier-contribute:8090",
+		"--contribute-status-token-file="+statusTokenFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ContributeStatusURL != "http://courier-contribute:8090" {
+		t.Fatalf("ContributeStatusURL = %q", cfg.ContributeStatusURL)
+	}
+	if string(cfg.ContributeStatusToken) != "status-read-secret" {
+		t.Fatalf("ContributeStatusToken = %q, want the trimmed token file content", cfg.ContributeStatusToken)
+	}
+
+	for _, args := range [][]string{
+		{"--contribute-status-url=http://courier-contribute:8090"},
+		{"--contribute-status-token-file=" + statusTokenFile},
+	} {
+		if _, _, err := parseFlags(append(base, args...)); err == nil {
+			t.Fatalf("parseFlags %v = nil error, want the pair requirement rejected", args)
+		} else if !strings.Contains(err.Error(), "--contribute-status-url and --contribute-status-token-file") {
+			t.Fatalf("parseFlags %v error = %v, want it to name both flags", args, err)
+		}
+	}
+
+	_, _, err = parseFlags(append(base,
+		"--contribute-status-url=http://courier-contribute:8090",
+		"--contribute-status-token-file="+filepath.Join(dir, "absent")))
+	if err == nil {
+		t.Fatal("parseFlags with a missing contribution status token file = nil, want an error")
+	}
+}

@@ -322,6 +322,102 @@ stays open). If you restrict read API ingress with a NetworkPolicy of your own,
 allow the console pod as a source, or the explorer reports that the read API
 could not be reached.
 
+## Contribution status
+
+The console tracks one contribution run at a time. Two pages serve it.
+`/contributions` looks a run up by name and lists the contributions this
+browser viewed most recently. `/contributions/<run>` shows one run's status.
+An operator adds `?namespace=` to pin the admission namespace. Every view is a
+link, so a shared link opens the same view and a reload keeps it. The console
+renders these pages on the server and runs no client-side JavaScript.
+
+The status comes from the contribution status API, not the operator read API.
+The console calls `GET /v1/contributions/<run>` on the manager's contribution
+listener, the same listener that admits contributions when
+`contributeAPI.enabled`. The call uses the status-read bearer token — the
+same token the Secret named by `contributeAPI.readKeySecret` holds (see
+[External contributions](./external-contributions.md)). The token is separate
+on purpose. A status-read token cannot admit a contribution, and an admission
+token cannot read status. The console sends the token server-side only, and it
+never reaches the browser.
+
+To turn the view on, the deployment already runs the contribution listener,
+then you point the console at it. Set `contributeAPI.enabled` with its
+`readKeySecret` first. Then set `operatorConsole.contributeStatus.url` and
+`operatorConsole.contributeStatus.tokenSecret` together. The chart fails the
+render when you set only one. The token Secret holds the same bearer token
+that `contributeAPI.readKeySecret` names, and its entry key defaults to
+`token`. A raw `--contribute-status-url` or `--contribute-status-token-file`
+arg in `controllers.console.containers.console.args` wins over these values.
+With no URL or token the page says it is not configured and sends no request.
+
+```sh
+helm upgrade --install courier charts/courier \
+  --namespace courier-console-ns \
+  --set operatorConsole.enabled=true \
+  --set operatorConsole.auth.sessionKeySecret=courier-console-session \
+  --set operatorConsole.auth.operatorTokensSecret=courier-console-tokens \
+  --set contributeAPI.enabled=true \
+  --set contributeAPI.readKeySecret=courier-contribute-read-key \
+  --set operatorConsole.contributeStatus.url=http://courier-contribute \
+  --set operatorConsole.contributeStatus.tokenSecret=courier-contribute-status-token
+```
+
+The page reports what the run recorded and never guesses a phase:
+
+- `Pending`, `Claimed`, and `Running` show as admitted or executing.
+- `Verifying` shows verifying. A `Verifying` run with a CI park says it waits
+  on CI.
+- `AwaitingReview` and `HandedOff` say a pull request awaits review.
+- `NeedsHuman` says an operator must act.
+- `BlockedExternal` says Courier waits on something outside Courier.
+- `Done` and `AlreadyDone` say the run finished.
+- `Failed` shows the bounded cause, category and outcome, when the run
+  recorded one.
+- An unrecognized phase renders as the raw word marked unknown, and a run
+  with no phase stamped yet renders as unknown.
+
+A published pull request and a `Done` run both mean one thing only: Courier
+opened a pull request. The page never says "merged" or "successful". Courier
+does not track merges. It shows the pull request as a link only when the value
+is a plain `https` URL with no embedded credentials, and renders anything else
+as escaped text. The branch, the head repository, and the commit SHA render as
+text. The console builds every page with `html/template` and escapes every
+string a user or a model wrote. Nothing from the API becomes markup or a URL
+scheme.
+
+The page tells how fresh its data is. It shows the read's `observedAt` time and
+the controller's recorded admitted, started, phase-entered, and finished times.
+It shows the age of the current phase, which is approximate and clamped.
+Auto-refresh is a meta-refresh tag, not JavaScript. A fast interval applies
+while the run is active. A slow interval applies while the run is parked for
+review, for a human, or on something external. The tag is off once the run is
+terminal, and off in a static state such as not configured, a refused
+credential, not found, or a namespace outside Courier. A transient backend
+failure retries on a slow backoff, so the page does not hammer the listener.
+
+An error status renders honestly. A 404 covers three cases, and the page does
+not say which: the run was never admitted, the run finished and retention
+reaped it, or the run is not a contribution run. A run owned by another source
+reads the same way. A 403 says the namespace is outside the namespaces Courier
+owns. A 401 says the console's status credential was refused. A 503 says the
+read is busy or timed out, and the page retries slowly.
+
+A successful read stores a short history. The console sets a signed cookie
+(HMAC with the session key, `HttpOnly`, `SameSite=Lax`) that holds up to a few
+of the most recent namespace-and-run pairs for this browser. The cookie holds
+links only, never lifecycle data. A cookie whose signature does not verify is
+dropped whole, and a signed entry that is not a valid namespace-and-run pair is
+skipped. The cookie is cleared on sign-out. It never carries the run's goal
+text or any credential. A header-mode console has no session key, so it has no
+history list, and its detail page still works.
+
+The run explorer links an ad-hoc run's row, source `adhoc`, to its
+contribution status page, pinned to the namespace the row names. The console's
+other boundaries still hold: it imports
+only the standard library, never talks to Kubernetes, renders no client-side
+JavaScript, and reads tokens only from mounted files.
+
 ## Headless Courier is preserved
 
 The console block is additive. With `operatorConsole.enabled=false` (the
