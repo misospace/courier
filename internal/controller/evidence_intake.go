@@ -567,6 +567,32 @@ func (i *EvidenceIntake) credentialScanner(ctx context.Context, run *courierv1al
 		scanner.RegisterCredentials(map[string]string{ref.Name: value})
 	}
 
+	// Installation-token document (#871): in App mode the git credentials the
+	// pod actually holds are this run's per-repository installation tokens,
+	// which replace the static pair that CredentialEnvRefs deliberately omits
+	// in that mode. Register every entry so a captured bundle is scrubbed
+	// against the credential that actually existed in the pod. An absent
+	// document Secret — every static run — registers nothing; a Secret that
+	// exists but carries no parseable document fails the scan closed, because
+	// the intake cannot then prove the bundle clean. The registration name is
+	// secret-shaped so the scanner's short-value retention rule applies; the
+	// per-entry tokens are registered individually under it.
+	data, err := readSecret(ctx, i.APIReader, run.Namespace, topology.CredentialsSecretName(run.Name))
+	if err == nil {
+		var document topology.InstallationTokenDocument
+		if err := json.Unmarshal(data[topology.CredKeyInstallationToken], &document); err != nil {
+			return nil, fmt.Errorf("evidence intake: reading installation-token credentials: %w", err)
+		}
+		for _, entry := range document.Entries {
+			if entry.Token == "" {
+				continue
+			}
+			scanner.RegisterCredentials(map[string]string{"COURIER_INSTALLATION_TOKEN": entry.Token})
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return nil, fmt.Errorf("evidence intake: reading installation-token credentials: %w", err)
+	}
+
 	// Environment secret: envFrom, so every key is a candidate.
 	if i.Pod.EnvironmentSecret != "" {
 		data, err := readSecret(ctx, i.APIReader, run.Namespace, i.Pod.EnvironmentSecret)

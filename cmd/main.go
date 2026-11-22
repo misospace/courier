@@ -1059,6 +1059,17 @@ func main() {
 		secure.Sources = sources
 		reconciler.Secure = secure
 	}
+	if !secureMode && installationTokenMinter != nil {
+		// Legacy App-mode git credentials (#871): the GitHub App minter on a
+		// non-secure deployment switches every launched legacy coordinator to
+		// installation-token git transport, and the same launcher drives the
+		// steady-state rotation from the reconciler's settle. Secure-mode
+		// wiring above is untouched; a deployment without the minter keeps
+		// the static credential path byte-identically.
+		launcher.InstallationGit = &controller.InstallationGitOptions{Minter: installationTokenMinter}
+		reconciler.LegacyGitCredentials = launcher
+		setupLog.Info("GitHub App legacy coordinator git credentials enabled", "owner", appAuth.Owner)
+	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CoderRun")
 		os.Exit(1)

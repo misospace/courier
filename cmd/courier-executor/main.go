@@ -162,6 +162,9 @@ func main() {
 		return
 	}
 	if os.Getenv("COURIER_ASKPASS") == "1" {
+		if os.Getenv(executor.EnvGitInstallation) != "" {
+			os.Exit(runInstallationAskpass(os.Getenv, os.Args[1:], os.Stdout, os.Stderr))
+		}
 		os.Exit(askpass(os.Args[1:], os.Getenv("COURIER_GIT_USERNAME"), os.Getenv("COURIER_GIT_TOKEN"), os.Stdout))
 	}
 	// SIGTERM cancels the run context only: a handler that captured would

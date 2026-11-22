@@ -217,6 +217,14 @@ type CoderRunReconciler struct {
 	// insecure.
 	Secure *SecureControl
 
+	// LegacyGitCredentials, when set, drives steady-state rotation of the
+	// GitHub App installation-token credentials Secret for App-mode legacy
+	// runs (#871): the settle keeps the Secret of a live App-mode
+	// coordinator fresh and requeues at the refresh window. Nil outside
+	// App-mode legacy deployments leaves the settle's zero-result return
+	// byte-identical.
+	LegacyGitCredentials LegacyGitCredentials
+
 	// OwnedNamespaces is the deployment-ownership boundary (#632): the run
 	// namespaces this controller instance reconciles. A run outside them
 	// belongs to another deployment's controller, and every reconcile is a
@@ -1563,6 +1571,19 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		// refresh window; every other return already requeues through its
 		// own path and re-ensures on the way back through here.
 		return ctrl.Result{RequeueAfter: r.Secure.InstallationTokenRequeueDelay(ctx, run)}, nil
+	}
+	if r.LegacyGitCredentials != nil {
+		// The legacy App-mode counterpart of the secure rotation above, with
+		// the same last-runner rule and the same error-backoff contract. Only
+		// a coordinator that was rendered with the installation contract has
+		// a credential to rotate: a static legacy run settles to the same
+		// zero result it always did (#871).
+		if coordinator := coordinatorPodOf(pods.Items, run); coordinatorRendersGitInstallation(coordinator) {
+			if err := r.LegacyGitCredentials.EnsureInstallationToken(ctx, run); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: r.LegacyGitCredentials.InstallationTokenRequeueDelay(ctx, run)}, nil
+		}
 	}
 	return ctrl.Result{}, nil
 }

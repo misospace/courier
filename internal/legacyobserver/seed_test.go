@@ -44,7 +44,7 @@ func TestSeedForkWithoutBaseBranch(t *testing.T) {
 	upstream, _, _ := remoteWithBranches(t, root, "upstream", true, false)
 	fork, _, workTip := remoteWithBranches(t, root, "fork", false, true)
 	scratch := filepath.Join(root, "seed-scratch")
-	tip, err := Seed(ctx, fork, upstream, "main", "work", scratch, "", "")
+	tip, err := Seed(ctx, Options{RemoteURL: fork, BaseRemoteURL: upstream, BaseBranch: "main", Branch: "work", Scratch: scratch})
 	if err != nil {
 		t.Fatalf("Seed with fork head and upstream base: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestSeedForkMissingWorkFallsBackToUpstreamBase(t *testing.T) {
 	upstream, baseTip, _ := remoteWithBranches(t, root, "upstream", true, false)
 	fork, _, _ := remoteWithBranches(t, root, "fork-empty", false, false)
 	scratch := filepath.Join(root, "seed-scratch")
-	tip, err := Seed(ctx, fork, upstream, "main", "work", scratch, "", "")
+	tip, err := Seed(ctx, Options{RemoteURL: fork, BaseRemoteURL: upstream, BaseBranch: "main", Branch: "work", Scratch: scratch})
 	if err != nil {
 		t.Fatalf("Seed fallback to upstream base: %v", err)
 	}
@@ -76,14 +76,14 @@ func TestSeedSameRepositoryCases(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	remote, base, work := remoteWithBranches(t, root, "mono", true, true)
-	tip, err := Seed(ctx, remote, "", "main", "work", filepath.Join(root, "s1"), "", "")
+	tip, err := Seed(ctx, Options{RemoteURL: remote, BaseBranch: "main", Branch: "work", Scratch: filepath.Join(root, "s1")})
 	if err != nil {
 		t.Fatalf("Seed same-repository existing branch: %v", err)
 	}
 	if tip != work {
 		t.Fatalf("baseline = %q, want work tip %q", tip, work)
 	}
-	tip, err = Seed(ctx, remote, "", "main", "nope", filepath.Join(root, "s2"), "", "")
+	tip, err = Seed(ctx, Options{RemoteURL: remote, BaseBranch: "main", Branch: "nope", Scratch: filepath.Join(root, "s2")})
 	if err != nil {
 		t.Fatalf("Seed same-repository base fallback: %v", err)
 	}
