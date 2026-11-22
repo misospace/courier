@@ -6,7 +6,7 @@
 <p class="state">Contribution admission is not configured.</p>
 {{else}}
 {{if .HasIntent}}
-<p class="state">An unsettled attempt uses idempotency key <code>{{.Key}}</code>. Resubmission reuses this key.</p>
+<p class="state state-warn">An unsettled attempt uses idempotency key <code>{{.Key}}</code>. Resubmitting unchanged retries it; changed content cannot be submitted until this attempt settles or you start a new contribution.</p>
 {{end}}
 {{if .Message}}<p class="state {{.StateClass}}">{{.Message}}</p>{{end}}
 {{if eq .State "success"}}

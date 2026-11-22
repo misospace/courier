@@ -245,16 +245,18 @@ func TestContributeOutcomeRetryAndCSRF(t *testing.T) {
 		t.Fatalf("retry keys = %v", keys)
 	}
 	changed := contributionValues("changed goal")
-	_, _ = postContribution(t, client, base, csrf, changed)
-	if len(keys) != 3 || keys[2] == keys[1] {
-		t.Fatalf("changed-content key = %v; want a new attempt", keys)
+	_, page = postContribution(t, client, base, csrf, changed)
+	if !strings.Contains(page, "unsettled attempt") {
+		t.Fatalf("changed-content submission was not blocked: %s", page)
 	}
-	// The changed-content attempt is uncertain, so it must not overwrite the
-	// earlier still-unsettled attempt's cookie; its key survives in the
-	// two-minute minter only.
+	if len(keys) != 2 {
+		t.Fatalf("changed content reached the admission API: %v", keys)
+	}
+	// The blocked submission must not overwrite the earlier still-unsettled
+	// attempt's cookie and must not mint a key that lives nowhere durable.
 	intentParts := strings.Split(intentCookie(client).Value, ".")
 	if len(intentParts) != 3 || intentParts[0] != keys[0] || intentParts[1] != contributeDigest(contributeSubmission{Lane: "default", BaseRepo: "owner/base", BaseRef: "main", WorkRepo: "owner/fork", Goal: "goal"}) {
-		t.Fatalf("changed-content attempt overwrote the earlier unsettled intent cookie: %v", intentParts)
+		t.Fatalf("blocked submission overwrote the earlier unsettled intent cookie: %v", intentParts)
 	}
 	status = http.StatusBadRequest
 	_, page = postContribution(t, client, base, csrf, contributionValues("goal"))
@@ -262,8 +264,8 @@ func TestContributeOutcomeRetryAndCSRF(t *testing.T) {
 		t.Fatalf("refusal message missing: %s", page)
 	}
 	_, page = postContribution(t, client, base, csrf, contributionValues("goal"))
-	if keys[2] == keys[3] {
-		t.Fatal("refused outcome retained intent")
+	if keys[2] != keys[0] || keys[3] != keys[0] {
+		t.Fatalf("refused outcome lost the settled key mapping: %v", keys)
 	}
 	before := calls
 	bad, _ := postContribution(t, client, base, "bad", contributionValues("goal"))
@@ -635,12 +637,16 @@ func TestContributeCrossSessionSettlementKeepsUnsettledIntent(t *testing.T) {
 	if !strings.Contains(page, "A run was created") {
 		t.Fatalf("session B created state missing: %s", page)
 	}
-	// Session A starts a different attempt: B's settlement of the shared
-	// content must not authorize overwriting A's still-unsettled cookie.
+	// Session A submits different content: B's settlement of the shared
+	// content must not authorize overwriting A's still-unsettled cookie, so
+	// the submission is refused before any admission call.
 	mu.Lock()
 	status = http.StatusServiceUnavailable
 	mu.Unlock()
-	_, _ = postContribution(t, clientA, httpServer.URL, csrfA, contributionValues("goal two"))
+	_, page = postContribution(t, clientA, httpServer.URL, csrfA, contributionValues("goal two"))
+	if !strings.Contains(page, "unsettled attempt") {
+		t.Fatalf("session A other-content submission was not blocked: %s", page)
+	}
 	if got := intentCookie(clientA); got == nil || got.Value != cookieA.Value {
 		t.Fatal("another session's settlement let a submission overwrite this session's unsettled intent cookie")
 	}
@@ -650,7 +656,7 @@ func TestContributeCrossSessionSettlementKeepsUnsettledIntent(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(keys) != 4 || keys[3] != keys[0] {
+	if len(keys) != 3 || keys[2] != keys[0] {
 		t.Fatalf("keys = %v, want the cross-session unsettled key replayed", keys)
 	}
 }
@@ -793,9 +799,11 @@ func TestContributeIntentCookieFlags(t *testing.T) {
 	}
 }
 
-func TestContributeDefinitiveOtherContentKeepsUnsettledIntent(t *testing.T) {
+func TestContributeOtherContentBlockedWhileUnsettledIntent(t *testing.T) {
 	status := http.StatusServiceUnavailable
+	calls := 0
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
 		w.WriteHeader(status)
 		_, _ = w.Write([]byte(`{"error":"no"}`))
 	}))
@@ -812,13 +820,21 @@ func TestContributeDefinitiveOtherContentKeepsUnsettledIntent(t *testing.T) {
 		t.Fatal("uncertain outcome lost the intent cookie")
 	}
 	status = http.StatusBadRequest
-	_, page = postContribution(t, client, base, csrf, contributionValues("goal two"))
-	if !strings.Contains(page, "no") {
-		t.Fatalf("refusal missing: %s", page)
+	resp, page := postContribution(t, client, base, csrf, contributionValues("goal two"))
+	if !strings.Contains(page, "unsettled attempt") || !strings.Contains(page, "Start a new contribution") {
+		t.Fatalf("other content was not blocked: %s", page)
+	}
+	if calls != 1 {
+		t.Fatalf("blocked submission reached the admission API: %d calls", calls)
+	}
+	for _, c := range resp.Cookies() {
+		if c.Name == contributeIntentCookie {
+			t.Fatalf("blocked response rewrote the intent cookie: %v", c)
+		}
 	}
 	after := intentCookie(client)
 	if after == nil || after.Value != kept.Value {
-		t.Fatal("a definitive outcome for other content destroyed the unsettled intent")
+		t.Fatal("a blocked submission for other content destroyed the unsettled intent")
 	}
 	_, page = get(t, client, base+"/contribute")
 	if !strings.Contains(page, "unsettled attempt") {
@@ -844,5 +860,58 @@ func TestContributeDefinitiveOtherContentKeepsUnsettledIntent(t *testing.T) {
 	second := intentCookie(client2)
 	if first == nil || second == nil || first.Value != second.Value || keys[first.Value[:len("adhoc-console-")+16]] != 2 {
 		t.Fatal("identical-content retry did not replay the same key")
+	}
+}
+
+func TestContributeBlockedAbandonThenNewContent(t *testing.T) {
+	var mu sync.Mutex
+	var keys []string
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			IdempotencyKey string `json:"idempotencyKey"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		keys = append(keys, body.IdempotencyKey)
+		mu.Unlock()
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"busy"}`))
+	}))
+	defer api.Close()
+	server, base, client := newContributionTestServer(t, api.URL, time.Second)
+	_, page := get(t, client, base+"/contribute")
+	csrf := findCSRFToken(t, page)
+	_, page = postContribution(t, client, base, csrf, contributionValues("goal one"))
+	if !strings.Contains(page, "may have been admitted") {
+		t.Fatalf("first attempt not uncertain: %s", page)
+	}
+	_, page = postContribution(t, client, base, csrf, contributionValues("goal two"))
+	if !strings.Contains(page, "unsettled attempt") {
+		t.Fatalf("other content was not blocked: %s", page)
+	}
+	server.minter.mu.Lock()
+	minterEntries := len(server.minter.entries)
+	server.minter.mu.Unlock()
+	if minterEntries != 1 {
+		t.Fatalf("blocked submission touched the minter: %d entries", minterEntries)
+	}
+	// The only way past the block is the explicit abandon, which frees the
+	// browser's durable key slot so new content can own it.
+	resp, err := client.PostForm(base+"/contribute/new", url.Values{"csrf": {csrf}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("abandon response = %d", resp.StatusCode)
+	}
+	_, page = postContribution(t, client, base, csrf, contributionValues("goal two"))
+	if !strings.Contains(page, "may have been admitted") {
+		t.Fatalf("post-abandon new content was not admitted to a new attempt: %s", page)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(keys) != 2 || keys[1] == keys[0] {
+		t.Fatalf("post-abandon keys = %v; want a fresh key for the new content", keys)
 	}
 }

@@ -3092,17 +3092,19 @@ outbound-HTTP surface that submits server-side through the operator's
 contribution admission API under a file-mounted bearer token. The form is
 token-mode only and uses session-bound CSRF; a per-browser signed intent
 cookie carries the idempotency key across reloads, retries, and console
-restarts, and it is bound to the submitted content, so changed content starts
-a new attempt. When the browser holds no intent, holds this attempt, or holds
-a settled attempt's key, the response commits and flushes the signed intent
-before the admission call, so a lost response or a restart mid-submission
-still leaves the browser holding the key and an identical resubmission
-replays it instead of minting a new one that could duplicate an admitted run.
-When the cookie instead holds a different still-unsettled attempt, the
-submission never overwrites it — that attempt stays retryable from the
-browser — and the newest attempt's key survives only in the minter — two minutes
-while its outcome stays uncertain, one session TTL once its outcome is
-definitive — bounding its resubmission window. Settled attempt keys
+restarts, and it is bound to the submitted content. Every submission that
+reaches the admission call commits and flushes the signed intent cookie
+first, so a lost response or a restart mid-submission still leaves the browser
+holding the key and an identical resubmission replays it instead of minting
+a new one that could duplicate an admitted run. A submission whose content
+differs from a still-unsettled attempt already in the cookie is refused
+before any key is minted or any admission call is made, because the
+browser's single durable key slot belongs to that attempt and a newly
+minted key would have no durable home. The operator resubmits the earlier
+content unchanged, or abandons that attempt through the explicit "start a
+new contribution" action, which forgets its minter entry and clears the
+cookie, so resubmitting the abandoned content later can duplicate an
+admitted run; only then can different content start a new attempt. Settled attempt keys
 are remembered server-side per key, never per content digest, for one
 session TTL, so one settlement can never describe another live attempt
 (the minter is digest-keyed, so identical content from two sessions inside

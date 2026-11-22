@@ -452,16 +452,30 @@ func (s *Server) handleContributeSubmit(w http.ResponseWriter, r *http.Request) 
 	// so a definitive settlement clears only its own attempt and never an
 	// unrelated unsettled one from changed content.
 	storedDigest := ""
+	storedKey := ""
 	storedSettled := false
 	if cookie, err := r.Cookie(contributeIntentCookie); err == nil {
 		if cookieKey, candidateDigest, valid := verifyContributeIntent(cookie.Value, s.auth.key); valid {
 			storedDigest = candidateDigest
+			storedKey = cookieKey
 			if storedDigest == digest {
 				key = cookieKey
 			} else {
 				storedSettled = s.settled.contains(cookieKey, s.auth.now())
 			}
 		}
+	}
+	if storedDigest != "" && storedDigest != digest && !storedSettled {
+		// The browser's only durable key slot holds a different still-unsettled
+		// attempt. Submitting this content would mint a key that lives nowhere
+		// durable before the admission side effect: a lost uncertain response or
+		// a console restart would orphan it, and an identical resubmission could
+		// then duplicate an admitted run. Refuse before minting or contacting
+		// the admission API; the operator resubmits unchanged or abandons the
+		// earlier attempt explicitly.
+		data.State, data.StateClass, data.Message = "blocked", "state-warn", "this browser still has an unsettled attempt (idempotency key "+storedKey+"); resubmit it unchanged to retry, or use Start a new contribution to abandon it before submitting different content. Abandoning discards its key: resubmitting that content later can duplicate an admitted run"
+		s.render(w, http.StatusOK, "contribute", data)
+		return
 	}
 	if key == "" {
 		var err error
@@ -482,25 +496,18 @@ func (s *Server) handleContributeSubmit(w http.ResponseWriter, r *http.Request) 
 		s.render(w, http.StatusOK, "contribute", data)
 		return
 	}
-	// cookieTakeover is true when the browser holds no intent, holds this
-	// attempt, or holds a settled attempt whose key no longer needs
-	// preserving; only then may this response carry the cookie, because a
-	// cookie holding a different still-unsettled attempt may not be
-	// overwritten — that attempt must stay retryable, symmetric with the
-	// definitive-outcome paths below.
-	cookieTakeover := storedDigest == "" || storedDigest == digest || storedSettled
 	// Deliver the signed intent before the admission side effect: commit and
 	// flush the response headers so a lost response or console restart cannot
 	// leave the attempt's only key in the two-minute minter, which would let
 	// an identical resubmission mint a new key and duplicate an admitted run.
-	headersCommitted := false
-	if cookieTakeover {
-		http.SetCookie(w, s.auth.contributeIntentCookie(contributeIntentValue(key, digest, s.auth.key)))
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_ = http.NewResponseController(w).Flush()
-		headersCommitted = true
-	}
+	// Every submission that reaches this point may carry the cookie: the
+	// blocked case above — a different still-unsettled attempt owning the
+	// browser's only durable key slot — returns before minting or contacting
+	// the admission API.
+	http.SetCookie(w, s.auth.contributeIntentCookie(contributeIntentValue(key, digest, s.auth.key)))
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_ = http.NewResponseController(w).Flush()
 	result := s.contribute.Submit(r.Context(), sub)
 	switch result.Outcome {
 	case outcomeCreated, outcomeResumed:
@@ -530,16 +537,9 @@ func (s *Server) handleContributeSubmit(w http.ResponseWriter, r *http.Request) 
 		// for a replayed key no longer describes it, and a later page view
 		// must keep the retry key, not clear it.
 		s.settled.clear(key)
-		// The intent cookie was already delivered before Submit when this
-		// attempt owns the cookie; when it does not, the other attempt's
-		// cookie stays untouched and this key remains minter-held.
-		data.State, data.StateClass, data.Message = "uncertain", "state-error", "may have been admitted — resubmitting retries the same idempotency key ("+key+"). Changing the form and resubmitting starts a new attempt; the earlier one may still have been admitted."
+		data.State, data.StateClass, data.Message = "uncertain", "state-error", "may have been admitted — resubmitting retries the same idempotency key ("+key+"). Use Start a new contribution to abandon this attempt before submitting different content; the abandoned attempt may still have been admitted."
 	}
-	if headersCommitted {
-		s.renderBody(w, "contribute", data)
-		return
-	}
-	s.render(w, http.StatusOK, "contribute", data)
+	s.renderBody(w, "contribute", data)
 }
 
 func validateContributeSubmission(sub contributeSubmission) string {
