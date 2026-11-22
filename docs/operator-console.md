@@ -87,22 +87,29 @@ Secret read only by the console process; it is never rendered or proxied to
 the browser. The console uses no JavaScript.
 
 A signed intent cookie carries the idempotency key per browser, bound to the
-submitted content, across reloads, retries, and console restarts until the
-attempt is definitively settled. Every submission that reaches the
+submitted content, across reloads, retries, and console restarts; once the
+attempt definitively settles, a later page view re-signs the cookie so the
+key stays in the browser instead of being dropped. Every submission that reaches the
 admission call commits and flushes the cookie first, so even a lost response
 or a console restart mid-submission leaves the browser holding the key. A submission
 whose content differs from a still-unsettled attempt already in the cookie
 is refused before a key is minted or the admission API is contacted, because
 the browser's single durable key slot already belongs to that attempt. The
 operator resubmits the earlier content unchanged, or abandons the attempt
-with the explicit "start a new contribution" action, which forgets its
-minter entry and clears the cookie. Abandoning discards the earlier
-attempt's key, so resubmitting that content later can duplicate an admitted
-run. A later page view clears the
-cookie once the attempt's key is settled server-side. The cookie
-signature uses the session key, so
-rotating that key discards an unsettled attempt; a later resubmission then
-starts a new attempt and the earlier one may still have been admitted. A
+with the explicit "start a new contribution" action, which clears the
+cookie. Abandoning an unsettled attempt also forgets its minter entry and so
+discards its key: resubmitting that content later can duplicate an admitted
+run. Abandoning a settled attempt only frees the browser's key slot, and the
+settled key stays replayable. The
+settled flag is signed while this console holds the settlement record; a
+restart before that page view leaves the attempt looking
+unsettled, and resubmitting the content unchanged replays the key and
+re-settles it. The console supports exactly one replica because contribution attempt
+state is per-process. The cookie signature uses the session key, so
+rotating that key discards the browser's intent cookie; while the minter
+entry survives, an identical resubmission still replays the same key, and
+only once it expires does a resubmission start a new attempt whose earlier
+one may still have been admitted. A
 timeout or server error has an uncertain outcome and is shown as "may have been
 admitted"; while the key survives, resubmitting identical content retries with
 the same key, so it cannot create a duplicate run. Different content stays

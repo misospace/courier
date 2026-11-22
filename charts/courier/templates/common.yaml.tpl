@@ -552,6 +552,18 @@
   the manager Deployment keeps its name across the flip. */}}
 {{- $fullname := include "bjw-s.common.lib.chart.names.fullname" . }}
 {{- $console := index .Values.controllers "console" }}
+{{- if hasKey $console "replicas" }}
+{{- $consoleReplicas := $console.replicas }}
+{{- if or (ne (int $consoleReplicas) 1) (ne (printf "%v" $consoleReplicas) "1") }}
+{{- fail (printf "controllers.console.replicas %v must be 1: the console supports exactly one replica because contribution attempt state is per-process" $consoleReplicas) }}
+{{- end }}
+{{- end }}
+{{- if $console.horizontalPodAutoscaler }}
+{{- fail "controllers.console.horizontalPodAutoscaler must not be set: the console supports exactly one replica because contribution attempt state is per-process" }}
+{{- end }}
+{{- if and $console.strategy (ne $console.strategy "Recreate") }}
+{{- fail "controllers.console.strategy must be Recreate: a rolling update would run two consoles at once and contribution attempt state is per-process" }}
+{{- end }}
 {{- if not (hasKey $console "forceRename") }}{{- $_ := set $console "forceRename" (printf "%s-console" $fullname) }}{{- end }}
 {{- $mainController := index .Values.controllers "main" }}
 {{- if not (hasKey $mainController "forceRename") }}{{- $_ := set $mainController "forceRename" $fullname }}{{- end }}

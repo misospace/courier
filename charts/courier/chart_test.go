@@ -2786,6 +2786,60 @@ func TestChartOperatorConsoleDefaultDisabled(t *testing.T) {
 	}
 }
 
+func TestChartOperatorConsoleReplicaGuard(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	enabled := runHelm(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.contribute.url=http://courier-contribute-api",
+		"--set", "operatorConsole.contribute.tokenSecret=courier-contribute-token",
+	)...)
+	if !strings.Contains(enabled, "name: courier-console") {
+		t.Fatal("enabled console render did not succeed")
+	}
+
+	// The console's contribution attempt state is per-process, so the chart
+	// refuses any configuration that runs zero or two consoles, scales the
+	// console, or rolls it without recreating it.
+	for _, tc := range []struct {
+		name    string
+		set     string
+		message string
+	}{
+		{"two replicas", "controllers.console.replicas=2", "controllers.console.replicas"},
+		{"two replicas as string", "controllers.console.replicas=\"2\"", "controllers.console.replicas"},
+		{"zero replicas", "controllers.console.replicas=0", "controllers.console.replicas"},
+		{"fractional replicas", "controllers.console.replicas=1.5", "controllers.console.replicas"},
+		{"autoscaler", "controllers.console.horizontalPodAutoscaler.maxReplicas=3", "controllers.console.horizontalPodAutoscaler"},
+		{"rolling update", "controllers.console.strategy=RollingUpdate", "controllers.console.strategy"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := runHelmOutput(t, chartDir,
+				append(operatorConsoleRenderArgs(
+					"--set", "operatorConsole.contribute.url=http://courier-contribute-api",
+					"--set", "operatorConsole.contribute.tokenSecret=courier-contribute-token",
+				), "--set", tc.set)...)
+			if err == nil || !strings.Contains(out, tc.message) {
+				t.Fatalf("expected %s to fail with %q, err = %v:\n%s", tc.set, tc.message, err, out)
+			}
+		})
+	}
+
+	// With the console disabled the knobs are inert: the same values render
+	// fine because no console workload exists to scale.
+	disabled := runHelm(t, chartDir, "template", "courier", ".",
+		"--set", "controllers.console.replicas=2",
+		"--set", "controllers.console.horizontalPodAutoscaler.maxReplicas=3")
+	if strings.Contains(disabled, "courier-console") {
+		t.Fatal("disabled console render produced a console workload")
+	}
+}
+
 // TestChartOperatorConsoleEnabled covers the enabled token-mode render: a
 // second controller Deployment running the courier-console binary, a
 // ClusterIP-only Service in front of it, the session and token Secrets

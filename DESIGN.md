@@ -3102,15 +3102,22 @@ before any key is minted or any admission call is made, because the
 browser's single durable key slot belongs to that attempt and a newly
 minted key would have no durable home. The operator resubmits the earlier
 content unchanged, or abandons that attempt through the explicit "start a
-new contribution" action, which forgets its minter entry and clears the
-cookie, so resubmitting the abandoned content later can duplicate an
-admitted run; only then can different content start a new attempt. Settled attempt keys
+new contribution" action, which clears the cookie; abandoning an unsettled
+attempt also forgets its minter entry, so resubmitting the abandoned content
+later can duplicate an admitted run, while a settled attempt's key stays
+replayable. Only a settled or abandoned slot lets different content start a
+new attempt. Settled attempt keys
 are remembered server-side per key, never per content digest, for one
 session TTL, so one settlement can never describe another live attempt
 (the minter is digest-keyed, so identical content from two sessions inside
-the TTL shares one key and is the same attempt); a later page view uses that record to clear the retained cookie
-and drop the stale unsettled-attempt notice, the definitive response having
-already flushed its headers, and an uncertain outcome clears the record so a
+the TTL shares one key and is the same attempt); a later page view rewrites
+the retained cookie with a signed settled flag while this console holds the
+settlement record (the definitive response has already flushed its headers),
+so an identical resubmission replays the settled key even across a restart;
+a restart first leaves the attempt looking unsettled until an unchanged
+resubmission re-settles it. The console runs with exactly one replica — the
+chart fails renders that set more, scale it, or roll it without recreating
+it — because attempt state is per-process. An uncertain outcome clears the record so a
 replayed key stays retryable. The cookie signature uses the
 session key: rotating that key discards an unsettled attempt. The console
 claims "nothing was admitted" only for failures proven to precede sending the

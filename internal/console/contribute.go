@@ -192,10 +192,10 @@ func (m *contributeMinter) forget(digest string) {
 // remember retains the digest-to-key mapping past the two-minute in-flight
 // TTL, for the rest of the session: a definitive outcome means the admission
 // server has bound this key to this content, so an identical resubmission
-// after the settled cookie was cleared must replay the same key and let the
-// server deduplicate — never mint a new key that could admit a duplicate
-// run/branch/PR. Only the deliberate "start a new contribution" abandon
-// forgets a settled mapping.
+// after the browser's settled cookie was overwritten must replay the same key
+// and let the server deduplicate — never mint a new key that could admit a
+// duplicate run/branch/PR. Only abandoning an unsettled attempt forgets a
+// retained mapping; abandoning a settled attempt keeps it replayable.
 func (m *contributeMinter) remember(digest, key string, now time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -223,8 +223,8 @@ func (m *contributeMinter) remember(digest, key string, now time.Time) {
 // reached a definitive outcome, keyed by key — never by content digest, so
 // one session's settlement can never describe another session's live
 // attempt. The submit response has already flushed its headers by then, so
-// it cannot clear the browser's retained intent cookie; a later page view
-// uses this registry to clear the cookie and drop the stale
+// it cannot mark the browser's retained intent cookie settled; a later page
+// view uses this registry to sign the settled flag and drop the stale
 // unsettled-attempt notice instead.
 type contributeSettled struct {
 	mu   sync.Mutex
@@ -318,26 +318,38 @@ func contributeDigest(sub contributeSubmission) string {
 	return hex.EncodeToString(sum[:])[:16]
 }
 
-func contributeIntentValue(key, digest string, sessionKey []byte) string {
+func contributeIntentValue(key, digest string, settled bool, sessionKey []byte) string {
+	flag := "0"
+	if settled {
+		flag = "1"
+	}
+	prefix := key + "." + digest + "." + flag
 	mac := hmac.New(sha256.New, sessionKey)
-	mac.Write([]byte("contribute-intent:" + key + "." + digest))
-	return key + "." + digest + "." + hex.EncodeToString(mac.Sum(nil))
+	mac.Write([]byte("contribute-intent:" + prefix))
+	return prefix + "." + hex.EncodeToString(mac.Sum(nil))
 }
 
-func verifyContributeIntent(value string, sessionKey []byte) (key, digest string, ok bool) {
+func verifyContributeIntent(value string, sessionKey []byte) (key, digest string, settled, ok bool) {
 	if len(sessionKey) == 0 {
-		return "", "", false
+		return "", "", false, false
 	}
 	parts := strings.Split(value, ".")
-	if len(parts) != 3 || !strings.HasPrefix(parts[0], "adhoc-console-") || len(parts[0]) != len("adhoc-console-")+16 || len(parts[1]) != 16 || parts[2] == "" {
-		return "", "", false
+	if len(parts) != 4 || !strings.HasPrefix(parts[0], "adhoc-console-") || len(parts[0]) != len("adhoc-console-")+16 || len(parts[1]) != 16 || (parts[2] != "0" && parts[2] != "1") || parts[3] == "" {
+		return "", "", false, false
 	}
-	expected := contributeIntentValue(parts[0], parts[1], sessionKey)
-	_, expectedSig, _ := strings.Cut(expected, parts[0]+"."+parts[1]+".")
-	if subtle.ConstantTimeCompare([]byte(expectedSig), []byte(parts[2])) != 1 {
-		return "", "", false
+	if _, err := hex.DecodeString(strings.TrimPrefix(parts[0], "adhoc-console-")); err != nil {
+		return "", "", false, false
 	}
-	return parts[0], parts[1], true
+	if _, err := hex.DecodeString(parts[1]); err != nil {
+		return "", "", false, false
+	}
+	flag := parts[2] == "1"
+	expected := contributeIntentValue(parts[0], parts[1], flag, sessionKey)
+	_, expectedSig, _ := strings.Cut(expected, parts[0]+"."+parts[1]+"."+parts[2]+".")
+	if subtle.ConstantTimeCompare([]byte(expectedSig), []byte(parts[3])) != 1 {
+		return "", "", false, false
+	}
+	return parts[0], parts[1], flag, true
 }
 
 func mintContributeKey() (string, error) {
@@ -380,8 +392,8 @@ func (s *Server) contributePage(r *http.Request, sessionID string) contributeDat
 	default:
 		data.State = "form"
 		if cookie, err := r.Cookie(contributeIntentCookie); err == nil {
-			if key, _, valid := verifyContributeIntent(cookie.Value, s.auth.key); valid {
-				if s.settled.contains(key, s.auth.now()) {
+			if key, _, cookieSettled, valid := verifyContributeIntent(cookie.Value, s.auth.key); valid {
+				if cookieSettled || s.settled.contains(key, s.auth.now()) {
 					data.SettledIntent = true
 				} else {
 					data.Key, data.HasIntent = key, true
@@ -412,10 +424,14 @@ func (s *Server) handleContribute(w http.ResponseWriter, r *http.Request) {
 	sessionID, _ := s.auth.sessionAndIdentity(r)
 	data := s.contributePage(r, sessionID)
 	if data.SettledIntent {
-		// The definitive submit response had already flushed its headers, so
-		// it could not clear the cookie; clear it now that the digest is
-		// known settled.
-		http.SetCookie(w, s.auth.expiredContributeIntentCookie())
+		if cookie, err := r.Cookie(contributeIntentCookie); err == nil {
+			if key, digest, cookieSettled, valid := verifyContributeIntent(cookie.Value, s.auth.key); valid && !cookieSettled {
+				// The definitive submit response had already flushed its headers,
+				// so the settled flag makes the key's durable home the browser even
+				// after this page view or a console restart.
+				http.SetCookie(w, s.auth.contributeIntentCookie(contributeIntentValue(key, digest, true, s.auth.key)))
+			}
+		}
 	}
 	s.render(w, http.StatusOK, "contribute", data)
 }
@@ -455,13 +471,12 @@ func (s *Server) handleContributeSubmit(w http.ResponseWriter, r *http.Request) 
 	storedKey := ""
 	storedSettled := false
 	if cookie, err := r.Cookie(contributeIntentCookie); err == nil {
-		if cookieKey, candidateDigest, valid := verifyContributeIntent(cookie.Value, s.auth.key); valid {
+		if cookieKey, candidateDigest, cookieSettled, valid := verifyContributeIntent(cookie.Value, s.auth.key); valid {
 			storedDigest = candidateDigest
 			storedKey = cookieKey
+			storedSettled = cookieSettled || s.settled.contains(cookieKey, s.auth.now())
 			if storedDigest == digest {
 				key = cookieKey
-			} else {
-				storedSettled = s.settled.contains(cookieKey, s.auth.now())
 			}
 		}
 	}
@@ -504,7 +519,7 @@ func (s *Server) handleContributeSubmit(w http.ResponseWriter, r *http.Request) 
 	// blocked case above — a different still-unsettled attempt owning the
 	// browser's only durable key slot — returns before minting or contacting
 	// the admission API.
-	http.SetCookie(w, s.auth.contributeIntentCookie(contributeIntentValue(key, digest, s.auth.key)))
+	http.SetCookie(w, s.auth.contributeIntentCookie(contributeIntentValue(key, digest, false, s.auth.key)))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_ = http.NewResponseController(w).Flush()
@@ -575,8 +590,17 @@ func (s *Server) handleContributeNew(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if cookie, err := r.Cookie(contributeIntentCookie); err == nil {
-		if key, digest, valid := verifyContributeIntent(cookie.Value, s.auth.key); valid {
-			s.minter.forget(digest)
+		if key, digest, settled, valid := verifyContributeIntent(cookie.Value, s.auth.key); valid {
+			// Abandoning a settled attempt only frees the browser's key slot:
+			// its digest mapping stays, so resubmitting that content later
+			// still replays the admitted key. The attempt counts as settled
+			// from the signed flag or this process's settlement record, so
+			// abandoning straight off the success page — before any page
+			// view signs the flag — keeps the mapping too. Only abandoning
+			// an attempt that is unsettled by both measures discards the key.
+			if !settled && !s.settled.contains(key, s.auth.now()) {
+				s.minter.forget(digest)
+			}
 			s.settled.clear(key)
 		}
 	}
