@@ -11,7 +11,7 @@ import (
 // the broker refuses everything outside it and never names the defect.
 func TestForgeToolDescriptionTeachesTheVocabulary(t *testing.T) {
 	tool := forgeTool()
-	for _, want := range []string{"read-work-item", "read-pull-request", "list-reviews", "list-comments", "read-checks", "repo", "number", "headSHA", "id"} {
+	for _, want := range []string{"read-work-item", "read-pull-request", "list-reviews", "list-comments", "read-checks", "repo", "number", "headSHA", "id", "run branch"} {
 		if !strings.Contains(tool.Description, want) {
 			t.Fatalf("forge tool description does not teach %q: %s", want, tool.Description)
 		}
