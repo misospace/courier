@@ -296,6 +296,14 @@ func runArgs(args []string) error {
 			stderr:     os.Stderr,
 			invocation: invocation,
 		},
+		// The near-limit half of the same seam (#901): one
+		// session.budget_warning line per axis at the warning share of the
+		// declared bound, so the log shows the run approaching its ceiling.
+		BudgetNearLimit: budgetSink{
+			emitter:    courierlog.NewEmitter(os.Stdout, courierlog.ParseLevel(os.Getenv("COURIER_LOG_LEVEL"))),
+			stderr:     os.Stderr,
+			invocation: invocation,
+		},
 		// The run's model telemetry (#738): the sessions it opens report each
 		// request attempt through it and their applied compactions chain its
 		// tally beside the primary compaction sink, so the terminal
@@ -319,6 +327,13 @@ func runArgs(args []string) error {
 
 	result := coordinator.Run(ctx, invocation)
 	emitModelTelemetry(modelEvents, invocation, modelTally.Summary(), work.surface.Digest)
+	// The coordination-budget consumption (#901): one run.budget line on
+	// every finished run whose lane declared a budget, so operators see how
+	// close the run came to its ceilings without reading the terminal
+	// result. A non-declaring run emits nothing.
+	if consumption, declared := coordinator.BudgetConsumption(); declared {
+		emitRunBudget(modelEvents, invocation, consumption)
+	}
 	return declare(result, invocation.Mode, reporter, identity)
 }
 
@@ -595,6 +610,43 @@ func emitModelTelemetry(emitter *courierlog.Emitter, invocation executor.Invocat
 	}
 }
 
+// emitRunBudget records the finished run's coordination-budget consumption
+// (#901) on the structured event log: tool calls reserved against the
+// declared ceiling, elapsed seconds against the declared wall clock, and
+// whether (and on which axis) the budget tripped. Emitted once per finished
+// run whose lane declared a budget, next to model.telemetry; a run with no
+// declared budget has nothing to report. No status: the consumption is
+// observability, never a liveness or completion claim. Emission is
+// best-effort: a dropped event is noted on stderr and the run continues.
+func emitRunBudget(emitter *courierlog.Emitter, invocation executor.Invocation, consumption harness.BudgetConsumption) {
+	detail := map[string]any{
+		"tool_calls": consumption.ToolCalls,
+		"tripped":    consumption.Tripped,
+	}
+	if consumption.MaxToolCalls > 0 {
+		detail["max_tool_calls"] = consumption.MaxToolCalls
+	}
+	if consumption.WallClockSeconds > 0 {
+		detail["elapsed_seconds"] = consumption.ElapsedSeconds
+		detail["wall_clock_seconds"] = consumption.WallClockSeconds
+	}
+	if consumption.TripAxis != "" {
+		detail["trip_axis"] = consumption.TripAxis
+	}
+	err := emitter.Emit(courierlog.Event{
+		Type:    courierlog.EventRunBudget,
+		RunID:   invocation.RunName,
+		Repo:    invocation.Repo,
+		Ref:     invocation.Ref,
+		Mode:    string(invocation.Mode),
+		Detail:  detail,
+		Verbose: true,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "courier-control: dropped %s event: %v\n", courierlog.EventRunBudget, err)
+	}
+}
+
 // emitRunSurface records the run's model-surface provenance (#730) on the
 // structured event log: one run.surface line carrying the schema version,
 // the digest, and the canonical encoding that produced the digest — the
@@ -734,16 +786,18 @@ func (s compactionSink) SessionCompacted(event harness.CompactEvent) {
 	}
 }
 
-// budgetSink adapts the harness's coordination-budget trip (#901) onto the
+// budgetSink adapts the harness's coordination-budget seams (#901) onto the
 // run's structured event log: one session.budget_exhausted line carrying the
 // exhausted axis, the observed count, the declared limit, and the role whose
-// boundary tripped it.
+// boundary tripped it, and at most one session.budget_warning line per axis
+// carrying the same shape at the warning share of that axis's bound.
 //
-// It sets no Status: like session.compacted, the trip is observability,
-// never a liveness or completion claim, and the budget_exhausted terminal
-// result remains the classification surface. Detail is Verbose so the counts
-// reach the log store at info level. Emission is best-effort: a dropped
-// event is noted on stderr and the run continues.
+// It sets no Status: like session.compacted, the trip and the warning are
+// observability, never a liveness or completion claim, and the
+// budget_exhausted terminal result remains the classification surface.
+// Detail is Verbose so the counts reach the log store at info level.
+// Emission is best-effort: a dropped event is noted on stderr and the run
+// continues.
 type budgetSink struct {
 	emitter    *courierlog.Emitter
 	stderr     io.Writer
@@ -768,6 +822,29 @@ func (s budgetSink) BudgetExhausted(event harness.BudgetExhaustedEvent) {
 	})
 	if err != nil {
 		fmt.Fprintf(s.stderr, "courier-control: dropped %s event: %v\n", courierlog.EventSessionBudgetExhausted, err)
+	}
+}
+
+// BudgetNearLimit implements harness.BudgetWarningSink: the same line shape
+// under the warning event type, so an operator sees a run approaching its
+// ceiling before the trip line says it bound.
+func (s budgetSink) BudgetNearLimit(event harness.BudgetWarningEvent) {
+	err := s.emitter.Emit(courierlog.Event{
+		Type:  courierlog.EventSessionBudgetWarning,
+		RunID: s.invocation.RunName,
+		Repo:  s.invocation.Repo,
+		Ref:   s.invocation.Ref,
+		Mode:  string(s.invocation.Mode),
+		Role:  event.Role,
+		Detail: map[string]any{
+			"budget": event.Axis,
+			"count":  event.Count,
+			"limit":  event.Limit,
+		},
+		Verbose: true,
+	})
+	if err != nil {
+		fmt.Fprintf(s.stderr, "courier-control: dropped %s event: %v\n", courierlog.EventSessionBudgetWarning, err)
 	}
 }
 

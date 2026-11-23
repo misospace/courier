@@ -289,6 +289,11 @@ type CoordinatorConfig struct {
 	// (#901). Emission is best-effort and observability only, like the
 	// compaction sink: a failing sink is isolated and never fails the run.
 	BudgetExhausted BudgetExhaustSink
+	// BudgetNearLimit optionally receives each budget axis's single
+	// near-limit warning (#901), so run telemetry shows a run approaching
+	// its ceiling before it binds. Same best-effort, isolated,
+	// observability-only contract as the trip sink.
+	BudgetNearLimit BudgetWarningSink
 	// Compactions optionally receives one telemetry event per applied
 	// step-boundary compaction (#243). Emission is best-effort and
 	// observability only: it never changes a transcript or a run outcome.
@@ -336,11 +341,11 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 		budgets[role] = budget
 	}
 	// The coordination budget (#901) builds its ledger only when the lane
-	// declares something; the start instant is recorded here, at the point
-	// the session loop's owner comes into being.
+	// declares something; the wall clock starts later, at the beginning of
+	// the coordinator session loop, never here.
 	var runBudget *runBudgetLedger
 	if config.Budget.declares() {
-		runBudget = newRunBudgetLedger(config.Budget, time.Now, config.BudgetExhausted)
+		runBudget = newRunBudgetLedger(config.Budget, time.Now, config.BudgetExhausted, config.BudgetNearLimit)
 	}
 	return &Coordinator{
 		gateway:                 config.Transport,
@@ -490,6 +495,14 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 	if strings.TrimSpace(inv.Framing) != "" {
 		session.Pin(Message{Role: "system", Content: inv.Framing})
 	}
+	// The declared coordination budget is advisory to the model through
+	// framing and enforced by the runtime (#901): the ceiling rides the
+	// pinned transcript from the first request, so the model never
+	// discovers it only when a call is refused. An undeclared budget
+	// pins nothing.
+	if section := c.runBudget.framingSection(); section != "" {
+		session.Pin(Message{Role: "system", Content: section})
+	}
 	if c.skills != nil {
 		session.Pin(Message{Role: "system", Content: c.skills.Section()})
 	}
@@ -504,6 +517,10 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 	// declare before the harness ends the run through the budget ending.
 	budgetNoteInjected := false
 	budgetGraceTurnsUsed := 0
+	// The declared wall clock measures from here — the start of the
+	// coordinator session loop — never from coordinator construction, so
+	// startup time (probes included) never counts against the bound (#901).
+	c.runBudget.begin()
 	for {
 		// Step boundary (#238): read the broker-served control request and
 		// inject its control turn once. The latch, not the model, decides
@@ -526,16 +543,26 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 		if budgetNoteInjected && budgetGraceTurnsUsed >= budgetGraceTurns && !c.control.Stopped() {
 			// The grace exit re-checks the workspace-prerequisite latch the
 			// same way the final-turn path does (#737): a trip that landed
-			// during the grace — from a delegate goroutine, without a later
-			// tool boundary to consume it — owns the ending. The budget
-			// never masks a condition the workspace itself cannot satisfy.
+			// during the grace — inside a delegate session, without a later
+			// coordinator tool boundary to consume it — owns the ending.
+			// The budget never masks a condition the workspace itself
+			// cannot satisfy.
+			//
+			// No in-flight-brief guard is needed here (unlike the soft-stop
+			// final-turn path): brief execution is synchronous inside the
+			// coordinator's own pump — runDelegate registers, runs,
+			// integrates, and marks the brief terminal before its tool call
+			// returns — so by the time control reaches a step boundary
+			// every registered brief has reached its terminal. Nothing at
+			// this point could integrate a still-running brief, and looping
+			// without a model turn could only spin.
 			if failure := c.prerequisite.peek(); failure != nil {
 				if failure.kind == courierv1alpha1.NativeResultInfrastructureFailed {
 					return c.infrastructureEnding(ctx, failure)
 				}
 				return c.blockedExternalEnding(ctx, failure)
 			}
-			return c.budgetEnding(ctx)
+			return c.budgetEnding(ctx, budgetGraceTurnsUsed)
 		}
 		turn := c.pump(ctx, session, "", c.coordinatorTools())
 		if turn.blocker != nil {
@@ -596,7 +623,7 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 				// grace ends the run as budget-exhausted — never the
 				// clarification theater, and never the generic
 				// undeclared-ending workload failure.
-				return c.budgetEnding(ctx)
+				return c.budgetEnding(ctx, budgetGraceTurnsUsed)
 			}
 			if clarifications < maxOutcomeClarifications {
 				clarifications++
@@ -887,16 +914,27 @@ func (c *Coordinator) infrastructureEnding(ctx context.Context, cause error) exe
 // brief whose durable record never landed is an infrastructure failure, not
 // a clean budget ending — and ends with the budget_exhausted kind, never a
 // workload failure that would let an exhausted budget masquerade as an
-// undeclared ending.
-func (c *Coordinator) budgetEnding(ctx context.Context) executor.HarnessResult {
-	axis, count, limit := c.runBudget.tripInfo()
+// undeclared ending. The handoff text is the structured budget handoff the
+// issue requires: the trip facts plus the decisions, findings, and unfinished
+// work read from the brief ledger, never a silent truncation of the session.
+func (c *Coordinator) budgetEnding(ctx context.Context, graceTurnsUsed int) executor.HarnessResult {
 	if err := c.settleStatus(ctx); err != nil {
 		return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: err}
 	}
 	return executor.HarnessResult{
 		Kind:   courierv1alpha1.NativeResultBudgetExhausted,
-		Reason: fmt.Sprintf("coordination budget exhausted: %s %d/%d", axis, count, limit),
+		Reason: c.runBudget.handoffReason(graceTurnsUsed, c.briefs),
 	}
+}
+
+// BudgetConsumption reports the run's coordination-budget snapshot and
+// whether the lane declared a budget at all (#901): the terminal run.budget
+// telemetry line is emitted only for a declaring run.
+func (c *Coordinator) BudgetConsumption() (BudgetConsumption, bool) {
+	if c.runBudget == nil {
+		return BudgetConsumption{}, false
+	}
+	return c.runBudget.consumption(), true
 }
 
 // finish applies the declared outcome. Publication is the coordinator's own

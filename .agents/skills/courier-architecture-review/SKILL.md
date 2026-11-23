@@ -9,7 +9,10 @@ These are not style preferences; a change that violates them is wrong.
 
 - **Inform, don't constrain.** Do not add hard caps, gates, or governors on
   model behavior. Bound *stuck* (liveness), never *duration* (no wall-clock
-  timeouts on runs). Prompts are goals plus tools, not paragraphs of scaffolding.
+  timeouts on runs). The one duration bound allowed is the coordination budget
+  an operator opts into per lane on `LaneProfile.spec.budget` (#901), enforced
+  by the harness — never an ad-hoc governor in the control plane. Prompts are
+  goals plus tools, not paragraphs of scaffolding.
 - **The world is the source of truth.** Never trust internal/checkpoint state
   over git, the PR, or CI. On resume, re-read the world and let it win on
   conflict.

@@ -52,7 +52,11 @@ judgment, instead of boxing it in with gates, caps, and one-shot pods.
   any mix. Courier is **local-capable, not local-constrained**. Its author runs
   it local-only; nothing in the design requires that of anyone else.
 - **No wall-clock deadlines.** Consumer hardware is slow; an 18-hour run that is
-  making progress is fine. Courier bounds *stuck*, not *duration*.
+  making progress is fine. Courier bounds *stuck*, not *duration*. The one
+  declared exception is opt-in and lane-scoped: an operator may bound a lane's
+  coordination on `LaneProfile.spec.budget` (#901), which the harness — never
+  the controller — enforces as a coordination budget ending `budget_exhausted`.
+  Nothing may bound a run's duration that its lane did not declare.
 
 ## Architecture
 
@@ -865,7 +869,12 @@ added later.
 
 ## Liveness and stuck detection
 
-No wall-clock. Courier bounds *stuck*, never *duration*.
+No wall-clock deadlines imposed by the control plane. Courier bounds *stuck*,
+never *duration*. The only duration bound that exists is the one a lane opts
+into on `LaneProfile.spec.budget` (#901): the harness checks the coordinator
+session loop's wall clock at its step boundaries and ends an exhausted run
+`budget_exhausted`; a lane that declares no budget is bounded by liveness
+alone.
 
 The only safe progress signal is **successful model streaming or a completed
 tool call** — real activity. Commits are unsafe (opencode-style runs commit

@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -416,5 +417,156 @@ func TestRunBudgetTripNeverPreemptsOperatorSoftStop(t *testing.T) {
 	// the ending the latch owns.
 	if events := sink.all(); len(events) != 1 {
 		t.Fatalf("events = %+v, want the one trip event", events)
+	}
+}
+
+// TestRunBudgetDeclaredBoundsArePinnedIntoTheFraming proves the advisory half
+// of #901: a declaring lane's ceilings ride the coordinator transcript from
+// the first request, so the model is warned before the runtime refuses a
+// call — and an undeclared lane pins nothing, keeping today's transcript
+// byte-identical.
+func TestRunBudgetDeclaredBoundsArePinnedIntoTheFraming(t *testing.T) {
+	gateway, mocker, cleanup := gatewayFor(
+		budgetCancelTurn("1"),
+		budgetFinalTurn(budgetNoChange),
+	)
+	defer cleanup()
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Transport: gateway, Bindings: testBindings(),
+		Budget: RunBudget{MaxToolCalls: 1, WallClock: 300 * time.Second},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := coordinator.Run(context.Background(), testInvocation())
+	if result.Kind != courierv1alpha1.NativeResultNoChange {
+		t.Fatalf("result = %+v, want the declared ending", result)
+	}
+	mocker.mu.Lock()
+	first := mocker.calls[0].rawBody
+	mocker.mu.Unlock()
+	if !strings.Contains(first, "Coordination budget for this run") || !strings.Contains(first, "1 tool calls") || !strings.Contains(first, "300 seconds") {
+		t.Fatalf("the first request must carry the pinned budget advisory with both bounds: %q", first)
+	}
+
+	gateway2, mocker2, cleanup2 := gatewayFor(
+		budgetCancelTurn("1"),
+		budgetFinalTurn(budgetNoChange),
+	)
+	defer cleanup2()
+	coordinator2, err := NewCoordinator(CoordinatorConfig{
+		Transport: gateway2, Bindings: testBindings(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := coordinator2.Run(context.Background(), testInvocation()); result.Kind != courierv1alpha1.NativeResultNoChange {
+		t.Fatalf("result = %+v, want the declared ending", result)
+	}
+	mocker2.mu.Lock()
+	defer mocker2.mu.Unlock()
+	if strings.Contains(mocker2.calls[0].rawBody, "Coordination budget for this run") {
+		t.Fatal("an undeclared lane pins no budget section: the transcript stays byte-identical")
+	}
+}
+
+// TestRunBudgetNearLimitWarningCrossesBeforeTheTrip proves the warning seam
+// through the wiring: a reservation reaching the warning share emits one
+// session warning, and the later trip is still the single trip event.
+func TestRunBudgetNearLimitWarningCrossesBeforeTheTrip(t *testing.T) {
+	sink := &recordingBudgetSink{}
+	gateway, _, cleanup := gatewayFor(
+		budgetCancelTurn("1"), budgetCancelTurn("2"), budgetCancelTurn("3"), // 1..3 of 3 allowed; 3/3 warns
+		budgetCancelTurn("4"), // 4 of 3: refused, the trip
+		budgetFinalTurn(budgetNoChange),
+	)
+	defer cleanup()
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Transport: gateway, Bindings: testBindings(),
+		Budget:          RunBudget{MaxToolCalls: 3},
+		BudgetExhausted: sink,
+		BudgetNearLimit: sink,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := coordinator.Run(context.Background(), testInvocation()); result.Kind != courierv1alpha1.NativeResultNoChange {
+		t.Fatalf("result = %+v, want the declaration inside the grace", result)
+	}
+	warnings := sink.allWarnings()
+	if len(warnings) != 1 {
+		t.Fatalf("warnings = %+v, want exactly one at the warning share", warnings)
+	}
+	if warnings[0].Axis != budgetAxisToolCalls || warnings[0].Count != 3 || warnings[0].Limit != 3 {
+		t.Fatalf("warning = %+v, want tool_calls 3/3", warnings[0])
+	}
+	if events := sink.all(); len(events) != 1 || events[0].Count != 4 {
+		t.Fatalf("events = %+v, want the one 4/3 trip beside the warning", events)
+	}
+}
+
+// TestRunBudgetEndingCarriesStructuredHandoff proves #901's done-condition
+// for the ending itself: a run that exhausts the ceiling without declaring
+// ends budget_exhausted carrying the structured handoff — its integrated
+// brief as a finding, decisions, unfinished briefs as remaining work — not
+// a bare reason string.
+func TestRunBudgetEndingCarriesStructuredHandoff(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.completeAll = true
+	worker.snapshotTip = "snap-tip"
+	sink := &recordingBudgetSink{}
+	gateway, _, cleanup := gatewayFor(
+		// Coordinator: delegate b1. (reserve 1 of 2)
+		budgetToolTurn("call-1", toolDelegate, `{"id":"b1","role":"coder","objective":"Do the work","decisions":[{"summary":"shape","value":"pure seam"}],"successCheck":"tests pass"}`),
+		// Coder: shell, then final summary. (reserve 2 of 2)
+		budgetToolTurn("call-2", toolShell, `{"command":"echo work"}`),
+		budgetFinalTurn("work done"),
+		// Coordinator: a third call trips. (reserve 3 of 2)
+		budgetCancelTurn("3"),
+		// The grace burns without a declaration; the harness ends the run.
+		budgetCancelTurn("4"), budgetCancelTurn("5"), budgetCancelTurn("6"),
+	)
+	defer cleanup()
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Transport: gateway, Bindings: testBindings(),
+		Worker:          delegator,
+		Snapshot:        snapshotProvider("snap-tip"),
+		Publisher:       &mockPublisher{},
+		Budget:          RunBudget{MaxToolCalls: 2},
+		BudgetExhausted: sink,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := coordinator.Run(context.Background(), testInvocation())
+	if result.Kind != courierv1alpha1.NativeResultBudgetExhausted {
+		t.Fatalf("result = %+v, want the budget_exhausted ending", result)
+	}
+	payload, found := strings.CutPrefix(result.Reason, "coordination budget exhausted: tool_calls 3/2; "+budgetHandoffPrefix)
+	if !found {
+		t.Fatalf("reason = %q, want the trip line and the structured handoff", result.Reason)
+	}
+	var doc budgetHandoff
+	if err := json.Unmarshal([]byte(payload), &doc); err != nil {
+		t.Fatalf("handoff payload is not valid JSON: %v: %q", err, payload)
+	}
+	if doc.Axis != budgetAxisToolCalls || doc.Count != 3 || doc.Limit != 2 || doc.GraceTurns != budgetGraceTurns {
+		t.Fatalf("handoff trip facts = %+v, want tool_calls 3/2 after the full grace", doc)
+	}
+	if len(doc.Decisions) != 1 || !strings.Contains(doc.Decisions[0], "b1: shape=pure seam") {
+		t.Fatalf("decisions = %+v, want b1's settled decision", doc.Decisions)
+	}
+	if len(doc.Findings) != 1 || !strings.Contains(doc.Findings[0], "b1:") || !strings.Contains(doc.Findings[0], "work done") {
+		t.Fatalf("findings = %+v, want b1's recorded outcome", doc.Findings)
+	}
+	if len(doc.Remaining) != 0 {
+		t.Fatalf("remaining = %+v, want none: b1 reached its terminal", doc.Remaining)
+	}
+	// The consumption snapshot the run.budget line rides reflects the same
+	// ending: refused calls counted, the trip sticky.
+	consumption, declared := coordinator.BudgetConsumption()
+	if !declared || consumption.ToolCalls != 6 || consumption.MaxToolCalls != 2 || !consumption.Tripped || consumption.TripAxis != budgetAxisToolCalls {
+		t.Fatalf("consumption = %+v declared=%v, want 6/2 tripped on tool_calls", consumption, declared)
 	}
 }

@@ -9,7 +9,8 @@ The OpenCode bootstrap remains the default,
 explicitly insecure legacy mode until a safe replacement is proven.
 
 DESIGN.md remains authoritative. In particular: inform, don't constrain model
-behavior; git, the PR, and CI are source of truth; no wall-clock run deadlines;
+behavior; git, the PR, and CI are source of truth; no wall-clock run deadlines
+except the coordination budget a lane opts into on `spec.budget` (#901);
 provider configuration is not a `LaneProfile` concern; and Courier can publish
 but never merge.
 
@@ -1667,23 +1668,33 @@ only one axis a lane must bound: an over-budget coordinator can also burn
 unbounded tool calls and wall-clock time. The lane declares the rest on
 `LaneProfile.spec.budget` — `maxToolCalls` (total across the coordinator
 session and every delegate session) and `wallClockSeconds` (coordinator loop,
-step-boundary checked) — which travels the same trusted run-context
-environment as the context policy (`executor.Invocation.Budget`,
-`COURIER_BUDGET_JSON`), so a worker or model can never author it, and an
-absent budget enforces nothing. Enforcement lives in `internal/harness`
-beside the context seam: the tool pump reserves every requested call in every
-session before executing it — the bound is total for the run — and a call
-past the ceiling is refused with a fixed tool result so the transcript stays
-well-formed; the wall clock is checked at the coordinator loop's step
-boundaries. The first exhaustion trips once and sticks: it emits one
+step-boundary checked, measured from the loop's start) — which travels the
+same trusted run-context environment as the context policy
+(`executor.Invocation.Budget`, `COURIER_BUDGET_JSON`), so a worker or model
+can never author it, and an absent budget enforces nothing. The budget is
+advisory to the model through framing and enforced by the runtime: a
+declaring lane pins its bounds into the coordinator transcript from the first
+request; delegate sessions learn the ceiling from the fixed refusal at their
+own calls. Enforcement lives in `internal/harness` beside the context seam: the
+tool pump reserves every requested call in every session before executing it —
+the bound is total for the run — and a call past the ceiling is refused with a
+fixed tool result so the transcript stays well-formed; the wall clock is
+checked at the coordinator loop's step boundaries. Each axis warns once at 80%
+of its declared bound through `session.budget_warning`, and every finished
+declaring run reports its consumption next to `model.telemetry` as one
+`run.budget` event, so operators see a run approaching its ceiling and where
+it ended relative to it. The first exhaustion trips once and sticks: it emits one
 `session.budget_exhausted` event (axis, count, limit, role — observability
 only, like `session.compacted`) and injects one fixed stop instruction that
 reuses the soft-stop contract (stop new work, let in-flight briefs finish and
 integrate, validate, publish, declare). A valid declaration inside the fixed
 grace is honored exactly like any other ending; when the grace runs out or the
 model declares invalidly while tripped, the harness ends the run with the
-`budget_exhausted` terminal kind after settling status obligations — never a
-crash-shaped `infrastructure_failed`, and never a generic undeclared ending.
+`budget_exhausted` terminal kind after settling status obligations, its
+pre-exit handoff reason carrying a structured handoff (`budget_exhausted_handoff_v1`:
+the trip facts plus the decisions, findings, and unfinished work read from the
+brief ledger) — never a silent truncation, never a crash-shaped
+`infrastructure_failed`, and never a generic undeclared ending.
 The budget never preempts the operator soft-stop latch or a tripped workspace
 prerequisite, and an in-flight brief is never aborted by the trip: its calls
 meet the ceiling, and it reaches its terminal for integration.
