@@ -97,6 +97,18 @@ type LaneProfileSpec struct {
 	// +optional
 	Context *ContextPolicy `json:"context,omitempty"`
 
+	// Budget declares the coordination budgets the harness enforces on runs
+	// in this lane (#901): a total tool-call bound across the coordinator
+	// and every delegate session, and a wall-clock bound on the coordinator
+	// loop. An absent Budget enforces nothing: a spinning coordinator can
+	// consume tool calls and wall-clock time unbounded, stalling its lane.
+	// Like Context, this carries declarations only; internal/harness counts,
+	// checks, and enforces them. Enforcement is per incarnation at step
+	// boundaries: a relaunch starts a fresh clock, exactly like a fresh
+	// context budget.
+	// +optional
+	Budget *BudgetPolicy `json:"budget,omitempty"`
+
 	// Resources sizes the lane-sized pods Courier creates for runs on this
 	// lane — the coordinator and the secure topology's control, worker, and
 	// broker pods — using Courier's narrowed pod-sizing vocabulary: claims
@@ -193,6 +205,27 @@ type ContextBudget struct {
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	OutputReservation int `json:"outputReservation,omitempty"`
+}
+
+// BudgetPolicy is a lane's declared coordination budget for the harness
+// (#901). It carries declared bounds only: internal/harness counts every
+// tool call the coordinator or a delegate session executes, checks the
+// wall clock at each step boundary, and enforces a stop instruction with a
+// bounded grace before ending the run with the budget_exhausted terminal
+// result. A zero-valued field declares no bound for that axis; a
+// zero-valued policy enforces nothing.
+type BudgetPolicy struct {
+	// MaxToolCalls bounds the total number of model tool calls a run
+	// executes across the coordinator session and every delegate session.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	MaxToolCalls int `json:"maxToolCalls,omitempty"`
+
+	// WallClockSeconds bounds the run's wall clock, measured from the start
+	// of the coordinator session loop to the next step boundary.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	WallClockSeconds int `json:"wallClockSeconds,omitempty"`
 }
 
 // CIRepairPolicy is a lane's declared mechanical-CI repair policy (#475,

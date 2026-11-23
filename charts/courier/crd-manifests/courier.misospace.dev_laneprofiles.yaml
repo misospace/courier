@@ -56,6 +56,31 @@ spec:
               (internal/bootstrap/config.go), which carries the portable spec for
               manager-bootstrapped profiles.
             properties:
+              budget:
+                description: |-
+                  Budget declares the coordination budgets the harness enforces on runs
+                  in this lane (#901): a total tool-call bound across the coordinator
+                  and every delegate session, and a wall-clock bound on the coordinator
+                  loop. An absent Budget enforces nothing: a spinning coordinator can
+                  consume tool calls and wall-clock time unbounded, stalling its lane.
+                  Like Context, this carries declarations only; internal/harness counts,
+                  checks, and enforces them. Enforcement is per incarnation at step
+                  boundaries: a relaunch starts a fresh clock, exactly like a fresh
+                  context budget.
+                properties:
+                  maxToolCalls:
+                    description: |-
+                      MaxToolCalls bounds the total number of model tool calls a run
+                      executes across the coordinator session and every delegate session.
+                    minimum: 1
+                    type: integer
+                  wallClockSeconds:
+                    description: |-
+                      WallClockSeconds bounds the run's wall clock, measured from the start
+                      of the coordinator session loop to the next step boundary.
+                    minimum: 1
+                    type: integer
+                type: object
               capacityGroup:
                 description: |-
                   CapacityGroup names the opaque execution-capacity pool this lane draws
