@@ -67,6 +67,39 @@ func TestRunArgsFailsClosed(t *testing.T) {
 	}
 }
 
+// TestContributionFlags covers contribution flag pairing and file loading.
+func TestContributionFlags(t *testing.T) {
+	dir := t.TempDir()
+	sessionKeyFile := filepath.Join(dir, "session-key")
+	tokensFile := filepath.Join(dir, "tokens")
+	contributionTokenFile := filepath.Join(dir, "contribute-token")
+	for path, value := range map[string]string{sessionKeyFile: "key", tokensFile: "operator", contributionTokenFile: " admission-token\n"} {
+		if err := os.WriteFile(path, []byte(value), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base := []string{"--session-key-file=" + sessionKeyFile, "--operator-tokens-file=" + tokensFile}
+	for _, args := range [][]string{{"--contribute-url=http://example.test"}, {"--contribute-token-file=" + contributionTokenFile}} {
+		_, _, err := parseFlags(append(append([]string{}, base...), args...))
+		if err == nil || !strings.Contains(err.Error(), "--contribute-url and --contribute-token-file") {
+			t.Fatalf("pair args %v error = %v", args, err)
+		}
+	}
+	_, cfg, err := parseFlags(append(append([]string{}, base...), "--contribute-url=https://example.test/", "--contribute-token-file="+contributionTokenFile, "--contribute-timeout=3s"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ContributeURL != "https://example.test/" || string(cfg.ContributeToken) != "admission-token" || cfg.ContributeTimeout != 3*time.Second {
+		t.Fatalf("contribution config = %#v", cfg)
+	}
+	for _, timeout := range []string{"0s", "30s", "31s"} {
+		_, _, err := parseFlags(append(append([]string{}, base...), "--contribute-timeout="+timeout))
+		if err == nil || !strings.Contains(err.Error(), "less than 30s") {
+			t.Errorf("timeout %s error = %v", timeout, err)
+		}
+	}
+}
+
 // TestHTTPServerTimeouts pins the bounded-listener posture of the console's
 // http.Server: every listener timeout is set, and the write bound outlives
 // the default backend probe a page render may take.

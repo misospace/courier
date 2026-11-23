@@ -1,0 +1,38 @@
+{{define "content"}}
+<h1>Contribute</h1>
+{{if eq .State "requires token-mode sign-in"}}
+<p class="state">Contribution submission requires token-mode sign-in.</p>
+{{else if eq .State "not configured"}}
+<p class="state">Contribution admission is not configured.</p>
+{{else}}
+{{if .HasIntent}}
+<p class="state state-warn">An unsettled attempt uses idempotency key <code>{{.Key}}</code>. Resubmitting unchanged retries it; changed content cannot be submitted until this attempt settles or you start a new contribution.</p>
+{{end}}
+{{if .Message}}<p class="state {{.StateClass}}">{{.Message}}</p>{{end}}
+{{if eq .State "success"}}
+<p class="state state-ok">{{if .Resumed}}A run was resumed{{else}}A run was created{{end}} — admitted; this is not a pull request. The run publishes one only when it succeeds.</p>
+<p>Run: <a href="/runs/{{.Run}}">{{.Run}}</a><br>Namespace: {{.Namespace}}<br>Work item: {{.WorkItemID}}</p>
+{{else}}
+<form method="post" action="/contribute" class="contribute">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <label for="lane">Lane</label>
+  <input id="lane" name="lane" maxlength="512" required value="{{.Values.Lane}}">
+  <label for="baseRepo">Base repository</label>
+  <input id="baseRepo" name="baseRepo" maxlength="512" required value="{{.Values.BaseRepo}}">
+  <label for="baseRef">Base ref</label>
+  <input id="baseRef" name="baseRef" maxlength="255" required value="{{.Values.BaseRef}}">
+  <label for="workRepo">Work repository</label>
+  <input id="workRepo" name="workRepo" maxlength="512" required value="{{.Values.WorkRepo}}">
+  <label for="goal">Goal</label>
+  <textarea id="goal" name="goal" maxlength="16384" required>{{.Values.Goal}}</textarea>
+  <label for="upstreamIssue">Upstream issue <span>(optional; untrusted context only)</span></label>
+  <input id="upstreamIssue" name="upstreamIssue" maxlength="2048" value="{{.Values.UpstreamIssue}}">
+  <button type="submit">Submit contribution</button>
+</form>
+{{end}}
+<form method="post" action="/contribute/new" class="contribute-new">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <button type="submit">Start a new contribution</button>
+</form>
+{{end}}
+{{end}}

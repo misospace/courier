@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -106,7 +107,7 @@ func login(t *testing.T, baseURL, token string) *http.Client {
 		t.Fatalf("login set %d cookies, want 1", len(cookies))
 	}
 	return &http.Client{
-		Jar: &singleCookieJar{cookie: cookies[0]},
+		Jar: &singleCookieJar{cookies: map[string]*http.Cookie{cookies[0].Name: cookies[0]}},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
@@ -495,10 +496,21 @@ func TestSessionCookieFlags(t *testing.T) {
 		t.Fatalf("logout status = %d, want 303", logoutResp.StatusCode)
 	}
 	clearing := logoutResp.Cookies()
-	if len(clearing) != 1 {
-		t.Fatalf("logout set %d cookies, want 1", len(clearing))
+	if len(clearing) != 2 {
+		t.Fatalf("logout set %d cookies, want session and intent clears", len(clearing))
 	}
-	cleared := clearing[0]
+	var cleared *http.Cookie
+	for _, candidate := range clearing {
+		if candidate.Name == sessionCookieName {
+			cleared = candidate
+		}
+		if candidate.Name == contributeIntentCookie && candidate.MaxAge != -1 {
+			t.Fatal("logout did not clear the contribution-intent cookie")
+		}
+	}
+	if cleared == nil {
+		t.Fatal("logout did not clear the session cookie")
+	}
 	if cleared.Name != cookie.Name || cleared.Value != "" {
 		t.Fatalf("logout cookie = %q with value %q, want the session cookie name cleared",
 			cleared.Name, cleared.Value)
@@ -547,7 +559,7 @@ func TestSessionCookieFlagsOverProxyHop(t *testing.T) {
 		t.Fatal("session cookie at the default posture over a plaintext proxy hop is not Secure")
 	}
 	client := &http.Client{
-		Jar:           &singleCookieJar{cookie: session[0]},
+		Jar:           &singleCookieJar{cookies: map[string]*http.Cookie{session[0].Name: session[0]}},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	_, body := get(t, client, base+"/")
@@ -570,10 +582,22 @@ func TestSessionCookieFlagsOverProxyHop(t *testing.T) {
 		t.Fatalf("logout status = %d, want 303", logoutResp.StatusCode)
 	}
 	cleared := logoutResp.Cookies()
-	if len(cleared) != 1 {
-		t.Fatalf("logout set %d cookies, want 1", len(cleared))
+	if len(cleared) != 2 {
+		t.Fatalf("logout set %d cookies, want session and contribution-intent clearing cookies", len(cleared))
 	}
-	if !cleared[0].Secure {
+	var sessionCleared, intentCleared *http.Cookie
+	for _, cookie := range cleared {
+		if cookie.Name == sessionCookieName {
+			sessionCleared = cookie
+		}
+		if cookie.Name == contributeIntentCookie {
+			intentCleared = cookie
+		}
+	}
+	if sessionCleared == nil || intentCleared == nil || intentCleared.MaxAge != -1 {
+		t.Fatalf("logout did not clear both cookies: %#v", cleared)
+	}
+	if !sessionCleared.Secure {
 		t.Fatal("logout clearing cookie at the default posture is not Secure")
 	}
 	if cleared[0].HttpOnly != session[0].HttpOnly || cleared[0].SameSite != session[0].SameSite {
@@ -619,7 +643,7 @@ func TestInsecureCookiesOptOut(t *testing.T) {
 		t.Fatal("InsecureCookies opt-out moved a posture flag other than Secure")
 	}
 	client := &http.Client{
-		Jar:           &singleCookieJar{cookie: session[0]},
+		Jar:           &singleCookieJar{cookies: map[string]*http.Cookie{session[0].Name: session[0]}},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	_, body := get(t, client, httpServer.URL+"/")
@@ -642,11 +666,16 @@ func TestInsecureCookiesOptOut(t *testing.T) {
 		t.Fatalf("logout status = %d, want 303", logoutResp.StatusCode)
 	}
 	cleared := logoutResp.Cookies()
-	if len(cleared) != 1 {
-		t.Fatalf("logout set %d cookies, want 1", len(cleared))
+	if len(cleared) != 2 {
+		t.Fatalf("logout set %d cookies, want session and contribution-intent clearing cookies", len(cleared))
 	}
-	if cleared[0].Secure {
-		t.Fatal("logout clearing cookie mirrors a posture the opt-out turned off")
+	for _, cookie := range cleared {
+		if cookie.Name == contributeIntentCookie && cookie.MaxAge != -1 {
+			t.Fatal("logout did not clear the contribution-intent cookie")
+		}
+		if cookie.Name == sessionCookieName && cookie.Secure {
+			t.Fatal("logout clearing cookie mirrors a posture the opt-out turned off")
+		}
 	}
 }
 
@@ -655,11 +684,12 @@ func TestInsecureCookiesOptOut(t *testing.T) {
 // before or after login.
 func TestResponsesNeverLeakSecretMaterial(t *testing.T) {
 	secrets := newTestSecrets(t)
-	_, base := newTestServer(t, secrets, "")
-	paths := []string{"/", "/runs", "/runs/example-run", "/login", "/logout", "/healthz", "/static/main.css"}
+	server, base := newTestServer(t, secrets, "")
+	server.contribute, _ = newHTTPContributeClient("http://distinctive-admission.example.test", []byte("distinctive-contribution-bearer"), time.Second)
+	paths := []string{"/", "/runs", "/runs/example-run", "/contribute", "/login", "/logout", "/healthz", "/static/main.css"}
 	for _, path := range paths {
 		_, body := get(t, nil, base+path)
-		for _, marker := range []string{secrets.token, secrets.secondaryToken, secrets.sessionKey} {
+		for _, marker := range []string{secrets.token, secrets.secondaryToken, secrets.sessionKey, "distinctive-admission.example.test", "distinctive-contribution-bearer"} {
 			if strings.Contains(body, marker) {
 				t.Fatalf("GET %s (unauthenticated) leaked secret material in the response body", path)
 			}
@@ -671,7 +701,7 @@ func TestResponsesNeverLeakSecretMaterial(t *testing.T) {
 		// A wrong-token 401 re-renders; a 303 carries no body worth
 		// scanning, but scan it anyway.
 		_ = resp
-		for _, marker := range []string{secrets.token, secrets.secondaryToken, secrets.sessionKey} {
+		for _, marker := range []string{secrets.token, secrets.secondaryToken, secrets.sessionKey, "distinctive-admission.example.test", "distinctive-contribution-bearer"} {
 			if strings.Contains(body, marker) {
 				t.Fatalf("GET %s (authenticated) leaked secret material in the response body", path)
 			}
@@ -730,17 +760,41 @@ func TestBackendHealthAllowlist(t *testing.T) {
 }
 
 // singleCookieJar is the minimal cookie jar the tests need: one fixed
-// cookie on every request.
+// cookie on every request. The mutex keeps it safe when a test polls the
+// jar while the client is still writing a response's cookies.
 type singleCookieJar struct {
-	cookie *http.Cookie
+	mu      sync.Mutex
+	cookies map[string]*http.Cookie
 }
 
 func (j *singleCookieJar) Cookies(u *url.URL) []*http.Cookie {
-	c := *j.cookie
-	return []*http.Cookie{&c}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	cookies := make([]*http.Cookie, 0, len(j.cookies))
+	for _, cookie := range j.cookies {
+		if cookie.MaxAge >= 0 {
+			copy := *cookie
+			cookies = append(cookies, &copy)
+		}
+	}
+	return cookies
 }
 
-func (*singleCookieJar) SetCookies(*url.URL, []*http.Cookie) {}
+func (j *singleCookieJar) SetCookies(_ *url.URL, cookies []*http.Cookie) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.cookies == nil {
+		j.cookies = make(map[string]*http.Cookie)
+	}
+	for _, cookie := range cookies {
+		copy := *cookie
+		if cookie.MaxAge < 0 {
+			delete(j.cookies, cookie.Name)
+		} else {
+			j.cookies[cookie.Name] = &copy
+		}
+	}
+}
 
 // applyCookie copies the client's jar cookie onto a manually built request.
 func applyCookie(t *testing.T, client *http.Client, request *http.Request) {
@@ -749,7 +803,9 @@ func applyCookie(t *testing.T, client *http.Client, request *http.Request) {
 	if !ok || jar == nil {
 		t.Fatal("client carries no session cookie")
 	}
-	request.AddCookie(jar.cookie)
+	for _, cookie := range jar.Cookies(nil) {
+		request.AddCookie(cookie)
+	}
 }
 
 // readAll drains and returns a response body.

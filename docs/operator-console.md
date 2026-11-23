@@ -5,11 +5,12 @@ for authenticated operators. It is a standalone Go binary, separate from the
 manager. The overview page shows source health, lane capacity, and admission
 wedges from the operator read API. The run explorer lists CoderRuns from the
 operator read API with server-side search and pagination. The run-detail page
-is still a placeholder, and there are no mutating controls. The console never
-talks to the Kubernetes API. It reads the operator read API over a fixed
-allowlist of GET paths: the `/healthz` probe, and the overview, lane, source,
-and run-list projections when `--backend-url` and a read API token are both
-configured.
+is still a placeholder. The console never talks to the Kubernetes API. It
+reads the operator read API over a fixed allowlist of GET paths: the
+`/healthz` probe, and the overview, lane, source, and run-list projections
+when `--backend-url` and a read API token are both configured. In token mode
+it can also submit contributions to the separate admission API, the only
+mutating surface.
 
 ## Authentication modes
 
@@ -46,14 +47,14 @@ mutating controls must too. The first login POST carries no CSRF token yet,
 because a fresh browser session has none to present. Add login-CSRF
 protection before the console gains state a login can change.
 
-The session cookie always carries `Secure`. The console does not infer the
-flag from its own listener. In every chart-supported deployment the browser's
-TLS ends at a proxy, and the hop that reaches the console is plaintext HTTP.
-An inference from the listener would leave the flag permanently off, so the
-posture is configuration, not observation. `--cookie-secure=false`
-(`operatorConsole.auth.cookieSecure=false` in the chart) opts out explicitly.
-Do not run the console over a network you do not control without that flag
-set to its default.
+The session and contribution-intent cookies carry `Secure`. The console does
+not infer the flag from its own listener. In every chart-supported deployment
+the browser's TLS ends at a proxy, and the hop that reaches the console is
+plaintext HTTP. An inference from the listener would leave the flag permanently
+off, so the posture is configuration, not observation.
+`--cookie-secure=false` (`operatorConsole.auth.cookieSecure=false` in the chart)
+opts out explicitly. Do not run the console over a network you do not control
+without that flag set to its default.
 
 Every response carries `Content-Security-Policy: default-src 'self';
 frame-ancestors 'none'; form-action 'self'; base-uri 'self'`,
@@ -61,6 +62,104 @@ frame-ancestors 'none'; form-action 'self'; base-uri 'self'`,
 `Referrer-Policy: no-referrer`; authenticated pages are
 `Cache-Control: no-store`. There is no JavaScript, no external CDN
 reference, and no font download.
+
+## Submitting contributions (#829)
+
+Token-mode consoles can render a bounded server-side form for approved one-off
+contributions. The console submits `POST /v1/contributions` to the operator's
+contribution admission API (#708). It does no authority validation; the same
+server-side admission path used by `courierctl contribute` decides everything.
+
+The form fields are lane, base repository (`owner/name`), base ref, approved
+head/fork repository (`owner/name`), natural-language goal, and an optional
+upstream issue URL or number as untrusted context. Supplying an issue is not an
+ownership claim and never mutates the upstream issue. The form does not expose
+target host, git or API credentials, namespace, or fresh/debug idempotency
+escapes.
+
+The form is available only in token mode, because the form needs the
+session-bound CSRF token that only token mode has. A manually deployed
+header-mode console renders an unavailable state; the chart goes further and
+fails the render when the contribution pair is set with header mode, so a
+header-mode release can never ship the unused write credential. All
+state-changing requests are CSRF-verified. The bearer token is a file-mounted
+Secret read only by the console process; it is never rendered or proxied to
+the browser. The console uses no JavaScript.
+
+A signed intent cookie carries the idempotency key per browser, bound to the
+submitted content, across reloads, retries, and console restarts; once the
+attempt definitively settles, a later page view re-signs the cookie so the
+key stays in the browser instead of being dropped. Every submission that reaches the
+admission call commits and flushes the cookie first, so even a lost response
+or a console restart mid-submission leaves the browser holding the key. A submission
+whose content differs from a still-unsettled attempt already in the cookie
+is refused before a key is minted or the admission API is contacted, because
+the browser's single durable key slot already belongs to that attempt. The
+operator resubmits the earlier content unchanged, or abandons the attempt
+with the explicit "start a new contribution" action, which clears the cookie
+and frees this session's server-side key slot — settled or not — so
+resubmitting that content afterwards mints a fresh key and requests
+genuinely new work (an abandoned attempt that had been admitted keeps its
+run: the action ends the browser's attempt, never the server-side work).
+Retrying a settled attempt needs no action: the retained cookie replays its
+key, so an accidental identical resubmission cannot duplicate a run, and the
+explicit action is what distinguishes a deliberate new attempt from such a
+retry. Key reuse is scoped to the authenticated operator session: identical
+content arriving from a different session with no intent cookie is an
+independent submission and mints its own key, so one operator's submission
+can never resume another's admitted run. The
+settled flag is signed while this console holds the settlement record; a
+restart before that page view leaves the attempt looking
+unsettled, and resubmitting the content unchanged replays the key and
+re-settles it. The console supports exactly one replica because contribution attempt
+state is per-process. The cookie signature uses the session key, so
+rotating that key discards the browser's intent cookie, and the rotation's
+pod restart also drops every in-memory session and minter slot: the operator
+re-logs in under a new session id and an identical resubmission starts a
+fresh attempt with a new key. (An earlier definitive outcome whose other key
+record lived only in that restart-lost memory can therefore admit a
+duplicate run on such a resubmission; the browser's signed cookie is the
+key's durable home, and rotation destroys it.) A
+timeout or server error has an uncertain outcome and is shown as "may have been
+admitted"; while the key survives, resubmitting identical content retries with
+the same key, so it cannot create a duplicate run. Different content stays
+blocked until the earlier attempt settles or the operator abandons it with
+the explicit "start a new contribution" action. A submission the console
+cannot encode under its own 32 KiB request
+bound is refused locally, before any network contact.
+
+Outcomes stay distinct: created (`201`), resumed (`200`), policy or validation
+refusal (`400`, `403`, or `409`, with the server's message), rejected
+credentials (`401`), unreachable contribution API (nothing admitted only when
+failure is proven to precede sending the request, such as DNS resolution or a
+dial-phase network failure), and uncertain (may have been admitted). Timeouts
+and server errors remain uncertain. Admission is never presented as PR success.
+The result links to the run's status view at `/runs/<run>`. The bearer hop to the
+admission API is plaintext when its configured URL uses `http`; configure a
+cluster-internal Service URL.
+
+Enable the manager's `contributeAPI.enabled` with its `keySecret`, then set
+`operatorConsole.contribute.url` and `tokenSecret` together. The chart render
+fails if only one is set; a raw `--contribute-url` or `--contribute-token-file`
+arg in `controllers.console.containers.console.args` counts toward that pair,
+and a raw token-file path is the operator's own mount to provide. The form is
+off by default.
+
+```sh
+kubectl create secret generic courier-contribute-token \
+  --from-literal=token="$(head -c 32 /dev/urandom | base64)" \
+  --namespace courier-console-ns
+
+helm upgrade --install courier charts/courier \
+  --namespace courier-console-ns \
+  --set contributeAPI.enabled=true \
+  --set contributeAPI.keySecret=courier-contribute-api \
+  --set operatorConsole.enabled=true \
+  --set operatorConsole.auth.sessionKeySecret=courier-console-session \
+  --set operatorConsole.auth.operatorTokensSecret=courier-console-tokens \
+  --set operatorConsole.contribute.url=http://courier-contribute-api \
+  --set operatorConsole.contribute.tokenSecret=courier-contribute-token
+```
 
 ## Enabling via Helm
 
@@ -221,6 +320,6 @@ change nothing.
 
 ## Non-goals
 
-The console does not include, yet: run-detail data, a contribution form,
-mutating controls, any JavaScript, or an Ingress. The run explorer reads the
-read API but changes nothing; the other features grow alongside it.
+The console does not include, yet: run-detail data, mutating controls beyond
+the contribution form, any JavaScript, or an Ingress. The run explorer reads
+the read API but changes nothing; other features grow alongside it.

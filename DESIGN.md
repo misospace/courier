@@ -3067,7 +3067,7 @@ mirroring the lane-profiles transport.
 
 The operator console (`internal/console`, served by the standalone
 `courier-console` binary and enabled by `operatorConsole.enabled` in the
-chart) is a server-rendered UI for authenticated operators. It is
+chart) is a server-rendered interface for authenticated operators. It is
 deliberately independent of the manager and of the Kubernetes API: it imports
 only the standard library, never talks to a cluster, and reaches the operator
 read API only over a fixed allowlist of GET paths. The run explorer reads the
@@ -3086,7 +3086,46 @@ of an empty namespace. The page reloads on a bounded meta-refresh interval —
 never through JavaScript or a Kubernetes watch — and stops polling when the
 backend is unconfigured. The run-detail page stays scaffold; the console
 still probes the read API's `/healthz` path for the page backend note when
-`--backend-url` is configured.
+`--backend-url` is configured. The console additionally carries a bounded
+contribution form, a mutating, credentialed
+outbound-HTTP surface that submits server-side through the operator's
+contribution admission API under a file-mounted bearer token. The form is
+token-mode only and uses session-bound CSRF; a per-browser signed intent
+cookie carries the idempotency key across reloads, retries, and console
+restarts, and it is bound to the submitted content. Every submission that
+reaches the admission call commits and flushes the signed intent cookie
+first, so a lost response or a restart mid-submission still leaves the browser
+holding the key and an identical resubmission replays it instead of minting
+a new one that could duplicate an admitted run. A submission whose content
+differs from a still-unsettled attempt already in the cookie is refused
+before any key is minted or any admission call is made, because the
+browser's single durable key slot belongs to that attempt and a newly
+minted key would have no durable home. The operator resubmits the earlier
+content unchanged, or abandons that attempt through the explicit "start a
+new contribution" action, which clears the cookie and frees this session's
+key slot settled or not, so resubmitting identical content afterwards mints
+a fresh key and requests genuinely new work: the explicit action is what
+distinguishes a deliberate new attempt from retrying a settled one, which
+needs no action because the retained cookie replays its key. Only a settled
+or abandoned slot lets different content start a new attempt. The minter's
+retained slot is keyed by session and content digest, never by digest alone:
+identical content arriving from a different session with no intent cookie is
+an independent submission and mints its own key, so one session's key or
+settlement can never describe another session's live attempt (settlement
+records are per key);
+a later page view rewrites
+the retained cookie with a signed settled flag while this console holds the
+settlement record (the definitive response has already flushed its headers),
+so an identical resubmission replays the settled key even across a restart;
+a restart first leaves the attempt looking unsettled until an unchanged
+resubmission re-settles it. The console runs with exactly one replica — the
+chart fails renders that set more, scale it, or roll it without recreating
+it — because attempt state is per-process. An uncertain outcome clears the record so a
+replayed key stays retryable. The cookie signature uses the
+session key: rotating that key discards an unsettled attempt. The console
+claims "nothing was admitted" only for failures proven to precede sending the
+request (DNS or dial phase); timeouts and server errors stay "may have been
+admitted".
 
 The console decodes each projection into its own view types rather than
 importing `internal/readapi`, so the standard-library-only boundary holds and
@@ -3097,8 +3136,8 @@ serves its pages and the unauthenticated health probe, and the explorer states
 that it is not configured rather than sending an unauthenticated projection
 request. The backend path is a constant allowlist entry and only its query
 string varies, so a filter value can never redirect the request to another
-path or host. Secrets, including that token, travel as file paths read from
-mounted Secrets, never environment values.
+path or host. Secrets, including the contribution and read API tokens, travel
+as file paths read from mounted Secrets, never environment values.
 
 One authorization model: every authenticated identity is an operator, and
 `IsOperator` in `internal/console/auth.go` is the single seam where a
@@ -3123,9 +3162,10 @@ wire, not network position.
 The `Secure` cookie posture is configured, never inferred: every supported
 deployment terminates TLS at a proxy whose hop to the console listener is
 plaintext HTTP, so inferring from the listener would leave the flag
-permanently off. `Secure` defaults to true on the session cookie and on the
-mirrored clearing cookie (a browser is not guaranteed to remove a cookie
-whose attributes differ from the one `Set-Cookie` replaces), and
+permanently off. `Secure` defaults to true on the session cookie, the
+contribution-intent cookie, and their mirrored clearing cookies (a browser is
+not guaranteed to remove a cookie whose attributes differ from the one
+`Set-Cookie` replaces), and
 `--cookie-secure=false` (`operatorConsole.auth.cookieSecure=false`) is the
 only opt-out; the chart renders the flag explicitly so the posture is
 visible in the Deployment. The listener is bounded by fixed

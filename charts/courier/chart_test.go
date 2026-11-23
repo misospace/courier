@@ -2786,6 +2786,106 @@ func TestChartOperatorConsoleDefaultDisabled(t *testing.T) {
 	}
 }
 
+func TestChartOperatorConsoleReplicaGuard(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	enabled := runHelm(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.contribute.url=http://courier-contribute-api",
+		"--set", "operatorConsole.contribute.tokenSecret=courier-contribute-token",
+	)...)
+	if !strings.Contains(enabled, "name: courier-console") {
+		t.Fatal("enabled console render did not succeed")
+	}
+
+	// The console's contribution attempt state is per-process, so the chart
+	// refuses any configuration that runs zero or two consoles, scales the
+	// console, or rolls it without recreating it.
+	for _, tc := range []struct {
+		name    string
+		set     string
+		message string
+	}{
+		{"two replicas", "controllers.console.replicas=2", "controllers.console.replicas"},
+		{"two replicas as string", "controllers.console.replicas=\"2\"", "controllers.console.replicas"},
+		{"zero replicas", "controllers.console.replicas=0", "controllers.console.replicas"},
+		{"fractional replicas", "controllers.console.replicas=1.5", "controllers.console.replicas"},
+		{"autoscaler", "controllers.console.horizontalPodAutoscaler.maxReplicas=3", "controllers.console.horizontalPodAutoscaler"},
+		{"rolling update", "controllers.console.strategy=RollingUpdate", "controllers.console.strategy"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := runHelmOutput(t, chartDir,
+				append(operatorConsoleRenderArgs(
+					"--set", "operatorConsole.contribute.url=http://courier-contribute-api",
+					"--set", "operatorConsole.contribute.tokenSecret=courier-contribute-token",
+				), "--set", tc.set)...)
+			if err == nil || !strings.Contains(out, tc.message) {
+				t.Fatalf("expected %s to fail with %q, err = %v:\n%s", tc.set, tc.message, err, out)
+			}
+		})
+	}
+
+	// With the console disabled the knobs are inert: the same values render
+	// fine because no console workload exists to scale.
+	disabled := runHelm(t, chartDir, "template", "courier", ".",
+		"--set", "controllers.console.replicas=2",
+		"--set", "controllers.console.horizontalPodAutoscaler.maxReplicas=3")
+	if strings.Contains(disabled, "courier-console") {
+		t.Fatal("disabled console render produced a console workload")
+	}
+}
+
+// TestChartOperatorConsoleRawEnabledReplicaGuard closes the
+// deployment-boundary bypass: controllers.console.enabled=true without an
+// operatorConsole block still starts console pods — the same liveness
+// console-networkpolicy.yaml.tpl derives — and raw --contribute-* args on
+// that path are documented, so the one-replica guard must fail those
+// renders too, not only the operatorConsole.enabled convenience path.
+func TestChartOperatorConsoleRawEnabledReplicaGuard(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	// The raw-enabled path is operator-supplied end to end (image tag and
+	// any --contribute-* args come from the operator), so only a safe
+	// topology is asserted here: exactly one console pod still renders.
+	raw := []string{"template", "courier", ".",
+		"--set", "controllers.console.enabled=true",
+		"--set", "controllers.console.containers.console.image.tag=v0.1.25",
+	}
+	rendered := runHelm(t, chartDir, raw...)
+	if !strings.Contains(rendered, "name: courier-console") {
+		t.Fatal("raw-enabled console render did not produce a console workload")
+	}
+
+	for _, tc := range []struct {
+		name    string
+		set     string
+		message string
+	}{
+		{"two replicas", "controllers.console.replicas=2", "controllers.console.replicas"},
+		{"zero replicas", "controllers.console.replicas=0", "controllers.console.replicas"},
+		{"autoscaler", "controllers.console.horizontalPodAutoscaler.maxReplicas=3", "controllers.console.horizontalPodAutoscaler"},
+		{"rolling update", "controllers.console.strategy=RollingUpdate", "controllers.console.strategy"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := runHelmOutput(t, chartDir, append(append([]string{}, raw...), "--set", tc.set)...)
+			if err == nil || !strings.Contains(out, tc.message) {
+				t.Fatalf("expected raw-enabled %s to fail with %q, err = %v:\n%s", tc.set, tc.message, err, out)
+			}
+		})
+	}
+}
+
 // TestChartOperatorConsoleEnabled covers the enabled token-mode render: a
 // second controller Deployment running the courier-console binary, a
 // ClusterIP-only Service in front of it, the session and token Secrets
@@ -3239,6 +3339,116 @@ func TestChartOperatorConsolePortOverride(t *testing.T) {
 	deployment := findDocument(t, out, "kind: Deployment", "name: courier-console")
 	if !strings.Contains(deployment, "port: 9090") {
 		t.Fatalf("console liveness probe did not follow the port override:\n%s", deployment)
+	}
+}
+
+func TestChartRendersConsoleContributeForm(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	disabled := runHelm(t, chartDir, "template", "courier", ".")
+	for _, unwanted := range []string{"--contribute-url", "--contribute-token-file"} {
+		if strings.Contains(disabled, unwanted) {
+			t.Fatalf("default chart output unexpectedly contains %q", unwanted)
+		}
+	}
+
+	configured := []string{
+		"--set", "operatorConsole.contribute.url=http://courier-contribute-api",
+		"--set", "operatorConsole.contribute.tokenSecret=contribute-token",
+	}
+	enabled := runHelm(t, chartDir, operatorConsoleRenderArgs(configured...)...)
+	for _, want := range []string{
+		"--contribute-url=http://courier-contribute-api",
+		"--contribute-token-file=/etc/courier/console/contribute-token",
+		"mountPath: /etc/courier/console/contribute-token",
+		"secretName: contribute-token",
+	} {
+		if !strings.Contains(enabled, want) {
+			t.Fatalf("contribution form chart output is missing %q:\n%s", want, enabled)
+		}
+	}
+
+	overridden := runHelm(t, chartDir, operatorConsoleRenderArgs(append(configured,
+		"--set-string", "controllers.console.containers.console.args[0]=--contribute-url=http://operator-override")...)...)
+	if !strings.Contains(overridden, "--contribute-url=http://operator-override") {
+		t.Fatal("console output is missing the operator-supplied contribution URL")
+	}
+	if strings.Contains(overridden, "--contribute-url=http://courier-contribute-api") {
+		t.Fatal("operator-supplied contribution URL did not override the values-derived flag")
+	}
+
+	rawURLWithValuesToken := runHelm(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.contribute.tokenSecret=contribute-token",
+		"--set-string", "controllers.console.containers.console.args[0]=--contribute-url=http://operator-override",
+	)...)
+	if !strings.Contains(rawURLWithValuesToken, "--contribute-url=http://operator-override") || strings.Contains(rawURLWithValuesToken, "--contribute-url=http://courier-contribute-api") {
+		t.Fatal("raw contribution URL plus values token did not render as a complete effective pair")
+	}
+	if !strings.Contains(findDocument(t, rawURLWithValuesToken, "kind: Deployment", "name: courier-console"), "mountPath: /etc/courier/console/contribute-token") {
+		t.Fatal("raw URL plus values token omitted the values-derived token mount")
+	}
+
+	out, err := runHelmOutput(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.contribute.url=http://courier-contribute-api",
+	)...)
+	if err == nil {
+		t.Fatalf("expected helm template to fail without operatorConsole.contribute.tokenSecret, but it succeeded:\n%s", out)
+	}
+	for _, want := range []string{"operatorConsole.contribute.url", "operatorConsole.contribute.tokenSecret", "raw --contribute-url"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("contribution form guard message is missing %q:\n%s", want, out)
+		}
+	}
+
+	out, err = runHelmOutput(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.contribute.url=http://courier-contribute-api",
+		"--set", "operatorConsole.contribute.tokenSecret=contribute-token",
+		"--set", "operatorConsole.auth.mode=header",
+		"--set", "operatorConsole.auth.trustedHeader=X-Operator",
+		"--set-json", `operatorConsole.auth.headerAllowedPeers=[{"podSelector":{"app":"proxy"}}]`,
+	)...)
+	if err == nil || !strings.Contains(out, "operatorConsole.contribute requires token mode") {
+		t.Fatalf("header-mode contribution render error = %v, want token-mode message:\n%s", err, out)
+	}
+
+	out, err = runHelmOutput(t, chartDir, operatorConsoleRenderArgs(
+		"--set-string", "controllers.console.containers.console.args[0]=--contribute-url=http://operator-override",
+	)...)
+	if err == nil || !strings.Contains(out, "operatorConsole.contribute.url") || !strings.Contains(out, "raw --contribute-url") {
+		t.Fatalf("raw URL without effective token error = %v, want effective-pair message:\n%s", err, out)
+	}
+
+	// A bare --contribute-url whose value is the next argument is the
+	// spelling the binary's parser accepts, and it must count toward the
+	// pair guard the same as the = form.
+	out, err = runHelmOutput(t, chartDir, operatorConsoleRenderArgs(
+		"--set-string", "controllers.console.containers.console.args[0]=--contribute-url",
+		"--set-string", "controllers.console.containers.console.args[1]=http://operator-override",
+	)...)
+	if err == nil || !strings.Contains(out, "must be set together") {
+		t.Fatalf("bare raw URL without token error = %v, want effective-pair message:\n%s", err, out)
+	}
+
+	bareWithValue := runHelm(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.contribute.tokenSecret=contribute-token",
+		"--set-string", "controllers.console.containers.console.args[0]=--contribute-url",
+		"--set-string", "controllers.console.containers.console.args[1]=http://operator-override",
+	)...)
+	if !strings.Contains(bareWithValue, "--contribute-token-file=/etc/courier/console/contribute-token") {
+		t.Fatal("bare raw URL with a values token did not render the canonical token-file flag")
+	}
+
+	// A values override that omits the contribute block entirely must render
+	// a contribution-free console, not an opaque template error.
+	plain := runHelm(t, chartDir, operatorConsoleRenderArgs()...)
+	if strings.Contains(plain, "--contribute-url") || strings.Contains(plain, "contribute-token") {
+		t.Fatal("console without the contribute block unexpectedly rendered contribution configuration")
 	}
 }
 
