@@ -691,9 +691,12 @@ func TestContributionForgeLinks(t *testing.T) {
 		t.Errorf("commit link = %q, want the commit path under the PR URL", got)
 	}
 	// A query or fragment on the vetted PR URL never carries into a derived
-	// link.
+	// link, not even an empty forced query.
 	if got := contributionCommitLink("https://ghe.example/o/r/pull/1?x=1#frag", "0f4a9c8b"); got != "https://ghe.example/o/r/pull/1/commit/0f4a9c8b" {
 		t.Errorf("derived link carried the query or fragment: %q", got)
+	}
+	if got := contributionRepoLink("https://ghe.example/o/r/pull/1?", "misospace/courier"); got != "https://ghe.example/misospace/courier" {
+		t.Errorf("derived link carried a forced empty query: %q", got)
 	}
 	// With no vetted PR URL nothing derives: the projected values stay text.
 	for _, link := range []string{contributionRepoLink("", "misospace/courier"), contributionCommitLink("", "0f4a9c8b")} {
@@ -701,10 +704,13 @@ func TestContributionForgeLinks(t *testing.T) {
 			t.Errorf("a derived link existed without a vetted PR URL: %q", link)
 		}
 	}
-	for _, repo := range []string{"", "solo", "a/b/c", "bad name", "bad?x=1", "https://evil.example/o", "user:pw@evil.example/o", "/escape", strings.Repeat("a", 300) + "/b"} {
+	for _, repo := range []string{"", "solo", "a/b/c", "bad name", "bad?x=1", "https://evil.example/o", "user:pw@evil.example/o", "/escape", "./x", "../x", "o/.", "o/..", strings.Repeat("a", 300) + "/b"} {
 		if got := contributionRepoLink(pr, repo); got != "" {
 			t.Errorf("contributionRepoLink(%q) = %q, want rejected", repo, got)
 		}
+	}
+	if got := contributionRepoLink(pr, "dot./ok"); got != "https://github.com/dot./ok" {
+		t.Errorf("a dot-suffixed-but-not-dot-only segment should still link, got %q", got)
 	}
 	for _, sha := range []string{"", "xyz", "0f4a9c", "0f4a9c8b../", "0f4a9c8b?x=1", "0f4a9c8b z", strings.Repeat("0", 65)} {
 		if got := contributionCommitLink(pr, sha); got != "" {

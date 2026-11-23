@@ -589,19 +589,25 @@ func contributionRepoLink(prLink, repo string) string {
 	if prLink == "" || !contributeRepoPattern.MatchString(repo) {
 		return ""
 	}
+	// A dot-only segment would let a projected value collapse onto another
+	// path in a browser; a repository identity is not that shape.
+	if owner, name, _ := strings.Cut(repo, "/"); owner == "." || owner == ".." || name == "." || name == ".." {
+		return ""
+	}
 	u, err := url.Parse(prLink)
 	if err != nil {
 		return ""
 	}
 	u.Path = "/" + repo
-	u.RawQuery, u.Fragment, u.RawPath = "", "", ""
+	u.RawQuery, u.Fragment, u.RawPath, u.ForceQuery = "", "", "", false
 	return u.String()
 }
 
-// contributionCommitLink derives a commit link under a vetted PR URL's host
-// (every major forge serves /commit/<sha> and a pull request's commits under
-// the same origin). With no vetted PR URL or a value outside the
-// hexadecimal-SHA shape it returns empty and the page renders plain text.
+// contributionCommitLink derives a commit link under a vetted PR URL, where
+// every major forge serves a pull request's commits (GitHub and Forgejo at
+// /pull/N/commit/<sha>, GitLab at /merge_requests/N/commit/<sha>). With no
+// vetted PR URL or a value outside the hexadecimal-SHA shape it returns
+// empty and the page renders plain text.
 func contributionCommitLink(prLink, sha string) string {
 	if prLink == "" || !contributeSHAPattern.MatchString(sha) {
 		return ""
@@ -611,7 +617,7 @@ func contributionCommitLink(prLink, sha string) string {
 		return ""
 	}
 	u.Path = strings.TrimSuffix(u.Path, "/") + "/commit/" + sha
-	u.RawQuery, u.Fragment, u.RawPath = "", "", ""
+	u.RawQuery, u.Fragment, u.RawPath, u.ForceQuery = "", "", "", false
 	return u.String()
 }
 
