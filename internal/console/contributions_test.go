@@ -302,18 +302,27 @@ func TestContributeStatusClientStatusMapping(t *testing.T) {
 
 func TestContributeStatusClientUnexpectedBody(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "huge") {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "huge"):
 			_, _ = w.Write([]byte(strings.Repeat("x", maxContributeStatusBody+1)))
-			return
+		case strings.HasSuffix(r.URL.Path, "empty-object"):
+			// A misconfigured status URL pointed at some other service:
+			// valid JSON, but not a contribution status.
+			_, _ = w.Write([]byte(`{}`))
+		case strings.HasSuffix(r.URL.Path, "other-run"):
+			_, _ = w.Write([]byte(`{"run":"some-other-run","observedAt":"2026-11-20T09:00:00Z"}`))
+		case strings.HasSuffix(r.URL.Path, "no-observed"):
+			_, _ = w.Write([]byte(`{"run":"courier-no-observed","phase":"Pending"}`))
+		default:
+			_, _ = w.Write([]byte("<html>not json</html>"))
 		}
-		_, _ = w.Write([]byte("<html>not json</html>"))
 	}))
 	t.Cleanup(upstream.Close)
 	client, err := newHTTPContributeStatusClient(upstream.URL, []byte("t"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, run := range []string{"courier-ok", "courier-huge"} {
+	for _, run := range []string{"courier-ok", "courier-huge", "courier-empty-object", "courier-other-run", "courier-no-observed"} {
 		if _, err := client.Status(context.Background(), "", run); !errors.Is(err, ErrContributeStatusUnexpected) {
 			t.Errorf("%s: err = %v, want ErrContributeStatusUnexpected", run, err)
 		}
@@ -380,6 +389,9 @@ func TestContributionDetailFound(t *testing.T) {
 	for _, want := range []string{
 		"Verifying", "waits in the CI park",
 		`href="https://github.com/misospace/courier/pull/42"`, "contributor/fork", "courier-3f2a",
+		`href="https://github.com/contributor/fork"`,
+		`href="https://github.com/misospace/courier/pull/42/commit/0f4a9c8b"`,
+		`href="https://github.com/misospace/courier"`,
 		"does not track whether it was merged",
 		"2026-11-20T09:31:00Z", // observedAt verbatim
 		`content="15"`,         // active run polls
@@ -665,6 +677,75 @@ func TestContributionDetailPRLinkSanitized(t *testing.T) {
 			// see what the run recorded.
 			if !strings.Contains(body, tc.pr) {
 				t.Errorf("PR value %q missing from the page text:\n%s", tc.pr, body)
+			}
+		})
+	}
+}
+
+func TestContributionForgeLinks(t *testing.T) {
+	const pr = "https://github.com/misospace/courier/pull/42"
+	if got := contributionRepoLink(pr, "contributor/fork"); got != "https://github.com/contributor/fork" {
+		t.Errorf("repo link = %q, want the PR URL's host with the owner/name path", got)
+	}
+	if got := contributionCommitLink(pr, "0f4a9c8b"); got != pr+"/commit/0f4a9c8b" {
+		t.Errorf("commit link = %q, want the commit path under the PR URL", got)
+	}
+	// A query or fragment on the vetted PR URL never carries into a derived
+	// link.
+	if got := contributionCommitLink("https://ghe.example/o/r/pull/1?x=1#frag", "0f4a9c8b"); got != "https://ghe.example/o/r/pull/1/commit/0f4a9c8b" {
+		t.Errorf("derived link carried the query or fragment: %q", got)
+	}
+	// With no vetted PR URL nothing derives: the projected values stay text.
+	for _, link := range []string{contributionRepoLink("", "misospace/courier"), contributionCommitLink("", "0f4a9c8b")} {
+		if link != "" {
+			t.Errorf("a derived link existed without a vetted PR URL: %q", link)
+		}
+	}
+	for _, repo := range []string{"", "solo", "a/b/c", "bad name", "bad?x=1", "https://evil.example/o", "user:pw@evil.example/o", "/escape", strings.Repeat("a", 300) + "/b"} {
+		if got := contributionRepoLink(pr, repo); got != "" {
+			t.Errorf("contributionRepoLink(%q) = %q, want rejected", repo, got)
+		}
+	}
+	for _, sha := range []string{"", "xyz", "0f4a9c", "0f4a9c8b../", "0f4a9c8b?x=1", "0f4a9c8b z", strings.Repeat("0", 65)} {
+		if got := contributionCommitLink(pr, sha); got != "" {
+			t.Errorf("contributionCommitLink(%q) = %q, want rejected", sha, got)
+		}
+	}
+}
+
+// TestContributionDetailWrongShape200RendersMisconfigured pins the handler's
+// re-check of the decode boundary: a status that does not describe the
+// requested run — say what a bare {} decodes to, or another run's echo —
+// renders the documented misconfiguration state. It must not render found
+// state with blank fields, keep an active refresh, or store a history entry.
+func TestContributionDetailWrongShape200RendersMisconfigured(t *testing.T) {
+	cases := map[string]contributionStatus{
+		"zero body":        {},
+		"other run":        {Run: "some-other-run", ObservedAt: "2026-11-20T09:00:00Z"},
+		"missing readtime": {Run: "courier-3f2a", Phase: "Pending"},
+	}
+	for name, status := range cases {
+		t.Run(name, func(t *testing.T) {
+			secrets := newTestSecrets(t)
+			_, base := newContributeServer(t, secrets, &fakeContributeStatus{status: status})
+			client := login(t, base, secrets.token)
+			resp, body := get(t, client, base+"/contributions/courier-3f2a")
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200 with a state message", resp.StatusCode)
+			}
+			if !strings.Contains(body, "not with a contribution status") {
+				t.Errorf("wrong-shape 200 did not render the misconfiguration message:\n%s", body)
+			}
+			if strings.Contains(body, "Run identity") || strings.Contains(body, "Published</h2>") {
+				t.Errorf("wrong-shape 200 rendered found-state sections:\n%s", body)
+			}
+			if strings.Contains(body, `http-equiv="refresh"`) {
+				t.Errorf("misconfiguration is a static state and must not self-refresh:\n%s", body)
+			}
+			for _, c := range resp.Cookies() {
+				if c.Name == contributeHistoryCookie {
+					t.Errorf("wrong-shape 200 stored a history entry: %+v", c)
+				}
 			}
 		})
 	}

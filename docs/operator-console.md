@@ -381,8 +381,11 @@ A published pull request and a `Done` run both mean one thing only: Courier
 opened a pull request. The page never says "merged" or "successful". Courier
 does not track merges. It shows the pull request as a link only when the value
 is a plain `https` URL with no embedded credentials, and renders anything else
-as escaped text. The branch, the head repository, and the commit SHA render as
-text. The console builds every page with `html/template` and escapes every
+as escaped text. When the pull request links that way, the base repository, the
+head repository, and the commit link too. The console builds these links only
+from the pull request link's own host, a repository of the form `owner/name`,
+and a hexadecimal commit SHA. The branch and any other value render as text.
+The console builds every page with `html/template` and escapes every
 string a user or a model wrote. Nothing from the API becomes markup or a URL
 scheme.
 
@@ -401,7 +404,10 @@ not say which: the run was never admitted, the run finished and retention
 reaped it, or the run is not a contribution run. A run owned by another source
 reads the same way. A 403 says the namespace is outside the namespaces Courier
 owns. A 401 says the console's status credential was refused. A 503 says the
-read is busy or timed out, and the page retries slowly.
+read is busy or timed out, and the page retries slowly. A `200` that does not
+describe the requested run, such as an empty JSON object from a wrong status
+URL, shows a static misconfiguration message. The page does not render its
+fields as a run with blank values, and it stores no history entry for it.
 
 A successful read stores a short history. The console sets a signed cookie
 (HMAC with the session key, `HttpOnly`, `SameSite=Lax`) that holds up to a few
