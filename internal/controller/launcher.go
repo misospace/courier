@@ -134,6 +134,14 @@ type CoordinatorLauncher struct {
 	// EvidenceKey is the HMAC key that signs the per-incarnation token
 	// minted in Launch.
 	EvidenceKey []byte
+	// InstallationGit, when set, switches every launched legacy coordinator
+	// pod to GitHub App installation-token git credentials (#871): the launch
+	// mints the run's repository-scoped tokens into its credentials Secret,
+	// provisions the run-scoped identity allowed exactly one named-Secret
+	// get, and hands the pod builder the App-mode git contract. Nil keeps
+	// static deployments byte-identical: no mint, no Secret, no identity, and
+	// the static COURIER_GIT_* pair exactly as before.
+	InstallationGit *InstallationGitOptions
 }
 
 // baseUnverifiedReason marks the permanent launch rejection of a fix-pr run
@@ -270,6 +278,26 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 		}
 		podConfig.BaseBranch = base
 	}
+	// App-mode git credentials for legacy coordinator pods (#871): the mint
+	// identity is proven and the run's installation-token document is on the
+	// API server before the pod that reads it is even rendered, so a
+	// coordinator never starts against a credential its launch refused to
+	// mint. Identity and ownership refusals are permanent; mint and write
+	// failures stay ordinary errors on the claim-safe retry path.
+	if l.InstallationGit != nil {
+		if l.InstallationGit.Minter == nil {
+			return secureNeedsHuman("InstallationTokenOwner",
+				"legacy App-mode git credentials are configured without an installation-token minter")
+		}
+		installBase, installWork, installOwner, installConfig, err := l.legacyGitInstallationIdentity(run)
+		if err != nil {
+			return err
+		}
+		if err := l.ensureLegacyInstallationTokenCredential(ctx, run, installBase, installWork, installOwner, installConfig); err != nil {
+			return err
+		}
+		podConfig.InstallationGit = installConfig
+	}
 	builder := executor.NewPodBuilder(podConfig)
 	builder.Executor = l.Executor
 	pod, err := builder.Build(run, &lane)
@@ -291,6 +319,16 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 		// run as the namespace default SA with no access to its own pod.
 		pod.Spec.ServiceAccountName = legacyObserverResourceName(run.Name)
 		if err := l.ensureLegacyObserverResources(ctx, run, pod); err != nil {
+			return l.provisioningFailure(ctx, pod, err)
+		}
+	}
+	// An App-mode pod's credential-read identity — its ServiceAccount when
+	// the observer is not already the pod identity, plus the Role granting
+	// exactly one get on the run's credentials Secret and its RoleBinding —
+	// is provisioned and ownership-verified before the coordinator can begin
+	// execution, on the same ensure-or-refuse contract as the observer's.
+	if podConfig.InstallationGit != nil {
+		if err := l.ensureLegacyGitCredentialsResources(ctx, run, pod); err != nil {
 			return l.provisioningFailure(ctx, pod, err)
 		}
 	}

@@ -122,6 +122,16 @@ type PodConfig struct {
 	// ModelGatewayKeyName is the key within ModelGatewayKeySecret; empty
 	// defaults to "key".
 	ModelGatewayKeyName string
+	// InstallationGit opts the deployment into App-mode git credentials for
+	// legacy coordinator pods (#871): the pod renders the installation
+	// contract environment instead of the static COURIER_GIT_* pair, mounts
+	// its projected ServiceAccount token for the credentials-Secret read,
+	// and the launcher provisions the run-scoped identity that may read the
+	// run's installation-token document. Nil keeps the static pair exactly
+	// as before; non-nil suppresses the git pair even when
+	// GitCredentialSecret is configured, because an App-enabled run must
+	// not hold a static git credential to fall back to.
+	InstallationGit *InstallationGitConfig
 }
 
 // DefaultPodConfig is suitable for the temporary OpenCode shim image. The
@@ -325,6 +335,17 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 			}},
 		},
 	}
+	// App-mode git credentials read the run's installation-token document
+	// through the API with the pod's own projected identity (#871). The
+	// pod-level automount stays false; this explicit projection carries the
+	// token and the API-server CA bundle the helper's COURIER_API_* files
+	// point at.
+	if config.InstallationGit != nil {
+		pod.Spec.Volumes = append(pod.Spec.Volumes, gitCredentialsTokenVolume())
+		pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{
+			Name: gitCredentialsTokenVolumeName, MountPath: GitCredentialsTokenPath, ReadOnly: true,
+		})
+	}
 	// A 45-second grace only exists to fit the evidence capture deadline; a
 	// run that does not capture keeps the kubelet's default.
 	observerEnabled := executorImpl.Name() == "opencode"
@@ -370,7 +391,15 @@ type CredentialEnvRef struct {
 // widens its exposure to pods of other modes.
 func CredentialEnvRefs(config PodConfig, mode courierv1alpha1.Mode) []CredentialEnvRef {
 	var refs []CredentialEnvRef
-	if strings.TrimSpace(config.GitCredentialSecret) != "" {
+	// App-mode git credentials (#871) replace the static pair entirely: an
+	// App-enabled run must not hold a static git credential it could fall
+	// back to, so the pair is suppressed even when GitCredentialSecret is
+	// configured. GITHUB_TOKEN keeps its fallback to the git Secret only in
+	// static mode; in App mode a separately configured GitHubCredentialSecret
+	// remains the deployment's explicit choice for the executor's forge API
+	// reads, which are not the git transport this mode governs.
+	installationMode := config.InstallationGit != nil
+	if strings.TrimSpace(config.GitCredentialSecret) != "" && !installationMode {
 		usernameKey := config.GitUsernameKey
 		if usernameKey == "" {
 			usernameKey = "username"
@@ -385,7 +414,7 @@ func CredentialEnvRefs(config PodConfig, mode courierv1alpha1.Mode) []Credential
 		)
 	}
 	githubSecret := config.GitHubCredentialSecret
-	if githubSecret == "" {
+	if githubSecret == "" && !installationMode {
 		githubSecret = config.GitCredentialSecret
 	}
 	if strings.TrimSpace(githubSecret) != "" {
@@ -454,6 +483,27 @@ func podEnvironment(invocation Invocation, executorName string, config PodConfig
 		if gatewayURL := strings.TrimSpace(config.ModelGatewayURL); gatewayURL != "" {
 			values = append(values, corev1.EnvVar{Name: "COURIER_MODEL_GATEWAY_URL", Value: gatewayURL})
 		}
+	}
+	// App-mode git credentials (#871): the pod carries the installation
+	// contract instead of a static git credential. The helper reads the run's
+	// installation-token document through the API on every git prompt, so the
+	// projected token and namespace are runtime configuration, not secrets.
+	// credential.useHttpPath makes git name the repository in every askpass
+	// prompt; without it a prompt is host-only and the helper — which binds
+	// every served token to one pinned repository — refuses it by design.
+	if config.InstallationGit != nil {
+		values = append(values,
+			corev1.EnvVar{Name: EnvGitInstallation, Value: "1"},
+			corev1.EnvVar{Name: EnvInstallationOwner, Value: config.InstallationGit.Owner},
+			corev1.EnvVar{Name: EnvInstallationEndpoint, Value: config.InstallationGit.APIEndpoint},
+			corev1.EnvVar{Name: EnvInstallationSecret, Value: config.InstallationGit.CredentialsSecret},
+			corev1.EnvVar{Name: EnvAPITokenFile, Value: GitCredentialsTokenPath + "/token"},
+			corev1.EnvVar{Name: EnvAPICertFile, Value: GitCredentialsTokenPath + "/ca.crt"},
+			corev1.EnvVar{Name: "GIT_CONFIG_COUNT", Value: "1"},
+			corev1.EnvVar{Name: "GIT_CONFIG_KEY_0", Value: "credential.useHttpPath"},
+			corev1.EnvVar{Name: "GIT_CONFIG_VALUE_0", Value: "true"},
+			corev1.EnvVar{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},
+		)
 	}
 	// Per-key credential references come from the shared helper so the pod
 	// builder and the evidence intake can never enumerate the same Secret keys
@@ -576,6 +626,24 @@ func labelValue(value string) string {
 
 func nonEmpty(value string) string { return strings.TrimSpace(value) }
 
+const gitCredentialsTokenVolumeName = "git-credentials-token"
+
+// gitCredentialsTokenVolume projects the pod's ServiceAccount token and the
+// API-server CA bundle for the App-mode git credential helper (#871). The
+// kube-root-ca.crt ConfigMap is namespaced and always present; the token
+// projection carries no secret material into the pod spec itself.
+func gitCredentialsTokenVolume() corev1.Volume {
+	return corev1.Volume{
+		Name: gitCredentialsTokenVolumeName,
+		VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+			Sources: []corev1.VolumeProjection{
+				{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Path: "token", ExpirationSeconds: int64Ptr(3600)}},
+				{ConfigMap: &corev1.ConfigMapProjection{LocalObjectReference: corev1.LocalObjectReference{Name: observerCAName}, Items: []corev1.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}}}},
+			},
+		}},
+	}
+}
+
 func boolPtr(value bool) *bool { return &value }
 
 func int64Ptr(value int64) *int64 { return &value }
@@ -643,6 +711,9 @@ func (c PodConfig) Validate() error {
 	// different rules than the deployment asked for.
 	if c.RebaseModelAssist && strings.TrimSpace(c.ModelGatewayURL) == "" {
 		return errors.New("executor: rebase model assist is enabled but COURIER_MODEL_GATEWAY_URL is not set")
+	}
+	if err := c.InstallationGit.Validate(); err != nil {
+		return err
 	}
 	return nil
 }

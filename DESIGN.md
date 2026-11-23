@@ -4347,6 +4347,57 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   into two, and the chart's label-source guard accepts the seam as a
   credential argument, mirroring the Go rule.
    GitHub App authentication can replace the static identity for operator observation and admission reads, and can supply secure brokers' forge and git credentials. The operator retains the private key, refreshes its own read-only tokens, and mints and rotates short-lived tokens into that run's credentials Secret — one token per pinned repository, each carrying only the permissions the run needs against that repository, because GitHub applies an installation token's permissions to every repository the token names: the base repository's token carries the publication writes (issues, pull requests) and the reads that gate them but no contents write, and the work repository's token carries contents write for fetch and push plus administration read so the broker can establish the pinned work ref's effective protection before serving, but no publication write; a same-repository run is the one case whose single token legitimately carries both profiles. An existing credentials Secret is only trusted or updated once it is proven controlled by this exact run UID, its document owner and endpoint match the run's pinned identity, and a create that loses a race re-reads and re-validates the winner; a foreign or stale-owner object fails closed rather than being read or overwritten. The broker reads the Secret through the API server and never sees the private key or a pod-environment credential, and it asks for a token by full owner/name identity, so a fetch, push, or API request against one repository is never accompanied by a token minted for another. App mode never falls back to a static token, and a run whose pinned repositories have different owners cannot launch. The broker's git credential provider serves the token only for the run's pinned base and work repositories, and the broker refuses a token document whose shape it does not fully recognize. Rotation runs at launch and from the running-phase observer: a run that no observer supervises simply lets its tokens expire, and its broker then refuses every App-mode operation — fail-closed, never a silent fallback — until relaunch or the next supervised pass re-mints. See [HARNESS.md](./HARNESS.md) for setup and limits. Label discovery and settlement still use the static credential chain.
+- With the App configured, the legacy coordinator path (#871) gets the same
+  refreshable credential shape for its git checkout, fetch, push, and rebase:
+  the launcher mints the run's installation-token document with the
+  git-transport-only profiles — base repository contents read plus metadata
+  read, work repository contents write plus metadata read, merged on a
+  same-repository run, and never issues or pull-request writes because the
+  legacy git path performs no forge API writes with this credential — writes
+  it to the run's credentials Secret under the same document the secure broker
+  reads, and provisions a run-scoped identity whose only grant is one named
+  `get` on that Secret, bound to the coordinator pod's effective ServiceAccount
+  (the observer identity when the observer contract is on). Before any token
+  exists the launcher proves the mint identity: the base and head repositories
+  must name one owner and the installation must sign for exactly that owner,
+  so a cross-owner fork run is refused permanently at launch — a condition a
+  requeue never clears. The App-rendered pod carries no static git credential
+  at all: the `COURIER_GIT_*` pair is
+  suppressed from the shared credential enumeration even when
+  `GitCredentialSecret` is configured, so there is nothing to fall back to.
+  `GITHUB_TOKEN` keeps its fallback to the git Secret only in static mode:
+  the executor's forge-API reads are not the git transport this mode governs,
+  so an App-mode pod receives it solely from an explicitly configured
+  `GitHubCredentialSecret`. Every git prompt is answered by the executor
+  binary's askpass helper re-reading the document through the API with the
+  pod's projected token, so a rotation or an expiry takes effect on the next
+  prompt of a long run rather than at restart. The helper binds every served
+  token to one pinned repository: it serves only the two remote URLs the operator rendered
+  (work remote → head or base repository, base remote → base repository),
+  `credential.useHttpPath` is installed so git names the repository in every
+  prompt, and any other URL is refused before any API call and prints nothing,
+  so cross-repository and fork use cannot borrow a token. The isolated legacy
+  observer and its seed resolve the same document through their own projected
+  token, so workspace observation keeps working when no static git credential
+  exists. Rotation reuses the same refresh lead and mint-lifetime guard and runs
+  at launch and from the legacy run's steady settle, gated on the coordinator
+  pod actually rendering the App-mode marker — a static run never gains a
+  Secret behind its pod's back, and an App run whose Secret is gone re-mints.
+  A rotation also carries the credentials it replaced into the same Secret
+  under a distinct superseded key while GitHub still honors them: the evidence
+  intake registers those entries alongside the live document so a captured
+  bundle is scrubbed against every credential the pod held, and each entry is
+  dropped at the next rotation once expired. Only the launcher and the intake
+  write or read the superseded key — no credential-serving reader (broker,
+  askpass helper, observer) consults it, so a superseded token is never
+  served.
+  Refusals are fail-closed with no static fallback and no retry loop of
+  credentials, the rebase force-push keeps its head-SHA compare-and-set lease
+  unchanged under the new credential, and no merge capability is added
+  anywhere. The model can still reach its own run's short-lived,
+  repository-scoped tokens from inside its pod exactly as it could reach the
+  static PAT it no longer carries; what changed is lifetime, repository scope,
+  rotation, and the absence of any cross-repository credential.
 - The gateway response is untrusted, unbounded input, and trusted control
   bounds both its shape and what it will hold: one SSE line is capped at 1 MiB,
   and per completion the buffered content deltas (8 MiB), the buffered

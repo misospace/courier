@@ -34,6 +34,7 @@ import (
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/evidence"
 	"github.com/misospace/courier/internal/executor"
+	"github.com/misospace/courier/internal/topology"
 )
 
 // --- shared test helpers ----------------------------------------------------
@@ -1888,5 +1889,111 @@ func TestEvidenceIntakeRejectsForeignNamespaceRun(t *testing.T) {
 	req, _ = intakeRequest(t, testKey, owned, m, map[string][]byte{"src/a.go": []byte("benign")}, testNonce())
 	if rec := doIntake(i, req); rec.Code != http.StatusOK {
 		t.Fatalf("owned capture code = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestCredentialScannerRegistersInstallationTokenEntries pins the #871
+// scrub: in App mode the pod's live git credentials are the installation
+// document's per-repository tokens plus the entries the last rotation
+// superseded but GitHub may still honor, so the intake must withhold them
+// exactly as it withheld the static PAT before — including short values,
+// which the registration name's secret shape retains. An absent document
+// Secret (every static run) registers nothing and never fails, and neither
+// does a credentials Secret that exists without the document key (the secure
+// broker's static credential copy shares the Secret name); a key that is
+// present with an unparseable value fails the scan closed.
+func TestCredentialScannerRegistersInstallationTokenEntries(t *testing.T) {
+	t.Parallel()
+	const alpha = "install-token-alpha-0123456789"
+	const beta = "install-token-beta-0123456789"
+	const tiny = "t-1"
+	run := newIntakeRun("run-9", "default", "uid-9", courierv1alpha1.PhaseFailed)
+	document := topology.InstallationTokenDocument{
+		Version: topology.InstallationTokenDocumentVersion, Owner: "acme", Endpoint: "https://api.github.invalid",
+		Entries: []topology.InstallationTokenEntry{
+			{Repository: "acme/widgets", Token: alpha, ExpiresAt: time.Now().Add(time.Hour)},
+			{Repository: "acme/widgets", Token: tiny, ExpiresAt: time.Now().Add(time.Hour)},
+		},
+	}
+	data, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	superseded, err := json.Marshal([]topology.InstallationTokenEntry{
+		{Repository: "fork/widgets", Token: beta, ExpiresAt: time.Now().Add(time.Minute)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: topology.CredentialsSecretName(run.Name)},
+		Data: map[string][]byte{
+			topology.CredKeyInstallationToken:           data,
+			topology.CredKeyInstallationTokenSuperseded: superseded,
+		},
+	}
+	pod := executor.PodConfig{InstallationGit: &executor.InstallationGitConfig{Owner: "acme", APIEndpoint: "https://api.github.invalid", CredentialsSecret: topology.CredentialsSecretName(run.Name)}}
+	i, _ := newIntake(t, testKey, run, pod, secret)
+	scanner, err := i.credentialScanner(context.Background(), run, "")
+	if err != nil {
+		t.Fatalf("credentialScanner() error = %v", err)
+	}
+	if !scanner.Matched("pushed with "+alpha+" done") || !scanner.Matched("fetch via "+beta) {
+		t.Fatal("installation-token entries must be withheld from captured evidence")
+	}
+	if !scanner.Matched("quoted " + tiny + " reference") {
+		t.Fatal("a short token under the synthetic registration name must still be withheld")
+	}
+	if scanner.Matched("totally unrelated content") {
+		t.Fatal("scanner matched nothing")
+	}
+
+	// No document Secret: a static run captures exactly as before.
+	i2, _ := newIntake(t, testKey, run, executor.PodConfig{GitCredentialSecret: "git-cred"}, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "git-cred"},
+		Data:       map[string][]byte{"username": []byte("octocat"), "token": []byte("staticpat123456")},
+	})
+	scanner2, err := i2.credentialScanner(context.Background(), run, "")
+	if err != nil {
+		t.Fatalf("static credentialScanner() error = %v", err)
+	}
+	if !scanner2.Matched("leaked staticpat123456") {
+		t.Fatal("static mode must still withhold the PAT")
+	}
+
+	// A secure broker's static credential copy shares the credentials Secret
+	// name but carries no installation-token document: captures proceed.
+	i4, _ := newIntake(t, testKey, run, executor.PodConfig{}, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: topology.CredentialsSecretName(run.Name)},
+		Data: map[string][]byte{
+			topology.CredKeyForgeAPIToken: []byte("forge-api-secret-value"),
+			topology.CredKeyGitUsername:   []byte("octocat"),
+			topology.CredKeyGitToken:      []byte("secure-static-git-token-value"),
+		},
+	})
+	if _, err := i4.credentialScanner(context.Background(), run, ""); err != nil {
+		t.Fatalf("credentialScanner() on a document-less credentials Secret = %v, want no error", err)
+	}
+
+	// A foreign document-shaped Secret fails closed.
+	i3, _ := newIntake(t, testKey, run, pod, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: topology.CredentialsSecretName(run.Name)},
+		Data:       map[string][]byte{topology.CredKeyInstallationToken: []byte("{not json")},
+	})
+	if _, err := i3.credentialScanner(context.Background(), run, ""); err == nil {
+		t.Fatal("unparseable installation document must fail the scan closed")
+	}
+
+	// An unparseable superseded list fails closed the same way: the intake
+	// cannot prove the bundle clean against credentials it cannot read.
+	i5, _ := newIntake(t, testKey, run, pod, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: topology.CredentialsSecretName(run.Name)},
+		Data: map[string][]byte{
+			topology.CredKeyInstallationToken:           data,
+			topology.CredKeyInstallationTokenSuperseded: []byte("{not json"),
+		},
+	})
+	if _, err := i5.credentialScanner(context.Background(), run, ""); err == nil {
+		t.Fatal("unparseable superseded installation entries must fail the scan closed")
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -14,6 +15,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
+	"github.com/misospace/courier/internal/broker"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/legacyobserver"
 )
@@ -34,11 +36,23 @@ func observerMode(ctx context.Context, seed bool) error {
 		BaseBranch: os.Getenv("COURIER_BASE"), BaseRemoteURL: os.Getenv("COURIER_BASE_REPO_URL"),
 		Username: os.Getenv("COURIER_GIT_USERNAME"), Token: os.Getenv("COURIER_GIT_TOKEN"),
 	}
+	if _, ok := os.LookupEnv(executor.EnvGitInstallation); ok {
+		if os.Getenv(executor.EnvGitInstallation) != "1" {
+			return errors.New("observer: installation git credential mode is invalid")
+		}
+		provider, err := observerInstallationCredentials(os.Getenv)
+		if err != nil {
+			return err
+		}
+		options.Credentials = provider
+	}
 	baselineFile := filepath.Join(private, "baseline")
 	if seed {
 		operation, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
-		baseline, err := legacyobserver.Seed(operation, options.RemoteURL, options.BaseRemoteURL, options.BaseBranch, options.Branch, filepath.Join(private, "seed-repo"), options.Username, options.Token)
+		seedOptions := options
+		seedOptions.Scratch = filepath.Join(private, "seed-repo")
+		baseline, err := legacyobserver.Seed(operation, seedOptions)
 		if err != nil {
 			return fmt.Errorf("observer: could not pin initial remote head: %w", err)
 		}
@@ -109,4 +123,47 @@ func observerMode(ctx context.Context, seed bool) error {
 		return errors.New("observer: evidence exceeds termination budget")
 	}
 	return os.WriteFile(os.Getenv("COURIER_TERMINATION_FILE"), data, 0600)
+}
+
+// observerInstallationCredentials builds the App-mode credential provider for
+// the observer's own projected service identity (#871). It binds exactly the
+// two configured remote URLs to their pinned repository identities using the
+// same rule as the pod's askpass helper, and re-reads the run's
+// installation-token document through the API on every resolution, so
+// operator rotation and expiry take effect immediately with no static
+// fallback.
+func observerInstallationCredentials(getenv func(string) string) (func(context.Context, string) (string, string, error), error) {
+	remotes, ok := installationRemotesFrom(getenv)
+	if !ok {
+		return nil, errors.New("observer: installation git remote binding is incomplete")
+	}
+	owner := strings.TrimSpace(getenv(executor.EnvInstallationOwner))
+	endpoint := strings.TrimSpace(getenv(executor.EnvInstallationEndpoint))
+	namespace := strings.TrimSpace(getenv("POD_NAMESPACE"))
+	secretName := strings.TrimSpace(getenv(executor.EnvInstallationSecret))
+	if owner == "" || endpoint == "" || namespace == "" || secretName == "" {
+		return nil, errors.New("observer: installation git credential configuration is incomplete")
+	}
+	reader, err := installationAPIReader(getenv("KUBERNETES_SERVICE_HOST"), getenv("KUBERNETES_SERVICE_PORT"),
+		executor.ObserverTokenPath+"/token", executor.ObserverTokenPath+"/ca.crt")
+	if err != nil {
+		return nil, errors.New("observer: installation git API reader unavailable")
+	}
+	source, err := broker.NewSecretInstallationTokenSource(reader, namespace, secretName,
+		executor.InstallationTokenDocumentKey, owner, endpoint, nil)
+	if err != nil {
+		return nil, errors.New("observer: installation git credential source unavailable")
+	}
+	credentials := broker.NewInstallationGitCredentials(source, []string{remotes.baseIdentity, remotes.workIdentity})
+	return func(ctx context.Context, remoteURL string) (string, string, error) {
+		identity, ok := remotes.identityFor(remoteURL)
+		if !ok {
+			return "", "", errors.New("observer: remote is not a pinned installation repository")
+		}
+		served, err := credentials.Credentials(ctx, identity)
+		if err != nil {
+			return "", "", err
+		}
+		return served.Username, served.Token, nil
+	}, nil
 }
