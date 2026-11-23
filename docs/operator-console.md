@@ -394,7 +394,7 @@ the controller's recorded admitted, started, phase-entered, and finished times.
 It shows the age of the current phase, which is approximate and clamped.
 Auto-refresh is a meta-refresh tag, not JavaScript. A fast interval applies
 while the run is active. A slow interval applies while the run is parked for
-review, for a human, or on something external. The tag is off once the run is
+review, for a human, for CI, or on something external. The tag is off once the run is
 terminal, and off in a static state such as not configured, a refused
 credential, not found, or a namespace outside Courier. A transient backend
 failure retries on a slow backoff, so the page does not hammer the listener.

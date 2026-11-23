@@ -173,23 +173,29 @@ func TestContributePhaseLabel(t *testing.T) {
 }
 
 func TestContributeRefreshSeconds(t *testing.T) {
-	cases := map[string]int{
-		"Done": 0, "AlreadyDone": 0, "Failed": 0,
-		"AwaitingReview":  contributeStatusParkedSeconds,
-		"HandedOff":       contributeStatusParkedSeconds,
-		"NeedsHuman":      contributeStatusParkedSeconds,
-		"BlockedExternal": contributeStatusParkedSeconds,
-		"Pending":         contributeStatusRefreshSeconds,
-		"Claimed":         contributeStatusRefreshSeconds,
-		"Running":         contributeStatusRefreshSeconds,
-		"Verifying":       contributeStatusRefreshSeconds,
-		"unknown":         contributeStatusRefreshSeconds,
-		"":                contributeStatusRefreshSeconds,
-		"Teleported":      contributeStatusParkedSeconds,
+	cases := []struct {
+		phase    string
+		ciParked bool
+		want     int
+	}{
+		{"Done", false, 0}, {"AlreadyDone", false, 0}, {"Failed", false, 0},
+		{"Done", true, 0}, // a retained CI park never reactivates a terminal run
+		{"AwaitingReview", false, contributeStatusParkedSeconds},
+		{"HandedOff", false, contributeStatusParkedSeconds},
+		{"NeedsHuman", false, contributeStatusParkedSeconds},
+		{"BlockedExternal", false, contributeStatusParkedSeconds},
+		{"Pending", false, contributeStatusRefreshSeconds},
+		{"Claimed", false, contributeStatusRefreshSeconds},
+		{"Running", false, contributeStatusRefreshSeconds},
+		{"Verifying", false, contributeStatusRefreshSeconds},
+		{"Verifying", true, contributeStatusParkedSeconds}, // a CI-parked run waits outside the pipeline
+		{"unknown", false, contributeStatusRefreshSeconds},
+		{"", false, contributeStatusRefreshSeconds},
+		{"Teleported", false, contributeStatusParkedSeconds},
 	}
-	for phase, want := range cases {
-		if got := contributeRefreshSeconds(phase); got != want {
-			t.Errorf("contributeRefreshSeconds(%q) = %d, want %d", phase, got, want)
+	for _, tc := range cases {
+		if got := contributeRefreshSeconds(tc.phase, tc.ciParked); got != tc.want {
+			t.Errorf("contributeRefreshSeconds(%q, %v) = %d, want %d", tc.phase, tc.ciParked, got, tc.want)
 		}
 	}
 }
@@ -394,7 +400,7 @@ func TestContributionDetailFound(t *testing.T) {
 		`href="https://github.com/misospace/courier"`,
 		"does not track whether it was merged",
 		"2026-11-20T09:31:00Z", // observedAt verbatim
-		`content="15"`,         // active run polls
+		`content="60"`,         // a CI-parked Verifying run polls at the parked interval
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("detail page missing %q:\n%s", want, body)
@@ -403,6 +409,19 @@ func TestContributionDetailFound(t *testing.T) {
 	// The canonical namespace from the response is what the page names.
 	if !strings.Contains(body, "contrib") {
 		t.Errorf("detail page does not show the response namespace:\n%s", body)
+	}
+}
+
+func TestContributionDetailActiveVerifyingPollsFast(t *testing.T) {
+	secrets := newTestSecrets(t)
+	status := fullContributionStatus()
+	status.CIParked = false
+	stub := &fakeContributeStatus{status: status}
+	_, base := newContributeServer(t, secrets, stub)
+	client := login(t, base, secrets.token)
+	_, body := get(t, client, base+"/contributions/courier-3f2a")
+	if !strings.Contains(body, `content="15"`) {
+		t.Errorf("an unparked Verifying run must poll at the active interval:\n%s", body)
 	}
 }
 

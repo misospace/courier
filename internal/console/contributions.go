@@ -55,11 +55,13 @@ const (
 	maxContributeStatusBody = 64 * 1024
 
 	// contributeStatusRefreshSeconds is the meta-refresh interval while a
-	// run is active (no phase yet, Pending, Claimed, Running, Verifying).
+	// run is active (no phase yet, Pending, Claimed, Running, and an
+	// unparked Verifying).
 	contributeStatusRefreshSeconds = 15
 	// contributeStatusParkedSeconds is the interval while a run waits on
-	// something outside the pipeline: review, a human, or an external
-	// condition. Movement is possible but no longer pipeline-driven.
+	// something outside the pipeline: review, a human, an external
+	// condition, or CI in the CI park. Movement is possible but no longer
+	// pipeline-driven.
 	contributeStatusParkedSeconds = 60
 	// contributeStatusBackoffSeconds is the interval after a transient
 	// status failure (busy, timed out, unreachable). The page keeps a slow
@@ -460,7 +462,7 @@ func (s *Server) renderContributionStatus(w http.ResponseWriter, r *http.Request
 		data.CommitLink = contributionCommitLink(data.PRLink, status.Publication.HeadSHA)
 	}
 	data.BaseRepoLink = contributionRepoLink(data.PRLink, status.BaseRepo)
-	data.RefreshSeconds = contributeRefreshSeconds(status.Phase)
+	data.RefreshSeconds = contributeRefreshSeconds(status.Phase, status.CIParked)
 	s.rememberContributeHistory(w, r, status.Namespace, run)
 	s.renderContribution(w, http.StatusOK, "contribution", data)
 }
@@ -517,19 +519,23 @@ func contributePhaseLabel(phase string) (label, class string) {
 // contributeRefreshSeconds sets the meta-refresh interval from the lifecycle
 // state: active runs poll fastest, parked runs slower, terminal runs never,
 // and an unrecognized phase — state the console cannot reason about —
-// polls at the parked interval.
-func contributeRefreshSeconds(phase string) int {
+// polls at the parked interval. A Verifying run inside the CI park waits on
+// CI, not on the pipeline, so it polls at the parked interval like the other
+// parked phases.
+func contributeRefreshSeconds(phase string, ciParked bool) int {
 	switch {
 	case contributeStatusTerminalPhases[phase]:
 		return 0
+	case phase == "Verifying" && ciParked:
+		return contributeStatusParkedSeconds
 	case contributeStatusParkedPhases[phase]:
 		return contributeStatusParkedSeconds
 	case phase == "" || phase == phaseContributeUnknown:
 		return contributeStatusRefreshSeconds
 	}
 	if knownPhases[phase] {
-		// Known but neither terminal nor parked: Pending, Claimed, Running,
-		// Verifying. Active.
+		// Known but neither terminal nor parked: Pending, Claimed,
+		// Running, and a Verifying not waiting in the CI park. Active.
 		return contributeStatusRefreshSeconds
 	}
 	// An out-of-vocabulary phase could still move; check back slowly.
