@@ -66,6 +66,19 @@ func TestProjectRunTimelineBoundAndOrdering(t *testing.T) {
 			t.Fatalf("timeline not ascending at %d", i)
 		}
 	}
+	// The emitted labels are the closed vocabulary and nothing else: a new
+	// label must be added to the exported constants deliberately.
+	vocabulary := map[string]bool{
+		TimelineCreated: true, TimelineAdmitted: true, TimelineStarted: true,
+		TimelinePhase: true, TimelineHeartbeat: true, TimelineCIParked: true,
+		TimelineFinished: true, TimelineCoordinatorExited: true, TimelineResultRecorded: true,
+		TimelineRetentionMarked: true, TimelineCondition: true,
+	}
+	for _, entry := range entries {
+		if !vocabulary[entry.Label] {
+			t.Errorf("label %q is outside the pinned vocabulary", entry.Label)
+		}
+	}
 	projected := ProjectRunDetail(&run, testOptions())
 	if len(projected.Timeline) != MaxTimelineEntries || !projected.TimelineTruncated {
 		t.Fatalf("detail timeline = %d/%v", len(projected.Timeline), projected.TimelineTruncated)
@@ -88,12 +101,20 @@ func TestProjectRunTimelineEmptyOmittedAndBounded(t *testing.T) {
 }
 
 func TestProjectRunReapHolds(t *testing.T) {
+	// A Done run is reaped through resolveCompleted, which never gates on the
+	// lifecycle report: its only per-run hold before the marker is stamped is
+	// the missing marker itself.
 	base := runFixture("holds", "source", "lane", courierv1alpha1.PhaseDone, testNow)
-	if got := ProjectRunDetail(&base, testOptions()).Reap.Holds; fmt.Sprint(got) != "[no retention marker yet source report not settled]" {
+	if got := ProjectRunDetail(&base, testOptions()).Reap.Holds; fmt.Sprint(got) != "[no retention marker yet]" {
 		t.Fatalf("base holds = %v", got)
 	}
+	// Failed, NeedsHuman, and AlreadyDone runs are held until the report settles.
+	held := runFixture("holds", "source", "lane", courierv1alpha1.PhaseFailed, testNow)
+	if got := ProjectRunDetail(&held, testOptions()).Reap.Holds; fmt.Sprint(got) != "[no retention marker yet source report not settled]" {
+		t.Fatalf("failed holds = %v", got)
+	}
 	settled := func(reason string) courierv1alpha1.CoderRun {
-		run := base.DeepCopy()
+		run := held.DeepCopy()
 		run.Status.Conditions = []metav1.Condition{{Type: courierv1alpha1.ConditionLifecycleReported, Status: metav1.ConditionTrue, Reason: reason}}
 		return *run
 	}
@@ -108,7 +129,7 @@ func TestProjectRunReapHolds(t *testing.T) {
 		{Type: courierv1alpha1.ConditionLifecycleReported, Status: metav1.ConditionFalse, Reason: "Published"},
 		{Type: courierv1alpha1.ConditionLifecycleReported, Status: metav1.ConditionTrue, Reason: "Other"},
 	} {
-		run := base.DeepCopy()
+		run := held.DeepCopy()
 		run.Annotations = nil
 		run.Status.Conditions = []metav1.Condition{condition}
 		if got := ProjectRunDetail(run, testOptions()).Reap.Holds; len(got) != 2 || got[1] != "source report not settled" {

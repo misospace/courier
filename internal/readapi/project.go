@@ -310,6 +310,11 @@ const (
 	lifecycleReportPermanentRefusalReason = "PermanentRefusal"
 )
 
+// reapHolds derives why a run cannot be reaped yet from this object alone,
+// mirroring the controller's gates (internal/controller/reap.go and
+// coderun_controller.go's terminal dispatch). Only single-object facts are
+// used: the per-repository audit floor compares other runs and is never
+// derivable here.
 func reapHolds(run *courierv1alpha1.CoderRun, marker string) []string {
 	if !phaseIsReapEligible(run.Status.Phase) {
 		return []string{"phase is not reap-eligible"}
@@ -318,6 +323,12 @@ func reapHolds(run *courierv1alpha1.CoderRun, marker string) []string {
 	if marker == "" {
 		holds = append(holds, "no retention marker yet")
 	}
+	// The report-settlement gate mirrors the controller's terminal dispatch
+	// (internal/controller/coderun_controller.go): Failed, NeedsHuman, and
+	// AlreadyDone runs are held until the LifecycleReported condition settles,
+	// but a Done run is reaped through resolveCompleted, which gates on the
+	// done-at marker and the source resolve instead, so an unsettled report
+	// must not read as a Done-run hold.
 	settled := false
 	for i := range run.Status.Conditions {
 		cond := run.Status.Conditions[i]
@@ -327,7 +338,7 @@ func reapHolds(run *courierv1alpha1.CoderRun, marker string) []string {
 			break
 		}
 	}
-	if !settled {
+	if run.Status.Phase != courierv1alpha1.PhaseDone && !settled {
 		holds = append(holds, "source report not settled")
 	}
 	if run.Status.CISettlement != nil {

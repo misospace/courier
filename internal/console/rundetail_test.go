@@ -2,14 +2,42 @@ package console
 
 import (
 	"fmt"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/util/validation"
+
 	"github.com/misospace/courier/internal/readapi"
 )
+
+// TestValidRunNameMatchesAPIMachinery pins the hand-rolled validation to the
+// API server's own object-name gate: the console must never report a name
+// the read API would serve as not found, and never accept what the API
+// server would reject. A fixed-seed generated corpus keeps the comparison
+// deterministic.
+func TestValidRunNameMatchesAPIMachinery(t *testing.T) {
+	rng := rand.New(rand.NewSource(826))
+	charset := []byte("abz09.-_/A ")
+	for i := 0; i < 200_000; i++ {
+		var sb strings.Builder
+		n := 1 + rng.Intn(40)
+		if i%1000 == 0 {
+			n = 200 + rng.Intn(60) // exercise the 253-byte total bound
+		}
+		for j := 0; j < n; j++ {
+			sb.WriteByte(charset[rng.Intn(len(charset))])
+		}
+		name := sb.String()
+		want := len(validation.IsDNS1123Subdomain(name)) == 0
+		if got := validRunName(name); got != want {
+			t.Fatalf("validRunName(%q) = %v, want %v (api-machinery)", name, got, want)
+		}
+	}
+}
 
 func TestRunDetailWireConstantsAndNameValidation(t *testing.T) {
 	if backendRunDetailPrefix != readapi.PathRun[:strings.LastIndex(readapi.PathRun, "{")] {
@@ -18,12 +46,12 @@ func TestRunDetailWireConstantsAndNameValidation(t *testing.T) {
 	if kindRunDetail != readapi.KindRunDetail {
 		t.Fatalf("detail kind = %q, want %q", kindRunDetail, readapi.KindRunDetail)
 	}
-	for _, name := range []string{"a", "run-1", "a.b", strings.Repeat("a", 63), strings.Repeat("a", 63) + "." + strings.Repeat("b", 63)} {
+	for _, name := range []string{"a", "run-1", "a.b", strings.Repeat("a", 63), strings.Repeat("a", 64), strings.Repeat("a", 100), strings.Repeat("a", 63) + "." + strings.Repeat("b", 63)} {
 		if !validRunName(name) {
 			t.Errorf("validRunName(%q) = false", name)
 		}
 	}
-	bad := []string{"../secret", "a/b", "a b", "A-upper", "-lead", "trail-", "", strings.Repeat("a", 254), strings.Repeat("a", 64), "a..b"}
+	bad := []string{"../secret", "a/b", "a b", "A-upper", "-lead", "trail-", "", strings.Repeat("a", 254), "a.-b", "a-.b", "a..b", ".lead", "trail."}
 	for _, name := range bad {
 		if validRunName(name) {
 			t.Errorf("validRunName(%q) = true", name)
@@ -78,7 +106,9 @@ func TestRunDetailNotFoundAndErrors(t *testing.T) {
 		{"unconfigured", "", "tok", 0, "", "not configured for this console"},
 		{"no token", "http://127.0.0.1:1", "", 0, "", "no token"},
 		{"401", "", "tok", 401, `{}`, "refused this console"},
+		{"400", "", "tok", 400, `{}`, "rejected the run detail request"},
 		{"503", "", "tok", 503, `{}`, "read budget"},
+		{"500", "", "tok", 500, `{}`, "unexpected status (500)"},
 		{"wrong kind", "", "tok", 200, `{"kind":"Overview","payload":{}}`, "not with run detail"},
 		{"garbage", "", "tok", 200, `<html>bad</html>`, "not with run detail"},
 	}

@@ -547,43 +547,37 @@ func (b *HTTPBackend) projection(ctx context.Context, path, rawQuery, wantKind s
 	return nil
 }
 
-// validRunName mirrors DNS1123-subdomain validation without importing Kubernetes.
-// Names are at most 253 bytes, use lowercase alphanumerics, '-' and '.', and
-// each non-empty label starts and ends alphanumeric, so a validated name cannot
-// add a path segment or escape the composed detail endpoint.
+// validRunName mirrors k8s.io/apimachinery validation.IsDNS1123Subdomain
+// without importing Kubernetes: the name is at most 253 bytes, over the
+// charset [a-z0-9.-], with every '.'-separated label non-empty and starting
+// and ending alphanumeric ('-' only interior). Like the API server's object
+// name validation it bounds the total length only, never a single label, so
+// the console never reports a name the read API would serve as not found. A
+// validated name cannot add a path segment or escape the composed detail
+// endpoint.
 func validRunName(name string) bool {
 	if len(name) == 0 || len(name) > maxExplorerFilterLen {
 		return false
 	}
-	labelLength := 0
 	var previous byte
 	for i := 0; i < len(name); i++ {
 		c := name[i]
-		alnum := c >= 'a' && c <= 'z' || c >= '0' && c <= '9'
-		if alnum {
-			labelLength++
-			previous = c
-			continue
-		}
-		if c == '.' {
-			if labelLength == 0 || labelLength > 63 || previous == '-' {
+		switch {
+		case c >= 'a' && c <= 'z' || c >= '0' && c <= '9':
+		case c == '-':
+			if i == 0 || name[i-1] == '.' {
 				return false
 			}
-			labelLength = 0
-			previous = c
-			continue
-		}
-		if c == '-' {
-			if labelLength == 0 || previous == '.' || labelLength >= 63 {
+		case c == '.':
+			if i == 0 || name[i-1] == '.' || name[i-1] == '-' {
 				return false
 			}
-			labelLength++
-			previous = c
-			continue
+		default:
+			return false
 		}
-		return false
+		previous = c
 	}
-	return labelLength > 0 && labelLength <= 63 && previous != '-'
+	return previous != '-' && previous != '.'
 }
 
 // Runs GETs the allowlisted run-list projection with the validated filter's
@@ -627,14 +621,14 @@ func (b *HTTPBackend) Runs(ctx context.Context, filter RunsFilter) (*RunListResu
 // Run fetches one run detail. Invalid names map to the read API's not-found
 // state locally; syntactically invalid names receive 404 there as well.
 func (b *HTTPBackend) Run(ctx context.Context, name string) (*RunDetailResult, error) {
+	if !validRunName(name) {
+		return nil, &BackendError{Status: http.StatusNotFound}
+	}
 	if b.baseURL == "" {
 		return nil, ErrBackendUnavailable
 	}
 	if len(b.token) == 0 {
 		return nil, ErrBackendTokenMissing
-	}
-	if !validRunName(name) {
-		return nil, &BackendError{Status: http.StatusNotFound}
 	}
 	var detail RunDetailResult
 	if err := b.projection(ctx, backendRunDetailPrefix+name, "", kindRunDetail, &detail); err != nil {
