@@ -542,6 +542,33 @@
 {{- if not $hasReadAPIBind }}{{- $args = append $args (printf "--readapi-bind=:%d" (int $readAPI.port)) }}{{- end }}
 {{- end }}
 {{- $operatorConsole := .Values.operatorConsole }}
+{{- /* The console's contribution attempt state is per-process, so every live
+  console must render as exactly one non-autoscaled, recreated pod. The
+  guard derives liveness the same way console-networkpolicy.yaml.tpl does —
+  operatorConsole.enabled or a raw controllers.console.enabled=true both
+  start console pods, and the raw args path is a documented way to configure
+  the contribution form — so neither path can bypass the invariant. */}}
+{{- $consoleController := index .Values.controllers "console" }}
+{{- $consoleLive := $operatorConsole.enabled }}
+{{- if $consoleController }}
+{{- $consoleEnabledRaw := index $consoleController "enabled" }}
+{{- if eq (toString $consoleEnabledRaw) "true" }}{{- $consoleLive = true }}{{- end }}
+{{- end }}
+{{- if and $consoleLive $consoleController (hasKey $consoleController "replicas") }}
+{{- $consoleReplicas := index $consoleController "replicas" }}
+{{- if or (ne (int $consoleReplicas) 1) (ne (printf "%v" $consoleReplicas) "1") }}
+{{- fail (printf "controllers.console.replicas %v must be 1: the console supports exactly one replica because contribution attempt state is per-process" $consoleReplicas) }}
+{{- end }}
+{{- end }}
+{{- if and $consoleLive $consoleController (index $consoleController "horizontalPodAutoscaler") }}
+{{- fail "controllers.console.horizontalPodAutoscaler must not be set: the console supports exactly one replica because contribution attempt state is per-process" }}
+{{- end }}
+{{- if and $consoleLive $consoleController }}
+{{- $consoleStrategy := index $consoleController "strategy" }}
+{{- if and $consoleStrategy (ne $consoleStrategy "Recreate") }}
+{{- fail "controllers.console.strategy must be Recreate: a rolling update would run two consoles at once and contribution attempt state is per-process" }}
+{{- end }}
+{{- end }}
 {{- if $operatorConsole.enabled }}
 {{- /* The console is the chart's second controller. Its image and its
   operator-supplied args follow the same has* guard pattern as the manager
@@ -552,18 +579,6 @@
   the manager Deployment keeps its name across the flip. */}}
 {{- $fullname := include "bjw-s.common.lib.chart.names.fullname" . }}
 {{- $console := index .Values.controllers "console" }}
-{{- if hasKey $console "replicas" }}
-{{- $consoleReplicas := $console.replicas }}
-{{- if or (ne (int $consoleReplicas) 1) (ne (printf "%v" $consoleReplicas) "1") }}
-{{- fail (printf "controllers.console.replicas %v must be 1: the console supports exactly one replica because contribution attempt state is per-process" $consoleReplicas) }}
-{{- end }}
-{{- end }}
-{{- if $console.horizontalPodAutoscaler }}
-{{- fail "controllers.console.horizontalPodAutoscaler must not be set: the console supports exactly one replica because contribution attempt state is per-process" }}
-{{- end }}
-{{- if and $console.strategy (ne $console.strategy "Recreate") }}
-{{- fail "controllers.console.strategy must be Recreate: a rolling update would run two consoles at once and contribution attempt state is per-process" }}
-{{- end }}
 {{- if not (hasKey $console "forceRename") }}{{- $_ := set $console "forceRename" (printf "%s-console" $fullname) }}{{- end }}
 {{- $mainController := index .Values.controllers "main" }}
 {{- if not (hasKey $mainController "forceRename") }}{{- $_ := set $mainController "forceRename" $fullname }}{{- end }}

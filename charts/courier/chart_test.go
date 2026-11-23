@@ -2840,6 +2840,52 @@ func TestChartOperatorConsoleReplicaGuard(t *testing.T) {
 	}
 }
 
+// TestChartOperatorConsoleRawEnabledReplicaGuard closes the
+// deployment-boundary bypass: controllers.console.enabled=true without an
+// operatorConsole block still starts console pods — the same liveness
+// console-networkpolicy.yaml.tpl derives — and raw --contribute-* args on
+// that path are documented, so the one-replica guard must fail those
+// renders too, not only the operatorConsole.enabled convenience path.
+func TestChartOperatorConsoleRawEnabledReplicaGuard(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	// The raw-enabled path is operator-supplied end to end (image tag and
+	// any --contribute-* args come from the operator), so only a safe
+	// topology is asserted here: exactly one console pod still renders.
+	raw := []string{"template", "courier", ".",
+		"--set", "controllers.console.enabled=true",
+		"--set", "controllers.console.containers.console.image.tag=v0.1.25",
+	}
+	rendered := runHelm(t, chartDir, raw...)
+	if !strings.Contains(rendered, "name: courier-console") {
+		t.Fatal("raw-enabled console render did not produce a console workload")
+	}
+
+	for _, tc := range []struct {
+		name    string
+		set     string
+		message string
+	}{
+		{"two replicas", "controllers.console.replicas=2", "controllers.console.replicas"},
+		{"zero replicas", "controllers.console.replicas=0", "controllers.console.replicas"},
+		{"autoscaler", "controllers.console.horizontalPodAutoscaler.maxReplicas=3", "controllers.console.horizontalPodAutoscaler"},
+		{"rolling update", "controllers.console.strategy=RollingUpdate", "controllers.console.strategy"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := runHelmOutput(t, chartDir, append(append([]string{}, raw...), "--set", tc.set)...)
+			if err == nil || !strings.Contains(out, tc.message) {
+				t.Fatalf("expected raw-enabled %s to fail with %q, err = %v:\n%s", tc.set, tc.message, err, out)
+			}
+		})
+	}
+}
+
 // TestChartOperatorConsoleEnabled covers the enabled token-mode render: a
 // second controller Deployment running the courier-console binary, a
 // ClusterIP-only Service in front of it, the session and token Secrets
