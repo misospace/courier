@@ -284,6 +284,35 @@ func TestContributeStatusClientNeverSendsAnInvalidRun(t *testing.T) {
 	}
 }
 
+func TestContributeStatusClientNeverFollowsRedirects(t *testing.T) {
+	// The status bearer must never ride a redirect: Go's default policy
+	// keeps Authorization for a same-host or subdomain target, so the
+	// client must not follow any redirect at all. The landing path would
+	// record whatever it receives; reaching it fails the test.
+	var landedAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/landed" {
+			landedAuth = r.Header.Get("Authorization")
+			_, _ = w.Write([]byte(`{"run":"courier-abc","observedAt":"2026-11-20T09:00:00Z"}`))
+			return
+		}
+		http.Redirect(w, r, "/landed", http.StatusFound)
+	}))
+	t.Cleanup(upstream.Close)
+	client, err := newHTTPContributeStatusClient(upstream.URL, []byte("status-read-token-xyz"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Status(context.Background(), "", "courier-abc")
+	var statusErr *ContributeStatusError
+	if !errors.As(err, &statusErr) || statusErr.Status != http.StatusFound {
+		t.Fatalf("redirect = %v, want *ContributeStatusError with status 302", err)
+	}
+	if landedAuth != "" {
+		t.Errorf("the redirect was followed and carried authorization %q", landedAuth)
+	}
+}
+
 func TestContributeStatusClientStatusMapping(t *testing.T) {
 	for _, status := range []int{http.StatusNotFound, http.StatusForbidden, http.StatusUnauthorized, http.StatusServiceUnavailable, http.StatusInternalServerError} {
 		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -524,6 +553,9 @@ func TestContributionsIndexLookup(t *testing.T) {
 	resp, _ := get(t, client, base+"/contributions?run=courier-3f2a")
 	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/contributions/courier-3f2a" {
 		t.Fatalf("valid lookup = %d %q, want a redirect to the detail page", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	if resp, _ := get(t, client, base+"/contributions?run=courier-3f2a&namespace=contrib"); resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/contributions/courier-3f2a?namespace=contrib" {
+		t.Fatalf("namespace-pinned lookup = %d %q, want a redirect that keeps the pin", resp.StatusCode, resp.Header.Get("Location"))
 	}
 	resp, body := get(t, client, base+"/contributions?run=Bad%20Name")
 	if resp.StatusCode != http.StatusOK || !strings.Contains(body, "Enter the exact run name") {
