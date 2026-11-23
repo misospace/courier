@@ -239,8 +239,10 @@ func runArgs(args []string) error {
 		return declareNeedsHuman(gateFail.reason, gateFail.caps, reporter, identity)
 	}
 
-	// The coordinator loop. It is interrupted by pod termination (context),
-	// not by any wall-clock run limit.
+	// The coordinator loop. It is interrupted by pod termination (context)
+	// and, when the lane declares one (#901), by the run's coordination
+	// budget — a declared wall-clock and tool-call bound, not a
+	// deployment-imposed run limit.
 	//
 	// The status reporter is the harness's only path to the run's status: it
 	// asks the broker's trusted status listener, which alone holds the
@@ -279,7 +281,17 @@ func runArgs(args []string) error {
 			evidence.Branch = invocation.Branch
 			return evidence, err
 		},
+		// The lane's declared coordination budget (#901): the total
+		// tool-call ceiling and wall-clock bound the coordinator loop
+		// enforces, converted from the pinned COURIER_BUDGET_JSON
+		// declarations. Absent, the run enforces nothing.
+		Budget: harness.BudgetPolicyFromLane(invocation.Budget),
 		Compactions: compactionSink{
+			emitter:    courierlog.NewEmitter(os.Stdout, courierlog.ParseLevel(os.Getenv("COURIER_LOG_LEVEL"))),
+			stderr:     os.Stderr,
+			invocation: invocation,
+		},
+		BudgetExhausted: budgetSink{
 			emitter:    courierlog.NewEmitter(os.Stdout, courierlog.ParseLevel(os.Getenv("COURIER_LOG_LEVEL"))),
 			stderr:     os.Stderr,
 			invocation: invocation,
@@ -719,6 +731,43 @@ func (s compactionSink) SessionCompacted(event harness.CompactEvent) {
 	})
 	if err != nil {
 		fmt.Fprintf(s.stderr, "courier-control: dropped %s event: %v\n", courierlog.EventSessionCompacted, err)
+	}
+}
+
+// budgetSink adapts the harness's coordination-budget trip (#901) onto the
+// run's structured event log: one session.budget_exhausted line carrying the
+// exhausted axis, the observed count, the declared limit, and the role whose
+// boundary tripped it.
+//
+// It sets no Status: like session.compacted, the trip is observability,
+// never a liveness or completion claim, and the budget_exhausted terminal
+// result remains the classification surface. Detail is Verbose so the counts
+// reach the log store at info level. Emission is best-effort: a dropped
+// event is noted on stderr and the run continues.
+type budgetSink struct {
+	emitter    *courierlog.Emitter
+	stderr     io.Writer
+	invocation executor.Invocation
+}
+
+// BudgetExhausted implements harness.BudgetExhaustSink.
+func (s budgetSink) BudgetExhausted(event harness.BudgetExhaustedEvent) {
+	err := s.emitter.Emit(courierlog.Event{
+		Type:  courierlog.EventSessionBudgetExhausted,
+		RunID: s.invocation.RunName,
+		Repo:  s.invocation.Repo,
+		Ref:   s.invocation.Ref,
+		Mode:  string(s.invocation.Mode),
+		Role:  event.Role,
+		Detail: map[string]any{
+			"budget": event.Axis,
+			"count":  event.Count,
+			"limit":  event.Limit,
+		},
+		Verbose: true,
+	})
+	if err != nil {
+		fmt.Fprintf(s.stderr, "courier-control: dropped %s event: %v\n", courierlog.EventSessionBudgetExhausted, err)
 	}
 }
 

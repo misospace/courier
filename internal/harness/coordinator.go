@@ -76,6 +76,12 @@ type Coordinator struct {
 	// budgets is the context policy resolved per role at startup; a role
 	// with no entry has no policy and never compacts.
 	budgets map[string]ContextBudget
+	// runBudget is the run's coordination-budget ledger (#901): the total
+	// tool-call ceiling and wall-clock bound enforced across the
+	// coordinator session and every delegate session. Nil when the lane
+	// declared no budget: the run enforces nothing, and every nil-ledger
+	// method is a no-op.
+	runBudget *runBudgetLedger
 	// compactions receives applied-compaction telemetry.
 	compactions CompactionSink
 	// telemetry tallies the run's model requests and applied compactions
@@ -273,6 +279,16 @@ type CoordinatorConfig struct {
 	// capability gate verified; a lane that declares no policy populates
 	// nothing, which is the documented unbudgeted legacy behavior.
 	ContextBudgets map[string]ContextBudgetInput
+	// Budget is the lane's declared coordination budget (#901): the total
+	// tool calls the run may execute across the coordinator session and
+	// every delegate session, and the wall clock the run may take. The
+	// zero value enforces nothing — the documented unenforced legacy
+	// behavior — and no ledger is built.
+	Budget RunBudget
+	// BudgetExhausted optionally receives the run's single trip event
+	// (#901). Emission is best-effort and observability only, like the
+	// compaction sink: a failing sink is isolated and never fails the run.
+	BudgetExhausted BudgetExhaustSink
 	// Compactions optionally receives one telemetry event per applied
 	// step-boundary compaction (#243). Emission is best-effort and
 	// observability only: it never changes a transcript or a run outcome.
@@ -319,6 +335,13 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 		}
 		budgets[role] = budget
 	}
+	// The coordination budget (#901) builds its ledger only when the lane
+	// declares something; the start instant is recorded here, at the point
+	// the session loop's owner comes into being.
+	var runBudget *runBudgetLedger
+	if config.Budget.declares() {
+		runBudget = newRunBudgetLedger(config.Budget, time.Now, config.BudgetExhausted)
+	}
 	return &Coordinator{
 		gateway:                 config.Transport,
 		bindings:                config.Bindings,
@@ -328,6 +351,7 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 		publisher:               config.Publisher,
 		activity:                config.Activity,
 		budgets:                 budgets,
+		runBudget:               runBudget,
 		compactions:             config.Compactions,
 		telemetry:               config.Telemetry,
 		bootstrapReceipts:       config.BootstrapReceipts,
@@ -475,6 +499,11 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 	session.Pin(Message{Role: "user", Content: strings.TrimSpace(inv.Goal)})
 
 	clarifications := 0
+	// Budget state (#901): once the trip's stop note is injected the
+	// coordinator gets budgetGraceTurns further turns to integrate and
+	// declare before the harness ends the run through the budget ending.
+	budgetNoteInjected := false
+	budgetGraceTurnsUsed := 0
 	for {
 		// Step boundary (#238): read the broker-served control request and
 		// inject its control turn once. The latch, not the model, decides
@@ -482,6 +511,20 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 		c.control.Poll(ctx)
 		if note, ok := c.control.TakeControlTurn(); ok {
 			session.Append(note)
+		}
+		// Budget step boundary (#901): the wall clock is checked here,
+		// beside the control read; a trip queues its stop note once and
+		// emits its event once, and the note lands in the transcript at
+		// this boundary. The grace clock runs from the injection; the
+		// operator soft-stop latch owns the ending whenever it is set, so
+		// the budget never preempts finishSoftStop.
+		c.runBudget.checkWallClock(RoleCoordinator)
+		if note, ok := c.runBudget.takeNote(); ok {
+			session.Append(note)
+			budgetNoteInjected = true
+		}
+		if budgetNoteInjected && budgetGraceTurnsUsed >= budgetGraceTurns && !c.control.Stopped() {
+			return c.budgetEnding(ctx)
 		}
 		turn := c.pump(ctx, session, "", c.coordinatorTools())
 		if turn.blocker != nil {
@@ -537,6 +580,13 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 			if parseErr == nil {
 				return c.finish(ctx, inv, outcome, turn.text, noChange, pr)
 			}
+			if budgetNoteInjected {
+				// Tripped (#901): an invalid declaration inside the enforced
+				// grace ends the run as budget-exhausted — never the
+				// clarification theater, and never the generic
+				// undeclared-ending workload failure.
+				return c.budgetEnding(ctx)
+			}
 			if clarifications < maxOutcomeClarifications {
 				clarifications++
 				session.Append(Message{Role: "user", Content: outcomeClarification(inv.Mode)})
@@ -546,6 +596,12 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 				Kind:   courierv1alpha1.NativeResultWorkloadFailed,
 				Reason: fmt.Sprintf("undeclared ending: the coordinator's final message was not a valid outcome declaration: %v", parseErr),
 			}
+		}
+		// A non-final turn after the injection spends one grace turn: the
+		// next step boundary that finds the grace spent ends the run
+		// through budgetEnding whatever the model asks for next (#901).
+		if budgetNoteInjected {
+			budgetGraceTurnsUsed++
 		}
 	}
 }
@@ -691,6 +747,18 @@ func (c *Coordinator) pump(ctx context.Context, session *Session, briefID string
 	}
 	var toolResults []Event
 	for _, call := range calls {
+		// Budget ceiling (#901): reserve one tool call before executing it,
+		// in every session — the bound is total for the run, coordinator
+		// and delegates alike. Past the ceiling the call is never executed;
+		// the refusal is a fixed tool result so the transcript stays
+		// well-formed: every requested call gets a result.
+		if !c.runBudget.reserveToolCall(session.role) {
+			refused := ToolResult{ToolCallID: call.ID, Name: call.Name, IsError: true, Content: noticeBudgetCeiling}
+			event := Event{Kind: KindToolResult, Result: refused}
+			session.Append(ToolResultMessage(refused))
+			toolResults = append(toolResults, event)
+			continue
+		}
 		result := c.runTool(ctx, call, briefID)
 		// The verified tool boundary is a normalized tool-result event:
 		// trusted control produced it after verified termination, and the
@@ -799,6 +867,25 @@ func (c *Coordinator) infrastructureEnding(ctx context.Context, cause error) exe
 		return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: err}
 	}
 	return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: cause}
+}
+
+// budgetEnding closes a budget-exhausted run (#901): the declared
+// coordination budget ran out and the coordinator never declared a valid
+// outcome inside the enforced grace. It settles the run's durable status
+// obligations first, exactly like a blocked-external ending — a completed
+// brief whose durable record never landed is an infrastructure failure, not
+// a clean budget ending — and ends with the budget_exhausted kind, never a
+// workload failure that would let an exhausted budget masquerade as an
+// undeclared ending.
+func (c *Coordinator) budgetEnding(ctx context.Context) executor.HarnessResult {
+	axis, count, limit := c.runBudget.tripInfo()
+	if err := c.settleStatus(ctx); err != nil {
+		return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: err}
+	}
+	return executor.HarnessResult{
+		Kind:   courierv1alpha1.NativeResultBudgetExhausted,
+		Reason: fmt.Sprintf("coordination budget exhausted: %s %d/%d", axis, count, limit),
+	}
 }
 
 // finish applies the declared outcome. Publication is the coordinator's own
@@ -1419,6 +1506,15 @@ func (c *Coordinator) runDelegate(ctx context.Context, call ToolCall, result Too
 	if c.control.Stopped() {
 		result.IsError = true
 		result.Content = noticeSoftStop
+		return result
+	}
+	// Budget trip (#901): no new briefs once the run's coordination budget
+	// is exhausted. In-flight briefs are never aborted by the trip — their
+	// calls are governed by the ceiling in the pump and they reach their
+	// terminal so the coordinator can integrate them.
+	if c.runBudget.tripped() {
+		result.IsError = true
+		result.Content = noticeBudgetDispatchRefused
 		return result
 	}
 	var args struct {

@@ -120,6 +120,15 @@ const (
 	// observability, never status, and lets operators see compaction in run
 	// telemetry instead of inferring it from gateway failover.
 	EventSessionCompacted = "session.compacted"
+	// EventSessionBudgetExhausted reports the single trip of a run's
+	// declared coordination budget (#901): the exhausted axis (tool_calls
+	// or wall_clock) with the observed count and the declared limit, in the
+	// role whose boundary tripped it. Like session.compacted it is
+	// observability, never status, and lets operators see the budget bind
+	// in run telemetry instead of inferring it from the terminal result.
+	// The detail is Verbose so the counts reach the log store at info
+	// level, matching session.compacted.
+	EventSessionBudgetExhausted = "session.budget_exhausted"
 	// EventRunRetry reports one explicit operator-authorized retry-request
 	// transition on a terminal CoderRun (#97/#606): the request ID and the
 	// settled reason ride in the detail, and the status field carries the state

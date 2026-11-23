@@ -2956,7 +2956,8 @@ func nativeResultKindOf(message terminationMessage) courierv1alpha1.NativeResult
 	switch kind := courierv1alpha1.NativeResultKind(strings.TrimSpace(message.ResultKind)); kind {
 	case courierv1alpha1.NativeResultPublished, courierv1alpha1.NativeResultNoChange,
 		courierv1alpha1.NativeResultNeedsHuman, courierv1alpha1.NativeResultBlockedExternal,
-		courierv1alpha1.NativeResultCapacityExhausted, courierv1alpha1.NativeResultWorkloadFailed,
+		courierv1alpha1.NativeResultCapacityExhausted, courierv1alpha1.NativeResultBudgetExhausted,
+		courierv1alpha1.NativeResultWorkloadFailed,
 		courierv1alpha1.NativeResultInfrastructureFailed:
 		return kind
 	default:

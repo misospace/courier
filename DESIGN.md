@@ -510,7 +510,8 @@ The native harness ends with an explicit, structured terminal result, not a
 bare exit code (#127; the full contract is HARNESS.md §8). Trusted control
 classifies every ending into a `status.nativeResult` kind — `published`,
 `no_change`, `needs_human`, `blocked_external`, `capacity_exhausted`,
-`workload_failed`, or `infrastructure_failed` — and persists it through the
+`budget_exhausted`, `workload_failed`, or `infrastructure_failed` — and
+persists it through the
 run's broker status path before the control process exits. The broker fences
 the write to the authenticated control incarnation, so a stale pod cannot
 record a result, and one incarnation's recorded result is final: an identical
@@ -2646,6 +2647,9 @@ spec:
     roles:
       coordinator: {maxInputTokens: 128000}
       coder: {maxInputTokens: 32000}
+  budget:                          # optional coordination budgets the harness enforces (#901)
+    maxToolCalls: 200              # total tool calls across the coordinator and every delegate session
+    wallClockSeconds: 3600         # coordinator-loop wall clock, checked at step boundaries
   resources:                       # optional CPU/memory sizing for this lane's pods
     requests: {cpu: 500m, memory: 1Gi}
     limits: {cpu: "4", memory: 8Gi}

@@ -110,6 +110,47 @@ func TestCRDManifestContextSchema(t *testing.T) {
 	}
 }
 
+// TestCRDManifestBudgetSchema pins the generated LaneProfile CRD to the
+// coordination-budget bounds (#901): both axes are optional positive
+// integers with minimum 1, so a zero-valued field declares no bound and a
+// lane can never pin a budget that stops the run before its first step.
+func TestCRDManifestBudgetSchema(t *testing.T) {
+	manifest, err := os.ReadFile("../../charts/courier/crd-manifests/courier.misospace.dev_laneprofiles.yaml")
+	if err != nil {
+		t.Fatalf("read CRD manifest: %v", err)
+	}
+	lines := strings.Split(string(manifest), "\n")
+	var block []string
+	inBudget := false
+	indent := ""
+	for _, line := range lines {
+		if !inBudget {
+			if i := strings.Index(line, "budget:"); i >= 0 {
+				inBudget = true
+				indent = line[:i]
+			}
+			continue
+		}
+		// A sibling key at the same indent ends the budget block.
+		if strings.HasPrefix(line, indent) && len(line) > len(indent) && line[len(indent)] != ' ' {
+			break
+		}
+		block = append(block, line)
+	}
+	if !inBudget {
+		t.Fatal("CRD manifest has no spec.budget schema")
+	}
+	text := strings.Join(block, "\n")
+	for _, want := range []string{"maxToolCalls:", "minimum: 1", "type: integer", "wallClockSeconds:", "type: object"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("spec.budget schema missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "default:") {
+		t.Fatal("spec.budget defaults an axis; a zero-valued field must declare no bound")
+	}
+}
+
 // TestSkillsWire round-trips the skill selection (#658): a declared list
 // persists under the skills key with its order intact, and an undeclared
 // selection is absent from the wire so absence and an empty list are the same
