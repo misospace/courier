@@ -135,12 +135,14 @@ type CoordinatorLauncher struct {
 	// minted in Launch.
 	EvidenceKey []byte
 	// InstallationGit, when set, switches every launched legacy coordinator
-	// pod to GitHub App installation-token git credentials (#871): the launch
-	// mints the run's repository-scoped tokens into its credentials Secret,
-	// provisions the run-scoped identity allowed exactly one named-Secret
-	// get, and hands the pod builder the App-mode git contract. Nil keeps
-	// static deployments byte-identical: no mint, no Secret, no identity, and
-	// the static COURIER_GIT_* pair exactly as before.
+	// pod to GitHub App installation-token git credentials (#871, enforced
+	// by #902): the launch mints the run's repository-scoped tokens into its
+	// credentials Secret, provisions the run-scoped identity allowed exactly
+	// one named-Secret get (consumed by the pod's git egress guard, never by
+	// the model container), and hands the pod builder the App-mode git
+	// contract. Nil keeps static deployments byte-identical: no mint, no
+	// Secret, no identity, and the static COURIER_GIT_* pair exactly as
+	// before.
 	InstallationGit *InstallationGitOptions
 }
 

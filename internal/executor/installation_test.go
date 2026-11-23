@@ -94,35 +94,66 @@ func TestBuildCoordinatorPodInstallationGitReplacesStaticPair(t *testing.T) {
 		github.ValueFrom.SecretKeyRef.Name != "courier-api" {
 		t.Fatalf("the explicitly configured API Secret must still wire GITHUB_TOKEN, and never from the git Secret: %#v", github)
 	}
-	if got := environment[EnvGitInstallation].Value; got != "1" {
-		t.Fatalf("%s = %q, want 1", EnvGitInstallation, got)
+	// #902: the model container carries no git credential and no means to
+	// read one — no installation contract, no projected-token file, no
+	// namespace to call the API with.
+	for _, env := range pod.Spec.Containers[0].Env {
+		switch env.Name {
+		case EnvGitInstallation, EnvInstallationOwner, EnvInstallationEndpoint, EnvInstallationSecret, EnvAPITokenFile, EnvAPICertFile, "POD_NAMESPACE", "GIT_CONFIG_COUNT":
+			t.Fatalf("App-mode coordinator must not carry %s: the guard is the only credential reader", env.Name)
+		}
 	}
-	if got := environment[EnvInstallationOwner].Value; got != "acme" {
-		t.Fatalf("%s = %q, want acme", EnvInstallationOwner, got)
+	for _, mount := range pod.Spec.Containers[0].VolumeMounts {
+		if mount.Name == gitCredentialsTokenVolumeName {
+			t.Fatalf("App-mode coordinator must not mount the projected token: %#v", mount)
+		}
 	}
-	if got := environment[EnvInstallationEndpoint].Value; got != "https://api.github.com/" {
-		t.Fatalf("%s = %q", EnvInstallationEndpoint, got)
+	if got := environment["COURIER_REPO_URL"].Value; got != "http://"+GitEgressAddress+"/acme/widgets.git" {
+		t.Fatalf("COURIER_REPO_URL = %q, want the guard loopback remote", got)
 	}
-	if got := environment[EnvInstallationSecret].Value; got != "run-871-provider-creds" {
-		t.Fatalf("%s = %q", EnvInstallationSecret, got)
+	if got := environment["COURIER_BASE_REPO_URL"].Value; got != "http://"+GitEgressAddress+"/acme/widgets.git" {
+		t.Fatalf("COURIER_BASE_REPO_URL = %q, want the guard loopback remote", got)
 	}
-	if got := environment[EnvAPITokenFile].Value; got != GitCredentialsTokenPath+"/token" {
-		t.Fatalf("%s = %q", EnvAPITokenFile, got)
+	if pod.Annotations[GitEgressContractAnnotation] != GitEgressContractVersion {
+		t.Fatalf("App-mode pod must carry the git egress contract annotation")
 	}
-	if got := environment[EnvAPICertFile].Value; got != GitCredentialsTokenPath+"/ca.crt" {
-		t.Fatalf("%s = %q", EnvAPICertFile, got)
+	var guard *corev1.Container
+	for index := range pod.Spec.Containers {
+		if pod.Spec.Containers[index].Name == GitEgressContainerName {
+			guard = &pod.Spec.Containers[index]
+		}
 	}
-	if environment["GIT_CONFIG_KEY_0"].Value != "credential.useHttpPath" || environment["GIT_CONFIG_VALUE_0"].Value != "true" {
-		t.Fatalf("credential.useHttpPath not installed for path-bound prompts: %#v %#v", environment["GIT_CONFIG_KEY_0"], environment["GIT_CONFIG_VALUE_0"])
+	if guard == nil {
+		t.Fatalf("git egress guard container missing: %#v", pod.Spec.Containers)
 	}
-	if environment["GIT_CONFIG_COUNT"].Value != "1" {
-		t.Fatalf("GIT_CONFIG_COUNT = %q", environment["GIT_CONFIG_COUNT"].Value)
+	guardEnv := map[string]corev1.EnvVar{}
+	for _, env := range guard.Env {
+		guardEnv[env.Name] = env
 	}
-	namespace, ok := environment["POD_NAMESPACE"]
+	for name, want := range map[string]string{
+		EnvGitEgressAddress:     GitEgressAddress,
+		EnvInstallationOwner:    "acme",
+		EnvInstallationEndpoint: "https://api.github.com/",
+		EnvInstallationSecret:   "run-871-provider-creds",
+		EnvAPITokenFile:         GitCredentialsTokenPath + "/token",
+		EnvAPICertFile:          GitCredentialsTokenPath + "/ca.crt",
+		"COURIER_REPO":          "acme/widgets",
+		"COURIER_REPO_URL":      "https://github.com/acme/widgets.git",
+		"COURIER_BASE_REPO_URL": "https://github.com/acme/widgets.git",
+		"COURIER_BRANCH":        "courier/acme/widgets/issue-7",
+	} {
+		if got := guardEnv[name].Value; got != want {
+			t.Fatalf("guard %s = %q, want %q", name, got, want)
+		}
+	}
+	if _, ok := guardEnv["COURIER_HEAD_REPO"]; !ok {
+		t.Fatalf("guard env must carry the head identity even when empty")
+	}
+	namespace, ok := guardEnv["POD_NAMESPACE"]
 	if !ok || namespace.ValueFrom == nil || namespace.ValueFrom.FieldRef == nil || namespace.ValueFrom.FieldRef.FieldPath != "metadata.namespace" {
-		t.Fatalf("POD_NAMESPACE = %#v", namespace)
+		t.Fatalf("guard POD_NAMESPACE = %#v", namespace)
 	}
-	var volumeFound bool
+	var volumeFound, guardMount bool
 	for _, volume := range pod.Spec.Volumes {
 		if volume.Name != gitCredentialsTokenVolumeName {
 			continue
@@ -138,14 +169,13 @@ func TestBuildCoordinatorPodInstallationGitReplacesStaticPair(t *testing.T) {
 	if !volumeFound {
 		t.Fatalf("projected token volume %q missing", gitCredentialsTokenVolumeName)
 	}
-	var mountFound bool
-	for _, mount := range pod.Spec.Containers[0].VolumeMounts {
+	for _, mount := range guard.VolumeMounts {
 		if mount.Name == gitCredentialsTokenVolumeName {
-			mountFound = mount.MountPath == GitCredentialsTokenPath && mount.ReadOnly
+			guardMount = mount.MountPath == GitCredentialsTokenPath && mount.ReadOnly
 		}
 	}
-	if !mountFound {
-		t.Fatalf("coordinator token mount missing or wrong: %#v", pod.Spec.Containers[0].VolumeMounts)
+	if !guardMount {
+		t.Fatalf("guard token mount missing or wrong: %#v", guard.VolumeMounts)
 	}
 	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
 		t.Fatalf("pod-level automount must stay false")
@@ -167,6 +197,53 @@ func TestBuildCoordinatorPodStaticModeOmitsInstallationContract(t *testing.T) {
 		if volume.Name == gitCredentialsTokenVolumeName {
 			t.Fatalf("static pod carries the projected token volume")
 		}
+	}
+	for _, container := range pod.Spec.Containers {
+		if container.Name == GitEgressContainerName {
+			t.Fatalf("static pod carries the git egress guard")
+		}
+	}
+	if _, ok := pod.Annotations[GitEgressContractAnnotation]; ok {
+		t.Fatalf("static pod carries the git egress contract annotation")
+	}
+	if got := envValue(pod.Spec.Containers[0].Env, "COURIER_REPO_URL"); got != "https://github.com/acme/widgets.git" {
+		t.Fatalf("static pod remote rewritten: %q", got)
+	}
+}
+
+func TestLoopbackRemoteTemplate(t *testing.T) {
+	for template, want := range map[string]string{
+		"https://github.com/%s.git":             "http://" + GitEgressAddress + "/%s.git",
+		"https://ghe.example.com/api/%s":        "http://" + GitEgressAddress + "/api/%s",
+		"https://github.example.com/owner/%s.g": "http://" + GitEgressAddress + "/owner/%s.g",
+	} {
+		got, err := loopbackRemoteTemplate(template, GitEgressAddress)
+		if err != nil {
+			t.Fatalf("%q: %v", template, err)
+		}
+		if got != want {
+			t.Fatalf("%q rewrote to %q, want %q", template, got, want)
+		}
+	}
+	for _, template := range []string{
+		"https://github.com/acme/widgets.git",
+		"http://github.com/%s.git",
+		"git@github.com:%s.git",
+		"https://user@github.com/%s.git",
+		"https://github.com/%s.git?x=1",
+	} {
+		if _, err := loopbackRemoteTemplate(template, GitEgressAddress); err == nil {
+			t.Fatalf("%q accepted", template)
+		}
+	}
+	config := installationTestConfig()
+	config.InstallationGit = installationGitConfig()
+	if err := config.Validate(); err != nil {
+		t.Fatalf("valid App-mode config rejected: %v", err)
+	}
+	config.GitRemoteURL = "https://github.com/fixed/widgets.git"
+	if err := config.Validate(); err == nil {
+		t.Fatalf("App-mode config without the %%s placeholder accepted")
 	}
 }
 

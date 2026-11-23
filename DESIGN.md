@@ -4367,16 +4367,28 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   `GitCredentialSecret` is configured, so there is nothing to fall back to.
   `GITHUB_TOKEN` keeps its fallback to the git Secret only in static mode:
   the executor's forge-API reads are not the git transport this mode governs,
-  so an App-mode pod receives it solely from an explicitly configured
-  `GitHubCredentialSecret`. Every git prompt is answered by the executor
-  binary's askpass helper re-reading the document through the API with the
-  pod's projected token, so a rotation or an expiry takes effect on the next
-  prompt of a long run rather than at restart. The helper binds every served
-  token to one pinned repository: it serves only the two remote URLs the operator rendered
-  (work remote → head or base repository, base remote → base repository),
-  `credential.useHttpPath` is installed so git names the repository in every
-  prompt, and any other URL is refused before any API call and prints nothing,
-  so cross-repository and fork use cannot borrow a token. The isolated legacy
+   so an App-mode pod receives it solely from an explicitly configured
+   `GitHubCredentialSecret`. Every git operation the coordinator performs
+   goes through the run's loopback git egress guard (#902): the pod builder
+   rewrites both remotes to the guard's loopback origin, and the guard
+   container — the executor binary's `git-egress` mode — re-reads the
+   document through the API on every operation, so a rotation or an expiry
+   takes effect on the next operation rather than at restart. The guard is
+   the boundary a prompt could never be: git tells an askpass helper nothing
+   about the ref a push is about to update, but the guard sees the push
+   request itself. It serves only the smart-HTTP service endpoints of the two
+   pinned repository paths — fetch for both, and a push only for the work
+   repository and only when every ref update in the request is exactly the
+   run's approved work ref, so a same-repository push outside that ref, a
+   ref deletion, the base repository as a push destination, and any non-git
+   endpoint are refused before any credential is resolved or any byte leaves
+   the guard. The guard injects the credential into the upstream request
+   itself, so the token never enters the model container's environment,
+   mounts, or files: the coordinator container carries neither the static
+   pair nor the installation contract nor the projected token, and the only
+   readable credential source in the pod is a projected token the model
+   container cannot mount and a Secret the pod's single `get` grants only
+   through it. The isolated legacy
   observer and its seed resolve the same document through their own projected
   token, so workspace observation keeps working when no static git credential
   exists. Rotation reuses the same refresh lead and mint-lifetime guard and runs
@@ -4391,13 +4403,25 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   write or read the superseded key — no credential-serving reader (broker,
   askpass helper, observer) consults it, so a superseded token is never
   served.
-  Refusals are fail-closed with no static fallback and no retry loop of
-  credentials, the rebase force-push keeps its head-SHA compare-and-set lease
-  unchanged under the new credential, and no merge capability is added
-  anywhere. The model can still reach its own run's short-lived,
-  repository-scoped tokens from inside its pod exactly as it could reach the
-  static PAT it no longer carries; what changed is lifetime, repository scope,
-  rotation, and the absence of any cross-repository credential.
+   Refusals are fail-closed with no static fallback and no retry loop of
+   credentials, the rebase force-push keeps its head-SHA compare-and-set lease
+   unchanged under the new credential, and no merge capability is added
+   anywhere. The residual trust model is stated rather than wished away. The
+   guard shares the pod's network namespace, so a compromised model can still
+   bypass it and open its own connection to the forge — and be refused
+   unauthenticated, because the credential lives only inside the guard and
+   the projected token the model container cannot reach; bypassing the guard
+   loses the operation, not merely the policy. Making bypass impossible
+   instead of useless needs deployment-level egress control that a
+   pod-scoped NetworkPolicy cannot express (a policy cannot distinguish
+   containers inside one pod), which remains deployment work, not core work.
+   The guard enforces the operator-pinned work ref and the run's two pinned
+   repositories; it does not re-adjudicate the plan. The isolated observer
+   and its seed keep their own projected token and document read because
+   they are trusted containers that host no model process. Static-mode
+   pods, askpass semantics, and every render stay byte-identical; the
+   askpass installation path survives only to serve pods launched before
+   the guard, and steady-state rotation recognizes both pod shapes.
 - The gateway response is untrusted, unbounded input, and trusted control
   bounds both its shape and what it will hold: one SSE line is capped at 1 MiB,
   and per completion the buffered content deltas (8 MiB), the buffered

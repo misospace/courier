@@ -123,11 +123,12 @@ type PodConfig struct {
 	// defaults to "key".
 	ModelGatewayKeyName string
 	// InstallationGit opts the deployment into App-mode git credentials for
-	// legacy coordinator pods (#871): the pod renders the installation
-	// contract environment instead of the static COURIER_GIT_* pair, mounts
-	// its projected ServiceAccount token for the credentials-Secret read,
-	// and the launcher provisions the run-scoped identity that may read the
-	// run's installation-token document. Nil keeps the static pair exactly
+	// legacy coordinator pods (#871): the pod renders a git egress guard
+	// container that serves the run's installation-token document and binds
+	// every write to the run's approved work ref (#902), the coordinator
+	// container's git remotes are rewritten to the guard, and the launcher
+	// provisions the run-scoped identity the guard reads the run's
+	// installation-token document with. Nil keeps the static pair exactly
 	// as before; non-nil suppresses the git pair even when
 	// GitCredentialSecret is configured, because an App-enabled run must
 	// not hold a static git credential to fall back to.
@@ -233,6 +234,19 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 	if err != nil {
 		return nil, fmt.Errorf("executor: marshal OpenCode config: %w", err)
 	}
+	// App-mode coordinator containers talk to the git egress guard, never
+	// to the forge directly (#902): the remote template is rewritten to the
+	// guard's loopback origin so every model-driven clone, fetch, push, and
+	// rebase passes the ref-and-operation boundary. The guard container and
+	// the observer keep the absolute forge remotes.
+	coordinatorConfig := config
+	if config.InstallationGit != nil {
+		loopback, err := loopbackRemoteTemplate(config.GitRemoteURL, GitEgressAddress)
+		if err != nil {
+			return nil, err
+		}
+		coordinatorConfig.GitRemoteURL = loopback
+	}
 
 	labels := map[string]string{
 		LabelRun:                       RunLabelValue(run.Name),
@@ -305,7 +319,7 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 				Command:                  []string{command.Binary},
 				Args:                     append([]string(nil), command.Args...),
 				WorkingDir:               config.WorkspacePath,
-				Env:                      podEnvironment(invocation, executorImpl.Name(), config),
+				Env:                      podEnvironment(invocation, executorImpl.Name(), coordinatorConfig),
 				Resources:                lane.Spec.EffectiveResources(),
 				VolumeMounts: []corev1.VolumeMount{{
 					Name:      "workspace",
@@ -335,16 +349,17 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 			}},
 		},
 	}
-	// App-mode git credentials read the run's installation-token document
-	// through the API with the pod's own projected identity (#871). The
-	// pod-level automount stays false; this explicit projection carries the
-	// token and the API-server CA bundle the helper's COURIER_API_* files
-	// point at.
+	// The enforced git write boundary (#902): the projected token that
+	// reads the run's credentials Secret is mounted only in the guard
+	// container — never in the model container, which now holds neither a
+	// credential nor a means to read one. The guard container carries the
+	// installation contract and refuses every push outside the approved
+	// work ref; the annotation records the contract for the operator's
+	// rotation gate.
 	if config.InstallationGit != nil {
 		pod.Spec.Volumes = append(pod.Spec.Volumes, gitCredentialsTokenVolume())
-		pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{
-			Name: gitCredentialsTokenVolumeName, MountPath: GitCredentialsTokenPath, ReadOnly: true,
-		})
+		pod.Annotations[GitEgressContractAnnotation] = GitEgressContractVersion
+		pod.Spec.Containers = append(pod.Spec.Containers, gitEgressContainer(config, invocation))
 	}
 	// A 45-second grace only exists to fit the evidence capture deadline; a
 	// run that does not capture keeps the kubelet's default.
@@ -443,21 +458,7 @@ func CredentialEnvRefs(config PodConfig, mode courierv1alpha1.Mode) []Credential
 }
 
 func podEnvironment(invocation Invocation, executorName string, config PodConfig) []corev1.EnvVar {
-	repoForRemote := invocation.HeadRepo
-	if strings.TrimSpace(repoForRemote) == "" {
-		repoForRemote = invocation.Repo
-	}
-	remoteURL := config.GitRemoteURL
-	if strings.Contains(remoteURL, "%s") {
-		remoteURL = strings.Replace(remoteURL, "%s", escapedRepositoryPath(repoForRemote), 1)
-	}
-	// The base remote always points at the repository that owns the base
-	// branch: for a fork fix-pr run, syncing against the fork's base would
-	// merge a possibly stale fork main.
-	baseRemoteURL := config.GitRemoteURL
-	if strings.Contains(baseRemoteURL, "%s") {
-		baseRemoteURL = strings.Replace(baseRemoteURL, "%s", escapedRepositoryPath(invocation.Repo), 1)
-	}
+	remoteURL, baseRemoteURL := configuredRemotes(config, invocation)
 	terminationFile := runtimePath + "/termination"
 	// Validate and the launcher both check the trimmed URL, so the pod env
 	// must carry the trimmed value too: a caller that bypasses the launcher
@@ -484,27 +485,12 @@ func podEnvironment(invocation Invocation, executorName string, config PodConfig
 			values = append(values, corev1.EnvVar{Name: "COURIER_MODEL_GATEWAY_URL", Value: gatewayURL})
 		}
 	}
-	// App-mode git credentials (#871): the pod carries the installation
-	// contract instead of a static git credential. The helper reads the run's
-	// installation-token document through the API on every git prompt, so the
-	// projected token and namespace are runtime configuration, not secrets.
-	// credential.useHttpPath makes git name the repository in every askpass
-	// prompt; without it a prompt is host-only and the helper — which binds
-	// every served token to one pinned repository — refuses it by design.
-	if config.InstallationGit != nil {
-		values = append(values,
-			corev1.EnvVar{Name: EnvGitInstallation, Value: "1"},
-			corev1.EnvVar{Name: EnvInstallationOwner, Value: config.InstallationGit.Owner},
-			corev1.EnvVar{Name: EnvInstallationEndpoint, Value: config.InstallationGit.APIEndpoint},
-			corev1.EnvVar{Name: EnvInstallationSecret, Value: config.InstallationGit.CredentialsSecret},
-			corev1.EnvVar{Name: EnvAPITokenFile, Value: GitCredentialsTokenPath + "/token"},
-			corev1.EnvVar{Name: EnvAPICertFile, Value: GitCredentialsTokenPath + "/ca.crt"},
-			corev1.EnvVar{Name: "GIT_CONFIG_COUNT", Value: "1"},
-			corev1.EnvVar{Name: "GIT_CONFIG_KEY_0", Value: "credential.useHttpPath"},
-			corev1.EnvVar{Name: "GIT_CONFIG_VALUE_0", Value: "true"},
-			corev1.EnvVar{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},
-		)
-	}
+	// App-mode pods (#871 as enforced by #902) carry neither the installation
+	// contract nor any projected token here: the model container holds no
+	// git credential and no means to read one. Its remotes were already
+	// rewritten to the git egress guard by the pod builder, and the guard
+	// container — not this one — reads the run's installation-token document
+	// and binds every write to the approved work ref.
 	// Per-key credential references come from the shared helper so the pod
 	// builder and the evidence intake can never enumerate the same Secret keys
 	// differently.
@@ -629,9 +615,12 @@ func nonEmpty(value string) string { return strings.TrimSpace(value) }
 const gitCredentialsTokenVolumeName = "git-credentials-token"
 
 // gitCredentialsTokenVolume projects the pod's ServiceAccount token and the
-// API-server CA bundle for the App-mode git credential helper (#871). The
-// kube-root-ca.crt ConfigMap is namespaced and always present; the token
-// projection carries no secret material into the pod spec itself.
+// API-server CA bundle for the App-mode readers of the run's credentials
+// document — the git egress guard and, when App-enabled, the observer seed
+// and observer (#871, #902). The volume is mounted only in those containers,
+// never in the model container. The kube-root-ca.crt ConfigMap is namespaced
+// and always present; the token projection carries no secret material into
+// the pod spec itself.
 func gitCredentialsTokenVolume() corev1.Volume {
 	return corev1.Volume{
 		Name: gitCredentialsTokenVolumeName,
@@ -714,6 +703,13 @@ func (c PodConfig) Validate() error {
 	}
 	if err := c.InstallationGit.Validate(); err != nil {
 		return err
+	}
+	// An App-mode deployment must be able to rewrite its remote template to
+	// the guard's loopback origin: fail at configuration time, not per pod.
+	if c.InstallationGit != nil {
+		if _, err := loopbackRemoteTemplate(c.GitRemoteURL, GitEgressAddress); err != nil {
+			return err
+		}
 	}
 	return nil
 }

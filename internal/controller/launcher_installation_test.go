@@ -45,7 +45,7 @@ func installationLauncher(c client.Client, minter InstallationTokenMinter, now t
 	return &CoordinatorLauncher{
 		Client:    c,
 		APIReader: c,
-		Pod:       executor.PodConfig{Image: "example/coordinator:test"},
+		Pod:       executor.PodConfig{Image: "example/coordinator:test", GitRemoteURL: "https://github.com/%s.git"},
 		Executor:  exec,
 		InstallationGit: &InstallationGitOptions{
 			Minter: minter,
@@ -94,7 +94,7 @@ func TestLaunchWithoutInstallationGitWritesNoCredentials(t *testing.T) {
 	launcher := &CoordinatorLauncher{
 		Client:    c,
 		APIReader: c,
-		Pod:       executor.PodConfig{Image: "example/opencode:test"},
+		Pod:       executor.PodConfig{Image: "example/opencode:test", GitRemoteURL: "https://github.com/%s.git"},
 		Executor:  &executor.OpenCode{},
 	}
 	if err := launcher.Launch(context.Background(), run); err != nil {
@@ -515,6 +515,23 @@ func TestEnsureInstallationTokenRotation(t *testing.T) {
 		}
 	})
 
+	t.Run("guard-shaped App pod is recreated on the annotation alone", func(t *testing.T) {
+		run := installationLegacyRun("rotate-guard")
+		pod := legacyGuardCoordinatorPod(run)
+		c := launcherClientForAdmission(t, run, pod)
+		minter := &fixedInstallationTokenMinter{token: "guarded", expiresAt: now.Add(2 * time.Hour)}
+		launcher := installationLauncher(c, minter, now, plainExecutor{})
+		if err := launcher.EnsureInstallationToken(context.Background(), run); err != nil {
+			t.Fatalf("EnsureInstallationToken: %v", err)
+		}
+		if minter.calls != 1 {
+			t.Fatalf("guard-shaped recreation minted %d tokens, want 1", minter.calls)
+		}
+		if secret := readInstallationSecret(t, c, run); !metav1.IsControlledBy(secret, run) {
+			t.Fatal("guard-shaped recreation did not produce a run-controlled Secret")
+		}
+	})
+
 	t.Run("static run never gains a Secret behind its back", func(t *testing.T) {
 		run := installationLegacyRun("rotate-static")
 		pod := legacyCoordinatorPod(run, false)
@@ -713,4 +730,18 @@ func legacyCoordinatorPod(run *courierv1alpha1.CoderRun, appMode bool) *corev1.P
 			Containers: []corev1.Container{{Name: "coordinator", Image: "example/coordinator:test", Env: env}},
 		},
 	}
+}
+
+// legacyGuardCoordinatorPod builds a #902 guard-shaped App-mode pod: the
+// contract is the annotation and the guard container; the coordinator
+// container itself carries no credential marker.
+func legacyGuardCoordinatorPod(run *courierv1alpha1.CoderRun) *corev1.Pod {
+	pod := legacyCoordinatorPod(run, false)
+	pod.Annotations = map[string]string{
+		executor.GitEgressContractAnnotation: executor.GitEgressContractVersion,
+	}
+	pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{
+		Name: executor.GitEgressContainerName, Image: "example/coordinator:test",
+	})
+	return pod
 }
