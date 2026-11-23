@@ -197,6 +197,7 @@ func run(ctx context.Context, config runConfig) error {
 		Authenticator: authenticator,
 		Importer:      gitBroker,
 		Snapshot:      engine,
+		ForgeReader:   adapter,
 		ScratchDir:    config.scratchDir,
 		TLSCertFile:   config.certFile,
 		TLSKeyFile:    config.keyFile,

@@ -257,6 +257,7 @@ func runArgs(args []string) error {
 		Transport: gateway,
 		Bindings:  bindings,
 		Worker:    identity.delegator(),
+		Forge:     identity.brokerForgeClient(),
 		Snapshot:  work.engine.PrepareSnapshot,
 		Publisher: work.engine,
 		Activity:  reporter,
@@ -405,9 +406,10 @@ func prepareModelWork(deps modelWorkDeps) (*modelWork, *gateFailure, error) {
 	// does not run a model — and its probe spend never exists without the
 	// durable surface identity that explains it. A computation or
 	// persistence failure is an infrastructure failure the relaunch owns,
-	// bounded by the crashloop backstop. The run path wires no forge seam,
-	// so the assembly sees the same nil seam the coordinator will.
-	surface, err := harness.AssembleModelSurface(deps.bindings, nil, skillSet, harness.ModelSurfaceInputs{
+	// bounded by the crashloop backstop. Forge reads use the run's authenticated
+	// broker client, the same seam the coordinator receives.
+	forgeClient := deps.identity.brokerForgeClient()
+	surface, err := harness.AssembleModelSurface(deps.bindings, forgeClient, skillSet, harness.ModelSurfaceInputs{
 		GatewayTransport: deps.invocation.GatewayTransport,
 		LaneFraming:      deps.invocation.Framing,
 		ContextPolicy:    deps.invocation.Context,
@@ -1143,6 +1145,11 @@ func (i *controlIdentity) brokerProber() *harness.BrokerProbeClient {
 // brokerClient reaches the broker's typed publication API over TLS.
 func (i *controlIdentity) brokerClient() *harness.BrokerClient {
 	return &harness.BrokerClient{BaseURL: i.brokerURL, TokenSource: i.brokerTokenSource, CA: i.brokerCA}
+}
+
+// brokerForgeClient routes model-facing forge reads through the run broker.
+func (i *controlIdentity) brokerForgeClient() *harness.BrokerForgeClient {
+	return &harness.BrokerForgeClient{BaseURL: i.brokerURL, TokenSource: i.brokerTokenSource, CA: i.brokerCA}
 }
 
 // brokerStatusClient reaches the broker's separate trusted status listener

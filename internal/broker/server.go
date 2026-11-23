@@ -25,6 +25,7 @@ const (
 	PathCreatePR       = "/v1/pull-requests"
 	PathUpdatePR       = "/v1/pull-requests/update"
 	PathTrustedStatus  = "/trusted/v1/status"
+	PathForgeCall      = "/v1/forge/call"
 	PathControlRequest = "/trusted/v1/control-request"
 )
 
@@ -57,6 +58,7 @@ type ServerConfig struct {
 	// Capabilities optionally serves the read-only capability report. It is
 	// captured at construction and never changes per request.
 	Capabilities CapabilityReporter
+	ForgeReader  ForgeReader
 }
 
 type Server struct {
@@ -66,6 +68,7 @@ type Server struct {
 	snapshot      SnapshotHandler
 	scratchDir    string
 	capabilities  CapabilityReporter
+	forgeReader   ForgeReader
 	importMu      sync.Mutex
 	handler       http.Handler
 	// bodyReadBudget bounds each request body read inside the listener's
@@ -99,7 +102,7 @@ func NewServer(config ServerConfig) (*Server, error) {
 	if _, err := tls.LoadX509KeyPair(config.TLSCertFile, config.TLSKeyFile); err != nil {
 		return nil, fmt.Errorf("load broker TLS identity: %w", err)
 	}
-	s := &Server{policy: config.Policy, authenticator: config.Authenticator, importer: config.Importer, snapshot: config.Snapshot, scratchDir: config.ScratchDir, capabilities: config.Capabilities, bodyReadBudget: apiBodyReadBudget}
+	s := &Server{policy: config.Policy, authenticator: config.Authenticator, importer: config.Importer, snapshot: config.Snapshot, scratchDir: config.ScratchDir, capabilities: config.Capabilities, forgeReader: config.ForgeReader, bodyReadBudget: apiBodyReadBudget}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+PathPublish, s.publish)
 	if s.importer != nil {
@@ -113,6 +116,9 @@ func NewServer(config ServerConfig) (*Server, error) {
 	}
 	mux.HandleFunc("POST "+PathCreatePR, s.createPR)
 	mux.HandleFunc("PATCH "+PathUpdatePR, s.updatePR)
+	if s.forgeReader != nil {
+		mux.HandleFunc("POST "+PathForgeCall, s.forgeCall)
+	}
 	s.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Bound the body read for every route before its handler runs, so a
 		// client that sends its headers and then stalls its body cannot hold

@@ -91,8 +91,10 @@ all workers or isolation controls are implemented or ready.
   status are #125/#126):** each run has trusted
   control, a dedicated trusted broker behind a run-specific Service, and an
   isolated untrusted worker. Control owns model calls, orchestration, integration,
-  and signed worker tasks; the broker holds credentials and enforces semantic
-  forge, git-repository, ref, and trusted-status policy. The worker has no
+  and signed worker tasks; model-facing forge reads travel over an authenticated,
+  broker-mediated route with a closed read-only vocabulary and repository pinning.
+  The broker holds credentials and enforces semantic forge, git-repository, ref,
+  and trusted-status policy. The worker has no
   credentials or workload identity and can reach only an administrator-populated
   Go module cache, without worker DNS, not the broker or forge. Secure mode requires
   enforced network policy, live deny probes, and fail-closed preflight before
