@@ -19,6 +19,24 @@ const DefaultStaleWindow = 15 * time.Minute
 // DefaultPageSize is the page size a list projection uses when none is given.
 const DefaultPageSize = 50
 
+// MaxTimelineEntries bounds a run detail's event timeline; newest entries win.
+const MaxTimelineEntries = 32
+
+// Timeline labels are the closed vocabulary emitted by ProjectRunTimeline.
+const (
+	TimelineCreated           = "created"
+	TimelineAdmitted          = "admitted"
+	TimelineStarted           = "started"
+	TimelinePhase             = "phase"
+	TimelineHeartbeat         = "heartbeat"
+	TimelineCIParked          = "ci-parked"
+	TimelineFinished          = "finished"
+	TimelineCoordinatorExited = "coordinator-exited"
+	TimelineResultRecorded    = "result-recorded"
+	TimelineRetentionMarked   = "retention-marked"
+	TimelineCondition         = "condition"
+)
+
 // Options carries the pure-projection inputs that are not cluster objects.
 // Now is the observation instant (injected, never read from the wall clock);
 // StaleWindow bounds Fresh/Stale judgments.
@@ -220,6 +238,110 @@ func retentionReasonFor(marker string) string {
 	}
 }
 
+// ProjectRunTimeline derives a bounded, deterministic timeline from recorded
+// status timestamps only. The observation instant plays no part: every entry
+// is a stamped fact the operator recorded, never a freshness judgment.
+func ProjectRunTimeline(run *courierv1alpha1.CoderRun) ([]TimelineView, bool) {
+	if run == nil {
+		return nil, false
+	}
+	var entries []TimelineView
+	add := func(at *metav1.Time, label, detail string) {
+		if at == nil || at.Time.IsZero() {
+			return
+		}
+		entry := TimelineView{At: at.DeepCopy(), Label: label}
+		if detail != "" {
+			entry.Detail = bound(detail)
+		}
+		entries = append(entries, entry)
+	}
+	add(&run.CreationTimestamp, TimelineCreated, "")
+	add(run.Status.AdmittedAt, TimelineAdmitted, "")
+	add(run.Status.StartedAt, TimelineStarted, "")
+	if run.Status.Phase != "" {
+		add(run.Status.PhaseEnteredAt, TimelinePhase, string(run.Status.Phase))
+	}
+	if hb := run.Status.Heartbeat; hb != nil {
+		add(&hb.At, TimelineHeartbeat, "")
+	}
+	if park := run.Status.CIPark; park != nil {
+		add(&park.ParkedAt, TimelineCIParked, "")
+	}
+	add(run.Status.FinishedAt, TimelineFinished, "")
+	if diag := run.Status.TerminalDiagnostic; diag != nil {
+		add(diag.ObservedAt, TimelineCoordinatorExited, "")
+	}
+	if result := run.Status.NativeResult; result != nil {
+		add(&result.At, TimelineResultRecorded, "")
+	}
+	if marker, at := reapMarker(run); marker != "" {
+		add(at, TimelineRetentionMarked, retentionReasonFor(marker))
+	}
+	for i := range run.Status.Conditions {
+		cond := run.Status.Conditions[i]
+		if conditionAllowlist[cond.Type] {
+			add(&cond.LastTransitionTime, TimelineCondition, string(cond.Type)+"="+string(cond.Status))
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if !entries[i].At.Equal(entries[j].At) {
+			return entries[i].At.Before(entries[j].At)
+		}
+		if entries[i].Label != entries[j].Label {
+			return entries[i].Label < entries[j].Label
+		}
+		return entries[i].Detail < entries[j].Detail
+	})
+	truncated := len(entries) > MaxTimelineEntries
+	if truncated {
+		entries = append([]TimelineView(nil), entries[len(entries)-MaxTimelineEntries:]...)
+	}
+	if len(entries) == 0 {
+		return nil, truncated
+	}
+	return entries, truncated
+}
+
+// These settlement reasons mirror internal/controller/coderun_controller.go's lifecycle report gate.
+const (
+	lifecycleReportPublishedReason        = "Published"
+	lifecycleReportSupersededReason       = "Superseded"
+	lifecycleReportPermanentRefusalReason = "PermanentRefusal"
+)
+
+func reapHolds(run *courierv1alpha1.CoderRun, marker string) []string {
+	if !phaseIsReapEligible(run.Status.Phase) {
+		return []string{"phase is not reap-eligible"}
+	}
+	var holds []string
+	if marker == "" {
+		holds = append(holds, "no retention marker yet")
+	}
+	settled := false
+	for i := range run.Status.Conditions {
+		cond := run.Status.Conditions[i]
+		if cond.Type == courierv1alpha1.ConditionLifecycleReported && cond.Status == metav1.ConditionTrue &&
+			(cond.Reason == lifecycleReportPublishedReason || cond.Reason == lifecycleReportSupersededReason || cond.Reason == lifecycleReportPermanentRefusalReason) {
+			settled = true
+			break
+		}
+	}
+	if !settled {
+		holds = append(holds, "source report not settled")
+	}
+	if run.Status.CISettlement != nil {
+		holds = append(holds, "ci settlement outstanding")
+	}
+	if run.Status.CIParkRelease != nil {
+		holds = append(holds, "ci park release outstanding")
+	}
+	if req := run.Status.RetryRequest; req != nil && req.State == courierv1alpha1.RetryRequestStateRequested {
+		holds = append(holds, "retry request outstanding")
+	}
+	return holds
+}
+
 // ProjectRunSummary projects one run's list-row view.
 func ProjectRunSummary(run *courierv1alpha1.CoderRun, opts Options) RunSummary {
 	if run == nil {
@@ -255,6 +377,7 @@ func ProjectRunDetail(run *courierv1alpha1.CoderRun, opts Options) RunDetail {
 	detail := RunDetail{
 		RunSummary: ProjectRunSummary(run, opts),
 	}
+	detail.Timeline, detail.TimelineTruncated = ProjectRunTimeline(run)
 	if run == nil {
 		return detail
 	}
@@ -333,15 +456,13 @@ func ProjectRunDetail(run *courierv1alpha1.CoderRun, opts Options) RunDetail {
 		detail.Admission.Note = "admittedAt is stamped but phase is Pending: a released or wedged admission"
 	}
 
-	if marker, at := reapMarker(run); marker != "" {
-		detail.Reap = ReapHealth{
-			MarkerAnnotation: marker,
-			MarkerAt:         at,
-			Reason:           retentionReasonFor(marker),
-			EligibleByPhase:  phaseIsReapEligible(run.Status.Phase),
-		}
-	} else {
-		detail.Reap = ReapHealth{EligibleByPhase: phaseIsReapEligible(run.Status.Phase)}
+	marker, at := reapMarker(run)
+	detail.Reap = ReapHealth{
+		MarkerAnnotation: marker,
+		MarkerAt:         at,
+		Reason:           retentionReasonFor(marker),
+		EligibleByPhase:  phaseIsReapEligible(run.Status.Phase),
+		Holds:            reapHolds(run, marker),
 	}
 
 	if safety := run.Status.WorkspaceSafety; safety != nil {

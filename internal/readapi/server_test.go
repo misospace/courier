@@ -368,6 +368,23 @@ func TestServerRunDetailNotFoundAndEnvelope(t *testing.T) {
 	if envelope.APIVersion != APIVersion || envelope.Kind != KindRunDetail {
 		t.Errorf("envelope = %s/%s, want %s/%s", envelope.APIVersion, envelope.Kind, APIVersion, KindRunDetail)
 	}
+	var detail RunDetail
+	if err := json.Unmarshal(envelope.Payload, &detail); err != nil {
+		t.Fatalf("detail payload: %v", err)
+	}
+	if len(detail.Timeline) == 0 || detail.Timeline[0].Label != TimelineCreated {
+		t.Errorf("detail timeline = %+v, want created entry", detail.Timeline)
+	}
+	withoutTimes := courierv1alpha1.CoderRun{ObjectMeta: metav1.ObjectMeta{Name: "no-times", Namespace: "courier"}}
+	_, emptyHandler := serverFixture(t, &withoutTimes)
+	emptyEnvelope, _ := envelopeOf(t, get(emptyHandler, "/v1/runs/no-times"))
+	var emptyDetail RunDetail
+	if err := json.Unmarshal(emptyEnvelope.Payload, &emptyDetail); err != nil {
+		t.Fatalf("empty detail payload: %v", err)
+	}
+	if len(emptyDetail.Timeline) != 0 || emptyDetail.TimelineTruncated {
+		t.Errorf("empty timeline = %+v truncated=%v", emptyDetail.Timeline, emptyDetail.TimelineTruncated)
+	}
 }
 
 // TestServerRedactionEndToEnd pushes a fully populated run through the HTTP

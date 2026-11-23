@@ -1,9 +1,40 @@
 {{define "content"}}
+{{if .RunNotFound}}
 <h1>Run {{.RunName}}</h1>
-{{if .BackendErr}}
-<p class="state state-error">The operator read API probe failed: {{.BackendErr}}</p>
+<p class="state">Run {{.RunName}} was not found in this namespace. <a href="/runs">Back to runs</a>.</p>
+{{else if .RunErr}}
+<h1>Run {{.RunName}}</h1>
+<p class="state state-error">{{.RunErr}} <a href="/runs">Back to runs</a>.</p>
+{{else if .Run}}
+<header class="run-header">
+  <h1>{{.Run.Name}}{{if .Run.Terminal}} <span class="tag tag-terminal">terminal</span>{{end}}</h1>
+  <dl class="identity">
+    <div><dt>Namespace</dt><dd>{{if .Run.Namespace}}{{.Run.Namespace}}{{else}}<span class="muted">—</span>{{end}}</dd></div>
+    <div><dt>Source</dt><dd>{{if .Run.Source}}{{.Run.Source}}{{else}}<span class="muted">—</span>{{end}}</dd></div>
+    <div><dt>Lane</dt><dd>{{if .Run.Lane}}{{.Run.Lane}}{{else}}<span class="muted">—</span>{{end}}</dd></div>
+    <div><dt>Phase</dt><dd>{{if .Run.Phase}}{{.Run.Phase}}{{else}}<span class="muted">—</span>{{end}}</dd></div>
+    <div><dt>Age</dt><dd>{{humanDuration .Run.AgeSeconds}}</dd></div>
+    <div><dt>Pull request</dt><dd>{{if .Run.PRNumber}}#{{.Run.PRNumber}}{{else}}<span class="muted">—</span>{{end}}</dd></div>
+    <div><dt>Branch</dt><dd>{{if .Run.Branch}}{{.Run.Branch}}{{else}}<span class="muted">—</span>{{end}}</dd></div>
+    <div><dt>Head SHA</dt><dd>{{if .Run.HeadSHA}}{{.Run.HeadSHA}}{{else}}<span class="muted">—</span>{{end}}</dd></div>
+    <div><dt>Restarts</dt><dd>{{.Run.Restarts}}</dd></div>
+  </dl>
+</header>
+<section><h2>Heartbeat</h2><dl class="detail-grid"><div><dt>Recorded</dt><dd>{{if .Run.Heartbeat.HasHeartbeat}}yes{{else}}no{{end}}</dd></div><div><dt>At</dt><dd>{{if .Run.Heartbeat.LastHeartbeatAt}}{{.Run.Heartbeat.LastHeartbeatAt}}{{else}}<span class="muted">—</span>{{end}}</dd></div><div><dt>Freshness</dt><dd>{{.Run.Heartbeat.Freshness}}</dd></div></dl></section>
+<section><h2>Admission</h2><dl class="detail-grid"><div><dt>Admitted at</dt><dd>{{if .Run.Admission.AdmittedAt}}{{.Run.Admission.AdmittedAt}}{{else}}<span class="muted">—</span>{{end}}</dd></div><div><dt>Disagreement</dt><dd>{{if .Run.Admission.Disagreement}}yes{{else}}no{{end}}</dd></div></dl>{{if .Run.Admission.Disagreement}}<p class="state state-warn">{{.Run.Admission.Note}}</p>{{end}}</section>
+<section><h2>Checkpoint</h2>{{if .Run.Checkpoint.Present}}<p>Recorded; {{.Run.Checkpoint.BriefCount}} completed briefs.</p>{{else}}<p class="muted">Not recorded.</p>{{end}}</section>
+<section><h2>Publication</h2><dl class="detail-grid"><div><dt>Last commit</dt><dd>{{if .Run.Publication.LastCommit}}{{.Run.Publication.LastCommit}}{{else}}<span class="muted">—</span>{{end}}</dd></div><div><dt>Check fingerprint</dt><dd>{{if .Run.Publication.HasCheckFingerprint}}recorded{{else}}not recorded{{end}}</dd></div><div><dt>Failed-check fingerprint</dt><dd>{{if .Run.Publication.HasFailedCheckFingerprint}}recorded{{else}}not recorded{{end}}</dd></div><div><dt>Declared no change</dt><dd>{{if .Run.Publication.DeclaredNoChange}}yes{{else}}no{{end}}</dd></div></dl></section>
+<section><h2>CI park</h2>{{if .Run.CIPark}}<dl class="detail-grid"><div><dt>Head</dt><dd>{{if .Run.CIPark.Head}}{{.Run.CIPark.Head}}{{else}}<span class="muted">—</span>{{end}}</dd></div><div><dt>Parked at</dt><dd>{{if .Run.CIPark.ParkedAt}}{{.Run.CIPark.ParkedAt}}{{else}}<span class="muted">—</span>{{end}}</dd></div><div><dt>Attempts</dt><dd>{{.Run.CIPark.Attempts}}</dd></div><div><dt>Last outcome</dt><dd>{{if .Run.CIPark.LastOutcome}}{{.Run.CIPark.LastOutcome}}{{else}}<span class="muted">—</span>{{end}}</dd></div></dl>{{else}}<p>Not parked.</p>{{end}}</section>
+<section><h2>Lifecycle report</h2><dl class="detail-grid"><div><dt>Condition present</dt><dd>{{if .Run.LifecycleReport.ConditionPresent}}yes{{else}}no{{end}}</dd></div><div><dt>Status</dt><dd>{{if .Run.LifecycleReport.ConditionStatus}}{{.Run.LifecycleReport.ConditionStatus}}{{else}}<span class="muted">—</span>{{end}}</dd></div><div><dt>Observed at</dt><dd>{{if .Run.LifecycleReport.ObservedAt}}{{.Run.LifecycleReport.ObservedAt}}{{else}}<span class="muted">—</span>{{end}}</dd></div><div><dt>Active retry token</dt><dd>{{if .Run.LifecycleReport.HasActiveRetryToken}}present{{else}}absent{{end}}</dd></div><div><dt>Last retry token</dt><dd>{{if .Run.LifecycleReport.HasLastRetryToken}}present{{else}}absent{{end}}</dd></div></dl></section>
+<section><h2>Coordinator diagnostic</h2>{{if .Run.Coordinator}}<dl class="detail-grid"><div><dt>Category</dt><dd>{{.Run.Coordinator.Category}}</dd></div><div><dt>Exit code</dt><dd>{{if .Run.Coordinator.ExitCode}}{{.Run.Coordinator.ExitCode}}{{else}}<span class="muted">—</span>{{end}}</dd></div><div><dt>Outcome</dt><dd>{{if .Run.Coordinator.Outcome}}{{.Run.Coordinator.Outcome}}{{else}}<span class="muted">—</span>{{end}}</dd></div><div><dt>Reason</dt><dd>{{if .Run.Coordinator.Reason}}{{.Run.Coordinator.Reason}}{{else}}<span class="muted">—</span>{{end}}</dd></div><div><dt>Observed at</dt><dd>{{if .Run.Coordinator.ObservedAt}}{{.Run.Coordinator.ObservedAt}}{{else}}<span class="muted">—</span>{{end}}</dd></div><div><dt>Freshness</dt><dd>{{.Run.Coordinator.Freshness}}</dd></div>{{if .Run.Coordinator.Container}}<div><dt>Container</dt><dd>{{.Run.Coordinator.Container.Name}}; restarts {{.Run.Coordinator.Container.RestartCount}}; {{.Run.Coordinator.Container.TerminationReason}}</dd></div>{{end}}</dl>{{else}}<p>No coordinator diagnostic recorded.</p>{{end}}</section>
+<section><h2>Reap</h2><dl class="detail-grid"><div><dt>Marker</dt><dd>{{if .Run.Reap.MarkerAnnotation}}{{.Run.Reap.MarkerAnnotation}}{{else}}<span class="muted">—</span>{{end}}</dd></div><div><dt>At</dt><dd>{{if .Run.Reap.MarkerAt}}{{.Run.Reap.MarkerAt}}{{else}}<span class="muted">—</span>{{end}}</dd></div><div><dt>Retention reason</dt><dd>{{if .Run.Reap.Reason}}{{.Run.Reap.Reason}}{{else}}<span class="muted">—</span>{{end}}</dd></div><div><dt>Eligible by phase</dt><dd>{{if .Run.Reap.EligibleByPhase}}yes{{else}}no{{end}}</dd></div></dl>{{if .Run.Reap.Holds}}<ul>{{range .Run.Reap.Holds}}<li>{{.}}</li>{{end}}</ul>{{else if .Run.Reap.EligibleByPhase}}<p>No per-run hold recorded (the per-repository audit floor is not reflected per run).</p>{{else}}<p>No per-run hold recorded.</p>{{end}}</section>
+<section><h2>Workspace safety</h2>{{if .Run.WorkspaceSafety}}<dl class="detail-grid"><div><dt>State</dt><dd>{{if .Run.WorkspaceSafety.State}}{{.Run.WorkspaceSafety.State}}{{else}}<span class="muted">—</span>{{end}}</dd></div><div><dt>Branch</dt><dd>{{if .Run.WorkspaceSafety.Branch}}{{.Run.WorkspaceSafety.Branch}}{{else}}<span class="muted">—</span>{{end}}</dd></div><div><dt>Head</dt><dd>{{if .Run.WorkspaceSafety.Head}}{{.Run.WorkspaceSafety.Head}}{{else}}<span class="muted">—</span>{{end}}</dd></div></dl>{{else}}<p>Not recorded.</p>{{end}}</section>
+<section><h2>Terminal reason</h2>{{if .Run.TerminalReason}}<p>{{.Run.TerminalReason}}</p>{{else}}<p class="muted">Not recorded.</p>{{end}}</section>
+<section><h2>Conditions</h2>{{if .Run.Conditions}}<table class="runs"><thead><tr><th>Type</th><th>Status</th><th>Observed at</th></tr></thead><tbody>{{range .Run.Conditions}}<tr><td>{{.Type}}</td><td>{{.Status}}</td><td>{{if .ObservedAt}}{{.ObservedAt}}{{else}}<span class="muted">—</span>{{end}}</td></tr>{{end}}</tbody></table>{{else}}<p>No recorded conditions.</p>{{end}}</section>
+<section><h2>Timeline</h2>{{if .Run.Timeline}}<ol class="timeline">{{range .Run.Timeline}}<li><time>{{.At}}</time> — <strong>{{.Label}}</strong>{{if .Detail}}: {{.Detail}}{{end}}</li>{{end}}</ol>{{if .Run.TimelineTruncated}}<p class="state-note">Showing {{len .Run.Timeline}} most recent entries; older entries were dropped.</p>{{end}}{{else}}<p>No recorded events.</p>{{end}}</section>
+<p><a href="/runs">Back to runs</a></p>
 {{else}}
-<p class="state">Run detail is a separate view. <a href="/runs">Back to the run explorer</a>.</p>
+<h1>Run {{.RunName}}</h1>
+<p class="state state-error">Run detail is unavailable. <a href="/runs">Back to runs</a>.</p>
 {{end}}
 {{end}}
-

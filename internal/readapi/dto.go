@@ -163,24 +163,26 @@ type RunSummary struct {
 }
 
 // RunDetail is the single-run response for GET runs/{name}: a RunSummary plus
-// the allowlisted per-run state. Every sub-block states its own presence and
-// freshness so missing data is never read as a zero.
+// the allowlisted per-run state and bounded status-timestamp timeline. Every
+// sub-block states its own presence and freshness so missing data is never read as a zero.
 type RunDetail struct {
 	RunSummary `json:",inline"`
 
-	Coordinator      *CoordinatorDiagnostic `json:"coordinator,omitempty"`
-	Heartbeat        HeartbeatHealth        `json:"heartbeat"`
-	Checkpoint       CheckpointHealth       `json:"checkpoint"`
-	Publication      PublicationHealth      `json:"publication"`
-	CIPark           *CIParkHealth          `json:"ciPark,omitempty"`
-	LifecycleReport  LifecycleReportHealth  `json:"lifecycleReport"`
-	Admission        AdmissionHealth        `json:"admission"`
-	Reap             ReapHealth             `json:"reap"`
-	WorkspaceSafety  *WorkspaceSafetyView   `json:"workspaceSafety,omitempty"`
-	NativeResultKind string                 `json:"nativeResultKind,omitempty"`
-	NativeResultAt   *metav1.Time           `json:"nativeResultAt,omitempty"`
-	Conditions       []ConditionView        `json:"conditions,omitempty"`
-	TerminalReason   string                 `json:"terminalReason,omitempty"`
+	Coordinator       *CoordinatorDiagnostic `json:"coordinator,omitempty"`
+	Heartbeat         HeartbeatHealth        `json:"heartbeat"`
+	Checkpoint        CheckpointHealth       `json:"checkpoint"`
+	Publication       PublicationHealth      `json:"publication"`
+	CIPark            *CIParkHealth          `json:"ciPark,omitempty"`
+	LifecycleReport   LifecycleReportHealth  `json:"lifecycleReport"`
+	Admission         AdmissionHealth        `json:"admission"`
+	Reap              ReapHealth             `json:"reap"`
+	WorkspaceSafety   *WorkspaceSafetyView   `json:"workspaceSafety,omitempty"`
+	NativeResultKind  string                 `json:"nativeResultKind,omitempty"`
+	NativeResultAt    *metav1.Time           `json:"nativeResultAt,omitempty"`
+	Conditions        []ConditionView        `json:"conditions,omitempty"`
+	Timeline          []TimelineView         `json:"timeline,omitempty"`
+	TimelineTruncated bool                   `json:"timelineTruncated,omitempty"`
+	TerminalReason    string                 `json:"terminalReason,omitempty"`
 }
 
 // CoordinatorDiagnostic is the redacted projection of Status.TerminalDiagnostic.
@@ -268,6 +270,7 @@ type ReapHealth struct {
 	MarkerAt         *metav1.Time `json:"markerAt,omitempty"`
 	Reason           string       `json:"reason,omitempty"`
 	EligibleByPhase  bool         `json:"eligibleByPhase"`
+	Holds            []string     `json:"holds,omitempty"`
 }
 
 // WorkspaceSafetyView projects the executor's workspace snapshot state and git
@@ -286,6 +289,13 @@ type ConditionView struct {
 	Type       string       `json:"type"`
 	Status     string       `json:"status"`
 	ObservedAt *metav1.Time `json:"observedAt,omitempty"`
+}
+
+// TimelineView is one bounded entry in the run's status-derived event timeline.
+type TimelineView struct {
+	At     *metav1.Time `json:"at,omitempty"`
+	Label  string       `json:"label"`
+	Detail string       `json:"detail,omitempty"`
 }
 
 // RunSummaryList is the paginated GET runs response payload.

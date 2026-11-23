@@ -45,6 +45,90 @@ func runFixture(name, source, lane string, phase courierv1alpha1.Phase, created 
 
 func ptrTime(t metav1.Time) *metav1.Time { return &t }
 
+func TestProjectRunTimelineBoundAndOrdering(t *testing.T) {
+	run := runFixture("timeline", "source", "lane", courierv1alpha1.PhaseRunning, testNow.Add(-time.Hour))
+	run.Status.PhaseEnteredAt = ptrTime(metav1.NewTime(testNow))
+	for i := 0; i < MaxTimelineEntries+5; i++ {
+		run.Status.Conditions = append(run.Status.Conditions, metav1.Condition{
+			Type: courierv1alpha1.ConditionCapacityRecovery, Status: metav1.ConditionTrue,
+			LastTransitionTime: metav1.NewTime(testNow.Add(time.Duration(i+1) * time.Minute)),
+		})
+	}
+	entries, truncated := ProjectRunTimeline(&run)
+	if !truncated || len(entries) != MaxTimelineEntries {
+		t.Fatalf("timeline len/truncated = %d/%v, want %d/true", len(entries), truncated, MaxTimelineEntries)
+	}
+	if entries[0].At.Time.Before(testNow.Add(6 * time.Minute)) {
+		t.Errorf("oldest retained entry = %s, want newest window", entries[0].At)
+	}
+	for i := 1; i < len(entries); i++ {
+		if entries[i].At.Before(entries[i-1].At) {
+			t.Fatalf("timeline not ascending at %d", i)
+		}
+	}
+	projected := ProjectRunDetail(&run, testOptions())
+	if len(projected.Timeline) != MaxTimelineEntries || !projected.TimelineTruncated {
+		t.Fatalf("detail timeline = %d/%v", len(projected.Timeline), projected.TimelineTruncated)
+	}
+}
+
+func TestProjectRunTimelineEmptyOmittedAndBounded(t *testing.T) {
+	empty := courierv1alpha1.CoderRun{}
+	if got, truncated := ProjectRunTimeline(&empty); got != nil || truncated {
+		t.Fatalf("empty timeline = %#v/%v, want nil/false", got, truncated)
+	}
+	run := runFixture("timeline", "source", "lane", courierv1alpha1.PhaseRunning, time.Time{})
+	run.CreationTimestamp = metav1.Time{}
+	run.Status.PhaseEnteredAt = ptrTime(metav1.Time{})
+	run.Status.Conditions = []metav1.Condition{{Type: courierv1alpha1.ConditionCapacityRecovery, Status: metav1.ConditionTrue, Reason: strings.Repeat("x", 500), LastTransitionTime: metav1.NewTime(testNow)}}
+	entries, truncated := ProjectRunTimeline(&run)
+	if truncated || len(entries) != 1 || entries[0].At == nil || len([]rune(entries[0].Detail)) > DefaultTextBound {
+		t.Fatalf("timeline entries = %#v truncated=%v", entries, truncated)
+	}
+}
+
+func TestProjectRunReapHolds(t *testing.T) {
+	base := runFixture("holds", "source", "lane", courierv1alpha1.PhaseDone, testNow)
+	if got := ProjectRunDetail(&base, testOptions()).Reap.Holds; fmt.Sprint(got) != "[no retention marker yet source report not settled]" {
+		t.Fatalf("base holds = %v", got)
+	}
+	settled := func(reason string) courierv1alpha1.CoderRun {
+		run := base.DeepCopy()
+		run.Status.Conditions = []metav1.Condition{{Type: courierv1alpha1.ConditionLifecycleReported, Status: metav1.ConditionTrue, Reason: reason}}
+		return *run
+	}
+	for _, reason := range []string{"Published", "Superseded", "PermanentRefusal"} {
+		run := settled(reason)
+		if got := ProjectRunDetail(&run, testOptions()).Reap.Holds; len(got) != 1 || got[0] != "no retention marker yet" {
+			t.Errorf("settled %s holds = %v", reason, got)
+		}
+	}
+	for _, condition := range []metav1.Condition{
+		{Type: courierv1alpha1.ConditionLifecycleReported, Status: metav1.ConditionUnknown, Reason: "Published"},
+		{Type: courierv1alpha1.ConditionLifecycleReported, Status: metav1.ConditionFalse, Reason: "Published"},
+		{Type: courierv1alpha1.ConditionLifecycleReported, Status: metav1.ConditionTrue, Reason: "Other"},
+	} {
+		run := base.DeepCopy()
+		run.Annotations = nil
+		run.Status.Conditions = []metav1.Condition{condition}
+		if got := ProjectRunDetail(run, testOptions()).Reap.Holds; len(got) != 2 || got[1] != "source report not settled" {
+			t.Errorf("unsettled report holds = %v", got)
+		}
+	}
+	run := settled("Published")
+	run.Annotations = map[string]string{AnnotationDoneAt: testNow.Format(time.RFC3339)}
+	run.Status.CISettlement = &courierv1alpha1.CISettlement{}
+	run.Status.CIParkRelease = &courierv1alpha1.CIParkRelease{}
+	run.Status.RetryRequest = &courierv1alpha1.RetryRequest{State: courierv1alpha1.RetryRequestStateRequested}
+	if got := ProjectRunDetail(&run, testOptions()).Reap.Holds; fmt.Sprint(got) != "[ci settlement outstanding ci park release outstanding retry request outstanding]" {
+		t.Fatalf("intent holds = %v", got)
+	}
+	base.Status.Phase = courierv1alpha1.PhaseRunning
+	if got := ProjectRunDetail(&base, testOptions()).Reap.Holds; fmt.Sprint(got) != "[phase is not reap-eligible]" {
+		t.Fatalf("noneligible holds = %v", got)
+	}
+}
+
 func laneFixture(name string, concurrency int) courierv1alpha1.LaneProfile {
 	return courierv1alpha1.LaneProfile{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
