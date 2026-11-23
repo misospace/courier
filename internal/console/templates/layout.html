@@ -12,6 +12,7 @@
   <span class="brand">Courier console</span>
   <a href="/"{{if eq .Active "overview"}} class="active"{{end}}>Overview</a>
   <a href="/runs"{{if eq .Active "runs"}} class="active"{{end}}>Runs</a>
+  <a href="/contribute"{{if eq .Active "contribute"}} class="active"{{end}}>Contribute</a>
   {{if .Authenticated}}
   <form method="post" action="/logout" class="signout">
     <input type="hidden" name="csrf" value="{{.CSRF}}">
@@ -22,7 +23,7 @@
 <main>
 {{template "content" .}}
 </main>
-<footer>Courier operator console — reads the operator read API. Run detail is a separate view.</footer>
+<footer>Courier operator console — reads the operator read API. Run detail is a separate view; contributions submit through the admission API.</footer>
 </body>
 </html>
 {{end}}

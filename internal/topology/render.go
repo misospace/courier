@@ -86,6 +86,13 @@ const (
 	CredKeyInstallationToken = "forge-installation-token"
 )
 
+// CredKeyInstallationTokenSuperseded carries, as a JSON array of
+// InstallationTokenEntry, the credentials a legacy App-mode rotation replaced
+// but that GitHub still honors until their expiry. The legacy launcher writes
+// it on rotation and the evidence intake re-scans captured bundles against it;
+// no credential-serving path (broker, askpass helper, observer) reads it.
+const CredKeyInstallationTokenSuperseded = "forge-installation-token-superseded"
+
 // Labels returns the standard label set for one component of one run. The
 // run label value is bounded and sanitized (RunLabelValue) so every rendered
 // object passes Kubernetes label validation for every supported CoderRun

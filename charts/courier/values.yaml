@@ -352,7 +352,8 @@ readAPI:
 #    binary behind a ClusterIP-only Service. The run explorer (#825) reads
 #    the read API when operatorConsole.backendURL and
 #    operatorConsole.readAPITokenSecret are set; overview and run detail stay
-#    placeholder, and there are no mutating controls. The console never talks
+#    placeholder, and the only mutating surface is the token-mode contribution
+#    form, which submits to the admission API. The console never talks
 #    to the Kubernetes API. No Ingress is rendered; exposing it is a
 #    deployment concern (docs/operator-console.md).
 operatorConsole:
@@ -399,6 +400,23 @@ operatorConsole:
   #    "token", matching readAPI.keySecret.
   readAPITokenSecret: ""
   readAPITokenSecretKey: token
+
+  contribute:
+    # -- Authenticated contribution form (#829). Disabled by default. When
+    #    url and tokenSecret are both set the console renders a bounded
+    #    new-contribution form that POSTs server-side to the operator's
+    #    contribution admission API (contributeAPI); the browser never sees
+    #    the credential, API URL, namespace field, or fresh/debug escapes.
+    #    Requires contributeAPI.enabled on the manager. Header-auth consoles
+    #    render the unavailable state because only token mode has a
+    #    session-bound CSRF token.
+    url: ""
+    # -- Name of a Secret in the release namespace whose tokenSecretKey entry
+    #    holds the admission bearer token. Required with contribute.url; both
+    #    must be set or rendering fails (the binary also fails startup on a
+    #    half-configured contribution form).
+    tokenSecret: ""
+    tokenSecretKey: token
 
 retention:
   # -- Terminal CoderRun retention (#287). The controller deletes terminal runs

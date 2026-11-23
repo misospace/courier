@@ -35,57 +35,74 @@ type Options struct {
 	Baseline      string
 	Username      string
 	Token         string
+	// Credentials optionally resolves git credentials per remote URL,
+	// immediately before each fetch of that remote (#871 App mode). When set,
+	// it replaces the static Username/Token entirely: a remote the provider
+	// refuses fails its fetch, and there is no static fallback.
+	Credentials func(ctx context.Context, remoteURL string) (username, token string, err error)
 }
+
+// errObserverCredentials distinguishes a credential refusal from a transport
+// failure so callers keep a credential refusal from masquerading as a
+// missing-branch observation.
+var errObserverCredentials = errors.New("observer git credentials unavailable")
 
 // Seed fetches trusted refs into a fresh bare repository and returns the work
 // branch tip, or the base tip when no work branch exists yet. The work branch
-// resolves against RemoteURL; the base-branch fallback resolves against
-// baseRemoteURL (falling back to remoteURL when unset), so a fork holding a
-// valid PR head without the upstream base branch still seeds (#368 review).
-func Seed(ctx context.Context, remoteURL, baseRemoteURL, baseBranch, workBranch, scratch, username, token string) (string, error) {
-	if !validBranch(baseBranch) || !validBranch(workBranch) || baseBranch == workBranch {
+// resolves against o.RemoteURL; the base-branch fallback resolves against
+// o.BaseRemoteURL (falling back to o.RemoteURL when unset), so a fork holding
+// a valid PR head without the upstream base branch still seeds (#368 review).
+// Credentials for each remote come from o.Credentials when set, resolved
+// immediately before that remote's fetch, or from the static o.Username and
+// o.Token otherwise.
+func Seed(ctx context.Context, o Options) (string, error) {
+	if !validBranch(o.BaseBranch) || !validBranch(o.Branch) || o.BaseBranch == o.Branch {
 		return "", errors.New("invalid observer branch")
 	}
-	if remoteURL == "" || scratch == "" {
+	if o.RemoteURL == "" || o.Scratch == "" {
 		return "", errors.New("missing observer remote or scratch")
 	}
-	if err := os.Mkdir(scratch, 0700); err != nil {
+	if err := os.Mkdir(o.Scratch, 0700); err != nil {
 		return "", err
 	}
-	if err := runGit(ctx, scratch, nil, "init", "--bare", "--quiet", "."); err != nil {
+	if err := runGit(ctx, o.Scratch, nil, "init", "--bare", "--quiet", "."); err != nil {
 		return "", errors.New("observer repository initialization failed")
 	}
-	auth, cleanup, err := askpass(scratch, username, token)
-	if err != nil {
-		return "", err
-	}
-	defer cleanup()
 	// Resolve the work branch first. On a fork PR-fix run the head remote may
 	// legitimately lack the base branch, and an unavailable base there must
 	// not forfeit a seed whose baseline is the existing head; the base is
 	// consulted only when the fallback is genuinely needed, and then only
 	// from its authoritative upstream remote.
-	remoteWork, err := remoteBranchExists(ctx, scratch, remoteURL, workBranch, auth)
+	remoteWork, err := o.remoteBranchExists(ctx, o.Scratch, o.RemoteURL, o.Branch)
 	if err != nil {
+		if errors.Is(err, errObserverCredentials) {
+			return "", err
+		}
 		return "", errors.New("observer work branch lookup failed")
 	}
 	if remoteWork {
-		if err := fetch(ctx, scratch, remoteURL, "refs/heads/"+workBranch, "refs/observer/work", auth); err != nil {
+		if err := o.fetch(ctx, o.Scratch, o.RemoteURL, "refs/heads/"+o.Branch, "refs/observer/work"); err != nil {
+			if errors.Is(err, errObserverCredentials) {
+				return "", err
+			}
 			return "", errors.New("observer work fetch failed")
 		}
-		if tip, err := refOID(ctx, scratch, "refs/observer/work"); err == nil {
+		if tip, err := refOID(ctx, o.Scratch, "refs/observer/work"); err == nil {
 			return tip, nil
 		}
 		return "", errors.New("observer work ref unavailable")
 	}
-	baseSource := strings.TrimSpace(baseRemoteURL)
+	baseSource := strings.TrimSpace(o.BaseRemoteURL)
 	if baseSource == "" {
-		baseSource = remoteURL
+		baseSource = o.RemoteURL
 	}
-	if err := fetch(ctx, scratch, baseSource, "refs/heads/"+baseBranch, "refs/observer/base", auth); err != nil {
+	if err := o.fetch(ctx, o.Scratch, baseSource, "refs/heads/"+o.BaseBranch, "refs/observer/base"); err != nil {
+		if errors.Is(err, errObserverCredentials) {
+			return "", err
+		}
 		return "", errors.New("observer base fetch failed")
 	}
-	base, err := refOID(ctx, scratch, "refs/observer/base")
+	base, err := refOID(ctx, o.Scratch, "refs/observer/base")
 	if err != nil {
 		return "", errors.New("observer base ref unavailable")
 	}
@@ -116,13 +133,11 @@ func Observe(ctx context.Context, o Options) (executor.WorkspaceSafetyEvidence, 
 	if err := runGit(ctx, o.Scratch, nil, "init", "--bare", "--quiet", "."); err != nil {
 		return ev, nil
 	}
-	auth, cleanup, err := askpass(o.Scratch, o.Username, o.Token)
+	exists, err := o.remoteBranchExists(ctx, o.Scratch, o.RemoteURL, o.Branch)
 	if err != nil {
-		return ev, nil
-	}
-	defer cleanup()
-	exists, err := remoteBranchExists(ctx, o.Scratch, o.RemoteURL, o.Branch, auth)
-	if err != nil {
+		if errors.Is(err, errObserverCredentials) {
+			return ev, err
+		}
 		return ev, nil
 	}
 	if !exists {
@@ -136,7 +151,10 @@ func Observe(ctx context.Context, o Options) (executor.WorkspaceSafetyEvidence, 
 		if baseSource == "" {
 			baseSource = o.RemoteURL
 		}
-		if err := fetch(ctx, o.Scratch, baseSource, "refs/heads/"+o.BaseBranch, "refs/observer/base", auth); err != nil {
+		if err := o.fetch(ctx, o.Scratch, baseSource, "refs/heads/"+o.BaseBranch, "refs/observer/base"); err != nil {
+			if errors.Is(err, errObserverCredentials) {
+				return ev, err
+			}
 			return ev, nil
 		}
 		base, err := refOID(ctx, o.Scratch, "refs/observer/base")
@@ -150,7 +168,10 @@ func Observe(ctx context.Context, o Options) (executor.WorkspaceSafetyEvidence, 
 		}
 		return ev, nil
 	}
-	if err := fetch(ctx, o.Scratch, o.RemoteURL, "refs/heads/"+o.Branch, "refs/observer/work", auth); err != nil {
+	if err := o.fetch(ctx, o.Scratch, o.RemoteURL, "refs/heads/"+o.Branch, "refs/observer/work"); err != nil {
+		if errors.Is(err, errObserverCredentials) {
+			return ev, err
+		}
 		return ev, nil
 	}
 	tip, err := refOID(ctx, o.Scratch, "refs/observer/work")
@@ -214,6 +235,42 @@ func runGit(ctx context.Context, dir string, extra []string, args ...string) err
 func fetch(ctx context.Context, repo, url, src, dst string, env []string) error {
 	return runGit(ctx, repo, env, "-c", "fetch.fsckObjects=true", "fetch", "--no-tags", "--no-recurse-submodules", url, "+"+src+":"+dst)
 }
+
+// authEnv resolves the git credentials for exactly one remote URL and returns
+// the child-env askpass mechanics carrying them. With a Credentials provider
+// the resolution happens immediately before the caller's fetch and a refusal
+// fails that fetch; the static Username/Token pair serves the same mechanics
+// for non-App callers.
+func (o Options) authEnv(ctx context.Context, dir, remoteURL string) ([]string, func(), error) {
+	username, token := o.Username, o.Token
+	if o.Credentials != nil {
+		resolvedUsername, resolvedToken, err := o.Credentials(ctx, remoteURL)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w for %s", errObserverCredentials, remoteURL)
+		}
+		username, token = resolvedUsername, resolvedToken
+	}
+	return askpass(dir, username, token)
+}
+
+func (o Options) fetch(ctx context.Context, repo, url, src, dst string) error {
+	auth, cleanup, err := o.authEnv(ctx, repo, url)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	return fetch(ctx, repo, url, src, dst, auth)
+}
+
+func (o Options) remoteBranchExists(ctx context.Context, repo, url, branch string) (bool, error) {
+	auth, cleanup, err := o.authEnv(ctx, repo, url)
+	if err != nil {
+		return false, err
+	}
+	defer cleanup()
+	return remoteBranchExists(ctx, repo, url, branch, auth)
+}
+
 func remoteBranchExists(ctx context.Context, repo, url, branch string, auth []string) (bool, error) {
 	cmd := exec.CommandContext(ctx, "git", "ls-remote", "--heads", url, "refs/heads/"+branch)
 	cmd.Dir = repo

@@ -3080,7 +3080,7 @@ mirroring the lane-profiles transport.
 
 The operator console (`internal/console`, served by the standalone
 `courier-console` binary and enabled by `operatorConsole.enabled` in the
-chart) is a server-rendered UI for authenticated operators. It is
+chart) is a server-rendered interface for authenticated operators. It is
 deliberately independent of the manager and of the Kubernetes API: it imports
 only the standard library, never talks to a cluster, and reaches the operator
 read API only over a fixed allowlist of GET paths. The run explorer reads the
@@ -3099,7 +3099,46 @@ of an empty namespace. The page reloads on a bounded meta-refresh interval —
 never through JavaScript or a Kubernetes watch — and stops polling when the
 backend is unconfigured. The run-detail page stays scaffold; the console
 still probes the read API's `/healthz` path for the page backend note when
-`--backend-url` is configured.
+`--backend-url` is configured. The console additionally carries a bounded
+contribution form, a mutating, credentialed
+outbound-HTTP surface that submits server-side through the operator's
+contribution admission API under a file-mounted bearer token. The form is
+token-mode only and uses session-bound CSRF; a per-browser signed intent
+cookie carries the idempotency key across reloads, retries, and console
+restarts, and it is bound to the submitted content. Every submission that
+reaches the admission call commits and flushes the signed intent cookie
+first, so a lost response or a restart mid-submission still leaves the browser
+holding the key and an identical resubmission replays it instead of minting
+a new one that could duplicate an admitted run. A submission whose content
+differs from a still-unsettled attempt already in the cookie is refused
+before any key is minted or any admission call is made, because the
+browser's single durable key slot belongs to that attempt and a newly
+minted key would have no durable home. The operator resubmits the earlier
+content unchanged, or abandons that attempt through the explicit "start a
+new contribution" action, which clears the cookie and frees this session's
+key slot settled or not, so resubmitting identical content afterwards mints
+a fresh key and requests genuinely new work: the explicit action is what
+distinguishes a deliberate new attempt from retrying a settled one, which
+needs no action because the retained cookie replays its key. Only a settled
+or abandoned slot lets different content start a new attempt. The minter's
+retained slot is keyed by session and content digest, never by digest alone:
+identical content arriving from a different session with no intent cookie is
+an independent submission and mints its own key, so one session's key or
+settlement can never describe another session's live attempt (settlement
+records are per key);
+a later page view rewrites
+the retained cookie with a signed settled flag while this console holds the
+settlement record (the definitive response has already flushed its headers),
+so an identical resubmission replays the settled key even across a restart;
+a restart first leaves the attempt looking unsettled until an unchanged
+resubmission re-settles it. The console runs with exactly one replica — the
+chart fails renders that set more, scale it, or roll it without recreating
+it — because attempt state is per-process. An uncertain outcome clears the record so a
+replayed key stays retryable. The cookie signature uses the
+session key: rotating that key discards an unsettled attempt. The console
+claims "nothing was admitted" only for failures proven to precede sending the
+request (DNS or dial phase); timeouts and server errors stay "may have been
+admitted".
 
 The console decodes each projection into its own view types rather than
 importing `internal/readapi`, so the standard-library-only boundary holds and
@@ -3110,8 +3149,8 @@ serves its pages and the unauthenticated health probe, and the explorer states
 that it is not configured rather than sending an unauthenticated projection
 request. The backend path is a constant allowlist entry and only its query
 string varies, so a filter value can never redirect the request to another
-path or host. Secrets, including that token, travel as file paths read from
-mounted Secrets, never environment values.
+path or host. Secrets, including the contribution and read API tokens, travel
+as file paths read from mounted Secrets, never environment values.
 
 One authorization model: every authenticated identity is an operator, and
 `IsOperator` in `internal/console/auth.go` is the single seam where a
@@ -3136,9 +3175,10 @@ wire, not network position.
 The `Secure` cookie posture is configured, never inferred: every supported
 deployment terminates TLS at a proxy whose hop to the console listener is
 plaintext HTTP, so inferring from the listener would leave the flag
-permanently off. `Secure` defaults to true on the session cookie and on the
-mirrored clearing cookie (a browser is not guaranteed to remove a cookie
-whose attributes differ from the one `Set-Cookie` replaces), and
+permanently off. `Secure` defaults to true on the session cookie, the
+contribution-intent cookie, and their mirrored clearing cookies (a browser is
+not guaranteed to remove a cookie whose attributes differ from the one
+`Set-Cookie` replaces), and
 `--cookie-secure=false` (`operatorConsole.auth.cookieSecure=false`) is the
 only opt-out; the chart renders the flag explicitly so the posture is
 visible in the Deployment. The listener is bounded by fixed
@@ -4320,6 +4360,57 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   into two, and the chart's label-source guard accepts the seam as a
   credential argument, mirroring the Go rule.
    GitHub App authentication can replace the static identity for operator observation and admission reads, and can supply secure brokers' forge and git credentials. The operator retains the private key, refreshes its own read-only tokens, and mints and rotates short-lived tokens into that run's credentials Secret — one token per pinned repository, each carrying only the permissions the run needs against that repository, because GitHub applies an installation token's permissions to every repository the token names: the base repository's token carries the publication writes (issues, pull requests) and the reads that gate them but no contents write, and the work repository's token carries contents write for fetch and push plus administration read so the broker can establish the pinned work ref's effective protection before serving, but no publication write; a same-repository run is the one case whose single token legitimately carries both profiles. An existing credentials Secret is only trusted or updated once it is proven controlled by this exact run UID, its document owner and endpoint match the run's pinned identity, and a create that loses a race re-reads and re-validates the winner; a foreign or stale-owner object fails closed rather than being read or overwritten. The broker reads the Secret through the API server and never sees the private key or a pod-environment credential, and it asks for a token by full owner/name identity, so a fetch, push, or API request against one repository is never accompanied by a token minted for another. App mode never falls back to a static token, and a run whose pinned repositories have different owners cannot launch. The broker's git credential provider serves the token only for the run's pinned base and work repositories, and the broker refuses a token document whose shape it does not fully recognize. Rotation runs at launch and from the running-phase observer: a run that no observer supervises simply lets its tokens expire, and its broker then refuses every App-mode operation — fail-closed, never a silent fallback — until relaunch or the next supervised pass re-mints. See [HARNESS.md](./HARNESS.md) for setup and limits. Label discovery and settlement still use the static credential chain.
+- With the App configured, the legacy coordinator path (#871) gets the same
+  refreshable credential shape for its git checkout, fetch, push, and rebase:
+  the launcher mints the run's installation-token document with the
+  git-transport-only profiles — base repository contents read plus metadata
+  read, work repository contents write plus metadata read, merged on a
+  same-repository run, and never issues or pull-request writes because the
+  legacy git path performs no forge API writes with this credential — writes
+  it to the run's credentials Secret under the same document the secure broker
+  reads, and provisions a run-scoped identity whose only grant is one named
+  `get` on that Secret, bound to the coordinator pod's effective ServiceAccount
+  (the observer identity when the observer contract is on). Before any token
+  exists the launcher proves the mint identity: the base and head repositories
+  must name one owner and the installation must sign for exactly that owner,
+  so a cross-owner fork run is refused permanently at launch — a condition a
+  requeue never clears. The App-rendered pod carries no static git credential
+  at all: the `COURIER_GIT_*` pair is
+  suppressed from the shared credential enumeration even when
+  `GitCredentialSecret` is configured, so there is nothing to fall back to.
+  `GITHUB_TOKEN` keeps its fallback to the git Secret only in static mode:
+  the executor's forge-API reads are not the git transport this mode governs,
+  so an App-mode pod receives it solely from an explicitly configured
+  `GitHubCredentialSecret`. Every git prompt is answered by the executor
+  binary's askpass helper re-reading the document through the API with the
+  pod's projected token, so a rotation or an expiry takes effect on the next
+  prompt of a long run rather than at restart. The helper binds every served
+  token to one pinned repository: it serves only the two remote URLs the operator rendered
+  (work remote → head or base repository, base remote → base repository),
+  `credential.useHttpPath` is installed so git names the repository in every
+  prompt, and any other URL is refused before any API call and prints nothing,
+  so cross-repository and fork use cannot borrow a token. The isolated legacy
+  observer and its seed resolve the same document through their own projected
+  token, so workspace observation keeps working when no static git credential
+  exists. Rotation reuses the same refresh lead and mint-lifetime guard and runs
+  at launch and from the legacy run's steady settle, gated on the coordinator
+  pod actually rendering the App-mode marker — a static run never gains a
+  Secret behind its pod's back, and an App run whose Secret is gone re-mints.
+  A rotation also carries the credentials it replaced into the same Secret
+  under a distinct superseded key while GitHub still honors them: the evidence
+  intake registers those entries alongside the live document so a captured
+  bundle is scrubbed against every credential the pod held, and each entry is
+  dropped at the next rotation once expired. Only the launcher and the intake
+  write or read the superseded key — no credential-serving reader (broker,
+  askpass helper, observer) consults it, so a superseded token is never
+  served.
+  Refusals are fail-closed with no static fallback and no retry loop of
+  credentials, the rebase force-push keeps its head-SHA compare-and-set lease
+  unchanged under the new credential, and no merge capability is added
+  anywhere. The model can still reach its own run's short-lived,
+  repository-scoped tokens from inside its pod exactly as it could reach the
+  static PAT it no longer carries; what changed is lifetime, repository scope,
+  rotation, and the absence of any cross-repository credential.
 - The gateway response is untrusted, unbounded input, and trusted control
   bounds both its shape and what it will hold: one SSE line is capped at 1 MiB,
   and per completion the buffered content deltas (8 MiB), the buffered

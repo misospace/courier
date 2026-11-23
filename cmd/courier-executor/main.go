@@ -162,7 +162,7 @@ func main() {
 		return
 	}
 	if os.Getenv("COURIER_ASKPASS") == "1" {
-		os.Exit(askpass(os.Args[1:], os.Getenv("COURIER_GIT_USERNAME"), os.Getenv("COURIER_GIT_TOKEN"), os.Stdout))
+		os.Exit(askpassMode(os.Getenv, os.LookupEnv, os.Args[1:], os.Stdout, os.Stderr))
 	}
 	// SIGTERM cancels the run context only: a handler that captured would
 	// race os.Exit, and the cancellation path funnels the child kill and the
@@ -174,6 +174,18 @@ func main() {
 	// and PID 1 reaps none of them on its own (#347).
 	installAdoptedChildReaper()
 	os.Exit(run(ctx, os.Stdout, os.Stderr))
+}
+
+// askpassMode routes one COURIER_ASKPASS invocation. Presence of
+// COURIER_GIT_INSTALLATION — any value, including a present-but-empty one —
+// selects the installation askpass, which refuses closed unless the flag is
+// exactly "1"; only its complete absence selects the static path, so a broken
+// App-mode configuration never falls back to static credentials.
+func askpassMode(getenv func(string) string, lookupEnv func(string) (string, bool), args []string, stdout, stderr io.Writer) int {
+	if _, ok := lookupEnv(executor.EnvGitInstallation); ok {
+		return runInstallationAskpass(getenv, args, stdout, stderr)
+	}
+	return askpass(args, getenv("COURIER_GIT_USERNAME"), getenv("COURIER_GIT_TOKEN"), stdout)
 }
 
 func readConfig(getenv func(string) string) (config, error) {

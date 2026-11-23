@@ -547,6 +547,11 @@ func evidencePhaseAdmitted(phase courierv1alpha1.Phase) bool {
 	}
 }
 
+// evidenceInstallationTokenEnvName is the synthetic registration name for
+// installation-token entries. It is secret-shaped by suffix, so the scanner
+// retains every non-empty value under it regardless of length.
+const evidenceInstallationTokenEnvName = "COURIER_INSTALLATION_TOKEN"
+
 // credentialScanner assembles the re-scan credential set: the same per-key
 // references the pod builder injects (CredentialEnvRefs), plus the
 // EnvironmentSecret's keys (envFrom, where the executor could not tell key
@@ -565,6 +570,46 @@ func (i *EvidenceIntake) credentialScanner(ctx context.Context, run *courierv1al
 			return nil, fmt.Errorf("evidence intake: reading credential secret %s: %w", ref.Secret, err)
 		}
 		scanner.RegisterCredentials(map[string]string{ref.Name: value})
+	}
+
+	// Installation-token document (#871): in App mode the git credentials the
+	// pod actually holds are this run's per-repository installation tokens,
+	// which replace the static pair that CredentialEnvRefs deliberately omits
+	// in that mode. Register every entry, and every entry the last rotation
+	// superseded but GitHub may still honor, so a captured bundle is scrubbed
+	// against every credential that could have existed in the pod. An absent
+	// document Secret — every static run — registers nothing, and so does a
+	// credentials Secret that exists without the document key (the secure
+	// broker's static credential copy shares the Secret name); a key that is
+	// present but carries no parseable value fails the scan closed, because
+	// the intake cannot then prove the bundle clean. The registration name is
+	// secret-shaped so the scanner's short-value retention rule applies; the
+	// per-entry tokens are registered individually under it.
+	data, err := readSecret(ctx, i.APIReader, run.Namespace, topology.CredentialsSecretName(run.Name))
+	if err == nil {
+		var entries []topology.InstallationTokenEntry
+		if raw, ok := data[topology.CredKeyInstallationToken]; ok {
+			var document topology.InstallationTokenDocument
+			if err := json.Unmarshal(raw, &document); err != nil {
+				return nil, fmt.Errorf("evidence intake: reading installation-token credentials: %w", err)
+			}
+			entries = append(entries, document.Entries...)
+		}
+		if raw, ok := data[topology.CredKeyInstallationTokenSuperseded]; ok {
+			var superseded []topology.InstallationTokenEntry
+			if err := json.Unmarshal(raw, &superseded); err != nil {
+				return nil, fmt.Errorf("evidence intake: reading superseded installation-token credentials: %w", err)
+			}
+			entries = append(entries, superseded...)
+		}
+		for _, entry := range entries {
+			if entry.Token == "" {
+				continue
+			}
+			scanner.RegisterCredentials(map[string]string{evidenceInstallationTokenEnvName: entry.Token})
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return nil, fmt.Errorf("evidence intake: reading installation-token credentials: %w", err)
 	}
 
 	// Environment secret: envFrom, so every key is a candidate.

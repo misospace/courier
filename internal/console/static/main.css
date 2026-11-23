@@ -57,11 +57,35 @@ main {
   border-color: #cf222e;
   background: #fff5f5;
 }
+.state-ok {
+  border-color: #1a7f37;
+  background: #eefaf0;
+}
 .state-warn {
   border-color: #bf8700;
   background: #fff8c5;
   color: #7d4e00;
 }
+form.contribute {
+  display: grid;
+  grid-template-columns: minmax(10rem, 1fr) minmax(0, 2fr);
+  gap: 0.5rem 1rem;
+  max-width: 48rem;
+  align-items: start;
+}
+form.contribute input, form.contribute textarea, form.contribute button,
+form.contribute-new button {
+  padding: 0.4rem 0.6rem;
+  border-radius: 4px;
+  border: 1px solid #d0d7de;
+}
+form.contribute textarea {
+  min-height: 10rem;
+  resize: vertical;
+  font: inherit;
+}
+form.contribute button { grid-column: 2; cursor: pointer; }
+form.contribute-new button { cursor: pointer; }
 form.login {
   display: flex;
   flex-direction: column;

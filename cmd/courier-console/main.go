@@ -49,6 +49,7 @@ const (
 // health probe and a run-explorer fetch). The test for the write bound pins
 // against this same constant.
 const defaultBackendTimeout = 5 * time.Second
+const defaultContributeTimeout = 20 * time.Second
 
 func runArgs(args []string) error {
 	bind, cfg, err := parseFlags(args)
@@ -102,8 +103,8 @@ func newHTTPServer(bind string, handler http.Handler) *http.Server {
 func parseFlags(args []string) (string, console.Config, error) {
 	flags := flag.NewFlagSet("courier-console", flag.ContinueOnError)
 	var bind, authMode, sessionKeyFile, operatorTokensFile, trustedHeader, backendURL string
-	var readAPITokenFile string
-	var backendTimeout time.Duration
+	var contributeURL, contributeTokenFile, readAPITokenFile string
+	var backendTimeout, contributeTimeout time.Duration
 	var cookieSecure bool
 	flags.StringVar(&bind, "bind", defaultBind, "listen address")
 	flags.StringVar(&authMode, "auth-mode", string(console.AuthModeToken), "authentication mode: token or header")
@@ -113,16 +114,34 @@ func parseFlags(args []string) (string, console.Config, error) {
 	flags.StringVar(&backendURL, "backend-url", "", "base URL of the operator read API; empty renders the backend-unavailable states")
 	flags.StringVar(&readAPITokenFile, "readapi-token-file", "", "file holding the read API bearer token that enables the run explorer; empty leaves the explorer off")
 	flags.DurationVar(&backendTimeout, "backend-timeout", defaultBackendTimeout, "timeout for each operator read API request (the health probe and the run explorer)")
+	flags.StringVar(&contributeURL, "contribute-url", "", "base URL of the contribution admission API")
+	flags.StringVar(&contributeTokenFile, "contribute-token-file", "", "file holding the contribution admission bearer token")
+	flags.DurationVar(&contributeTimeout, "contribute-timeout", defaultContributeTimeout, "contribution admission timeout")
 	flags.BoolVar(&cookieSecure, "cookie-secure", true, "set the Secure attribute on session cookies; false is an explicit opt-out for a console reachable only over plaintext the operator controls")
 	if err := flags.Parse(args); err != nil {
 		return "", console.Config{}, err
 	}
+	if (contributeURL == "") != (contributeTokenFile == "") {
+		return "", console.Config{}, errors.New("courier-console contribution admission requires both --contribute-url and --contribute-token-file")
+	}
+	if contributeTimeout <= 0 || contributeTimeout >= writeTimeout {
+		return "", console.Config{}, fmt.Errorf("courier-console --contribute-timeout must be greater than zero and less than %s so the console write deadline can return the admission result", writeTimeout)
+	}
 	cfg := console.Config{
-		Mode:            console.AuthMode(authMode),
-		TrustedHeader:   trustedHeader,
-		BackendURL:      backendURL,
-		BackendTimeout:  backendTimeout,
-		InsecureCookies: !cookieSecure,
+		Mode:              console.AuthMode(authMode),
+		TrustedHeader:     trustedHeader,
+		BackendURL:        backendURL,
+		BackendTimeout:    backendTimeout,
+		ContributeURL:     contributeURL,
+		ContributeTimeout: contributeTimeout,
+		InsecureCookies:   !cookieSecure,
+	}
+	if contributeTokenFile != "" {
+		token, err := readTrimmedFile(contributeTokenFile)
+		if err != nil {
+			return "", console.Config{}, err
+		}
+		cfg.ContributeToken = token
 	}
 	switch cfg.Mode {
 	case console.AuthModeToken:
