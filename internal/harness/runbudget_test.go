@@ -586,6 +586,18 @@ func TestBudgetFramingSectionNamesOnlyDeclaredBounds(t *testing.T) {
 			t.Fatalf("framing must name %q: %q", want, section)
 		}
 	}
+	// The grace promise the framing makes is the one the coordinator loop
+	// keeps: a valid declaration inside the grace is honored (the run is
+	// never doomed to budget_exhausted once tripped), and the text must not
+	// claim otherwise.
+	for _, want := range []string{"A valid declaration inside the short post-exhaustion grace is honored", "undeclared when that grace ends ends budget_exhausted"} {
+		if !strings.Contains(section, want) {
+			t.Fatalf("framing must state the grace contract %q: %q", want, section)
+		}
+	}
+	if strings.Contains(section, "whether or not you declare") {
+		t.Fatalf("framing must not promise a tripped run ends budget_exhausted regardless of its declaration: %q", section)
+	}
 	toolOnly := RunBudget{MaxToolCalls: 40}.framingSection()
 	if strings.Contains(toolOnly, "300 seconds") || !strings.Contains(toolOnly, "no wall-clock bound") {
 		t.Fatalf("tool-only framing = %q, want the wall clock named as unbounded", toolOnly)

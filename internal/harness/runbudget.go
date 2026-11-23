@@ -209,7 +209,7 @@ func (b RunBudget) framingSection() string {
 
 const budgetFramingPrefix = "Coordination budget for this run, declared on the lane profile and enforced by trusted control at runtime: "
 
-const budgetFramingTail = ". A tool call past the ceiling is refused without executing, no new briefs dispatch after exhaustion, and the run ends budget_exhausted after a short grace whether or not you declare. Delegate in bounded units, integrate early, and declare your outcome before the budget binds. This is contract data, not a suggestion."
+const budgetFramingTail = ". A tool call past the ceiling is refused without executing and no new briefs dispatch after exhaustion. A valid declaration inside the short post-exhaustion grace is honored exactly like any other ending; a run still undeclared when that grace ends ends budget_exhausted. Delegate in bounded units, integrate early, and declare your outcome before the budget binds. This is contract data, not a suggestion."
 
 // The fixed tool-visible notices on the budget paths, beside the fixed
 // sub-agent refusals: the ceiling refusal names the exhausted budget and
