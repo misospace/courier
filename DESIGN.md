@@ -3102,15 +3102,18 @@ before any key is minted or any admission call is made, because the
 browser's single durable key slot belongs to that attempt and a newly
 minted key would have no durable home. The operator resubmits the earlier
 content unchanged, or abandons that attempt through the explicit "start a
-new contribution" action, which clears the cookie; abandoning an unsettled
-attempt also forgets its minter entry, so resubmitting the abandoned content
-later can duplicate an admitted run, while a settled attempt's key stays
-replayable. Only a settled or abandoned slot lets different content start a
-new attempt. Settled attempt keys
-are remembered server-side per key, never per content digest, for one
-session TTL, so one settlement can never describe another live attempt
-(the minter is digest-keyed, so identical content from two sessions inside
-the TTL shares one key and is the same attempt); a later page view rewrites
+new contribution" action, which clears the cookie and frees this session's
+key slot settled or not, so resubmitting identical content afterwards mints
+a fresh key and requests genuinely new work: the explicit action is what
+distinguishes a deliberate new attempt from retrying a settled one, which
+needs no action because the retained cookie replays its key. Only a settled
+or abandoned slot lets different content start a new attempt. The minter's
+retained slot is keyed by session and content digest, never by digest alone:
+identical content arriving from a different session with no intent cookie is
+an independent submission and mints its own key, so one session's key or
+settlement can never describe another session's live attempt (settlement
+records are per key);
+a later page view rewrites
 the retained cookie with a signed settled flag while this console holds the
 settlement record (the definitive response has already flushed its headers),
 so an identical resubmission replays the settled key even across a restart;

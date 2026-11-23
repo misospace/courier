@@ -183,20 +183,34 @@ type contributeMinter struct {
 	entries map[string]contributeMinterEntry
 }
 
-func (m *contributeMinter) forget(digest string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.entries, digest)
+// contributeMinterSlot scopes a retained key to the operator session that
+// owns the attempt. Content identity alone must never share a key across
+// sessions: an identical payload arriving from another session — with no
+// intent cookie of its own — is an independent submission and must mint its
+// own key, never resume the first session's admitted run. Within one session
+// the slot ties this attempt's retries and identical resubmissions to one
+// key; the explicit new-attempt action frees it.
+func contributeMinterSlot(sessionID, digest string) string {
+	return sessionID + "\x00" + digest
 }
 
-// remember retains the digest-to-key mapping past the two-minute in-flight
-// TTL, for the rest of the session: a definitive outcome means the admission
-// server has bound this key to this content, so an identical resubmission
-// after the browser's settled cookie was overwritten must replay the same key
-// and let the server deduplicate — never mint a new key that could admit a
-// duplicate run/branch/PR. Only abandoning an unsettled attempt forgets a
-// retained mapping; abandoning a settled attempt keeps it replayable.
-func (m *contributeMinter) remember(digest, key string, now time.Time) {
+func (m *contributeMinter) forget(sessionID, digest string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.entries, contributeMinterSlot(sessionID, digest))
+}
+
+// remember retains the session-and-digest-to-key mapping past the two-minute
+// in-flight TTL, for the rest of the session: a definitive outcome means the
+// admission server has bound this key to this content, so an identical
+// resubmission in this session after the browser's settled cookie was
+// overwritten must replay the same key and let the server deduplicate —
+// never mint a new key that could admit a duplicate run/branch/PR. The
+// mapping lives only in the submitting session's slot, so it never describes
+// another session's attempt, and this session's explicit new-attempt action
+// frees the slot settled or not, making a deliberately new attempt
+// distinguishable from a retry of a settled one.
+func (m *contributeMinter) remember(sessionID, digest, key string, now time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.entries == nil {
@@ -216,7 +230,7 @@ func (m *contributeMinter) remember(digest, key string, now time.Time) {
 		}
 		delete(m.entries, oldest)
 	}
-	m.entries[digest] = contributeMinterEntry{key: key, expires: now.Add(sessionTTL)}
+	m.entries[contributeMinterSlot(sessionID, digest)] = contributeMinterEntry{key: key, expires: now.Add(sessionTTL)}
 }
 
 // contributeSettled records attempt keys whose most recent submission
@@ -233,10 +247,12 @@ type contributeSettled struct {
 
 const contributeSettledCap = 4096
 
-// contributeMinterCap bounds retained digest mappings: definitive outcomes
-// extend an entry's life from the two-minute in-flight TTL to one session
-// TTL, so without a cap steady-state size would track every distinct
-// submission for up to 12 hours.
+// contributeMinterCap bounds retained session-scoped slots: definitive
+// outcomes extend a slot's life from the two-minute in-flight TTL to one
+// session TTL, so without a cap steady-state size would track every distinct
+// submission of every live session for up to 12 hours. Eviction can only
+// cost a session its local replay convenience — the browser's signed cookie
+// stays the key's durable home — and never shares a key across sessions.
 const contributeMinterCap = 4096
 
 func (r *contributeSettled) mark(key string, now time.Time) {
@@ -284,25 +300,26 @@ func (r *contributeSettled) contains(key string, now time.Time) bool {
 	return true
 }
 
-func (m *contributeMinter) keyFor(digest string, now time.Time) (string, error) {
+func (m *contributeMinter) keyFor(sessionID, digest string, now time.Time) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.entries == nil {
 		m.entries = make(map[string]contributeMinterEntry)
 	}
+	slot := contributeMinterSlot(sessionID, digest)
 	for held, entry := range m.entries {
 		if !now.Before(entry.expires) {
 			delete(m.entries, held)
 		}
 	}
-	if entry, ok := m.entries[digest]; ok {
+	if entry, ok := m.entries[slot]; ok {
 		return entry.key, nil
 	}
 	key, err := mintContributeKey()
 	if err != nil {
 		return "", err
 	}
-	m.entries[digest] = contributeMinterEntry{key: key, expires: now.Add(contributeIntentTTL)}
+	m.entries[slot] = contributeMinterEntry{key: key, expires: now.Add(contributeIntentTTL)}
 	return key, nil
 }
 
@@ -494,7 +511,7 @@ func (s *Server) handleContributeSubmit(w http.ResponseWriter, r *http.Request) 
 	}
 	if key == "" {
 		var err error
-		key, err = s.minter.keyFor(digest, s.auth.now())
+		key, err = s.minter.keyFor(sessionID, digest, s.auth.now())
 		if err != nil {
 			http.Error(w, "could not prepare contribution", http.StatusInternalServerError)
 			return
@@ -526,25 +543,25 @@ func (s *Server) handleContributeSubmit(w http.ResponseWriter, r *http.Request) 
 	result := s.contribute.Submit(r.Context(), sub)
 	switch result.Outcome {
 	case outcomeCreated, outcomeResumed:
-		s.minter.remember(digest, key, s.auth.now())
+		s.minter.remember(sessionID, digest, key, s.auth.now())
 		s.settled.mark(key, s.auth.now())
 		data.State, data.StateClass = "success", "state-ok"
 		data.Run, data.Namespace, data.WorkItemID = result.Run, result.Namespace, result.WorkItemID
 		data.Resumed = result.Outcome == outcomeResumed
 	case outcomeRefused:
-		s.minter.remember(digest, key, s.auth.now())
+		s.minter.remember(sessionID, digest, key, s.auth.now())
 		s.settled.mark(key, s.auth.now())
 		data.State, data.StateClass, data.Message = "refused", "state-error", result.Message
 	case outcomeCredentialDenied:
-		s.minter.remember(digest, key, s.auth.now())
+		s.minter.remember(sessionID, digest, key, s.auth.now())
 		s.settled.mark(key, s.auth.now())
 		data.State, data.StateClass, data.Message = "credentialDenied", "state-error", result.Message
 	case outcomeAPIMismatch:
-		s.minter.remember(digest, key, s.auth.now())
+		s.minter.remember(sessionID, digest, key, s.auth.now())
 		s.settled.mark(key, s.auth.now())
 		data.State, data.StateClass, data.Message = "apiMismatch", "state-error", result.Message
 	case outcomeUnreachable:
-		s.minter.remember(digest, key, s.auth.now())
+		s.minter.remember(sessionID, digest, key, s.auth.now())
 		s.settled.mark(key, s.auth.now())
 		data.State, data.StateClass, data.Message = "unreachable", "state-error", "nothing was admitted; the contribution API could not be reached"
 	default:
@@ -590,17 +607,18 @@ func (s *Server) handleContributeNew(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if cookie, err := r.Cookie(contributeIntentCookie); err == nil {
-		if key, digest, settled, valid := verifyContributeIntent(cookie.Value, s.auth.key); valid {
-			// Abandoning a settled attempt only frees the browser's key slot:
-			// its digest mapping stays, so resubmitting that content later
-			// still replays the admitted key. The attempt counts as settled
-			// from the signed flag or this process's settlement record, so
-			// abandoning straight off the success page — before any page
-			// view signs the flag — keeps the mapping too. Only abandoning
-			// an attempt that is unsettled by both measures discards the key.
-			if !settled && !s.settled.contains(key, s.auth.now()) {
-				s.minter.forget(digest)
-			}
+		if key, digest, _, valid := verifyContributeIntent(cookie.Value, s.auth.key); valid {
+			// "Start a new contribution" is this session's explicit
+			// new-attempt action: it frees the session's key slot whether
+			// the attempt is settled or not, so resubmitting identical
+			// content afterwards mints a fresh key and requests genuinely
+			// new work. Retrying a settled attempt needs no action — the
+			// retained cookie replays its key — which is what makes the
+			// deliberate new attempt distinguishable from a retry. An
+			// abandoned attempt that had been admitted keeps its run: the
+			// action ends this browser's attempt, never the server-side
+			// work.
+			s.minter.forget(sessionID, digest)
 			s.settled.clear(key)
 		}
 	}

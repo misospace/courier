@@ -96,20 +96,30 @@ whose content differs from a still-unsettled attempt already in the cookie
 is refused before a key is minted or the admission API is contacted, because
 the browser's single durable key slot already belongs to that attempt. The
 operator resubmits the earlier content unchanged, or abandons the attempt
-with the explicit "start a new contribution" action, which clears the
-cookie. Abandoning an unsettled attempt also forgets its minter entry and so
-discards its key: resubmitting that content later can duplicate an admitted
-run. Abandoning a settled attempt only frees the browser's key slot, and the
-settled key stays replayable. The
+with the explicit "start a new contribution" action, which clears the cookie
+and frees this session's server-side key slot — settled or not — so
+resubmitting that content afterwards mints a fresh key and requests
+genuinely new work (an abandoned attempt that had been admitted keeps its
+run: the action ends the browser's attempt, never the server-side work).
+Retrying a settled attempt needs no action: the retained cookie replays its
+key, so an accidental identical resubmission cannot duplicate a run, and the
+explicit action is what distinguishes a deliberate new attempt from such a
+retry. Key reuse is scoped to the authenticated operator session: identical
+content arriving from a different session with no intent cookie is an
+independent submission and mints its own key, so one operator's submission
+can never resume another's admitted run. The
 settled flag is signed while this console holds the settlement record; a
 restart before that page view leaves the attempt looking
 unsettled, and resubmitting the content unchanged replays the key and
 re-settles it. The console supports exactly one replica because contribution attempt
 state is per-process. The cookie signature uses the session key, so
-rotating that key discards the browser's intent cookie; while the minter
-entry survives, an identical resubmission still replays the same key, and
-only once it expires does a resubmission start a new attempt whose earlier
-one may still have been admitted. A
+rotating that key discards the browser's intent cookie, and the rotation's
+pod restart also drops every in-memory session and minter slot: the operator
+re-logs in under a new session id and an identical resubmission starts a
+fresh attempt with a new key. (An earlier definitive outcome whose other key
+record lived only in that restart-lost memory can therefore admit a
+duplicate run on such a resubmission; the browser's signed cookie is the
+key's durable home, and rotation destroys it.) A
 timeout or server error has an uncertain outcome and is shown as "may have been
 admitted"; while the key survives, resubmitting identical content retries with
 the same key, so it cannot create a duplicate run. Different content stays

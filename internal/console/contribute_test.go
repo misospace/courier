@@ -328,7 +328,7 @@ func TestContributeUnsettledAbandonMintsFreshKey(t *testing.T) {
 	}
 }
 
-func TestContributeAbandonSettledKeepsReplayableKey(t *testing.T) {
+func TestContributeAbandonSettledStartsNewAttempt(t *testing.T) {
 	var mu sync.Mutex
 	var keys []string
 	admission := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -356,10 +356,18 @@ func TestContributeAbandonSettledKeepsReplayableKey(t *testing.T) {
 	if cookie := intentCookie(client); cookie == nil || strings.Split(cookie.Value, ".")[2] != "0" {
 		t.Fatalf("pre-abandon cookie unexpectedly settled: %+v", cookie)
 	}
-	// Abandoning a settled attempt — even straight off the success page —
-	// only frees the browser's key slot: the digest mapping survives, so
-	// an identical resubmission replays the admitted key instead of
-	// minting a duplicate.
+	// Retrying the settled attempt without an explicit action replays its
+	// key, so an accidental identical resubmission cannot duplicate the run.
+	resp, page = postContribution(t, client, base, csrf, contributionValues("goal"))
+	if resp.StatusCode != http.StatusOK || !strings.Contains(page, "A run was created") {
+		t.Fatalf("settled retry response: %s", page)
+	}
+	// The explicit "start a new contribution" action ends the attempt even
+	// when settled — straight off the success page, before any page view
+	// signs the settled flag: it frees this session's key slot, so an
+	// identical resubmission mints a fresh key and requests genuinely new
+	// work. That is what makes a deliberate new attempt distinguishable
+	// from a retry of a settled one.
 	resp, err := client.PostForm(base+"/contribute/new", url.Values{"csrf": {csrf}})
 	if err != nil {
 		t.Fatal(err)
@@ -377,8 +385,77 @@ func TestContributeAbandonSettledKeepsReplayableKey(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(keys) != 2 || keys[0] != keys[1] {
-		t.Fatalf("abandon of settled attempt did not replay the settled key: %v", keys)
+	if len(keys) != 3 || keys[1] != keys[0] {
+		t.Fatalf("settled retry did not replay the settled key: %v", keys)
+	}
+	if keys[2] == keys[0] {
+		t.Fatalf("explicit new attempt after settle did not mint a fresh key: %v", keys)
+	}
+}
+
+// TestContributeIdenticalContentDistinctSessions is the reviewer's
+// two-browser scenario with no minter.forget anywhere: two authenticated
+// sessions submit the same payload, and each must reach admission with its
+// own idempotency key — never the other session's, so admission can never
+// resume one session's run for the other's independent submission.
+func TestContributeIdenticalContentDistinctSessions(t *testing.T) {
+	var mu sync.Mutex
+	var keys []string
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			IdempotencyKey string `json:"idempotencyKey"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		keys = append(keys, body.IdempotencyKey)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"run":"run-1","namespace":"courier","workItemId":"item-1"}`))
+	}))
+	defer api.Close()
+	secrets := newTestSecrets(t)
+	server, err := NewServer(Config{Mode: AuthModeToken, SessionKey: []byte(secrets.sessionKey), OperatorTokens: [][]byte{[]byte(secrets.token)}, ContributeURL: api.URL, ContributeToken: []byte("admission-secret"), ContributeTimeout: time.Second, InsecureCookies: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+	clientA := login(t, httpServer.URL, secrets.token)
+	_, page := get(t, clientA, httpServer.URL+"/contribute")
+	csrfA := findCSRFToken(t, page)
+	if _, page = postContribution(t, clientA, httpServer.URL, csrfA, contributionValues("goal")); !strings.Contains(page, "A run was created") {
+		t.Fatalf("session A created state missing: %s", page)
+	}
+	// Session B — separate login, no intent cookie — submits the identical
+	// payload: an independent attempt that must mint its own key.
+	clientB := login(t, httpServer.URL, secrets.token)
+	_, page = get(t, clientB, httpServer.URL+"/contribute")
+	csrfB := findCSRFToken(t, page)
+	if _, page = postContribution(t, clientB, httpServer.URL, csrfB, contributionValues("goal")); !strings.Contains(page, "A run was created") {
+		t.Fatalf("session B created state missing: %s", page)
+	}
+	// Each session's unchanged resubmission replays its own key, and only
+	// its own.
+	if _, page = postContribution(t, clientB, httpServer.URL, csrfB, contributionValues("goal")); !strings.Contains(page, "A run was created") {
+		t.Fatalf("session B retry state missing: %s", page)
+	}
+	if _, page = postContribution(t, clientA, httpServer.URL, csrfA, contributionValues("goal")); !strings.Contains(page, "A run was created") {
+		t.Fatalf("session A retry state missing: %s", page)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(keys) != 4 {
+		t.Fatalf("keys = %v, want four admission calls", keys)
+	}
+	if keys[1] == keys[0] {
+		t.Fatalf("session B reused session A's key: %v", keys)
+	}
+	if keys[2] != keys[1] {
+		t.Fatalf("session B retry did not replay session B's key: %v", keys)
+	}
+	if keys[3] != keys[0] {
+		t.Fatalf("session A retry did not replay session A's key: %v", keys)
 	}
 }
 
@@ -853,10 +930,9 @@ func TestContributeCrossSessionSettlementKeepsUnsettledIntent(t *testing.T) {
 	if cookieA == nil {
 		t.Fatal("session A uncertain outcome wrote no intent cookie")
 	}
-	// Let A's minter entry lapse, as the two-minute TTL eventually does, so
-	// B's identical content mints its own key instead of replaying A's.
-	server.minter.forget(contributeDigest(contributeSubmission{Lane: "default", BaseRepo: "owner/base", BaseRef: "main", WorkRepo: "owner/fork", Goal: "goal"}))
-	// Session B settles the same content with its own key.
+	// Session B settles the same content with its own key: the minter slot
+	// is session-scoped, so B needs no server-side clearing to be an
+	// independent submission — this is the production cross-session path.
 	clientB := login(t, httpServer.URL, secrets.token)
 	_, page = get(t, clientB, httpServer.URL+"/contribute")
 	csrfB := findCSRFToken(t, page)
@@ -888,6 +964,9 @@ func TestContributeCrossSessionSettlementKeepsUnsettledIntent(t *testing.T) {
 	defer mu.Unlock()
 	if len(keys) != 3 || keys[2] != keys[0] {
 		t.Fatalf("keys = %v, want the cross-session unsettled key replayed", keys)
+	}
+	if keys[1] == keys[0] {
+		t.Fatalf("session B inherited session A's key: %v", keys)
 	}
 }
 
@@ -968,28 +1047,40 @@ func TestContributeIntentCookieVerification(t *testing.T) {
 func TestContributeMinter(t *testing.T) {
 	var m contributeMinter
 	now := time.Unix(0, 0)
-	first, err := m.keyFor("digest-a", now)
+	first, err := m.keyFor("session-a", "digest-a", now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	again, err := m.keyFor("digest-a", now.Add(time.Minute))
+	again, err := m.keyFor("session-a", "digest-a", now.Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if first != again {
 		t.Fatal("minter minted a second key for the same digest inside the TTL")
 	}
-	m.forget("digest-a")
-	fresh, err := m.keyFor("digest-a", now.Add(90*time.Second))
+	// Another session's identical content is an independent submission:
+	// it must mint its own key, never inherit this session's.
+	other, err := m.keyFor("session-b", "digest-a", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other == first {
+		t.Fatal("minter shared a key across sessions for identical content")
+	}
+	m.forget("session-a", "digest-a")
+	fresh, err := m.keyFor("session-a", "digest-a", now.Add(90*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if fresh == first {
 		t.Fatal("minter resurrected a forgotten digest")
 	}
+	if fresh == other {
+		t.Fatal("forgotten session resurrected another session's key")
+	}
 	// An entry past its TTL is swept, not served: the re-minted entry
 	// from 90s lives until 3m30s, so check past it.
-	expired, err := m.keyFor("digest-a", now.Add(4*time.Minute))
+	expired, err := m.keyFor("session-a", "digest-a", now.Add(4*time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
