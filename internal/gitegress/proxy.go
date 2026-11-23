@@ -2,6 +2,7 @@ package gitegress
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -43,7 +44,7 @@ func (g *Guard) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	request, err := http.NewRequestWithContext(r.Context(), r.Method, target, body)
 	if err != nil {
-		refuse(w, err)
+		refuse(w, errors.New("refused: malformed request"))
 		return
 	}
 	if contentType := r.Header.Get("Content-Type"); contentType != "" {

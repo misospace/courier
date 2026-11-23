@@ -109,7 +109,16 @@ func New(config Config) (*Guard, error) {
 	if len(config.Remotes) == 0 {
 		return nil, errors.New("gitegress: at least one pinned remote is required")
 	}
-	guard := &Guard{workRef: config.WorkRef, credentials: config.Credentials, upstream: &http.Client{}}
+	guard := &Guard{
+		workRef:     config.WorkRef,
+		credentials: config.Credentials,
+		// The guard never follows a redirect: the credential it injects may
+		// travel only to the pinned upstream, and a redirect it passed back
+		// is the client's problem (git reports it), not a token forward.
+		upstream: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}},
+	}
 	seen := map[string]string{}
 	for _, remote := range config.Remotes {
 		identity := strings.TrimSpace(remote.Identity)

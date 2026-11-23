@@ -472,7 +472,10 @@ func coordinatorRendersGitInstallation(pod *corev1.Pod) bool {
 	if pod == nil || !hasCoordinatorContainer(pod) || pod.DeletionTimestamp != nil {
 		return false
 	}
-	if pod.Annotations[executor.GitEgressContractAnnotation] == executor.GitEgressContractVersion {
+	// The guard contract is recognized by presence, not by version match:
+	// a future contract-version bump must never silently stop steady-state
+	// rotation for pods that carry it.
+	if pod.Annotations[executor.GitEgressContractAnnotation] != "" {
 		return true
 	}
 	for _, container := range pod.Spec.Containers {

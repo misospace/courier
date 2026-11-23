@@ -1,6 +1,9 @@
 package main
 
 import (
+	"context"
+	"io"
+	"net"
 	"testing"
 
 	"github.com/misospace/courier/internal/executor"
@@ -12,7 +15,7 @@ func gitEgressEnv(values map[string]string) func(string) string {
 
 func validGitEgressEnv() map[string]string {
 	return map[string]string{
-		executor.EnvGitEgressAddress:     "127.0.0.1:43184",
+		executor.EnvGitEgressAddress:     executor.GitEgressAddress,
 		executor.EnvInstallationOwner:    "acme",
 		executor.EnvInstallationEndpoint: "https://api.github.com/",
 		executor.EnvInstallationSecret:   "run-creds",
@@ -73,5 +76,22 @@ func TestDecideGitEgress(t *testing.T) {
 		if _, err := decideGitEgress(gitEgressEnv(env)); err == nil {
 			t.Fatalf("dropping %s accepted", drop)
 		}
+	}
+}
+
+func TestRunGitEgressFailsClosedBeforeListening(t *testing.T) {
+	if err := runGitEgress(context.Background(), func(string) string { return "" }, io.Discard); err == nil {
+		t.Fatal("empty environment accepted")
+	}
+	env := validGitEgressEnv()
+	if err := runGitEgress(context.Background(), gitEgressEnv(env), io.Discard); err == nil {
+		t.Fatal("missing kubernetes API endpoint accepted")
+	}
+	listener, err := net.Listen("tcp", env[executor.EnvGitEgressAddress])
+	if err != nil {
+		t.Fatalf("refused startups left the guard address bound: %v", err)
+	}
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

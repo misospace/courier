@@ -314,6 +314,11 @@ func TestBuildCoordinatorPodInstallationGitObserverContract(t *testing.T) {
 		if _, ok := environment["COURIER_HEAD_REPO"]; !ok {
 			t.Fatalf("App-mode observer env must carry the head identity for fork bindings, even when empty: %#v", container.Env)
 		}
+		if environment["COURIER_REPO_URL"].Value != "https://github.com/acme/widgets.git" ||
+			environment["COURIER_BASE_REPO_URL"].Value != "https://github.com/acme/widgets.git" {
+			t.Fatalf("App-mode %s must keep the absolute forge remotes, not the guard loopback: %#v %#v",
+				container.Name, environment["COURIER_REPO_URL"], environment["COURIER_BASE_REPO_URL"])
+		}
 		var mounted bool
 		for _, mount := range container.VolumeMounts {
 			if mount.Name == observerTokenVolume {

@@ -27,7 +27,8 @@ const (
 	GitEgressContainerName = "git-egress"
 
 	// GitEgressContractAnnotation marks a pod whose writes are bound by the
-	// git egress guard. The version is the contract revision.
+	// git egress guard. Recognition is by presence; the version records the
+	// contract revision the pod builder renders.
 	GitEgressContractAnnotation = "courier.misospace.dev/git-egress"
 	GitEgressContractVersion    = "1"
 
@@ -36,8 +37,9 @@ const (
 	// plain http to a loopback address is intentional: the transport is
 	// process-local, the guard terminates TLS to the real forge upstream,
 	// and the guard's authority — not a TLS chain — decides what the
-	// credential may do.
-	GitEgressAddress = "127.0.0.1:43184"
+	// credential may do. The port sits below the Linux ephemeral range so
+	// no ordinary outbound socket can transiently squat the guard's address.
+	GitEgressAddress = "127.0.0.1:18443"
 
 	// EnvGitEgressAddress names the guard's listen address so one producer
 	// (the pod builder) decides it.

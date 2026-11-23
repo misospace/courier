@@ -97,6 +97,14 @@ func TestResolve(t *testing.T) {
 		{"https://x/o/r.git/objects/info/packs", "GET", false},
 		{"https://x/o/r.git/repos", "GET", false},
 		{"https://x/", "GET", false},
+		{"https://x/o/w.git/../x/git-receive-pack", "POST", false},
+		{"https://x/o/w.git/%2e%2e/git-upload-pack", "POST", false},
+		{"https://x/o/w.git/./git-upload-pack", "POST", false},
+		// A trailing-slash spelling of a pinned repository resolves because
+		// the guard rebuilds the upstream URL from the pinned remote and
+		// never forwards the client path.
+		{"https://x/o/w.git//git-upload-pack", "POST", true},
+		{"https://x/O/W.GIT/git-receive-pack", "POST", true},
 	} {
 		parsed, err := url.Parse(test.target)
 		if err != nil {
@@ -134,6 +142,7 @@ func TestCheckReceivePack(t *testing.T) {
 		{"no updates", flush, false},
 		{"malformed oid", pkt("zz "+oidB+" refs/heads/courier/run") + flush, false},
 		{"garbage line", pkt("nonsense") + flush, false},
+		{"v2 command section", pkt("command=push\x00agent=git/2.47") + flush, false},
 		{"mixed lengths", pkt(oidA+" "+strings.Repeat("a", 64)+" refs/heads/courier/run") + flush, true},
 	}
 	for _, test := range tests {
@@ -236,6 +245,20 @@ func TestServeHTTPServesOnlyApprovedSurface(t *testing.T) {
 	}
 	if last.content != "application/x-git-receive-pack-request" {
 		t.Errorf("content type not forwarded: %q", last.content)
+	}
+
+	// A chunked client body (no Content-Length) is inspected and forwarded
+	// byte-for-byte as well.
+	recorder = httptest.NewRecorder()
+	chunked := httptest.NewRequest("POST", "/backend/work.git/git-receive-pack", nil)
+	chunked.Body = io.NopCloser(strings.NewReader(pushBody))
+	chunked.ContentLength = -1
+	guard.ServeHTTP(recorder, chunked)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("chunked approved push: code=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+	if got := requests[len(requests)-1]; got.body != pushBody {
+		t.Errorf("chunked upstream body drifted: %q", got.body)
 	}
 
 	// A push outside the work ref is refused before the credential is

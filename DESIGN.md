@@ -4415,6 +4415,11 @@ control code — registration grants no shell, forge, or Kubernetes authority.
    instead of useless needs deployment-level egress control that a
    pod-scoped NetworkPolicy cannot express (a policy cannot distinguish
    containers inside one pod), which remains deployment work, not core work.
+   An explicitly configured forge-API token (`GitHubCredentialSecret`) stays
+   outside this boundary by design: it never served the git transport the
+   guard governs, the guard neither mints nor relays it, and its scope is the
+   deployment's own decision, recorded here so the boundary claim is read as
+   exactly the git surface.
    The guard enforces the operator-pinned work ref and the run's two pinned
    repositories; it does not re-adjudicate the plan. The isolated observer
    and its seed keep their own projected token and document read because
