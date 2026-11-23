@@ -3576,6 +3576,42 @@ func TestChartOperatorConsoleContributeStatus(t *testing.T) {
 		t.Fatal("bare raw URL with a values token did not render the canonical token-file flag")
 	}
 
+	// A raw token-file arg completes the binary's flag pair but only
+	// tokenSecret mounts the file, so without it the console would start
+	// paired and exit reading a file that was never mounted. Both arg
+	// spellings must fail the render even when a URL is set.
+	for _, spellings := range [][]string{
+		{"--set-string", "controllers.console.containers.console.args[0]=--contribute-status-token-file=/custom/path"},
+		{"--set-string", "controllers.console.containers.console.args[0]=--contribute-status-token-file",
+			"--set-string", "controllers.console.containers.console.args[1]=/custom/path"},
+	} {
+		out, err = runHelmOutput(t, chartDir, operatorConsoleRenderArgs(append(
+			[]string{"--set", "operatorConsole.contributeStatus.url=http://courier-contribute-api"},
+			spellings...)...)...)
+
+		if err == nil || !strings.Contains(out, "operatorConsole.contributeStatus.tokenSecret") || !strings.Contains(out, "mounts the contribution status token only") {
+			t.Fatalf("raw token-file arg without tokenSecret render error = %v, want the mount-availability guard:\n%s", err, out)
+		}
+	}
+
+	// With tokenSecret set, a raw token-file arg keeps its own path, drops
+	// the values-derived canonical flag, and still gets the mount.
+	rawArgWithSecret := runHelm(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.contributeStatus.url=http://courier-contribute-api",
+		"--set", "operatorConsole.contributeStatus.tokenSecret=contribute-status-token",
+		"--set-string", "controllers.console.containers.console.args[0]=--contribute-status-token-file=/custom/path",
+	)...)
+	rawArgDeployment := findDocument(t, rawArgWithSecret, "kind: Deployment", "name: courier-console")
+	if !strings.Contains(rawArgDeployment, "--contribute-status-token-file=/custom/path") {
+		t.Fatal("raw token-file arg did not survive alongside tokenSecret")
+	}
+	if strings.Contains(rawArgDeployment, "--contribute-status-token-file=/etc/courier/console/contribute-status-token") {
+		t.Fatal("tokenSecret injected a second token-file flag under a raw token-file arg")
+	}
+	if !strings.Contains(rawArgDeployment, "mountPath: /etc/courier/console/contribute-status-token") {
+		t.Fatal("raw token-file arg with tokenSecret omitted the Secret mount")
+	}
+
 	// A values override that omits the contributeStatus block entirely must
 	// render a contribution-status-free console, not an opaque template
 	// error.
