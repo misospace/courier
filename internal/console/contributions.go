@@ -225,7 +225,18 @@ func newHTTPContributeStatusClient(base string, token []byte) (*httpContributeSt
 	return &httpContributeStatusClient{
 		baseURL: strings.TrimRight(base, "/"),
 		token:   append([]byte(nil), token...),
-		client:  &http.Client{Timeout: contributeStatusTimeout},
+		client: &http.Client{
+			Timeout: contributeStatusTimeout,
+			// Go's default policy keeps Authorization on a redirect that
+			// stays on the same host or moves to a subdomain of it, so a
+			// rewriting proxy or a hijacked subdomain would receive the
+			// status bearer. The contribution listener never redirects:
+			// a 3xx is a misconfiguration, so none is followed and the
+			// 3xx itself answers as an unexpected status instead.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}, nil
 }
 
@@ -348,7 +359,12 @@ func (s *Server) handleContributions(w http.ResponseWriter, r *http.Request) {
 			s.renderContribution(w, http.StatusOK, "contributions", data)
 			return
 		}
-		http.Redirect(w, r, contributionRunURL(run, ""), http.StatusSeeOther)
+		// Carry ?namespace= through the redirect so a lookup pinned to a
+		// non-default namespace keeps its pin; the detail page validates
+		// the shape locally before any backend call, and the value is
+		// percent-encoded into the Location either way.
+		namespace := strings.TrimSpace(r.URL.Query().Get("namespace"))
+		http.Redirect(w, r, contributionRunURL(run, namespace), http.StatusSeeOther)
 		return
 	}
 	data.History = s.readContributeHistory(r)
