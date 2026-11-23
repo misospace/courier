@@ -118,13 +118,24 @@ func TestBuildCoordinatorPodInstallationGitReplacesStaticPair(t *testing.T) {
 		t.Fatalf("App-mode pod must carry the git egress contract annotation")
 	}
 	var guard *corev1.Container
-	for index := range pod.Spec.Containers {
-		if pod.Spec.Containers[index].Name == GitEgressContainerName {
-			guard = &pod.Spec.Containers[index]
+	for index := range pod.Spec.InitContainers {
+		if pod.Spec.InitContainers[index].Name == GitEgressContainerName {
+			guard = &pod.Spec.InitContainers[index]
 		}
 	}
 	if guard == nil {
-		t.Fatalf("git egress guard container missing: %#v", pod.Spec.Containers)
+		t.Fatalf("git egress guard init container missing: %#v", pod.Spec.InitContainers)
+	}
+	if pod.Spec.InitContainers[0].Name != GitEgressContainerName {
+		t.Fatalf("the guard must be the first init container so it starts before every other container: %#v", pod.Spec.InitContainers)
+	}
+	for index := range pod.Spec.Containers {
+		if pod.Spec.Containers[index].Name == GitEgressContainerName {
+			t.Fatalf("git egress guard must be a native sidecar, not an app container")
+		}
+	}
+	if guard.RestartPolicy == nil || *guard.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+		t.Fatalf("guard restart policy = %v, want Always so the kubelet stops it with the app containers", guard.RestartPolicy)
 	}
 	guardEnv := map[string]corev1.EnvVar{}
 	for _, env := range guard.Env {
@@ -198,9 +209,11 @@ func TestBuildCoordinatorPodStaticModeOmitsInstallationContract(t *testing.T) {
 			t.Fatalf("static pod carries the projected token volume")
 		}
 	}
-	for _, container := range pod.Spec.Containers {
-		if container.Name == GitEgressContainerName {
-			t.Fatalf("static pod carries the git egress guard")
+	for _, containers := range [][]corev1.Container{pod.Spec.Containers, pod.Spec.InitContainers} {
+		for _, container := range containers {
+			if container.Name == GitEgressContainerName {
+				t.Fatalf("static pod carries the git egress guard")
+			}
 		}
 	}
 	if _, ok := pod.Annotations[GitEgressContractAnnotation]; ok {

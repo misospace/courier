@@ -266,10 +266,21 @@ func e2eTryGit(t *testing.T, env []string, dir string, args ...string) (string, 
 	return string(out), err
 }
 
+// e2eRequire skips a missing local tool away from CI and fails on it: the
+// push/fetch boundary coverage this suite provides must be visible, not
+// silently skipped, wherever results are relied on.
+func e2eRequire(t *testing.T, reason string) {
+	t.Helper()
+	if os.Getenv("CI") != "" {
+		t.Fatalf("%s: the boundary suite must run in CI", reason)
+	}
+	t.Skip(reason)
+}
+
 func e2eRequireGit(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git binary unavailable")
+		e2eRequire(t, "git binary unavailable")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -288,7 +299,7 @@ func e2eRequireGit(t *testing.T) {
 		code = exitErr.ExitCode()
 	}
 	if code == 129 || strings.Contains(combined, "unknown") || strings.Contains(combined, "not a git command") {
-		t.Skip("git http-backend unavailable")
+		e2eRequire(t, "git http-backend unavailable")
 	}
 }
 

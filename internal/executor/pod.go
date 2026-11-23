@@ -355,11 +355,14 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 	// credential nor a means to read one. The guard container carries the
 	// installation contract and refuses every push outside the approved
 	// work ref; the annotation records the contract for the operator's
-	// rotation gate.
+	// rotation gate. It renders as a native sidecar (init container with a
+	// restart policy) so the kubelet starts it before every app container
+	// and stops it once all of them have terminated: the credential surface
+	// can never outlive the coordinator it serves.
 	if config.InstallationGit != nil {
 		pod.Spec.Volumes = append(pod.Spec.Volumes, gitCredentialsTokenVolume())
 		pod.Annotations[GitEgressContractAnnotation] = GitEgressContractVersion
-		pod.Spec.Containers = append(pod.Spec.Containers, gitEgressContainer(config, invocation))
+		pod.Spec.InitContainers = append(pod.Spec.InitContainers, gitEgressContainer(config, invocation))
 	}
 	// A 45-second grace only exists to fit the evidence capture deadline; a
 	// run that does not capture keeps the kubelet's default.

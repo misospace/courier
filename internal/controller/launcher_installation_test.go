@@ -733,15 +733,17 @@ func legacyCoordinatorPod(run *courierv1alpha1.CoderRun, appMode bool) *corev1.P
 }
 
 // legacyGuardCoordinatorPod builds a #902 guard-shaped App-mode pod: the
-// contract is the annotation and the guard container; the coordinator
+// contract is the annotation and the guard native sidecar; the coordinator
 // container itself carries no credential marker.
 func legacyGuardCoordinatorPod(run *courierv1alpha1.CoderRun) *corev1.Pod {
 	pod := legacyCoordinatorPod(run, false)
 	pod.Annotations = map[string]string{
 		executor.GitEgressContractAnnotation: executor.GitEgressContractVersion,
 	}
-	pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{
+	restartAlways := corev1.ContainerRestartPolicyAlways
+	pod.Spec.InitContainers = append(pod.Spec.InitContainers, corev1.Container{
 		Name: executor.GitEgressContainerName, Image: "example/coordinator:test",
+		RestartPolicy: &restartAlways,
 	})
 	return pod
 }

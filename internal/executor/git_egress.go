@@ -89,21 +89,26 @@ func configuredRemotes(config PodConfig, invocation Invocation) (string, string)
 	return work, base
 }
 
-// gitEgressContainer renders the guard sidecar: the only container that
-// mounts the projected token reading the run's credentials Secret, and the
-// only process that can serve the run's git credential. Its environment is
-// the same installation contract the pre-#902 coordinator container carried
-// (owner, endpoint, Secret name, projected token), plus the run's pinned
-// remotes, repository identities, and the approved work ref the guard
-// enforces.
+// gitEgressContainer renders the guard as a native sidecar — an init
+// container with a restart policy — the only container that mounts the
+// projected token reading the run's credentials Secret, and the only process
+// that can serve the run's git credential. The kubelet starts it before
+// every app container and stops it once all of them have terminated, so the
+// credential surface is torn down with the coordinator instead of serving
+// until the pod is deleted. Its environment is the same installation
+// contract the pre-#902 coordinator container carried (owner, endpoint,
+// Secret name, projected token), plus the run's pinned remotes, repository
+// identities, and the approved work ref the guard enforces.
 func gitEgressContainer(config PodConfig, invocation Invocation) corev1.Container {
 	workRemote, baseRemote := configuredRemotes(config, invocation)
+	restartAlways := corev1.ContainerRestartPolicyAlways
 	return corev1.Container{
 		Name:            GitEgressContainerName,
 		Image:           config.Image,
 		ImagePullPolicy: config.ImagePullPolicy,
 		Command:         []string{config.BootstrapBinary},
 		Args:            []string{"git-egress"},
+		RestartPolicy:   &restartAlways,
 		Env: []corev1.EnvVar{
 			{Name: EnvGitEgressAddress, Value: GitEgressAddress},
 			{Name: EnvInstallationOwner, Value: config.InstallationGit.Owner},
