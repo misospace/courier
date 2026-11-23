@@ -161,16 +161,19 @@ type contributionCause struct {
 	Outcome  string `json:"outcome,omitempty"`
 }
 
-// ErrContributeStatusUnavailable reports that this console has no
-// contribution status backend. It is a valid deployment state; the pages
-// render their not-configured state and send no request.
-var ErrContributeStatusUnavailable = errors.New("contribution status API is not configured")
-
 // ErrContributeStatusUnexpected reports a 200 the console could not read as
-// a contribution status: an unparseable or over-large body. Like the read
+// a contribution status: an unparseable or over-large body, or a body that
+// parses as JSON but does not describe the requested run. Like the read
 // API client's counterpart, it exists so a broken upstream never renders as
-// "no contribution".
+// "no contribution". The not-configured case is not an error: a console
+// without a status backend has a nil client and renders its
+// not-configured state without a request.
 var ErrContributeStatusUnexpected = errors.New("contribution status API returned an unexpected response")
+
+// contributeUnexpectedMessage is the one copy of the misconfiguration
+// message every 200 the console cannot read as a contribution status
+// renders: a static state, so a broken upstream never loops a retry.
+const contributeUnexpectedMessage = "The contribution status API answered, but not with a contribution status. Check that the console's contribution status URL points at the contribution listener."
 
 // ContributeStatusError reports a status reply that carried a non-200
 // status. It names the status only, never the response body, so an
@@ -188,10 +191,12 @@ func (e *ContributeStatusError) Error() string {
 // testable without a listener.
 type contributeStatusClient interface {
 	// Status reads one contribution. namespace may be empty, which asks the
-	// endpoint its own default. ErrContributeStatusUnavailable means no
-	// backend is configured; *ContributeStatusError carries a non-200; any
-	// other error is a transport or decode failure. The bearer token and the
-	// raw body never cross into the result.
+	// endpoint its own default. A console with no backend has a nil client,
+	// not an error; *ContributeStatusError carries a non-200; any other
+	// error is a transport or decode failure, and a 200 the client could
+	// not read as a status of the requested run fails as
+	// ErrContributeStatusUnexpected. The bearer token and the raw body
+	// never cross into the result.
 	Status(ctx context.Context, namespace, run string) (contributionStatus, error)
 }
 
@@ -262,7 +267,26 @@ func (c *httpContributeStatusClient) Status(ctx context.Context, namespace, run 
 	if err := json.Unmarshal(body, &status); err != nil {
 		return contributionStatus{}, fmt.Errorf("%w: %v", ErrContributeStatusUnexpected, err)
 	}
+	if !status.describes(run) {
+		// The endpoint always echoes the run's name and stamps the read's
+		// observedAt. A 200 that parses as JSON but does not — say a bare
+		// {} from a misconfigured status URL pointed at some other service —
+		// fails as the documented misconfiguration error instead of
+		// decoding to a zero status the page would render as an empty
+		// "found".
+		return contributionStatus{}, fmt.Errorf("%w: response does not describe the requested run", ErrContributeStatusUnexpected)
+	}
 	return status, nil
+}
+
+// describes reports whether the decoded body carries the two fields the
+// status endpoint always projects: the echo of the requested run's name and
+// the read's observedAt. The run name the endpoint echoes is the object name
+// it was addressed by — always the validated request name, never a
+// truncated form, because the projection's field cap exceeds the object-name
+// cap the request is validated against.
+func (s contributionStatus) describes(run string) bool {
+	return s.Run == run && s.ObservedAt != ""
 }
 
 // validContributeRunName reports whether the name could address a run on the
@@ -279,7 +303,7 @@ func validContributeNamespace(namespace string) bool {
 
 // contributionData is the view both contribution pages render. State picks
 // the page body: "notconfigured", "invalid", "notfound", "forbidden",
-// "denied", "unreachable", "error", or "found".
+// "denied", "error", or "found".
 type contributionData struct {
 	Title          string
 	Active         string
@@ -301,6 +325,9 @@ type contributionData struct {
 	PhaseClass   string
 	PhaseAge     string
 	PRLink       string
+	BaseRepoLink string
+	HeadRepoLink string
+	CommitLink   string
 	HasPublished bool
 
 	History []contributeHistoryEntry
@@ -364,12 +391,10 @@ func (s *Server) renderContributionStatus(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		data.State = "error"
 		switch {
-		case errors.Is(err, ErrContributeStatusUnavailable):
-			data.State = "notconfigured"
 		case errors.Is(err, ErrContributeStatusUnexpected):
 			// A 200 that is not a contribution status is a misconfigured
 			// URL or a rewriting proxy: a static state, no point retrying.
-			data.ErrorMessage = "The contribution status API answered, but not with a contribution status. Check that the console's contribution status URL points at the contribution listener."
+			data.ErrorMessage = contributeUnexpectedMessage
 		default:
 			var statusErr *ContributeStatusError
 			if errors.As(err, &statusErr) {
@@ -401,6 +426,19 @@ func (s *Server) renderContributionStatus(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Defensive re-check of the decode boundary: the client rejects a body
+	// that does not describe the requested run, but "found" is the one
+	// state that renders backend content, so it validates here too. A
+	// status that echoes another run or carries no observedAt is the same
+	// misconfiguration as an unparseable body and renders as its static
+	// state — never blank fields, an active refresh, or a history entry.
+	if !status.describes(run) {
+		data.State = "error"
+		data.ErrorMessage = contributeUnexpectedMessage
+		s.renderContribution(w, http.StatusOK, "contribution", data)
+		return
+	}
+
 	data.State = "found"
 	data.Status = status
 	// The response echoes the canonical namespace; the deep link and the
@@ -415,7 +453,13 @@ func (s *Server) renderContributionStatus(w http.ResponseWriter, r *http.Request
 		data.HasPublished = status.Publication.PR != "" || status.Publication.Branch != "" ||
 			status.Publication.HeadRepo != "" || status.Publication.HeadSHA != ""
 		data.PRLink = safeContributionURL(status.Publication.PR)
+		// The repository and commit links are derived, never projected:
+		// their host is the vetted PR URL's own, so a projected value can
+		// at worst point at a wrong path on a host the page already links.
+		data.HeadRepoLink = contributionRepoLink(data.PRLink, status.Publication.HeadRepo)
+		data.CommitLink = contributionCommitLink(data.PRLink, status.Publication.HeadSHA)
 	}
+	data.BaseRepoLink = contributionRepoLink(data.PRLink, status.BaseRepo)
 	data.RefreshSeconds = contributeRefreshSeconds(status.Phase)
 	s.rememberContributeHistory(w, r, status.Namespace, run)
 	s.renderContribution(w, http.StatusOK, "contribution", data)
@@ -522,6 +566,52 @@ func safeContributionURL(raw string) string {
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil {
 		return ""
 	}
+	return u.String()
+}
+
+// contributeRepoPattern is the forge "owner/name" repository shape, bounded
+// to the segment lengths forges accept. Admission accepts a looser shape
+// (internal/source/adhoc's repoPattern), so this is the link-safety bound,
+// not the identity bound: only a value of this shape is ever embedded in a
+// derived repository link, and anything longer stays plain text.
+var contributeRepoPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100}$`)
+
+// contributeSHAPattern is a hexadecimal commit SHA. Only this shape is ever
+// embedded in a derived commit link.
+var contributeSHAPattern = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
+
+// contributionRepoLink derives a repository link from a
+// safeContributionURL-vetted PR URL: the link's host is that URL's host, so
+// no projected value chooses the scheme or host. With no vetted PR URL — the
+// common case before a pull request is published — or a value outside the
+// "owner/name" shape it returns empty and the page renders plain text.
+func contributionRepoLink(prLink, repo string) string {
+	if prLink == "" || !contributeRepoPattern.MatchString(repo) {
+		return ""
+	}
+	u, err := url.Parse(prLink)
+	if err != nil {
+		return ""
+	}
+	u.Path = "/" + repo
+	u.RawQuery, u.Fragment, u.RawPath = "", "", ""
+	return u.String()
+}
+
+// contributionCommitLink derives a commit link under a vetted PR URL's host
+// (every major forge serves /commit/<sha> and a pull request's commits under
+// the same origin). With no vetted PR URL or a value outside the
+// hexadecimal-SHA shape it returns empty and the page renders plain text.
+func contributionCommitLink(prLink, sha string) string {
+	if prLink == "" || !contributeSHAPattern.MatchString(sha) {
+		return ""
+	}
+	u, err := url.Parse(prLink)
+	if err != nil {
+		return ""
+	}
+	u.Path = strings.TrimSuffix(u.Path, "/") + "/commit/" + sha
+	u.RawQuery, u.Fragment, u.RawPath = "", "", ""
 	return u.String()
 }
 
