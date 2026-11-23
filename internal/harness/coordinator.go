@@ -524,6 +524,17 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 			budgetNoteInjected = true
 		}
 		if budgetNoteInjected && budgetGraceTurnsUsed >= budgetGraceTurns && !c.control.Stopped() {
+			// The grace exit re-checks the workspace-prerequisite latch the
+			// same way the final-turn path does (#737): a trip that landed
+			// during the grace — from a delegate goroutine, without a later
+			// tool boundary to consume it — owns the ending. The budget
+			// never masks a condition the workspace itself cannot satisfy.
+			if failure := c.prerequisite.peek(); failure != nil {
+				if failure.kind == courierv1alpha1.NativeResultInfrastructureFailed {
+					return c.infrastructureEnding(ctx, failure)
+				}
+				return c.blockedExternalEnding(ctx, failure)
+			}
 			return c.budgetEnding(ctx)
 		}
 		turn := c.pump(ctx, session, "", c.coordinatorTools())

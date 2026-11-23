@@ -578,6 +578,59 @@ func TestParseContextDefaultsWhenOmitted(t *testing.T) {
 	}
 }
 
+func TestParseAcceptsBudgetPolicy(t *testing.T) {
+	profiles, err := Parse([]byte(`profiles:
+  - name: local
+    roles:
+      coder: gpt-5
+    budget:
+      maxToolCalls: 200
+      wallClockSeconds: 3600
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	budget := profiles[0].Budget
+	if budget == nil {
+		t.Fatal("budget is nil, want the declared policy")
+	}
+	if budget.MaxToolCalls != 200 || budget.WallClockSeconds != 3600 {
+		t.Fatalf("budget = %#v, want the declared bounds", budget)
+	}
+}
+
+func TestParseBudgetAbsent(t *testing.T) {
+	profiles, err := Parse([]byte(`profiles:
+  - name: local
+    roles:
+      coder: gpt-5
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profiles[0].Budget != nil {
+		t.Fatalf("budget = %#v, want nil when the config declares none", profiles[0].Budget)
+	}
+}
+
+func TestParseRejectsUnknownBudgetKeys(t *testing.T) {
+	data := []byte("profiles:\n  - name: local\n    roles:\n      coder: gpt-5\n    budget:\n      maxToolCallsPct: 60\n")
+	if _, err := Parse(data); err == nil || !strings.Contains(err.Error(), "unknown field") {
+		t.Fatalf("error = %v, want unknown budget key rejected", err)
+	}
+}
+
+func TestParseRejectsNegativeBudgetBounds(t *testing.T) {
+	for _, content := range []string{
+		"profiles:\n  - name: local\n    roles:\n      coder: gpt-5\n    budget:\n      maxToolCalls: -1\n",
+		"profiles:\n  - name: local\n    roles:\n      coder: gpt-5\n    budget:\n      wallClockSeconds: -1\n",
+	} {
+		if _, err := Parse([]byte(content)); err == nil || !strings.Contains(err.Error(), "must not be negative") {
+			t.Fatalf("error = %v, want negative budget bound rejected: %s", err, content)
+		}
+	}
+}
+
 func TestParseContextAbsent(t *testing.T) {
 	data := []byte(`profiles:
   - name: local

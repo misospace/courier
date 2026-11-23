@@ -54,6 +54,11 @@ type Profile struct {
 	// #295); nil means no declared budget. Same bounds as the CRD field it
 	// mirrors; resolution stays in internal/harness.
 	Context *courierv1alpha1.ContextPolicy `json:"context,omitempty"`
+	// Budget declares the coordination budgets for this lane (#901): the
+	// total tool-call bound and wall-clock bound the harness enforces; nil
+	// means no declared budget. Same bounds as the CRD field it mirrors;
+	// enforcement stays in internal/harness.
+	Budget *courierv1alpha1.BudgetPolicy `json:"budget,omitempty"`
 	// Resources sizes the pods Courier creates using Courier's narrowed
 	// requests/limits vocabulary; empty means the lane gets the built-in default.
 	Resources courierv1alpha1.PodResources `json:"resources,omitempty"`
@@ -146,6 +151,11 @@ func Parse(data []byte) ([]Profile, error) {
 		}
 		if profile.Context != nil {
 			if err := normalizeContext(name, profile.Context); err != nil {
+				return nil, err
+			}
+		}
+		if profile.Budget != nil {
+			if err := normalizeBudget(name, profile.Budget); err != nil {
 				return nil, err
 			}
 		}
@@ -254,6 +264,22 @@ func normalizeContext(name string, policy *courierv1alpha1.ContextPolicy) error 
 		roles[trimmedRole] = budget
 	}
 	policy.Roles = roles
+	return nil
+}
+
+// normalizeBudget validates a declared coordination budget (#901) against the
+// same bounds the CRD enforces: each axis is either absent (zero: that axis
+// enforces nothing) or at least one; a negative bound is configuration error.
+// A policy with no bound on either axis is accepted — it enforces nothing,
+// exactly like an absent policy, and an all-zero declaration must not churn
+// against the server-decoded nil differently than it reads.
+func normalizeBudget(name string, policy *courierv1alpha1.BudgetPolicy) error {
+	if policy.MaxToolCalls < 0 {
+		return fmt.Errorf("bootstrap profile %q: budget.maxToolCalls must not be negative, got %d", name, policy.MaxToolCalls)
+	}
+	if policy.WallClockSeconds < 0 {
+		return fmt.Errorf("bootstrap profile %q: budget.wallClockSeconds must not be negative, got %d", name, policy.WallClockSeconds)
+	}
 	return nil
 }
 

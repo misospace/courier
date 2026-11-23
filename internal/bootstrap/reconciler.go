@@ -213,7 +213,10 @@ func desiredSpec(profile *Profile) courierv1alpha1.LaneProfileSpec {
 		// DeepCopy so the managed object never shares the provider-owned
 		// policy: the client decodes the server response through the spec,
 		// and a cached Provider must not see desired state mutated.
-		Context:   profile.Context.DeepCopy(),
+		Context: profile.Context.DeepCopy(),
+		// DeepCopy for the same reason: the managed object must never share
+		// provider-owned policy with the cached profile (#901).
+		Budget:    profile.Budget.DeepCopy(),
 		Resources: profile.Resources,
 		// DeepCopy for the same reason: the managed object must never share
 		// provider-owned policy with the cached profile.

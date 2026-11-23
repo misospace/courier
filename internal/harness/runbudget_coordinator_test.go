@@ -8,6 +8,7 @@ import (
 	"time"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/executor"
 )
 
 // budgetToolTurn scripts one model turn that requests a single tool call.
@@ -371,5 +372,49 @@ func TestRunBudgetWallClockTripsAtStepBoundaryWithInjectedClock(t *testing.T) {
 	events := sink.all()
 	if len(events) != 1 || events[0].Axis != budgetAxisWallClock || events[0].Count != 90 || events[0].Limit != 30 || events[0].Role != RoleCoordinator {
 		t.Fatalf("events = %+v, want one wall_clock 90/30 event from the coordinator boundary", events)
+	}
+}
+
+// TestRunBudgetTripNeverPreemptsOperatorSoftStop pins the precedence rule:
+// when the operator soft-stop latch is set, that path owns the ending even
+// while the coordination budget is tripped. A fix-pr run whose work ref holds
+// a tip beyond the anchor finishes through the world-derived soft-stop
+// publication — never the budget ending — because the latch's contract, not
+// the budget, decides how a stopped run ends.
+func TestRunBudgetTripNeverPreemptsOperatorSoftStop(t *testing.T) {
+	sink := &recordingBudgetSink{}
+	gateway, _, cleanup := gatewayFor(
+		budgetCancelTurn("1"), // 1 of 1: allowed
+		budgetCancelTurn("2"), // 2 of 1: refused, the budget trip
+		budgetFinalTurn(`{"outcome":"changes"}`),
+	)
+	defer cleanup()
+	watcher := NewControlWatcher(&stubControlSource{requests: []*courierv1alpha1.ControlRequest{controlRequest("req-1")}}, &stubAckWriter{})
+	watcher.Poll(context.Background()) // the operator request landed before the first turn
+	publisher := &stubPublisher{result: Publication{OID: "abc123"}}
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Transport: gateway, Bindings: testBindings(),
+		Budget:              RunBudget{MaxToolCalls: 1},
+		BudgetExhausted:     sink,
+		Control:             watcher,
+		Publisher:           publisher,
+		WorkRefBeyondAnchor: func(context.Context) (bool, error) { return true, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inv := testInvocation()
+	inv.Mode = courierv1alpha1.ModeFixPR
+	result := coordinator.Run(context.Background(), inv)
+	if result.Kind != courierv1alpha1.NativeResultPublished || result.Outcome != executor.OutcomeChanges {
+		t.Fatalf("result = %+v, want the soft-stop world-derived changes ending, not a budget ending", result)
+	}
+	if publisher.count() != 1 {
+		t.Fatalf("publishes = %d, want the one world-derived publication", publisher.count())
+	}
+	// The trip still happened and is still observable — it just never owns
+	// the ending the latch owns.
+	if events := sink.all(); len(events) != 1 {
+		t.Fatalf("events = %+v, want the one trip event", events)
 	}
 }

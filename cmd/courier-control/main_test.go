@@ -505,6 +505,64 @@ func TestCompactionSinkEmitsSessionCompacted(t *testing.T) {
 	}
 }
 
+// TestBudgetSinkEmitsSessionBudgetExhausted pins #901's telemetry contract:
+// the harness's single budget-trip event reaches the run's structured log as
+// one session.budget_exhausted line carrying the exhausted axis, the observed
+// count, the declared limit, and the tripping role — the counts the issue
+// requires operators to read without inferring them from the terminal result.
+// Like session.compacted, the event marks itself Verbose and sets no Status:
+// the trip is observability, and the budget_exhausted terminal kind remains
+// the classification surface.
+func TestBudgetSinkEmitsSessionBudgetExhausted(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	sink := budgetSink{
+		emitter: courierlog.NewEmitter(&stdout, courierlog.LevelInfo),
+		stderr:  &stderr,
+		invocation: executor.Invocation{
+			RunName: "run-1",
+			Repo:    "owner/name",
+			Ref:     7,
+			Mode:    courierv1alpha1.ModeResolveIssue,
+		},
+	}
+	sink.BudgetExhausted(harness.BudgetExhaustedEvent{
+		Axis:  "tool_calls",
+		Count: 41,
+		Limit: 40,
+		Role:  "coordinator",
+	})
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want a clean emission", stderr.String())
+	}
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("emitted %d lines, want exactly one: %q", len(lines), stdout.String())
+	}
+	var event map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &event); err != nil {
+		t.Fatalf("emitted line is not JSON: %v: %q", err, lines[0])
+	}
+	if event["event"] != courierlog.EventSessionBudgetExhausted {
+		t.Fatalf("event = %v, want %q", event["event"], courierlog.EventSessionBudgetExhausted)
+	}
+	if event["run_id"] != "run-1" || event["repo"] != "owner/name" {
+		t.Fatalf("run identity = %v/%v, want the invocation's", event["run_id"], event["repo"])
+	}
+	if event["role"] != "coordinator" {
+		t.Fatalf("role = %v, want coordinator", event["role"])
+	}
+	if _, ok := event["status"]; ok {
+		t.Fatalf("session.budget_exhausted carries status %v; the trip is observability, never status", event["status"])
+	}
+	detail, ok := event["detail"].(map[string]any)
+	if !ok {
+		t.Fatalf("detail = %v, want the verbose counts at info level", event["detail"])
+	}
+	if detail["budget"] != "tool_calls" || detail["count"] != float64(41) || detail["limit"] != float64(40) {
+		t.Fatalf("detail = %v, want budget tool_calls with count 41 and limit 40", detail)
+	}
+}
+
 // TestModelRequestSinkEmitsModelCall pins #738's per-request telemetry
 // contract: one model.call line per model request the native harness sent,
 // carrying the run identity, the role and bound model, the request class and
