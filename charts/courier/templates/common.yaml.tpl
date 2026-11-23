@@ -734,6 +734,13 @@ instead of crash-looping the console. */}}
 {{- if ne (empty $effectiveContributeStatusURL) (empty $effectiveContributeStatusToken) }}
 {{- fail "operatorConsole.contributeStatus.url and operatorConsole.contributeStatus.tokenSecret must be set together (a raw --contribute-status-url or --contribute-status-token-file arg counts)" }}
 {{- end }}
+{{- /* A raw token-file arg completes the flag pair but the chart mounts the
+token content only from tokenSecret, so without it the binary would start
+paired and exit reading a file that was never mounted. Fail the render for
+that half-supplied pair too. */}}
+{{- if and $hasConsoleContributeStatusTokenFile (empty $consoleContributeStatusValues.tokenSecret) }}
+{{- fail "operatorConsole.contributeStatus.tokenSecret must be set with a raw --contribute-status-token-file arg: the chart mounts the contribution status token only from that Secret" }}
+{{- end }}
 {{- if and $consoleContributeStatusValues.tokenSecret (hasKey $consoleContributeStatusValues "tokenSecretKey") (empty $consoleContributeStatusValues.tokenSecretKey) }}
 {{- fail "operatorConsole.contributeStatus.tokenSecretKey must name a Secret entry when tokenSecret is set" }}
 {{- end }}

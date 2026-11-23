@@ -349,7 +349,10 @@ render when you set only one. The token Secret holds the same bearer token
 that `contributeAPI.readKeySecret` names, and its entry key defaults to
 `token`. A raw `--contribute-status-url` or `--contribute-status-token-file`
 arg in `controllers.console.containers.console.args` wins over these values.
-With no URL or token the page says it is not configured and sends no request.
+The Secret is the only thing that puts the token file in the container, so a
+raw `--contribute-status-token-file` arg also needs `tokenSecret` set. Without
+it the chart fails the render. With no URL or token the page says it is not
+configured and sends no request.
 
 ```sh
 helm upgrade --install courier charts/courier \
