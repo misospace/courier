@@ -4,6 +4,8 @@ import (
 	"testing"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/readapi"
 )
@@ -110,5 +112,64 @@ func TestReadAPIAuditFloorMirrorPinsControllerPhases(t *testing.T) {
 		if got, want := readapi.AuditFloorGovernsPhase(phase), auditFloorPhase(phase); got != want {
 			t.Errorf("audit floor phase %q: readapi %v, controller %v", phase, got, want)
 		}
+	}
+}
+
+// TestReadAPIReapMarkerSelectionMatchesController pins the read model's
+// current-phase marker selection against this package: the phase-to-marker
+// mapping the terminal dispatch uses, and the controller.reapMarker parse the
+// window is measured from. A run can transition between terminal phases and
+// keep the earlier outcome's marker, so a projection that picked "the first
+// marker present" would promise an expiry the reaper will not honor; this pin
+// forces the projection to read exactly what reapTerminal reads.
+func TestReadAPIReapMarkerSelectionMatchesController(t *testing.T) {
+	for _, tc := range []struct {
+		phase  courierv1alpha1.Phase
+		marker string
+	}{
+		{courierv1alpha1.PhaseDone, doneAtAnnotation},
+		{courierv1alpha1.PhaseAlreadyDone, alreadyDoneAtAnnotation},
+		{courierv1alpha1.PhaseFailed, failedAtAnnotation},
+		{courierv1alpha1.PhaseNeedsHuman, needsHumanAtAnnotation},
+		{courierv1alpha1.PhaseRunning, ""},
+		{courierv1alpha1.PhaseAwaitingReview, ""},
+	} {
+		if got := readapi.ReapMarkerForPhase(tc.phase); got != tc.marker {
+			t.Errorf("phase %q: readapi names marker %q, controller dispatch reads %q", tc.phase, got, tc.marker)
+		}
+	}
+
+	stale := time.Date(2026, 11, 13, 10, 0, 0, 0, time.UTC)
+	valid := stale.Add(time.Hour).Format(time.RFC3339)
+	for _, tc := range []struct {
+		name        string
+		phase       courierv1alpha1.Phase
+		annotations map[string]string
+	}{
+		{"stale prior-phase marker only", courierv1alpha1.PhaseNeedsHuman, map[string]string{failedAtAnnotation: stale.Format(time.RFC3339)}},
+		{"missing current marker", courierv1alpha1.PhaseDone, map[string]string{alreadyDoneAtAnnotation: valid}},
+		{"whitespace-padded current marker", courierv1alpha1.PhaseDone, map[string]string{doneAtAnnotation: "  " + valid + " "}},
+		{"malformed current marker", courierv1alpha1.PhaseFailed, map[string]string{failedAtAnnotation: "not-a-timestamp"}},
+		{"valid current marker beside a stale one", courierv1alpha1.PhaseDone, map[string]string{failedAtAnnotation: stale.Format(time.RFC3339), doneAtAnnotation: valid}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			run := &courierv1alpha1.CoderRun{ObjectMeta: metav1.ObjectMeta{Annotations: tc.annotations}}
+			run.Status.Phase = tc.phase
+			marker := readapi.ReapMarkerForPhase(tc.phase)
+			if marker == "" {
+				t.Fatalf("fixture phase %q has no controller marker", tc.phase)
+			}
+			controllerAt, controllerOK := reapMarker(run, marker)
+			_, readAPIAt, readAPIOK := readapi.CurrentReapMarker(run)
+			if controllerOK != readAPIOK {
+				t.Fatalf("controller honors marker %v, read model %v", controllerOK, readAPIOK)
+			}
+			if controllerOK && (readAPIAt == nil || !readAPIAt.Time.Equal(controllerAt)) {
+				t.Fatalf("controller measures from %v, read model from %v", controllerAt, readAPIAt)
+			}
+			if !controllerOK && readAPIAt != nil {
+				t.Fatalf("read model stamped %v where the controller starts a fresh window", readAPIAt)
+			}
+		})
 	}
 }

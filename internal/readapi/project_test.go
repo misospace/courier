@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -345,7 +346,8 @@ func TestProjectRunReapAuditFloorAndFutureMarker(t *testing.T) {
 	}
 
 	// A malformed marker starts a fresh window in the controller, so the read
-	// model reports the missing marker and no expiry rather than a zero time.
+	// model reports no stamp and no expiry rather than a zero time, and names
+	// the unreadable marker as the hold.
 	bad := runFixture("bad", "source", "lane", courierv1alpha1.PhaseFailed, testNow.Add(-time.Hour))
 	bad.Annotations = map[string]string{AnnotationFailedAt: "not-a-timestamp"}
 	bad.Status.Conditions = []metav1.Condition{{
@@ -353,7 +355,7 @@ func TestProjectRunReapAuditFloorAndFutureMarker(t *testing.T) {
 		LastTransitionTime: metav1.NewTime(testNow.Add(-time.Hour)),
 	}}
 	badDetail := ProjectRunDetail(&bad, testOptions())
-	if fmt.Sprint(badDetail.Reap.Holds) != "[no retention marker yet]" {
+	if fmt.Sprint(badDetail.Reap.Holds) != "[retention marker unreadable; the reaper will restart its window]" {
 		t.Errorf("malformed-marker holds = %v", badDetail.Reap.Holds)
 	}
 	if badDetail.Reap.RetentionExpiresAt != nil {
@@ -1143,12 +1145,18 @@ func TestReapEligibilityAndMarkers(t *testing.T) {
 		})
 	}
 
-	t.Run("malformed marker projects absent", func(t *testing.T) {
+	t.Run("malformed current marker projects no clock", func(t *testing.T) {
 		run := runFixture("run", "src", "local", courierv1alpha1.PhaseDone, testNow)
 		run.Annotations = map[string]string{AnnotationDoneAt: "not-a-timestamp"}
 		detail := ProjectRunDetail(&run, testOptions())
-		if detail.Reap.MarkerAnnotation != "" || detail.Reap.MarkerAt != nil {
-			t.Errorf("malformed marker projected as %+v, want absent", detail.Reap)
+		if detail.Reap.MarkerAnnotation != AnnotationDoneAt || detail.Reap.MarkerAt != nil {
+			t.Errorf("malformed marker projected as %+v, want the phase's marker name with no stamp", detail.Reap)
+		}
+		if fmt.Sprint(detail.Reap.Holds) != "[retention marker unreadable; the reaper will restart its window]" {
+			t.Errorf("holds = %v, want the unreadable-marker hold", detail.Reap.Holds)
+		}
+		if detail.Reap.RetentionExpiresAt != nil {
+			t.Errorf("expiry = %v, want none", detail.Reap.RetentionExpiresAt)
 		}
 		if !detail.Reap.EligibleByPhase {
 			t.Error("phase eligibility must not depend on the marker")
@@ -1185,6 +1193,117 @@ func TestReapEligibilityAndMarkers(t *testing.T) {
 			phaseIsReapEligible(courierv1alpha1.PhaseHandedOff) ||
 			phaseIsReapEligible(courierv1alpha1.PhaseBlockedExternal) {
 			t.Error("review-parked terminal phases must stay reap-exempt")
+		}
+	})
+}
+
+// TestReapClockReadsOnlyCurrentPhaseMarker pins that the reap projection
+// measures expiry only from the marker the controller's reaper reads for the
+// run's current phase, parsed with the controller's exact semantics
+// (internal/controller/reap.go): a stale marker from an earlier terminal
+// outcome is timeline history, never a clock; a missing current marker means
+// no clock at all; and a value the controller's untrimmed RFC3339 parse
+// refuses — including whitespace padding — starts a fresh window there, so the
+// projection must refuse it too rather than promise an honourable expiry.
+func TestReapClockReadsOnlyCurrentPhaseMarker(t *testing.T) {
+	stale := testNow.Add(-2 * time.Hour).Format(time.RFC3339)
+
+	retentionEntries := func(entries []TimelineView) map[string]TimelineView {
+		out := map[string]TimelineView{}
+		for _, entry := range entries {
+			if entry.Label == TimelineRetentionMarked {
+				out[strings.TrimPrefix(entry.Source, TimelineSourceRetention+"/")] = entry
+			}
+		}
+		return out
+	}
+
+	t.Run("stale prior-phase marker is history, not the clock", func(t *testing.T) {
+		run := runFixture("run", "src", "local", courierv1alpha1.PhaseNeedsHuman, testNow)
+		run.Annotations = map[string]string{AnnotationFailedAt: stale}
+		detail := ProjectRunDetail(&run, testOptions())
+		if detail.Reap.MarkerAnnotation != AnnotationNeedsHumanAt || detail.Reap.MarkerAt != nil {
+			t.Errorf("reap = %+v, want the current phase's marker name with no stamp", detail.Reap)
+		}
+		if detail.Reap.RetentionExpiresAt != nil {
+			t.Errorf("expiry = %v, must not be derived from another phase's marker", detail.Reap.RetentionExpiresAt)
+		}
+		if !slices.Contains(detail.Reap.Holds, "no retention marker yet") {
+			t.Errorf("holds = %v, want the missing-marker hold", detail.Reap.Holds)
+		}
+		if slices.Contains(detail.Reap.Holds, "retention window still open") {
+			t.Errorf("holds = %v, must not claim a window measured from a stale marker", detail.Reap.Holds)
+		}
+		entries, _ := ProjectRunTimeline(&run)
+		if _, ok := retentionEntries(entries)[AnnotationFailedAt]; !ok {
+			t.Error("the recorded failed-at marker must remain a timeline entry")
+		}
+	})
+
+	t.Run("missing current marker with a foreign marker present", func(t *testing.T) {
+		run := runFixture("run", "src", "local", courierv1alpha1.PhaseDone, testNow)
+		run.Annotations = map[string]string{AnnotationAlreadyDoneAt: stale}
+		detail := ProjectRunDetail(&run, testOptions())
+		if detail.Reap.MarkerAnnotation != AnnotationDoneAt || detail.Reap.MarkerAt != nil {
+			t.Errorf("reap = %+v, want done-at named with no stamp", detail.Reap)
+		}
+		if detail.Reap.RetentionExpiresAt != nil {
+			t.Errorf("expiry = %v, want none", detail.Reap.RetentionExpiresAt)
+		}
+		entries, _ := ProjectRunTimeline(&run)
+		if _, ok := retentionEntries(entries)[AnnotationAlreadyDoneAt]; !ok {
+			t.Error("the recorded already-done-at marker must remain a timeline entry")
+		}
+	})
+
+	t.Run("whitespace-padded current marker is refused like the controller", func(t *testing.T) {
+		run := runFixture("run", "src", "local", courierv1alpha1.PhaseDone, testNow)
+		run.Annotations = map[string]string{AnnotationDoneAt: "  " + stale + " "}
+		detail := ProjectRunDetail(&run, testOptions())
+		if detail.Reap.MarkerAt != nil {
+			t.Errorf("marker stamp = %v, want none: the controller parses untrimmed", detail.Reap.MarkerAt)
+		}
+		if detail.Reap.RetentionExpiresAt != nil {
+			t.Errorf("expiry = %v, want none", detail.Reap.RetentionExpiresAt)
+		}
+		if !slices.Contains(detail.Reap.Holds, "retention marker unreadable; the reaper will restart its window") {
+			t.Errorf("holds = %v, want the unreadable-marker hold", detail.Reap.Holds)
+		}
+		entries, _ := ProjectRunTimeline(&run)
+		if _, ok := retentionEntries(entries)[AnnotationDoneAt]; ok {
+			t.Error("a value the controller refuses carries no trustworthy instant; it must not be a timeline entry")
+		}
+	})
+
+	t.Run("current marker wins over a stale one", func(t *testing.T) {
+		current := testNow.Add(-time.Hour).Format(time.RFC3339)
+		run := runFixture("run", "src", "local", courierv1alpha1.PhaseDone, testNow)
+		run.Annotations = map[string]string{
+			AnnotationFailedAt: stale,
+			AnnotationDoneAt:   current,
+		}
+		detail := ProjectRunDetail(&run, testOptions())
+		want := metav1.NewTime(testNow.Add(-time.Hour))
+		if detail.Reap.MarkerAt == nil || !detail.Reap.MarkerAt.Time.Equal(want.Time) {
+			t.Fatalf("marker stamp = %v, want %v", detail.Reap.MarkerAt, want.Time)
+		}
+		if detail.Reap.RetentionExpiresAt == nil ||
+			!detail.Reap.RetentionExpiresAt.Time.Equal(want.Time.Add(DefaultDoneRetention)) {
+			t.Errorf("expiry = %v, want %v", detail.Reap.RetentionExpiresAt, want.Time.Add(DefaultDoneRetention))
+		}
+		entries, _ := ProjectRunTimeline(&run)
+		marked := retentionEntries(entries)
+		if len(marked) != 2 {
+			t.Fatalf("retention entries = %v, want both markers enumerated", marked)
+		}
+		for _, annotation := range []string{AnnotationDoneAt, AnnotationFailedAt} {
+			entry, ok := marked[annotation]
+			if !ok {
+				t.Fatalf("timeline lacks %s", annotation)
+			}
+			if entry.Source != TimelineSourceRetention+"/"+annotation || entry.Authority != TimelineAuthorityOperator {
+				t.Errorf("%s provenance = %s/%s", annotation, entry.Source, entry.Authority)
+			}
 		}
 	})
 }

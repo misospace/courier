@@ -268,12 +268,15 @@ type AdmissionHealth struct {
 	Note         string       `json:"note,omitempty"`
 }
 
-// ReapHealth projects retention state: which reap marker is present (by
-// annotation name), when it was stamped, the retention outcome that marker
-// names, whether the run's phase is one the reaper manages (Done,
-// AlreadyDone, Failed, NeedsHuman; review-parked terminal phases are exempt),
-// the retention window that phase carries and when it expires, and the per-run
-// reasons the run cannot be reaped yet.
+// ReapHealth projects retention state for the run's current phase: the reap
+// marker that phase's reaper reads (by annotation name) and the stamp it parses
+// — nil when that annotation is absent or unreadable, in which case the
+// controller starts a fresh window rather than measuring from any marker — the
+// retention outcome the marker names, whether the phase is one the reaper
+// manages (Done, AlreadyDone, Failed, NeedsHuman; review-parked terminal phases
+// are exempt), the retention window that phase carries and when it expires, and
+// the per-run reasons the run cannot be reaped yet. Markers left from an earlier
+// terminal outcome never drive this clock; they appear in the timeline.
 type ReapHealth struct {
 	MarkerAnnotation string       `json:"markerAnnotation,omitempty"`
 	MarkerAt         *metav1.Time `json:"markerAt,omitempty"`

@@ -235,30 +235,94 @@ func parsePRNumber(pr string) *int {
 	return nil
 }
 
-// reapMarker reports the run's present reap-marker annotation: its name and
-// parsed RFC3339 stamp. The names mirror internal/controller/reap.go exactly;
-// this package only reads them, the controller remains their sole writer. The
-// first present marker in a fixed order (done, already-done, failed,
-// needs-human) wins; the controller holds at most one, and a stable order
-// keeps the projection deterministic.
-func reapMarker(run *courierv1alpha1.CoderRun) (string, *metav1.Time) {
-	markers := []string{
-		AnnotationDoneAt,
-		AnnotationAlreadyDoneAt,
-		AnnotationFailedAt,
-		AnnotationNeedsHumanAt,
+// reapMarkerOrder is the fixed scan order of the retention markers, used so
+// historical enumeration stays deterministic. The names mirror
+// internal/controller/reap.go exactly; this package only reads them, the
+// controller remains their sole writer.
+var reapMarkerOrder = []string{
+	AnnotationDoneAt,
+	AnnotationAlreadyDoneAt,
+	AnnotationFailedAt,
+	AnnotationNeedsHumanAt,
+}
+
+// ReapMarkerForPhase names the retention marker the reaper measures from for
+// this phase, mirroring internal/controller/reap.go and coderun_controller.go's
+// terminal dispatch (exported so internal/controller can pin the mapping): Done reads done-at, AlreadyDone already-done-at, Failed
+// failed-at, NeedsHuman needs-human-at. No other phase is reaped, so it has no
+// marker to read. A run that transitioned between terminal phases can carry an
+// earlier outcome's marker; the reaper reads only the current phase's, so a
+// single scan across markers must not pick the clock up from another phase.
+func ReapMarkerForPhase(phase courierv1alpha1.Phase) string {
+	switch phase {
+	case courierv1alpha1.PhaseDone:
+		return AnnotationDoneAt
+	case courierv1alpha1.PhaseAlreadyDone:
+		return AnnotationAlreadyDoneAt
+	case courierv1alpha1.PhaseFailed:
+		return AnnotationFailedAt
+	case courierv1alpha1.PhaseNeedsHuman:
+		return AnnotationNeedsHumanAt
 	}
-	for _, key := range markers {
+	return ""
+}
+
+// CurrentReapMarker reports the marker the reaper reads for this run's phase and
+// its parsed stamp, using the controller's exact parse semantics (exported so
+// internal/controller can pin the semantics)
+// (internal/controller/reap.go's reapMarker): the named annotation parsed as
+// untrimmed RFC3339. Absent or malformed means false with no stamp — the
+// controller starts a fresh window from either, never an immediate delete. The
+// bool distinguishes "valid clock" from "no clock the reaper will honor" so the
+// reap block never reads another phase's or a hand-edited marker as this run's
+// retention expiry.
+func CurrentReapMarker(run *courierv1alpha1.CoderRun) (string, *metav1.Time, bool) {
+	marker := ReapMarkerForPhase(run.Status.Phase)
+	if marker == "" {
+		return "", nil, false
+	}
+	raw, ok := run.Annotations[marker]
+	if !ok {
+		return marker, nil, false
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return marker, nil, false
+	}
+	at := metav1.NewTime(t)
+	return marker, &at, true
+}
+
+// recordedReapMarkers enumerates every retention marker the run carries with a
+// valid untrimmed RFC3339 stamp, in the fixed scan order, for the historical
+// timeline. Unlike currentReapMarker this spans phases: an earlier outcome's
+// marker is a real recorded fact even when it no longer drives the clock.
+// Malformed values carry no trustworthy instant and are omitted; the reap block
+// names that case instead.
+func recordedReapMarkers(run *courierv1alpha1.CoderRun) []struct {
+	Annotation string
+	At         *metav1.Time
+} {
+	var out []struct {
+		Annotation string
+		At         *metav1.Time
+	}
+	for _, key := range reapMarkerOrder {
 		raw, ok := run.Annotations[key]
-		if !ok || strings.TrimSpace(raw) == "" {
+		if !ok {
 			continue
 		}
-		if t, err := time.Parse(time.RFC3339, strings.TrimSpace(raw)); err == nil {
-			at := metav1.NewTime(t)
-			return key, &at
+		t, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			continue
 		}
+		at := metav1.NewTime(t)
+		out = append(out, struct {
+			Annotation string
+			At         *metav1.Time
+		}{Annotation: key, At: &at})
 	}
-	return "", nil
+	return out
 }
 
 // retentionReasonFor names the retention outcome a marker implies, for ReapHealth.
@@ -320,8 +384,8 @@ func ProjectRunTimeline(run *courierv1alpha1.CoderRun) ([]TimelineView, bool) {
 	if result := run.Status.NativeResult; result != nil {
 		add(&result.At, TimelineResultRecorded, "", TimelineSourceNativeResultAt, TimelineAuthorityCoordinator)
 	}
-	if marker, at := reapMarker(run); marker != "" {
-		add(at, TimelineRetentionMarked, retentionReasonFor(marker), TimelineSourceRetention+"/"+marker, TimelineAuthorityOperator)
+	for _, marker := range recordedReapMarkers(run) {
+		add(marker.At, TimelineRetentionMarked, retentionReasonFor(marker.Annotation), TimelineSourceRetention+"/"+marker.Annotation, TimelineAuthorityOperator)
 	}
 	for i := range run.Status.Conditions {
 		cond := run.Status.Conditions[i]
@@ -356,6 +420,17 @@ const (
 	lifecycleReportPermanentRefusalReason = "PermanentRefusal"
 )
 
+// markerPresent reports whether the run carries the named retention annotation
+// at all, however unreadable, so the reap block can distinguish "no marker yet"
+// from "a marker the controller's parse refuses".
+func markerPresent(run *courierv1alpha1.CoderRun, marker string) bool {
+	if marker == "" {
+		return false
+	}
+	_, ok := run.Annotations[marker]
+	return ok
+}
+
 // reapHolds derives why a run cannot be reaped yet from this object alone,
 // mirroring the controller's gates (internal/controller/reap.go,
 // internal/controller/capacity_recovery.go and coderun_controller.go's terminal
@@ -365,7 +440,7 @@ const (
 // reported only under the phase exemption it belongs to: the controller's
 // Failed, NeedsHuman, Done, and AlreadyDone reap paths never consult workspace
 // evidence, so an eligible-phase run must not inherit one.
-func reapHolds(run *courierv1alpha1.CoderRun, marker string, markerAt *metav1.Time, opts Options) []string {
+func reapHolds(run *courierv1alpha1.CoderRun, marker string, markerAt *metav1.Time, markerValid bool, opts Options) []string {
 	if !phaseIsReapEligible(run.Status.Phase) {
 		holds := []string{"phase is not reap-eligible"}
 		// A capacity-exhaustion run is the case where the phase exemption has a
@@ -379,13 +454,20 @@ func reapHolds(run *courierv1alpha1.CoderRun, marker string, markerAt *metav1.Ti
 		return holds
 	}
 	var holds []string
-	if marker == "" {
+	switch {
+	case !markerValid && markerPresent(run, marker):
+		// The annotation exists but the controller's parse refuses it, which
+		// starts a fresh window rather than measuring from the stamped time.
+		holds = append(holds, "retention marker unreadable; the reaper will restart its window")
+	case !markerValid:
 		holds = append(holds, "no retention marker yet")
-	} else if window, ok := opts.retentionWindowFor(run.Status.Phase); ok && markerAt != nil {
-		// The window is the phase TTL the reaper measures from the durable
-		// marker. Until it passes, the reaper only requeues.
-		if opts.now().Before(markerAt.Time.Add(window)) {
-			holds = append(holds, "retention window still open")
+	default:
+		if window, ok := opts.retentionWindowFor(run.Status.Phase); ok && markerAt != nil {
+			// The window is the phase TTL the reaper measures from the marker it
+			// actually reads. Until it passes, the reaper only requeues.
+			if opts.now().Before(markerAt.Time.Add(window)) {
+				holds = append(holds, "retention window still open")
+			}
 		}
 	}
 	// The report-settlement gate mirrors the controller's terminal dispatch
@@ -600,13 +682,16 @@ func ProjectRunDetail(run *courierv1alpha1.CoderRun, opts Options) RunDetail {
 		detail.Admission.Note = "admittedAt is stamped but phase is Pending: a released or wedged admission"
 	}
 
-	marker, at := reapMarker(run)
+	// The reap clock is the marker the reaper reads for this run's phase, parsed
+	// with the controller's semantics — never the first marker present in any
+	// order, which could measure the current phase from another outcome's stamp.
+	marker, at, markerValid := CurrentReapMarker(run)
 	detail.Reap = ReapHealth{
 		MarkerAnnotation:       marker,
 		MarkerAt:               at,
 		Reason:                 retentionReasonFor(marker),
 		EligibleByPhase:        phaseIsReapEligible(run.Status.Phase),
-		Holds:                  reapHolds(run, marker, at, opts),
+		Holds:                  reapHolds(run, marker, at, markerValid, opts),
 		AuditFloorGovernsPhase: AuditFloorGovernsPhase(run.Status.Phase),
 	}
 	// The phase's retention window and the expiry the reaper reads off the
