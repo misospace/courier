@@ -562,7 +562,10 @@ func (l *CoordinatorLauncher) ensureGitGuardEgressPolicy(ctx context.Context, ru
 			// The update writes the rendered spec whole — the operator never
 			// merges the live policy into the rendered one — so convergence
 			// cannot weaken a provisioned boundary, and the in-place update
-			// leaves no moment in which the pod has no policy at all.
+			// leaves no moment in which the pod has no policy at all. The
+			// envtest suite pins that a policy a real API server stored
+			// compares equal to the rendered spec, so server-side defaulting
+			// never re-fires this update on every launch.
 			updated := actual.DeepCopy()
 			updated.Spec = *desired.Spec.DeepCopy()
 			if err := l.Client.Update(ctx, updated); err != nil {

@@ -1063,12 +1063,12 @@ func main() {
 		reconciler.Secure = secure
 	}
 	if legacyGitGuardEgressCIDRs != "" {
-		if installationTokenMinter == nil {
-			setupLog.Error(fmt.Errorf("--legacy-git-guard-egress-cidrs requires --github-app-id, --github-app-installation-id, --github-app-owner, and --github-app-private-key-secret: the policy only makes sense for pods that carry the git egress guard"), "unable to configure legacy git-guard egress policy")
-			os.Exit(1)
-		}
 		if secureMode {
 			setupLog.Error(fmt.Errorf("--legacy-git-guard-egress-cidrs applies to the legacy coordinator path; secure mode renders its own per-run policies"), "unable to configure legacy git-guard egress policy")
+			os.Exit(1)
+		}
+		if installationTokenMinter == nil {
+			setupLog.Error(fmt.Errorf("--legacy-git-guard-egress-cidrs requires --github-app-id, --github-app-installation-id, --github-app-owner, and --github-app-private-key-secret: the policy only makes sense for pods that carry the git egress guard"), "unable to configure legacy git-guard egress policy")
 			os.Exit(1)
 		}
 		parsed, err := parseGitGuardCIDRFlag(legacyGitGuardEgressCIDRs)
