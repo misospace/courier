@@ -464,6 +464,19 @@ controllers:
         #                               to the chart appVersion release tag
         #   --git-remote-template      forge remote URL template, one %s
         #                               placeholder filled with spec.repo
+        #   --legacy-git-guard-egress-cidrs
+        #                               Optional comma-separated CIDRs a legacy
+        #                               App-mode git-guard pod may reach on TCP
+        #                               443; the pod admits no other 443
+        #                               destination, so the list must cover
+        #                               every 443 host the pod needs: the forge
+        #                               (git and API, e.g. github.com and
+        #                               api.github.com) and the cluster API
+        #                               server the guard reads the run's
+        #                               credentials document through. The
+        #                               operator derives nothing from hostnames
+        #                               — CIDRs are operator-provided. Empty
+        #                               (the default) renders no per-run policy.
         #   --git-credential-secret    Secret with username/token keys for
         #                               git access; empty disables git injection
         #   --git-token-key             Optional key for the git token; defaults to token
@@ -518,6 +531,7 @@ controllers:
           - --leader-elect
           - --git-remote-template=https://github.com/%s.git
           - --git-credential-secret=courier-github
+          # - --legacy-git-guard-egress-cidrs=140.82.112.0/20,185.199.108.0/22,140.82.114.0/20
           # - --github-credential-secret=courier-github-api
           # - --github-token-key=token
           # - --git-author-name=bot

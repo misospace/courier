@@ -7,6 +7,7 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"reflect"
 	"strconv"
@@ -93,6 +94,7 @@ func main() {
 	var enableLeaderElection bool
 	var executorImage string
 	var gitRemoteTemplate string
+	var legacyGitGuardEgressCIDRs string
 	var gitCredentialSecret string
 	var gitTokenKey string
 	var githubCredentialSecret string
@@ -171,6 +173,7 @@ func main() {
 	defaults := executor.DefaultPodConfig()
 	flag.StringVar(&executorImage, "executor-image", defaults.Image, "Coordinator image containing courier-executor, git, and opencode.")
 	flag.StringVar(&gitRemoteTemplate, "git-remote-template", defaults.GitRemoteURL, "Git remote URL template containing one %s repository placeholder.")
+	flag.StringVar(&legacyGitGuardEgressCIDRs, "legacy-git-guard-egress-cidrs", "", "Optional comma-separated CIDRs allowed for legacy App-mode git guard TLS egress; empty disables the per-run policy.")
 	flag.StringVar(&gitCredentialSecret, "git-credential-secret", "courier-github", "Secret containing username and token keys for private git access; empty disables git secret injection.")
 	flag.StringVar(&gitTokenKey, "git-token-key", "", "Optional key in the git credential Secret; empty defaults to token.")
 	flag.StringVar(&githubCredentialSecret, "github-credential-secret", "", "Optional Secret containing the GitHub API token; empty falls back to --git-credential-secret.")
@@ -1059,6 +1062,22 @@ func main() {
 		secure.Sources = sources
 		reconciler.Secure = secure
 	}
+	if legacyGitGuardEgressCIDRs != "" {
+		if installationTokenMinter == nil {
+			setupLog.Error(fmt.Errorf("--legacy-git-guard-egress-cidrs requires --github-app-id, --github-app-installation-id, --github-app-owner, and --github-app-private-key-secret: the policy only makes sense for pods that carry the git egress guard"), "unable to configure legacy git-guard egress policy")
+			os.Exit(1)
+		}
+		if secureMode {
+			setupLog.Error(fmt.Errorf("--legacy-git-guard-egress-cidrs applies to the legacy coordinator path; secure mode renders its own per-run policies"), "unable to configure legacy git-guard egress policy")
+			os.Exit(1)
+		}
+		parsed, err := parseGitGuardCIDRFlag(legacyGitGuardEgressCIDRs)
+		if err != nil {
+			setupLog.Error(err, "unable to configure legacy git-guard egress policy")
+			os.Exit(1)
+		}
+		launcher.GitGuardEgressCIDRs = parsed
+	}
 	if !secureMode && installationTokenMinter != nil {
 		// Legacy App-mode git credentials (#871): the GitHub App minter on a
 		// non-secure deployment switches every launched legacy coordinator to
@@ -1189,6 +1208,24 @@ func validateRebaseModelAssistFlags(enabled bool, gatewayURL string) error {
 		return fmt.Errorf("--rebase-model-assist is enabled but --rebase-model-gateway-url is not set")
 	}
 	return nil
+}
+
+// parseGitGuardCIDRFlag splits the comma-separated
+// --legacy-git-guard-egress-cidrs value into its CIDRs. Every entry is
+// canonicalized through its parsed network, so an operator spelling that
+// carries host bits ("140.82.112.9/20") cannot render a policy spec that
+// disagrees with its canonical form on a relaunch.
+func parseGitGuardCIDRFlag(value string) ([]string, error) {
+	var cidrs []string
+	for _, raw := range strings.Split(value, ",") {
+		entry := strings.TrimSpace(raw)
+		_, parsed, err := net.ParseCIDR(entry)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --legacy-git-guard-egress-cidrs entry %q: %w", raw, err)
+		}
+		cidrs = append(cidrs, parsed.String())
+	}
+	return cidrs, nil
 }
 
 // validateEvidenceFlags reports a clear error when the evidence intake flags

@@ -235,6 +235,11 @@ func ControlNetworkPolicyName(runName string) string { return resourceName(runNa
 
 func BrokerNetworkPolicyName(runName string) string { return resourceName(runName, "-broker") }
 
+// GitGuardNetworkPolicyName names the optional legacy git-guard egress policy.
+func GitGuardNetworkPolicyName(runName string) string {
+	return resourceName(runName, "-git-guard-egress")
+}
+
 // BrokerServiceDNS returns the in-cluster DNS name of the run's broker
 // Service, the only address control ever uses to reach the broker.
 func BrokerServiceDNS(namespace, runName string) string {
