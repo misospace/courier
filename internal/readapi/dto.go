@@ -182,7 +182,12 @@ type RunDetail struct {
 	Conditions        []ConditionView        `json:"conditions,omitempty"`
 	Timeline          []TimelineView         `json:"timeline,omitempty"`
 	TimelineTruncated bool                   `json:"timelineTruncated,omitempty"`
-	TerminalReason    string                 `json:"terminalReason,omitempty"`
+	// TimelineObservedAt is when this projection read the run object. It is
+	// not an event: every Timeline entry's At is a stamp recorded on the run
+	// on or before this instant, so an operator can tell "the event happened
+	// at X" from "the read model observed the run at Y".
+	TimelineObservedAt *metav1.Time `json:"timelineObservedAt,omitempty"`
+	TerminalReason     string       `json:"terminalReason,omitempty"`
 }
 
 // CoordinatorDiagnostic is the redacted projection of Status.TerminalDiagnostic.
@@ -263,14 +268,25 @@ type AdmissionHealth struct {
 
 // ReapHealth projects retention state: which reap marker is present (by
 // annotation name), when it was stamped, the retention outcome that marker
-// names, and whether the run's phase is one the reaper manages (Done,
-// AlreadyDone, Failed, NeedsHuman; review-parked terminal phases are exempt).
+// names, whether the run's phase is one the reaper manages (Done,
+// AlreadyDone, Failed, NeedsHuman; review-parked terminal phases are exempt),
+// the retention window that phase carries and when it expires, and the per-run
+// reasons the run cannot be reaped yet.
 type ReapHealth struct {
 	MarkerAnnotation string       `json:"markerAnnotation,omitempty"`
 	MarkerAt         *metav1.Time `json:"markerAt,omitempty"`
 	Reason           string       `json:"reason,omitempty"`
 	EligibleByPhase  bool         `json:"eligibleByPhase"`
-	Holds            []string     `json:"holds,omitempty"`
+	// RetentionWindowSeconds is the retention window (the phase TTL) the reaper
+	// measures from the marker for this run's phase, taken from the windows the
+	// wiring configures. Nil when the phase carries no window, because then
+	// nothing about retention expires.
+	RetentionWindowSeconds *int64 `json:"retentionWindowSeconds,omitempty"`
+	// RetentionExpiresAt is MarkerAt plus the window: the instant the window
+	// stops holding the run. Nil while no marker has been stamped, because the
+	// window only starts at the first eligible observation.
+	RetentionExpiresAt *metav1.Time `json:"retentionExpiresAt,omitempty"`
+	Holds              []string     `json:"holds,omitempty"`
 }
 
 // WorkspaceSafetyView projects the executor's workspace snapshot state and git
@@ -279,6 +295,10 @@ type WorkspaceSafetyView struct {
 	State  string `json:"state,omitempty"`
 	Branch string `json:"branch,omitempty"`
 	Head   string `json:"head,omitempty"`
+	// RemoteHead is the recorded remote head, projected because the operator's
+	// safety gate reads it: a "pushed" state proves partial work is safely held
+	// remotely only when it matches the run's own head and branch.
+	RemoteHead string `json:"remoteHead,omitempty"`
 }
 
 // ConditionView is one allowlisted status condition. Only the condition types
@@ -292,10 +312,19 @@ type ConditionView struct {
 }
 
 // TimelineView is one bounded entry in the run's status-derived event timeline.
+// Every entry carries its own source of truth: At is the instant the recording
+// authority stamped, Source is the run-object field path that holds it, and
+// Authority names who wrote that field. Entries derive only from structured
+// status the operator or the run's coordinator recorded on this object — never
+// from logs, transcripts, or the read model's own guesses — and
+// RunDetail.TimelineObservedAt states when this projection read them.
 type TimelineView struct {
 	At     *metav1.Time `json:"at,omitempty"`
 	Label  string       `json:"label"`
 	Detail string       `json:"detail,omitempty"`
+	Source string       `json:"source"`
+	// Authority is one of the TimelineAuthority* values.
+	Authority string `json:"authority"`
 }
 
 // RunSummaryList is the paginated GET runs response payload.

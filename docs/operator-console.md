@@ -294,7 +294,13 @@ An operator never reads an outage as an empty namespace.
 Each row links to that run's detail page and shows the run's phase, source,
 lane, age, pull-request number, and restart count. The detail page shows the
 allowlisted per-run status blocks, retention holds, and a bounded timeline of
-recorded timestamps. The console
+recorded timestamps. Each timeline entry names the run-object field that holds
+its timestamp and the authority that writes it — the operator, the run's
+coordinator, or the API server — and the page states separately when the read
+model observed the run, so a recorded event time and an observation time are
+never the same claim. The retention block states the phase's retention window and
+the instant it expires, and it names an unsafe-workspace or capacity-recovery
+hold when the operator is still holding that attempt's partial work. The console
 escapes every value the read API returns, including a name or label that a
 repository or model authored. It shows the pull request as a number, not a
 link, because the run projection carries no repository URL to trust.

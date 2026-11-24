@@ -238,16 +238,19 @@ type RunDetailResult struct {
 		} `json:"container"`
 	}
 	Reap struct {
-		MarkerAnnotation string   `json:"markerAnnotation"`
-		MarkerAt         string   `json:"markerAt"`
-		Reason           string   `json:"reason"`
-		EligibleByPhase  bool     `json:"eligibleByPhase"`
-		Holds            []string `json:"holds"`
+		MarkerAnnotation       string   `json:"markerAnnotation"`
+		MarkerAt               string   `json:"markerAt"`
+		Reason                 string   `json:"reason"`
+		EligibleByPhase        bool     `json:"eligibleByPhase"`
+		RetentionWindowSeconds *int64   `json:"retentionWindowSeconds"`
+		RetentionExpiresAt     string   `json:"retentionExpiresAt"`
+		Holds                  []string `json:"holds"`
 	}
 	WorkspaceSafety *struct {
-		State  string `json:"state"`
-		Branch string `json:"branch"`
-		Head   string `json:"head"`
+		State      string `json:"state"`
+		Branch     string `json:"branch"`
+		Head       string `json:"head"`
+		RemoteHead string `json:"remoteHead"`
 	}
 	NativeResultKind string `json:"nativeResultKind"`
 	NativeResultAt   string `json:"nativeResultAt"`
@@ -260,8 +263,14 @@ type RunDetailResult struct {
 		At     string `json:"at"`
 		Label  string `json:"label"`
 		Detail string `json:"detail"`
+		// Source is the run-object field path that carries the stamp and
+		// Authority who writes it: the entry's source of truth, stated per
+		// entry rather than implied by the page.
+		Source    string `json:"source"`
+		Authority string `json:"authority"`
 	} `json:"timeline"`
-	TimelineTruncated bool `json:"timelineTruncated"`
+	TimelineTruncated  bool   `json:"timelineTruncated"`
+	TimelineObservedAt string `json:"timelineObservedAt"`
 }
 
 // OverviewResult is the decoded GET /v1/overview payload. Freshness,
@@ -468,15 +477,10 @@ func (b *HTTPBackend) Health(ctx context.Context) error {
 	return nil
 }
 
-// projection GETs an allowlisted projection path with the bearer token,
-// checks the envelope kind, and decodes the payload into out. Only rawQuery
-// varies per call; the path is a constant the caller passes and is re-checked
-// against the allowlist before the request leaves, so no call site can steer
-// the console to another path or host. A non-200 reply becomes a
-// *BackendError carrying only the status; the body is discarded up to a small
-// bound and never reaches the browser. A 200 whose body is not valid JSON, or
-// whose kind is not wantKind, is ErrBackendUnexpectedResponse: an outage
-// signature, never an empty result.
+// allowlistedBackendPath reports whether path is a backend path the console may
+// ever GET: a constant allowlist entry, or the run-detail prefix followed by a
+// run name that passes DNS-subdomain validation. Nothing else is ever
+// requestable, so no call site can steer the console to another path or host.
 func allowlistedBackendPath(path string) bool {
 	if backendAllowlist[path] {
 		return true
@@ -487,6 +491,15 @@ func allowlistedBackendPath(path string) bool {
 	return validRunName(strings.TrimPrefix(path, backendRunDetailPrefix))
 }
 
+// projection GETs an allowlisted projection path with the bearer token,
+// checks the envelope kind, and decodes the payload into out. Only rawQuery
+// varies per call; the path is a constant the caller passes and is re-checked
+// against the allowlist before the request leaves, so no call site can steer
+// the console to another path or host. A non-200 reply becomes a
+// *BackendError carrying only the status; the body is discarded up to a small
+// bound and never reaches the browser. A 200 whose body is not valid JSON, or
+// whose kind is not wantKind, is ErrBackendUnexpectedResponse: an outage
+// signature, never an empty result.
 func (b *HTTPBackend) projection(ctx context.Context, path, rawQuery, wantKind string, out any) error {
 	if b.baseURL == "" {
 		return ErrBackendUnavailable
@@ -615,11 +628,9 @@ func (b *HTTPBackend) Runs(ctx context.Context, filter RunsFilter) (*RunListResu
 	}, nil
 }
 
-// Overview GETs the allowlisted namespace summary. The projection carries no
-// query state: the read API serves exactly the namespace it is configured
-// for, so nothing from a browser can shape the request.
 // Run fetches one run detail. Invalid names map to the read API's not-found
-// state locally; syntactically invalid names receive 404 there as well.
+// state locally, without a request; syntactically invalid names receive 404
+// there as well.
 func (b *HTTPBackend) Run(ctx context.Context, name string) (*RunDetailResult, error) {
 	if !validRunName(name) {
 		return nil, &BackendError{Status: http.StatusNotFound}
@@ -637,6 +648,9 @@ func (b *HTTPBackend) Run(ctx context.Context, name string) (*RunDetailResult, e
 	return &detail, nil
 }
 
+// Overview GETs the allowlisted namespace summary. The projection carries no
+// query state: the read API serves exactly the namespace it is configured for,
+// so nothing from a browser can shape the request.
 func (b *HTTPBackend) Overview(ctx context.Context) (*OverviewResult, error) {
 	var page overviewPage
 	if err := b.projection(ctx, backendOverviewPath, "", kindOverview, &page); err != nil {

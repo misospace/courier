@@ -74,14 +74,104 @@ func TestProjectRunTimelineBoundAndOrdering(t *testing.T) {
 		TimelineFinished: true, TimelineCoordinatorExited: true, TimelineResultRecorded: true,
 		TimelineRetentionMarked: true, TimelineCondition: true,
 	}
+	sources := map[string]bool{
+		TimelineSourceCreationTimestamp: true, TimelineSourceAdmittedAt: true,
+		TimelineSourceStartedAt: true, TimelineSourcePhaseEnteredAt: true,
+		TimelineSourceHeartbeatAt: true, TimelineSourceCIParkParkedAt: true,
+		TimelineSourceFinishedAt: true, TimelineSourceDiagnosticAt: true,
+		TimelineSourceNativeResultAt: true,
+	}
+	authorities := map[string]bool{
+		TimelineAuthorityOperator: true, TimelineAuthorityCoordinator: true,
+		TimelineAuthorityAPIServer: true,
+	}
 	for _, entry := range entries {
 		if !vocabulary[entry.Label] {
 			t.Errorf("label %q is outside the pinned vocabulary", entry.Label)
+		}
+		// Sources that name a per-object key (a marker annotation, a condition
+		// type) are prefixed; everything else is a constant field path.
+		if !sources[entry.Source] &&
+			!strings.HasPrefix(entry.Source, TimelineSourceRetention+"/") &&
+			!strings.HasPrefix(entry.Source, TimelineSourceCondition+"[") {
+			t.Errorf("source %q is outside the pinned vocabulary", entry.Source)
+		}
+		if !authorities[entry.Authority] {
+			t.Errorf("authority %q is outside the pinned vocabulary", entry.Authority)
 		}
 	}
 	projected := ProjectRunDetail(&run, testOptions())
 	if len(projected.Timeline) != MaxTimelineEntries || !projected.TimelineTruncated {
 		t.Fatalf("detail timeline = %d/%v", len(projected.Timeline), projected.TimelineTruncated)
+	}
+}
+
+// TestProjectRunTimelineProvenance pins the source-of-truth attribution every
+// entry carries: which run-object field stamped it and who writes that field.
+// An observation time with no attribution is the failure mode #826 exists to
+// close, so the vocabularies are closed here rather than left to the template.
+func TestProjectRunTimelineProvenance(t *testing.T) {
+	run := runFixture("prov", "source", "lane", courierv1alpha1.PhaseRunning, testNow.Add(-3*time.Hour))
+	markerAt := testNow.Add(-time.Hour)
+	run.Annotations = map[string]string{AnnotationFailedAt: markerAt.Format(time.RFC3339)}
+	run.Status.AdmittedAt = ptrTime(metav1.NewTime(testNow.Add(-170 * time.Minute)))
+	run.Status.StartedAt = ptrTime(metav1.NewTime(testNow.Add(-160 * time.Minute)))
+	run.Status.Heartbeat = &courierv1alpha1.Heartbeat{At: metav1.NewTime(testNow.Add(-time.Minute))}
+	run.Status.CIPark = &courierv1alpha1.CIParkState{Head: "abc", ParkedAt: metav1.NewTime(testNow.Add(-2 * time.Minute))}
+	run.Status.NativeResult = &courierv1alpha1.NativeResult{Kind: "succeeded", At: metav1.NewTime(testNow.Add(-90 * time.Second))}
+	run.Status.TerminalDiagnostic = &courierv1alpha1.TerminalDiagnostic{
+		Category: courierv1alpha1.TerminalDiagnosticCategoryExecutorCrash, ObservedAt: ptrTime(metav1.NewTime(testNow.Add(-120 * time.Second))),
+	}
+	run.Status.Conditions = []metav1.Condition{{
+		Type: courierv1alpha1.ConditionLifecycleReported, Status: metav1.ConditionTrue,
+		Reason: "Published", LastTransitionTime: metav1.NewTime(testNow.Add(-45 * time.Second)),
+	}}
+
+	entries, _ := ProjectRunTimeline(&run)
+	want := map[string][2]string{
+		TimelineCreated:           {TimelineSourceCreationTimestamp, TimelineAuthorityAPIServer},
+		TimelineAdmitted:          {TimelineSourceAdmittedAt, TimelineAuthorityOperator},
+		TimelineStarted:           {TimelineSourceStartedAt, TimelineAuthorityOperator},
+		TimelinePhase:             {TimelineSourcePhaseEnteredAt, TimelineAuthorityOperator},
+		TimelineHeartbeat:         {TimelineSourceHeartbeatAt, TimelineAuthorityCoordinator},
+		TimelineCIParked:          {TimelineSourceCIParkParkedAt, TimelineAuthorityOperator},
+		TimelineCoordinatorExited: {TimelineSourceDiagnosticAt, TimelineAuthorityOperator},
+		TimelineResultRecorded:    {TimelineSourceNativeResultAt, TimelineAuthorityCoordinator},
+	}
+	seen := map[string][2]string{}
+	for _, entry := range entries {
+		if entry.Source == "" || entry.Authority == "" {
+			t.Errorf("entry %s has no provenance: %+v", entry.Label, entry)
+		}
+		seen[entry.Label] = [2]string{entry.Source, entry.Authority}
+	}
+	for label, expected := range want {
+		if got := seen[label]; got != expected {
+			t.Errorf("%s provenance = %v, want %v", label, got, expected)
+		}
+	}
+	if got, expected := seen[TimelineRetentionMarked], [2]string{TimelineSourceRetention + "/" + AnnotationFailedAt, TimelineAuthorityOperator}; got != expected {
+		t.Errorf("retention provenance = %v, want %v", got, expected)
+	}
+	if got, expected := seen[TimelineCondition], [2]string{TimelineSourceCondition + "[" + courierv1alpha1.ConditionLifecycleReported + "]", TimelineAuthorityOperator}; got != expected {
+		t.Errorf("condition provenance = %v, want %v", got, expected)
+	}
+
+	// The projection's observation instant rides separately from every recorded
+	// stamp, so "the read model saw this" is never confused with "this happened".
+	detail := ProjectRunDetail(&run, testOptions())
+	if detail.TimelineObservedAt == nil || !detail.TimelineObservedAt.Time.Equal(testNow) {
+		t.Fatalf("timeline observedAt = %v, want %s", detail.TimelineObservedAt, testNow)
+	}
+	for _, entry := range detail.Timeline {
+		if entry.At.Time.After(detail.TimelineObservedAt.Time) {
+			t.Errorf("entry %s at %s is after the projection observed %s", entry.Label, entry.At, detail.TimelineObservedAt)
+		}
+	}
+	// A nil run still states when it was read rather than pretending to know
+	// nothing about its own clock.
+	if empty := ProjectRunDetail(nil, testOptions()); empty.TimelineObservedAt == nil {
+		t.Error("nil run lost the projection observation instant")
 	}
 }
 
@@ -137,7 +227,7 @@ func TestProjectRunReapHolds(t *testing.T) {
 		}
 	}
 	run := settled("Published")
-	run.Annotations = map[string]string{AnnotationDoneAt: testNow.Format(time.RFC3339)}
+	run.Annotations = map[string]string{AnnotationFailedAt: testNow.Add(-200 * time.Hour).Format(time.RFC3339)}
 	run.Status.CISettlement = &courierv1alpha1.CISettlement{}
 	run.Status.CIParkRelease = &courierv1alpha1.CIParkRelease{}
 	run.Status.RetryRequest = &courierv1alpha1.RetryRequest{State: courierv1alpha1.RetryRequestStateRequested}
@@ -147,6 +237,141 @@ func TestProjectRunReapHolds(t *testing.T) {
 	base.Status.Phase = courierv1alpha1.PhaseRunning
 	if got := ProjectRunDetail(&base, testOptions()).Reap.Holds; fmt.Sprint(got) != "[phase is not reap-eligible]" {
 		t.Fatalf("noneligible holds = %v", got)
+	}
+}
+
+func TestProjectRunReapRetentionWindow(t *testing.T) {
+	// A marker stamped inside the window is the phase TTL holding the run: the
+	// page must say how long, and until when, not only that it is held.
+	run := runFixture("window", "source", "lane", courierv1alpha1.PhaseDone, testNow.Add(-time.Hour))
+	markerAt := testNow.Add(-time.Minute)
+	run.Annotations = map[string]string{AnnotationDoneAt: markerAt.Format(time.RFC3339)}
+	detail := ProjectRunDetail(&run, testOptions())
+	if fmt.Sprint(detail.Reap.Holds) != "[retention window still open]" {
+		t.Fatalf("open-window holds = %v", detail.Reap.Holds)
+	}
+	if detail.Reap.RetentionWindowSeconds == nil || *detail.Reap.RetentionWindowSeconds != int64(DefaultDoneRetention/time.Second) {
+		t.Errorf("retention window = %v, want %ds", detail.Reap.RetentionWindowSeconds, int64(DefaultDoneRetention/time.Second))
+	}
+	if detail.Reap.RetentionExpiresAt == nil || !detail.Reap.RetentionExpiresAt.Time.Equal(markerAt.Add(DefaultDoneRetention)) {
+		t.Errorf("retention expiry = %v, want %s", detail.Reap.RetentionExpiresAt, markerAt.Add(DefaultDoneRetention))
+	}
+
+	// Past the window the TTL no longer holds the run, and the stated expiry is
+	// the instant the reaper stopped waiting for.
+	expired := run.DeepCopy()
+	expired.Annotations = map[string]string{AnnotationDoneAt: testNow.Add(-time.Hour).Format(time.RFC3339)}
+	expiredDetail := ProjectRunDetail(expired, testOptions())
+	if len(expiredDetail.Reap.Holds) != 0 {
+		t.Errorf("expired-window holds = %v, want none", expiredDetail.Reap.Holds)
+	}
+	if expiredDetail.Reap.RetentionExpiresAt == nil || !expiredDetail.Reap.RetentionExpiresAt.Time.Before(testNow) {
+		t.Errorf("expired-window expiry = %v, want before the observation instant", expiredDetail.Reap.RetentionExpiresAt)
+	}
+
+	// A configured window is what the projection states, so a deployment that
+	// overrides the flag never reads an expiry the reaper will not honor.
+	custom := ProjectRunDetail(&run, Options{Now: testNow, DoneRetention: time.Hour})
+	if fmt.Sprint(custom.Reap.Holds) != "[retention window still open]" {
+		t.Fatalf("custom-window holds = %v", custom.Reap.Holds)
+	}
+	if custom.Reap.RetentionExpiresAt == nil || !custom.Reap.RetentionExpiresAt.Time.Equal(markerAt.Add(time.Hour)) {
+		t.Errorf("custom-window expiry = %v, want %s", custom.Reap.RetentionExpiresAt, markerAt.Add(time.Hour))
+	}
+
+	// No marker means the window has not started: the expiry is unknown rather
+	// than immediate, and the missing marker is itself the stated hold.
+	unmarked := runFixture("unmarked", "source", "lane", courierv1alpha1.PhaseFailed, testNow.Add(-time.Hour))
+	unmarkedDetail := ProjectRunDetail(&unmarked, testOptions())
+	if unmarkedDetail.Reap.RetentionExpiresAt != nil {
+		t.Errorf("unmarked expiry = %v, want nil", unmarkedDetail.Reap.RetentionExpiresAt)
+	}
+	if unmarkedDetail.Reap.RetentionWindowSeconds == nil || *unmarkedDetail.Reap.RetentionWindowSeconds != int64(DefaultFailedRetention/time.Second) {
+		t.Errorf("unmarked window = %v, want %ds", unmarkedDetail.Reap.RetentionWindowSeconds, int64(DefaultFailedRetention/time.Second))
+	}
+
+	// A review-parked run has no window at all: nothing about retention expires.
+	parked := runFixture("parked", "source", "lane", courierv1alpha1.PhaseAwaitingReview, testNow.Add(-time.Hour))
+	parkedDetail := ProjectRunDetail(&parked, testOptions())
+	if parkedDetail.Reap.RetentionWindowSeconds != nil || parkedDetail.Reap.RetentionExpiresAt != nil {
+		t.Errorf("parked window/expiry = %v/%v, want nil/nil",
+			parkedDetail.Reap.RetentionWindowSeconds, parkedDetail.Reap.RetentionExpiresAt)
+	}
+}
+
+func TestProjectRunReapCapacityOwnership(t *testing.T) {
+	// A capacity-exhaustion run is retained because the operator still owns the
+	// attempt's partial work; the phase exemption alone is not the answer the
+	// operator needs.
+	exhaustion := func() *courierv1alpha1.CoderRun {
+		run := runFixture("exhaustion", "source", "lane", courierv1alpha1.PhaseBlockedExternal, testNow.Add(-time.Hour))
+		run.Status.TerminalDiagnostic = &courierv1alpha1.TerminalDiagnostic{
+			Category: courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion,
+		}
+		return &run
+	}
+	const unsafe = "unsafe workspace evidence holds ownership of partial work"
+
+	if got := fmt.Sprint(ProjectRunDetail(exhaustion(), testOptions()).Reap.Holds); got != "[phase is not reap-eligible capacity recovery has not settled this attempt]" {
+		t.Fatalf("unsettled holds = %s", got)
+	}
+	// Evidence the controller's own safety gate would refuse is the unsafe hold.
+	dirty := exhaustion()
+	dirty.Status.WorkspaceSafety = &courierv1alpha1.WorkspaceSafetyEvidence{State: "dirty", Branch: "b", Head: "h"}
+	if got := fmt.Sprint(ProjectRunDetail(dirty, testOptions()).Reap.Holds); got != "[phase is not reap-eligible "+unsafe+"]" {
+		t.Fatalf("dirty-evidence holds = %s", got)
+	}
+	// "pushed" proves safety only when the recorded remote head and branch match
+	// the run's own; a mismatch keeps the ownership hold.
+	mismatched := exhaustion()
+	mismatched.Status.Branch = "main"
+	mismatched.Status.WorkspaceSafety = &courierv1alpha1.WorkspaceSafetyEvidence{State: "pushed", Branch: "other", Head: "h", RemoteHead: "h"}
+	if got := fmt.Sprint(ProjectRunDetail(mismatched, testOptions()).Reap.Holds); got != "[phase is not reap-eligible "+unsafe+"]" {
+		t.Fatalf("mismatched-push holds = %s", got)
+	}
+	safe := exhaustion()
+	safe.Status.Branch = "main"
+	safe.Status.WorkspaceSafety = &courierv1alpha1.WorkspaceSafetyEvidence{State: "pushed", Branch: "main", Head: "h", RemoteHead: "h"}
+	if got := fmt.Sprint(ProjectRunDetail(safe, testOptions()).Reap.Holds); got != "[phase is not reap-eligible capacity recovery has not settled this attempt]" {
+		t.Fatalf("safe-evidence holds = %s", got)
+	}
+	// The controller's recorded reason wins over the evidence: UnsafeWork is the
+	// stopping reason for the same condition, and Settled or Stale release the
+	// ownership hold, leaving only the phase exemption.
+	recorded := func(status metav1.ConditionStatus, reason string) string {
+		run := exhaustion()
+		run.Status.WorkspaceSafety = &courierv1alpha1.WorkspaceSafetyEvidence{State: "empty"}
+		run.Status.Conditions = []metav1.Condition{{Type: courierv1alpha1.ConditionCapacityRecovery, Status: status, Reason: reason}}
+		return fmt.Sprint(ProjectRunDetail(run, testOptions()).Reap.Holds)
+	}
+	if got := recorded(metav1.ConditionFalse, "UnsafeWork"); got != "[phase is not reap-eligible "+unsafe+"]" {
+		t.Errorf("UnsafeWork holds = %s", got)
+	}
+	if got := recorded(metav1.ConditionFalse, "Unsupported"); got != "[phase is not reap-eligible capacity recovery is unsupported: an operator must settle this attempt]" {
+		t.Errorf("Unsupported holds = %s", got)
+	}
+	if got := recorded(metav1.ConditionTrue, "Settled"); got != "[phase is not reap-eligible]" {
+		t.Errorf("Settled holds = %s", got)
+	}
+	if got := recorded(metav1.ConditionFalse, "Stale"); got != "[phase is not reap-eligible]" {
+		t.Errorf("Stale holds = %s", got)
+	}
+	if got := recorded(metav1.ConditionFalse, "Retryable"); got != "[phase is not reap-eligible capacity recovery has not settled this attempt]" {
+		t.Errorf("Retryable holds = %s", got)
+	}
+	// A BlockedExternal run outside the capacity-recovery path keeps only the
+	// phase exemption: the ownership story is not borrowed from another path.
+	plain := runFixture("blocked", "source", "lane", courierv1alpha1.PhaseBlockedExternal, testNow.Add(-time.Hour))
+	if got := fmt.Sprint(ProjectRunDetail(&plain, testOptions()).Reap.Holds); got != "[phase is not reap-eligible]" {
+		t.Errorf("nonexhaustion holds = %s", got)
+	}
+	// And an exhaustion run's workspace hold never replaces an eligible phase's
+	// own reasons.
+	done := runFixture("done", "source", "lane", courierv1alpha1.PhaseDone, testNow.Add(-200*time.Hour))
+	done.Status.WorkspaceSafety = &courierv1alpha1.WorkspaceSafetyEvidence{State: "dirty"}
+	done.Annotations = map[string]string{AnnotationDoneAt: testNow.Add(-200 * time.Hour).Format(time.RFC3339)}
+	if got := fmt.Sprint(ProjectRunDetail(&done, testOptions()).Reap.Holds); got != "[]" {
+		t.Errorf("done-with-evidence holds = %s, want none", got)
 	}
 }
 

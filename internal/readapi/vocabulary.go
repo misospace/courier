@@ -152,3 +152,71 @@ func phaseIsTerminal(phase courierv1alpha1.Phase) bool {
 	}
 	return false
 }
+
+// capacityExhaustionCategories mirrors isCapacityExhaustionRun in
+// internal/controller/capacity_recovery.go: the terminal diagnostic categories
+// that put a BlockedExternal run in the operator's capacity-recovery path.
+var capacityExhaustionCategories = map[courierv1alpha1.TerminalDiagnosticCategory]bool{
+	courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion:  true,
+	courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable: true,
+	courierv1alpha1.TerminalDiagnosticCategoryForgeUnavailable:    true,
+	courierv1alpha1.TerminalDiagnosticCategoryModelTransportError: true,
+}
+
+// phaseIsCapacityExhaustion mirrors the controller's capacity-exhaustion gate:
+// a BlockedExternal run whose terminal diagnostic names a failure the operator
+// must settle before it releases ownership of the attempt's partial work.
+func phaseIsCapacityExhaustion(run *courierv1alpha1.CoderRun) bool {
+	return run != nil && run.Status.Phase == courierv1alpha1.PhaseBlockedExternal &&
+		run.Status.TerminalDiagnostic != nil &&
+		capacityExhaustionCategories[run.Status.TerminalDiagnostic.Category]
+}
+
+// CapacityRecovery condition reasons, mirrored from
+// internal/controller/capacity_recovery.go so the read model can name the
+// operator's own settlement states. The controller remains the sole writer.
+const (
+	capacityRecoverySettled     = "Settled"
+	capacityRecoveryUnsupported = "Unsupported"
+	capacityRecoveryStale       = "Stale"
+	capacityRecoveryUnsafeWork  = "UnsafeWork"
+)
+
+// Timeline source-of-truth vocabularies. Source names the run-object field
+// path that carries an entry's timestamp; Authority names who writes that
+// field. Together they attribute every observation time the page shows, so an
+// operator sees which recorded authority a stamp came from rather than being
+// asked to trust the read model. Entries derive only from structured status on
+// this one object: no log, transcript, or cluster-wide query is ever replayed.
+const (
+	TimelineSourceCreationTimestamp = "metadata.creationTimestamp"
+	TimelineSourceAdmittedAt        = "status.admittedAt"
+	TimelineSourceStartedAt         = "status.startedAt"
+	TimelineSourcePhaseEnteredAt    = "status.phaseEnteredAt"
+	TimelineSourceHeartbeatAt       = "status.heartbeat.at"
+	TimelineSourceCIParkParkedAt    = "status.ciPark.parkedAt"
+	TimelineSourceFinishedAt        = "status.finishedAt"
+	TimelineSourceDiagnosticAt      = "status.terminalDiagnostic.observedAt"
+	TimelineSourceNativeResultAt    = "status.nativeResult.at"
+	// TimelineSourceRetention prefixes the reap-marker annotation that stamped
+	// the entry, e.g. metadata.annotations/courier.misospace.dev/failed-at.
+	TimelineSourceRetention = "metadata.annotations"
+	// TimelineSourceCondition prefixes the allowlisted condition type that
+	// stamped the entry, e.g. status.conditions[LifecycleReported].
+	TimelineSourceCondition = "status.conditions"
+)
+
+// Timeline authorities: who writes the field a timeline entry reads.
+const (
+	// TimelineAuthorityOperator is the Courier controller: admission stamps,
+	// phase transitions, CI park, terminal dispatch, retention markers, and
+	// status conditions all land through its reconciles.
+	TimelineAuthorityOperator = "operator"
+	// TimelineAuthorityCoordinator is the run's own coordinator process, whose
+	// heartbeat and terminal result reach the object only through the
+	// operator's validated status path.
+	TimelineAuthorityCoordinator = "coordinator"
+	// TimelineAuthorityAPIServer is the API server's bookkeeping for the object
+	// itself, namely its creation timestamp.
+	TimelineAuthorityAPIServer = "apiserver"
+)

@@ -3091,13 +3091,20 @@ admission, checkpoint, publication, CI park, lifecycle report, coordinator
 diagnostic, reap, workspace safety), and a bounded event timeline derived
 only from recorded status timestamps (at most the newest
 `readapi.MaxTimelineEntries` entries, omission explicit, truncation stated).
-A 404 is a not-found state with a link back, never an error box, and the
-reap block lists the single-object hold reasons a terminal run cannot be
-reaped yet, mirroring the controller's gates; the per-repository audit
-floor compares other runs and is not derivable per run, so the page says
-so rather than implying an empty hold list. The console still probes the
-read API's `/healthz` path for the page backend note when `--backend-url`
-is configured. The console additionally carries a bounded
+Every entry carries its own source of truth — the run-object field path that
+holds the stamp and which authority writes it — and the payload states the
+projection's own observation instant separately, so "the event happened at X" is
+never read as "the read model observed the run at Y". A 404 is a not-found state
+with a link back, never an error box, and the reap block lists the single-object
+hold reasons a terminal run cannot be reaped yet, mirroring the controller's
+gates: phase eligibility, the retention marker, the phase retention window and
+the expiry it implies, report settlement, outstanding CI settlement or park
+release, an outstanding retry, and the capacity-recovery ownership hold whose
+unsafe-workspace case the controller itself records. The per-repository audit
+floor compares other runs and is not derivable per run, so the page says so
+rather than implying an empty hold list. The console still probes the read API's
+`/healthz` path for the page backend note when `--backend-url` is configured.
+The console additionally carries a bounded
 contribution form, a mutating, credentialed
 outbound-HTTP surface that submits server-side through the operator's
 contribution admission API under a file-mounted bearer token. The form is

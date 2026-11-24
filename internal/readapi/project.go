@@ -39,11 +39,26 @@ const (
 
 // Options carries the pure-projection inputs that are not cluster objects.
 // Now is the observation instant (injected, never read from the wall clock);
-// StaleWindow bounds Fresh/Stale judgments.
+// StaleWindow bounds Fresh/Stale judgments. The retention windows are the
+// phase TTLs the reaper applies: the wiring passes the controller's own
+// configured values, and a zero falls back to the defaults mirrored from
+// internal/controller/reap.go, which are those flags' own defaults.
 type Options struct {
-	Now         time.Time
-	StaleWindow time.Duration
+	Now                 time.Time
+	StaleWindow         time.Duration
+	DoneRetention       time.Duration
+	FailedRetention     time.Duration
+	NeedsHumanRetention time.Duration
 }
+
+// Retention defaults mirrored from internal/controller/reap.go, which remains
+// the authority; the wiring supplies the configured values so a deployment that
+// overrides a flag never sees a projected expiry it cannot act on.
+const (
+	DefaultDoneRetention       = 5 * time.Minute
+	DefaultFailedRetention     = 168 * time.Hour
+	DefaultNeedsHumanRetention = 168 * time.Hour
+)
 
 func (o Options) now() time.Time {
 	if o.Now.IsZero() {
@@ -57,6 +72,28 @@ func (o Options) window() time.Duration {
 		return o.StaleWindow
 	}
 	return DefaultStaleWindow
+}
+
+// retentionWindowFor returns the retention window the reaper measures from the
+// marker for this phase, and whether the phase has one at all. Review-parked
+// terminal phases are exempt from reaping, so they have no window to state.
+func (o Options) retentionWindowFor(phase courierv1alpha1.Phase) (time.Duration, bool) {
+	switch phase {
+	case courierv1alpha1.PhaseDone, courierv1alpha1.PhaseAlreadyDone:
+		return positiveOrDefault(o.DoneRetention, DefaultDoneRetention), true
+	case courierv1alpha1.PhaseFailed:
+		return positiveOrDefault(o.FailedRetention, DefaultFailedRetention), true
+	case courierv1alpha1.PhaseNeedsHuman:
+		return positiveOrDefault(o.NeedsHumanRetention, DefaultNeedsHumanRetention), true
+	}
+	return 0, false
+}
+
+func positiveOrDefault(configured, fallback time.Duration) time.Duration {
+	if configured > 0 {
+		return configured
+	}
+	return fallback
 }
 
 // boundTruncate bounds s to max runes (DefaultTextBound when max <= 0),
@@ -240,48 +277,57 @@ func retentionReasonFor(marker string) string {
 
 // ProjectRunTimeline derives a bounded, deterministic timeline from recorded
 // status timestamps only. The observation instant plays no part: every entry
-// is a stamped fact the operator recorded, never a freshness judgment.
+// is a stamped fact the operator or the run's coordinator recorded on this
+// object, and each entry names where it was recorded (Source) and who records
+// it (Authority). RunDetail.TimelineObservedAt carries the read side
+// separately, so the two are never confused.
 func ProjectRunTimeline(run *courierv1alpha1.CoderRun) ([]TimelineView, bool) {
 	if run == nil {
 		return nil, false
 	}
 	var entries []TimelineView
-	add := func(at *metav1.Time, label, detail string) {
+	add := func(at *metav1.Time, label, detail, source, authority string) {
 		if at == nil || at.Time.IsZero() {
 			return
 		}
-		entry := TimelineView{At: at.DeepCopy(), Label: label}
+		entry := TimelineView{
+			At:        at.DeepCopy(),
+			Label:     label,
+			Source:    source,
+			Authority: authority,
+		}
 		if detail != "" {
 			entry.Detail = bound(detail)
 		}
 		entries = append(entries, entry)
 	}
-	add(&run.CreationTimestamp, TimelineCreated, "")
-	add(run.Status.AdmittedAt, TimelineAdmitted, "")
-	add(run.Status.StartedAt, TimelineStarted, "")
+	add(&run.CreationTimestamp, TimelineCreated, "", TimelineSourceCreationTimestamp, TimelineAuthorityAPIServer)
+	add(run.Status.AdmittedAt, TimelineAdmitted, "", TimelineSourceAdmittedAt, TimelineAuthorityOperator)
+	add(run.Status.StartedAt, TimelineStarted, "", TimelineSourceStartedAt, TimelineAuthorityOperator)
 	if run.Status.Phase != "" {
-		add(run.Status.PhaseEnteredAt, TimelinePhase, string(run.Status.Phase))
+		add(run.Status.PhaseEnteredAt, TimelinePhase, string(run.Status.Phase), TimelineSourcePhaseEnteredAt, TimelineAuthorityOperator)
 	}
 	if hb := run.Status.Heartbeat; hb != nil {
-		add(&hb.At, TimelineHeartbeat, "")
+		add(&hb.At, TimelineHeartbeat, "", TimelineSourceHeartbeatAt, TimelineAuthorityCoordinator)
 	}
 	if park := run.Status.CIPark; park != nil {
-		add(&park.ParkedAt, TimelineCIParked, "")
+		add(&park.ParkedAt, TimelineCIParked, "", TimelineSourceCIParkParkedAt, TimelineAuthorityOperator)
 	}
-	add(run.Status.FinishedAt, TimelineFinished, "")
+	add(run.Status.FinishedAt, TimelineFinished, "", TimelineSourceFinishedAt, TimelineAuthorityOperator)
 	if diag := run.Status.TerminalDiagnostic; diag != nil {
-		add(diag.ObservedAt, TimelineCoordinatorExited, "")
+		add(diag.ObservedAt, TimelineCoordinatorExited, "", TimelineSourceDiagnosticAt, TimelineAuthorityOperator)
 	}
 	if result := run.Status.NativeResult; result != nil {
-		add(&result.At, TimelineResultRecorded, "")
+		add(&result.At, TimelineResultRecorded, "", TimelineSourceNativeResultAt, TimelineAuthorityCoordinator)
 	}
 	if marker, at := reapMarker(run); marker != "" {
-		add(at, TimelineRetentionMarked, retentionReasonFor(marker))
+		add(at, TimelineRetentionMarked, retentionReasonFor(marker), TimelineSourceRetention+"/"+marker, TimelineAuthorityOperator)
 	}
 	for i := range run.Status.Conditions {
 		cond := run.Status.Conditions[i]
 		if conditionAllowlist[cond.Type] {
-			add(&cond.LastTransitionTime, TimelineCondition, string(cond.Type)+"="+string(cond.Status))
+			add(&cond.LastTransitionTime, TimelineCondition, string(cond.Type)+"="+string(cond.Status),
+				TimelineSourceCondition+"["+cond.Type+"]", TimelineAuthorityOperator)
 		}
 	}
 	sort.Slice(entries, func(i, j int) bool {
@@ -311,17 +357,30 @@ const (
 )
 
 // reapHolds derives why a run cannot be reaped yet from this object alone,
-// mirroring the controller's gates (internal/controller/reap.go and
-// coderun_controller.go's terminal dispatch). Only single-object facts are
-// used: the per-repository audit floor compares other runs and is never
-// derivable here.
-func reapHolds(run *courierv1alpha1.CoderRun, marker string) []string {
+// mirroring the controller's gates (internal/controller/reap.go,
+// internal/controller/capacity_recovery.go and coderun_controller.go's terminal
+// dispatch). Only single-object facts are used: the per-repository audit floor
+// compares other runs and is never derivable here.
+func reapHolds(run *courierv1alpha1.CoderRun, marker string, markerAt *metav1.Time, opts Options) []string {
 	if !phaseIsReapEligible(run.Status.Phase) {
-		return []string{"phase is not reap-eligible"}
+		holds := []string{"phase is not reap-eligible"}
+		// A capacity-exhaustion run is the case where the phase exemption has a
+		// reason behind it the operator needs: the object is retained because
+		// the operator still owns the attempt's partial work.
+		if hold := capacityOwnershipHold(run); hold != "" {
+			holds = append(holds, hold)
+		}
+		return holds
 	}
 	var holds []string
 	if marker == "" {
 		holds = append(holds, "no retention marker yet")
+	} else if window, ok := opts.retentionWindowFor(run.Status.Phase); ok && markerAt != nil {
+		// The window is the phase TTL the reaper measures from the durable
+		// marker. Until it passes, the reaper only requeues.
+		if opts.now().Before(markerAt.Time.Add(window)) {
+			holds = append(holds, "retention window still open")
+		}
 	}
 	// The report-settlement gate mirrors the controller's terminal dispatch
 	// (internal/controller/coderun_controller.go): Failed, NeedsHuman, and
@@ -350,7 +409,71 @@ func reapHolds(run *courierv1alpha1.CoderRun, marker string) []string {
 	if req := run.Status.RetryRequest; req != nil && req.State == courierv1alpha1.RetryRequestStateRequested {
 		holds = append(holds, "retry request outstanding")
 	}
+	if hold := capacityOwnershipHold(run); hold != "" {
+		holds = append(holds, hold)
+	}
 	return holds
+}
+
+// capacityOwnershipHold mirrors the operator's capacity-recovery ownership gate
+// (internal/controller/capacity_recovery.go). A capacity-exhaustion run sits in
+// BlockedExternal, which the reaper never collects, and what keeps it there is
+// the fenced settlement: the operator refuses to release ownership while the
+// attempt's partial work is not proven safely held remotely. UnsafeWork is the
+// controller's own stopping reason for exactly that, and workspace evidence the
+// controller's gate would not accept says the same thing here. A settlement that
+// has merely not run yet is reported as unsettled rather than as unsafe, and
+// Settled and Stale release the hold — the attempt settled, or a newer attempt
+// owns the work — leaving only the phase exemption and the audit floor. The
+// reason vocabulary mirrors the controller's; this package only reads it.
+func capacityOwnershipHold(run *courierv1alpha1.CoderRun) string {
+	if !phaseIsCapacityExhaustion(run) {
+		return ""
+	}
+	const unsafe = "unsafe workspace evidence holds ownership of partial work"
+	for i := range run.Status.Conditions {
+		cond := run.Status.Conditions[i]
+		if cond.Type != courierv1alpha1.ConditionCapacityRecovery {
+			continue
+		}
+		switch cond.Reason {
+		case capacityRecoveryUnsafeWork:
+			return unsafe
+		case capacityRecoveryUnsupported:
+			return "capacity recovery is unsupported: an operator must settle this attempt"
+		case capacityRecoveryStale:
+			return ""
+		case capacityRecoverySettled:
+			if cond.Status == metav1.ConditionTrue {
+				return ""
+			}
+		}
+		break
+	}
+	if run.Status.WorkspaceSafety != nil && !capacityWorkspaceProvenSafe(run) {
+		return unsafe
+	}
+	return "capacity recovery has not settled this attempt"
+}
+
+// capacityWorkspaceProvenSafe mirrors safeCapacityWorkspace in
+// internal/controller/capacity_recovery.go exactly: "empty" proves nothing was
+// left behind, "pushed" only proves safety when the recorded remote head and
+// branch match the run's own, and anything else — including a state this
+// vocabulary does not yet know — fails closed.
+func capacityWorkspaceProvenSafe(run *courierv1alpha1.CoderRun) bool {
+	evidence := run.Status.WorkspaceSafety
+	if evidence == nil {
+		return false
+	}
+	switch evidence.State {
+	case "empty":
+		return true
+	case "pushed":
+		return evidence.RemoteHead != "" && evidence.Head != "" && evidence.RemoteHead == evidence.Head &&
+			evidence.Branch != "" && evidence.Branch == run.Status.Branch && run.Status.Branch != ""
+	}
+	return false
 }
 
 // ProjectRunSummary projects one run's list-row view.
@@ -389,6 +512,12 @@ func ProjectRunDetail(run *courierv1alpha1.CoderRun, opts Options) RunDetail {
 		RunSummary: ProjectRunSummary(run, opts),
 	}
 	detail.Timeline, detail.TimelineTruncated = ProjectRunTimeline(run)
+	// The projection's own observation instant, kept apart from every entry's
+	// recorded stamp: it says when the read model read this object, not when
+	// anything happened.
+	if observed := metav1.NewTime(opts.now()); !observed.Time.IsZero() {
+		detail.TimelineObservedAt = &observed
+	}
 	if run == nil {
 		return detail
 	}
@@ -473,14 +602,25 @@ func ProjectRunDetail(run *courierv1alpha1.CoderRun, opts Options) RunDetail {
 		MarkerAt:         at,
 		Reason:           retentionReasonFor(marker),
 		EligibleByPhase:  phaseIsReapEligible(run.Status.Phase),
-		Holds:            reapHolds(run, marker),
+		Holds:            reapHolds(run, marker, at, opts),
+	}
+	// The phase's retention window and the expiry the reaper reads off the
+	// durable marker: the page can then say how long a retained run is still
+	// held for, not only that it is held.
+	if window, ok := opts.retentionWindowFor(run.Status.Phase); ok {
+		detail.Reap.RetentionWindowSeconds = secondsOf(window)
+		if at != nil && !at.Time.IsZero() {
+			expires := metav1.NewTime(at.Time.Add(window))
+			detail.Reap.RetentionExpiresAt = &expires
+		}
 	}
 
 	if safety := run.Status.WorkspaceSafety; safety != nil {
 		detail.WorkspaceSafety = &WorkspaceSafetyView{
-			State:  bound(safety.State),
-			Branch: bound(safety.Branch),
-			Head:   bound(safety.Head),
+			State:      bound(safety.State),
+			Branch:     bound(safety.Branch),
+			Head:       bound(safety.Head),
+			RemoteHead: bound(safety.RemoteHead),
 		}
 	}
 

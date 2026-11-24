@@ -375,6 +375,17 @@ func TestServerRunDetailNotFoundAndEnvelope(t *testing.T) {
 	if len(detail.Timeline) == 0 || detail.Timeline[0].Label != TimelineCreated {
 		t.Errorf("detail timeline = %+v, want created entry", detail.Timeline)
 	}
+	// The wire shape carries the attribution the page renders: every entry names
+	// where it was recorded, and the payload states when this projection read
+	// the object.
+	for _, entry := range detail.Timeline {
+		if entry.Source == "" || entry.Authority == "" {
+			t.Errorf("served entry %s has no provenance: %+v", entry.Label, entry)
+		}
+	}
+	if detail.TimelineObservedAt == nil {
+		t.Error("served detail has no projection observation instant")
+	}
 	withoutTimes := courierv1alpha1.CoderRun{ObjectMeta: metav1.ObjectMeta{Name: "no-times", Namespace: "courier"}}
 	_, emptyHandler := serverFixture(t, &withoutTimes)
 	emptyEnvelope, _ := envelopeOf(t, get(emptyHandler, "/v1/runs/no-times"))
@@ -384,6 +395,44 @@ func TestServerRunDetailNotFoundAndEnvelope(t *testing.T) {
 	}
 	if len(emptyDetail.Timeline) != 0 || emptyDetail.TimelineTruncated {
 		t.Errorf("empty timeline = %+v truncated=%v", emptyDetail.Timeline, emptyDetail.TimelineTruncated)
+	}
+}
+
+// TestServerRunDetailRetentionWindowServed pins that the retention truth the
+// operator acts on reaches the wire: the phase window, the expiry it implies,
+// and the window hold itself.
+func TestServerRunDetailRetentionWindowServed(t *testing.T) {
+	// The server reads its own clock, so the fixture stamps relative to now: the
+	// marker sits inside the window the projection must report.
+	markerAt := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
+	run := runFixture("retained", "github-label", "local", courierv1alpha1.PhaseFailed, markerAt.Add(-time.Hour))
+	run.Annotations = map[string]string{AnnotationFailedAt: markerAt.Format(time.RFC3339)}
+	run.Status.Conditions = []metav1.Condition{{
+		Type: courierv1alpha1.ConditionLifecycleReported, Status: metav1.ConditionTrue, Reason: "Published",
+		LastTransitionTime: metav1.NewTime(markerAt),
+	}}
+	_, handler := serverFixture(t, &run)
+	envelope, _ := envelopeOf(t, get(handler, "/v1/runs/retained"))
+	var detail RunDetail
+	if err := json.Unmarshal(envelope.Payload, &detail); err != nil {
+		t.Fatalf("detail payload: %v", err)
+	}
+	if fmt.Sprint(detail.Reap.Holds) != "[retention window still open]" {
+		t.Errorf("served holds = %v", detail.Reap.Holds)
+	}
+	if detail.Reap.RetentionWindowSeconds == nil || *detail.Reap.RetentionWindowSeconds != int64(DefaultFailedRetention/time.Second) {
+		t.Errorf("served window = %v, want %ds", detail.Reap.RetentionWindowSeconds, int64(DefaultFailedRetention/time.Second))
+	}
+	if detail.Reap.RetentionExpiresAt == nil || !detail.Reap.RetentionExpiresAt.Time.Equal(markerAt.Add(DefaultFailedRetention)) {
+		t.Fatalf("served expiry = %v, want %s", detail.Reap.RetentionExpiresAt, markerAt.Add(DefaultFailedRetention))
+	}
+	for _, entry := range detail.Timeline {
+		if entry.Label != TimelineRetentionMarked {
+			continue
+		}
+		if entry.Source != TimelineSourceRetention+"/"+AnnotationFailedAt {
+			t.Errorf("retention entry source = %q", entry.Source)
+		}
 	}
 }
 
