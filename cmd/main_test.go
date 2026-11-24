@@ -529,6 +529,69 @@ func TestResolveRebaseCapables(t *testing.T) {
 	}
 }
 
+// TestValidateRebaseDesignations pins the startup guard against one agent
+// identity declared both rebase-only executor and rebase-capable (#886).
+// The executor's rebase-only scope declines ordinary work while the capable
+// declaration arms the same identity to keep its ordinary lane, so the
+// conflict must fail startup rather than let one declaration silently win.
+func TestValidateRebaseDesignations(t *testing.T) {
+	tests := []struct {
+		name           string
+		executors      map[string]bool
+		capables       map[string]bool
+		wantErrContain string // substring required in the error; empty means no error
+	}{
+		{
+			name:      "neither designation set",
+			executors: map[string]bool{},
+			capables:  map[string]bool{},
+		},
+		{
+			name:      "executor only",
+			executors: map[string]bool{"courier-rebase": true},
+			capables:  map[string]bool{},
+		},
+		{
+			name:      "capable only",
+			executors: map[string]bool{},
+			capables:  map[string]bool{"courier-queue-a": true},
+		},
+		{
+			name:      "disjoint designations on different agents",
+			executors: map[string]bool{"courier-rebase": true},
+			capables:  map[string]bool{"courier-queue-a": true},
+		},
+		{
+			name:      "one agent declared both ways",
+			executors: map[string]bool{"courier-queue-a": true},
+			capables:  map[string]bool{"courier-queue-a": true},
+			wantErrContain: `agent "courier-queue-a" is declared both --dispatch-rebase-executor` +
+				` and --dispatch-rebase-capable`,
+		},
+		{
+			name:      "conflict names the clashing agent among several capables",
+			executors: map[string]bool{"courier-rebase": true, "courier-queue-b": true},
+			capables:  map[string]bool{"courier-queue-a": true, "courier-queue-b": true},
+			wantErrContain: `agent "courier-queue-b" is declared both --dispatch-rebase-executor` +
+				` and --dispatch-rebase-capable`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateRebaseDesignations(test.executors, test.capables)
+			if test.wantErrContain != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErrContain) {
+					t.Fatalf("validateRebaseDesignations() error = %v, want it to contain %q", err, test.wantErrContain)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validateRebaseDesignations() error = %v, want none", err)
+			}
+		})
+	}
+}
+
 // TestDeclaresRebaseCapability pins the one answer both Dispatch connectors
 // read (#796). The bare connector and the binding that owns its identity poll
 // the same agent, so an agent that is a rebase executor must declare the

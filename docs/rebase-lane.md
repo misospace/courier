@@ -221,7 +221,13 @@ ships is the preparation slice: the `--dispatch-rebase-capable`
 declaration, the chart wiring, the startup validation, and the
 fail-closed acceptance rules below, all dark by default. No production
 configuration changes, and #886 stays open until the Dispatch change
-lands and this section can document a safe enablement.
+lands and this section can document a safe enablement. Before any
+enablement, re-check this section against Dispatch main: REBASE
+eligibility must still follow the `rebase-executor:1` declaration and
+not the poll's work scope — the next-task route gates a REBASE handout
+on the item's dispatched lane and the declared capability, so an
+unscoped poll that declares the capability can still receive REBASE
+work.
 
 The rules that stay closed:
 

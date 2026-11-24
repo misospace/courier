@@ -790,11 +790,9 @@ func main() {
 		// ordinary work, so an agent also declared rebase-capable would be
 		// armed to keep its ordinary lane while the rebase-only scope
 		// declines it (#886).
-		for agent := range rebaseCapables {
-			if rebaseExecutors[agent] {
-				setupLog.Error(fmt.Errorf("dispatch: agent %q is declared both --dispatch-rebase-executor and --dispatch-rebase-capable; a rebase-only executor cannot also serve ordinary work", agent), "unable to configure Dispatch source")
-				os.Exit(1)
-			}
+		if err := validateRebaseDesignations(rebaseExecutors, rebaseCapables); err != nil {
+			setupLog.Error(err, "unable to configure Dispatch source")
+			os.Exit(1)
 		}
 		for _, binding := range bindings {
 			if declaresRebaseCapability(rebaseExecutors, binding.agentName) || declaresRebaseCapable(rebaseCapables, binding.agentName) {
@@ -1528,6 +1526,21 @@ func resolveRebaseCapables(bindings []dispatchBinding, capables []string) (map[s
 		}
 	}
 	return resolved, nil
+}
+
+// validateRebaseDesignations rejects an agent identity declared both as a
+// rebase-only executor and as rebase-capable (#886). The executor's
+// rebase-only work scope declines ordinary work while the capable
+// declaration arms the same identity to keep its ordinary lane, so which
+// declaration wins would silently decide whether the lane strands its own
+// fix work. Startup fails on the conflict instead of guessing.
+func validateRebaseDesignations(rebaseExecutors, rebaseCapables map[string]bool) error {
+	for agent := range rebaseCapables {
+		if rebaseExecutors[agent] {
+			return fmt.Errorf("dispatch: agent %q is declared both --dispatch-rebase-executor and --dispatch-rebase-capable; a rebase-only executor cannot also serve ordinary work", agent)
+		}
+	}
+	return nil
 }
 
 // declaresRebaseCapable reports whether the Dispatch agent identity must
