@@ -202,7 +202,10 @@ lane eligibility from the dedicated-executor claimant exclusion
   a second lane entry with the same `queueLane`, an explicit distinct
   `agentName`, and `rebaseCapable: true`; the chart requires distinct agent
   names for a repeated queue lane. This keeps the local-only allowlist
-  explicit.
+  explicit. Note that this binding is an ordinary worker on that lane, not
+  a rebase-only connector: it declares no work scope, so Dispatch hands it
+  the lane's ordinary work too, and only additionally offers it the lane's
+  REBASE followups.
 - **Bare `*` pool.** `DISPATCH_REBASE_AGENTS=*` is Dispatch's explicit
   unrestricted opt-in: every polling agent is lane-eligible, the wildcard
   names no executor identities, and claimant resolution excludes nobody,
