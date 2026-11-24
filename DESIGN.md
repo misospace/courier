@@ -3705,7 +3705,13 @@ scope, so Dispatch treats the poll as a capable REBASE recipient (for pool
 members) while its ordinary queue is unchanged; a REBASE offer is accepted
 only on a v1 acknowledgment granting the capability, and only when the
 claimant is bound to that connector's own queue lane — full lane equality,
-not the dedicated executor's membership-only verdict. A designation that
+not the dedicated executor's membership-only verdict. The server-side pool
+form matters: a bare name in `DISPATCH_REBASE_AGENTS` is also a
+dedicated-executor claimant exclusion for non-REBASE work
+(misospace/dispatch#1615), so naming a lane's own agent in the pool
+directly waits on misospace/dispatch#1701; the supported forms are a
+dedicated rebase-capable identity bound to the owning queue lane or the
+bare `*` opt-in (`docs/rebase-lane.md`). A designation that
 resolves to nothing fails startup like the executor form; one agent cannot
 carry both designations. Concurrency one per rebase is Dispatch's serialized
 lane admission plus the generation-pinned claim, not the connector count.

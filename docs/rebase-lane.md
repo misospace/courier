@@ -178,9 +178,38 @@ explicit `agentName`). A rebase-capable binding differs from a rebase
 executor in one thing: it declares `capabilities=rebase-executor:1` on every
 `next-task` call **without** `work_scope=rebase-only`. Dispatch (misospace/
 dispatch#1532) reads the capability as the proof this client can execute a
-mechanical rebase and may hand it REBASE followups — for that, the binding's
-agent must also be in the server-side `DISPATCH_REBASE_AGENTS` pool — while
-the unscoped poll keeps serving the lane's ordinary work.
+mechanical rebase and may hand it REBASE followups, while the unscoped poll
+keeps serving the lane's ordinary work.
+
+Server-side eligibility still runs through the `DISPATCH_REBASE_AGENTS`
+pool, and the pool form matters. The pool also marks every name it lists a
+dedicated rebase executor (misospace/dispatch#1615): Dispatch keeps pool
+names out of claimant resolution for non-REBASE work, and the handout gate
+refuses any non-REBASE item whose recorded claimant is a pool name. So
+naming the lane's own ordinary agent in the pool makes that agent's own
+PR-fix claims un-routable, and the lane rebases while its repair work
+stalls. The direct form, one identity that is both the lane's ordinary
+agent and a named pool member, waits on a Dispatch change that separates
+lane eligibility from the dedicated-executor claimant exclusion
+(misospace/dispatch#1701). Two forms work today:
+
+- **Dedicated rebase-capable identity on the owning lane (recommended).**
+  Bind a second binding with its own agent identity (for example
+  `courier-rebase`) to the owning lane's own queue lane and name only that
+  identity in the pool. It shares the lane, so lane equality admits the
+  REBASE handout for the lane's claimants, and the ordinary agent stays
+  outside the pool, so its ordinary fixes keep working. In the chart, add
+  a second lane entry with the same `queueLane`, an explicit distinct
+  `agentName`, and `rebaseCapable: true`; the chart requires distinct agent
+  names for a repeated queue lane. This keeps the local-only allowlist
+  explicit.
+- **Bare `*` pool.** `DISPATCH_REBASE_AGENTS=*` is Dispatch's explicit
+  unrestricted opt-in: every polling agent is lane-eligible, the wildcard
+  names no executor identities, and claimant resolution excludes nobody,
+  so the owning connector keeps its ordinary work. A REBASE handout still
+  requires the client's `rebase-executor:1` declaration, but the
+  fail-closed allowlist (#1327) is gone, so treat `*` as the
+  debugging/backcompat option, not the normal rollout.
 
 The rules that stay closed:
 
