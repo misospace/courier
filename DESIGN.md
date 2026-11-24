@@ -3729,14 +3729,17 @@ members) while its ordinary queue is unchanged; a REBASE offer is accepted
 only on a v1 acknowledgment granting the capability, and only when the
 claimant is bound to that connector's own queue lane — full lane equality,
 not the dedicated executor's membership-only verdict. The server-side pool
-form matters: a bare name in `DISPATCH_REBASE_AGENTS` is also a
-dedicated-executor claimant exclusion for non-REBASE work
-(misospace/dispatch#1615), so naming a lane's own agent in the pool
-directly waits on misospace/dispatch#1701; the supported forms are a
-dedicated rebase-capable identity bound to the owning queue lane — an
-unscoped poll, so that identity is also an ordinary worker on the lane —
-or the bare `*` opt-in, which drops the local-only allowlist and stays a
-debugging/backcompat choice, not a normal rollout (`docs/rebase-lane.md`).
+form decides whether a dual-role lane survives: every bare name in
+`DISPATCH_REBASE_AGENTS` is also a dedicated-executor claimant exclusion
+for non-REBASE work (misospace/dispatch#1615), so a pool-named identity —
+the lane's own agent, or a separate same-lane identity, since the unscoped
+poll serves it ordinary work too — strands its own newly authored PR-fix
+claims. The bare `*` opt-in avoids the exclusion but deletes the
+fail-closed local-only allowlist, so it stays a debugging/backcompat
+choice, never a normal rollout. No pool form is a safe normal enablement
+until misospace/dispatch#1701 separates lane eligibility from the
+claimant exclusion; the client capability ships dark and
+`docs/rebase-lane.md` carries the rule.
 A designation that
 resolves to nothing fails startup like the executor form; one agent cannot
 carry both designations. Concurrency one per rebase is Dispatch's serialized

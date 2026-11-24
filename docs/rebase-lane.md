@@ -182,37 +182,46 @@ mechanical rebase and may hand it REBASE followups, while the unscoped poll
 keeps serving the lane's ordinary work.
 
 Server-side eligibility still runs through the `DISPATCH_REBASE_AGENTS`
-pool, and the pool form matters. The pool also marks every name it lists a
-dedicated rebase executor (misospace/dispatch#1615): Dispatch keeps pool
-names out of claimant resolution for non-REBASE work, and the handout gate
-refuses any non-REBASE item whose recorded claimant is a pool name. So
-naming the lane's own ordinary agent in the pool makes that agent's own
-PR-fix claims un-routable, and the lane rebases while its repair work
-stalls. The direct form, one identity that is both the lane's ordinary
-agent and a named pool member, waits on a Dispatch change that separates
-lane eligibility from the dedicated-executor claimant exclusion
-(misospace/dispatch#1701). Two forms work today:
+pool, and the pool form matters. The pool also marks every name it lists
+a dedicated rebase executor (misospace/dispatch#1615): Dispatch keeps
+pool names out of claimant resolution for non-REBASE work, and the handout
+gate refuses any non-REBASE item whose recorded claimant is a pool name.
+Naming an identity in the pool therefore puts that identity's ordinary
+fix work at risk, in either form:
 
-- **Dedicated rebase-capable identity on the owning lane (recommended).**
-  Bind a second binding with its own agent identity (for example
-  `courier-rebase`) to the owning lane's own queue lane and name only that
-  identity in the pool. It shares the lane, so lane equality admits the
-  REBASE handout for the lane's claimants, and the ordinary agent stays
-  outside the pool, so its ordinary fixes keep working. In the chart, add
-  a second lane entry with the same `queueLane`, an explicit distinct
-  `agentName`, and `rebaseCapable: true`; the chart requires distinct agent
-  names for a repeated queue lane. This keeps the local-only allowlist
-  explicit. Note that this binding is an ordinary worker on that lane, not
-  a rebase-only connector: it declares no work scope, so Dispatch hands it
-  the lane's ordinary work too, and only additionally offers it the lane's
-  REBASE followups.
-- **Bare `*` pool.** `DISPATCH_REBASE_AGENTS=*` is Dispatch's explicit
-  unrestricted opt-in: every polling agent is lane-eligible, the wildcard
-  names no executor identities, and claimant resolution excludes nobody,
-  so the owning connector keeps its ordinary work. A REBASE handout still
-  requires the client's `rebase-executor:1` declaration, but the
-  fail-closed allowlist (#1327) is gone, so treat `*` as the
-  debugging/backcompat option, not the normal rollout.
+- **The lane's own agent in the pool.** One identity that is both the
+  lane's ordinary agent and a named pool member loses its ordinary
+  PR-fix routing: its claims are excluded at resolution and refused at
+  handout, so the lane rebases while its repair work stalls. This
+  direct form waits on a Dispatch change that separates lane eligibility
+  from the dedicated-executor claimant exclusion
+  (misospace/dispatch#1701).
+- **A separate same-lane identity in the pool.** A second binding with
+  its own agent identity (for example `courier-rebase`) on the owning
+  lane's queue lane keeps the ordinary agent outside the pool, but it
+  does not make the new identity safe. The binding declares no work
+  scope, so Dispatch serves it the lane's ordinary work too,
+  implementation tasks included. When that identity authors work and
+  becomes its claimant, its own non-REBASE PR-fix claims hit the same
+  exclusion and refusal, and the new work strands. The lane's existing
+  PRs stay routable; work the pool-named identity authors after
+  enablement does not. Do not deploy this form as a workaround.
+
+The bare `*` pool avoids the exclusion: it names no executor identities,
+so claimant resolution excludes nobody and the owning connector keeps its
+ordinary claims. But `DISPATCH_REBASE_AGENTS=*` is Dispatch's explicit
+unrestricted opt-in: every polling agent becomes lane-eligible and the
+fail-closed local-only allowlist (#1327) is gone. A REBASE handout still
+requires the client's `rebase-executor:1` declaration, but treat `*` as
+the debugging/backcompat option, never the normal rollout.
+
+No pool form is a safe normal enablement for owning-lane rebase today.
+The safe dual-role form needs misospace/dispatch#1701. What this change
+ships is the preparation slice: the `--dispatch-rebase-capable`
+declaration, the chart wiring, the startup validation, and the
+fail-closed acceptance rules below, all dark by default. No production
+configuration changes, and #886 stays open until the Dispatch change
+lands and this section can document a safe enablement.
 
 The rules that stay closed:
 
