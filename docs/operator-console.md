@@ -300,7 +300,10 @@ coordinator, or the API server — and the page states separately when the read
 model observed the run, so a recorded event time and an observation time are
 never the same claim. The retention block states the phase's retention window and
 the instant it expires, and it names an unsafe-workspace or capacity-recovery
-hold when the operator is still holding that attempt's partial work. The console
+hold when the operator is still holding that attempt's partial work. The
+per-repository audit floor is not a per-run fact, so the page mentions it only
+for the phases that consume a floor slot and never implies it elsewhere. The
+console
 escapes every value the read API returns, including a name or label that a
 repository or model authored. It shows the pull request as a number, not a
 link, because the run projection carries no repository URL to trust.

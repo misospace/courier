@@ -244,6 +244,7 @@ type RunDetailResult struct {
 		EligibleByPhase        bool     `json:"eligibleByPhase"`
 		RetentionWindowSeconds *int64   `json:"retentionWindowSeconds"`
 		RetentionExpiresAt     string   `json:"retentionExpiresAt"`
+		AuditFloorGovernsPhase bool     `json:"auditFloorGovernsPhase"`
 		Holds                  []string `json:"holds"`
 	}
 	WorkspaceSafety *struct {

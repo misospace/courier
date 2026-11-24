@@ -360,13 +360,19 @@ const (
 // mirroring the controller's gates (internal/controller/reap.go,
 // internal/controller/capacity_recovery.go and coderun_controller.go's terminal
 // dispatch). Only single-object facts are used: the per-repository audit floor
-// compares other runs and is never derivable here.
+// compares other runs and is never derivable here, and whether the floor governs
+// this run's phase is stated separately on ReapHealth. The ownership hold is
+// reported only under the phase exemption it belongs to: the controller's
+// Failed, NeedsHuman, Done, and AlreadyDone reap paths never consult workspace
+// evidence, so an eligible-phase run must not inherit one.
 func reapHolds(run *courierv1alpha1.CoderRun, marker string, markerAt *metav1.Time, opts Options) []string {
 	if !phaseIsReapEligible(run.Status.Phase) {
 		holds := []string{"phase is not reap-eligible"}
 		// A capacity-exhaustion run is the case where the phase exemption has a
-		// reason behind it the operator needs: the object is retained because
-		// the operator still owns the attempt's partial work.
+		// reason behind it the operator needs: the object is retained because the
+		// operator still owns the attempt's partial work. Only BlockedExternal
+		// runs reach here, matching the controller, which settles ownership
+		// before releasing capacity and never routes such a run to the reaper.
 		if hold := capacityOwnershipHold(run); hold != "" {
 			holds = append(holds, hold)
 		}
@@ -409,9 +415,6 @@ func reapHolds(run *courierv1alpha1.CoderRun, marker string, markerAt *metav1.Ti
 	if req := run.Status.RetryRequest; req != nil && req.State == courierv1alpha1.RetryRequestStateRequested {
 		holds = append(holds, "retry request outstanding")
 	}
-	if hold := capacityOwnershipHold(run); hold != "" {
-		holds = append(holds, hold)
-	}
 	return holds
 }
 
@@ -424,10 +427,11 @@ func reapHolds(run *courierv1alpha1.CoderRun, marker string, markerAt *metav1.Ti
 // controller's gate would not accept says the same thing here. A settlement that
 // has merely not run yet is reported as unsettled rather than as unsafe, and
 // Settled and Stale release the hold — the attempt settled, or a newer attempt
-// owns the work — leaving only the phase exemption and the audit floor. The
-// reason vocabulary mirrors the controller's; this package only reads it.
+// owns the work — leaving only the phase exemption, since a BlockedExternal run
+// is never reaped and never consumes an audit-floor slot. The reason vocabulary
+// mirrors the controller's; this package only reads it.
 func capacityOwnershipHold(run *courierv1alpha1.CoderRun) string {
-	if !phaseIsCapacityExhaustion(run) {
+	if !IsCapacityExhaustionRun(run) {
 		return ""
 	}
 	const unsafe = "unsafe workspace evidence holds ownership of partial work"
@@ -437,13 +441,13 @@ func capacityOwnershipHold(run *courierv1alpha1.CoderRun) string {
 			continue
 		}
 		switch cond.Reason {
-		case capacityRecoveryUnsafeWork:
+		case CapacityRecoveryUnsafeWork:
 			return unsafe
-		case capacityRecoveryUnsupported:
+		case CapacityRecoveryUnsupported:
 			return "capacity recovery is unsupported: an operator must settle this attempt"
-		case capacityRecoveryStale:
+		case CapacityRecoveryStale:
 			return ""
-		case capacityRecoverySettled:
+		case CapacityRecoverySettled:
 			if cond.Status == metav1.ConditionTrue {
 				return ""
 			}
@@ -598,11 +602,12 @@ func ProjectRunDetail(run *courierv1alpha1.CoderRun, opts Options) RunDetail {
 
 	marker, at := reapMarker(run)
 	detail.Reap = ReapHealth{
-		MarkerAnnotation: marker,
-		MarkerAt:         at,
-		Reason:           retentionReasonFor(marker),
-		EligibleByPhase:  phaseIsReapEligible(run.Status.Phase),
-		Holds:            reapHolds(run, marker, at, opts),
+		MarkerAnnotation:       marker,
+		MarkerAt:               at,
+		Reason:                 retentionReasonFor(marker),
+		EligibleByPhase:        phaseIsReapEligible(run.Status.Phase),
+		Holds:                  reapHolds(run, marker, at, opts),
+		AuditFloorGovernsPhase: AuditFloorGovernsPhase(run.Status.Phase),
 	}
 	// The phase's retention window and the expiry the reaper reads off the
 	// durable marker: the page can then say how long a retained run is still

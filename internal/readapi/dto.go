@@ -183,9 +183,11 @@ type RunDetail struct {
 	Timeline          []TimelineView         `json:"timeline,omitempty"`
 	TimelineTruncated bool                   `json:"timelineTruncated,omitempty"`
 	// TimelineObservedAt is when this projection read the run object. It is
-	// not an event: every Timeline entry's At is a stamp recorded on the run
-	// on or before this instant, so an operator can tell "the event happened
-	// at X" from "the read model observed the run at Y".
+	// not an event and it does not bound the entries: each Timeline At is a
+	// stamp some authority recorded, and a coordinator-supplied or clock-skewed
+	// stamp can postdate this read. What the two fields give an operator is the
+	// distinction between "the authority recorded X at T" and "the read model
+	// observed the object at now", never a claim that T is at or before now.
 	TimelineObservedAt *metav1.Time `json:"timelineObservedAt,omitempty"`
 	TerminalReason     string       `json:"terminalReason,omitempty"`
 }
@@ -286,7 +288,13 @@ type ReapHealth struct {
 	// stops holding the run. Nil while no marker has been stamped, because the
 	// window only starts at the first eligible observation.
 	RetentionExpiresAt *metav1.Time `json:"retentionExpiresAt,omitempty"`
-	Holds              []string     `json:"holds,omitempty"`
+	// AuditFloorGovernsPhase states whether this run's phase consumes a slot of
+	// the per-repository audit floor (Failed and NeedsHuman only). The floor
+	// itself compares other runs and is never derivable per run, so a run with no
+	// listed hold in one of those phases may still be retained by it, while a
+	// Done or AlreadyDone run never is and must not read as if it could be.
+	AuditFloorGovernsPhase bool     `json:"auditFloorGovernsPhase,omitempty"`
+	Holds                  []string `json:"holds,omitempty"`
 }
 
 // WorkspaceSafetyView projects the executor's workspace snapshot state and git

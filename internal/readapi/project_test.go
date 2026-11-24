@@ -159,13 +159,19 @@ func TestProjectRunTimelineProvenance(t *testing.T) {
 
 	// The projection's observation instant rides separately from every recorded
 	// stamp, so "the read model saw this" is never confused with "this happened".
+	// It is not an upper bound on the stamps: the controller tolerates a
+	// future-dated marker and the coordinator supplies its own heartbeat and
+	// result times, so the payload never claims the entries precede the read.
 	detail := ProjectRunDetail(&run, testOptions())
 	if detail.TimelineObservedAt == nil || !detail.TimelineObservedAt.Time.Equal(testNow) {
 		t.Fatalf("timeline observedAt = %v, want %s", detail.TimelineObservedAt, testNow)
 	}
+	if len(detail.Timeline) == 0 {
+		t.Fatal("provenance fixture projected no entries")
+	}
 	for _, entry := range detail.Timeline {
-		if entry.At.Time.After(detail.TimelineObservedAt.Time) {
-			t.Errorf("entry %s at %s is after the projection observed %s", entry.Label, entry.At, detail.TimelineObservedAt)
+		if entry.At == nil {
+			t.Errorf("entry %s has no recorded stamp", entry.Label)
 		}
 	}
 	// A nil run still states when it was read rather than pretending to know
@@ -296,6 +302,62 @@ func TestProjectRunReapRetentionWindow(t *testing.T) {
 	if parkedDetail.Reap.RetentionWindowSeconds != nil || parkedDetail.Reap.RetentionExpiresAt != nil {
 		t.Errorf("parked window/expiry = %v/%v, want nil/nil",
 			parkedDetail.Reap.RetentionWindowSeconds, parkedDetail.Reap.RetentionExpiresAt)
+	}
+}
+
+func TestProjectRunReapAuditFloorAndFutureMarker(t *testing.T) {
+	// The audit floor is stated only where the controller lets it bite, so a
+	// Done run read with no holds never implies a floor that cannot apply.
+	for _, tc := range []struct {
+		phase courierv1alpha1.Phase
+		want  bool
+	}{
+		{courierv1alpha1.PhaseFailed, true},
+		{courierv1alpha1.PhaseNeedsHuman, true},
+		{courierv1alpha1.PhaseDone, false},
+		{courierv1alpha1.PhaseAlreadyDone, false},
+		{courierv1alpha1.PhaseAwaitingReview, false},
+		{courierv1alpha1.PhaseBlockedExternal, false},
+	} {
+		run := runFixture("floor", "source", "lane", tc.phase, testNow.Add(-400*time.Hour))
+		run.Annotations = map[string]string{AnnotationFailedAt: testNow.Add(-400 * time.Hour).Format(time.RFC3339)}
+		run.Status.Conditions = []metav1.Condition{{
+			Type: courierv1alpha1.ConditionLifecycleReported, Status: metav1.ConditionTrue, Reason: "Published",
+			LastTransitionTime: metav1.NewTime(testNow.Add(-400 * time.Hour)),
+		}}
+		detail := ProjectRunDetail(&run, testOptions())
+		if detail.Reap.AuditFloorGovernsPhase != tc.want {
+			t.Errorf("phase %s audit floor = %v, want %v", tc.phase, detail.Reap.AuditFloorGovernsPhase, tc.want)
+		}
+	}
+
+	// A future-dated marker (clock skew) holds the run and states the expiry the
+	// reaper will actually honor, rather than reading as already expired.
+	skewed := runFixture("skew", "source", "lane", courierv1alpha1.PhaseDone, testNow.Add(-time.Hour))
+	markerAt := testNow.Add(30 * time.Minute)
+	skewed.Annotations = map[string]string{AnnotationDoneAt: markerAt.Format(time.RFC3339)}
+	detail := ProjectRunDetail(&skewed, testOptions())
+	if fmt.Sprint(detail.Reap.Holds) != "[retention window still open]" {
+		t.Errorf("skewed-marker holds = %v", detail.Reap.Holds)
+	}
+	if detail.Reap.RetentionExpiresAt == nil || !detail.Reap.RetentionExpiresAt.Time.Equal(markerAt.Add(DefaultDoneRetention)) {
+		t.Errorf("skewed-marker expiry = %v, want %s", detail.Reap.RetentionExpiresAt, markerAt.Add(DefaultDoneRetention))
+	}
+
+	// A malformed marker starts a fresh window in the controller, so the read
+	// model reports the missing marker and no expiry rather than a zero time.
+	bad := runFixture("bad", "source", "lane", courierv1alpha1.PhaseFailed, testNow.Add(-time.Hour))
+	bad.Annotations = map[string]string{AnnotationFailedAt: "not-a-timestamp"}
+	bad.Status.Conditions = []metav1.Condition{{
+		Type: courierv1alpha1.ConditionLifecycleReported, Status: metav1.ConditionTrue, Reason: "Published",
+		LastTransitionTime: metav1.NewTime(testNow.Add(-time.Hour)),
+	}}
+	badDetail := ProjectRunDetail(&bad, testOptions())
+	if fmt.Sprint(badDetail.Reap.Holds) != "[no retention marker yet]" {
+		t.Errorf("malformed-marker holds = %v", badDetail.Reap.Holds)
+	}
+	if badDetail.Reap.RetentionExpiresAt != nil {
+		t.Errorf("malformed-marker expiry = %v, want none", badDetail.Reap.RetentionExpiresAt)
 	}
 }
 

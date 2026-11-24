@@ -96,6 +96,47 @@ func TestRunDetailPageAndBackendRequest(t *testing.T) {
 	}
 }
 
+// TestRunDetailReapHoldStatesRendering pins the three retention states the page
+// must keep apart: a stated hold, a phase the per-repository audit floor governs,
+// and a phase it cannot govern. Implying the floor on a Done run would send an
+// operator hunting a hold the controller will simply delete past.
+func TestRunDetailReapHoldStatesRendering(t *testing.T) {
+	const floorSentence = "per-repository audit floor"
+	cases := []struct {
+		name          string
+		reap          string
+		wantHold      string
+		wantFloorSeen bool
+	}{
+		{"hold stated",
+			`{"markerAnnotation":"courier.misospace.dev/done-at","reason":"resolved","eligibleByPhase":true,"holds":["retention window still open"]}`,
+			"retention window still open", false},
+		{"floor governs",
+			`{"markerAnnotation":"courier.misospace.dev/failed-at","reason":"failed","eligibleByPhase":true,"auditFloorGovernsPhase":true}`,
+			"No per-run hold recorded.", true},
+		{"floor cannot govern",
+			`{"markerAnnotation":"courier.misospace.dev/done-at","reason":"resolved","eligibleByPhase":true}`,
+			"No per-run hold recorded.", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"apiVersion":"courier.misospace.dev/v1","kind":"RunDetail","payload":{"name":"run-one","phase":"Done","reap":` + tc.reap + `}}`
+			stub := newStubReadAPI(t, http.StatusOK, body, nil)
+			defer stub.Close()
+			secrets := newTestSecrets(t)
+			_, base := newTestServerWithToken(t, secrets, stub.URL, "tok")
+			client := login(t, base, secrets.token)
+			_, page := get(t, client, base+"/runs/run-one")
+			if !strings.Contains(page, tc.wantHold) {
+				t.Fatalf("page missing %q:\n%s", tc.wantHold, page)
+			}
+			if got := strings.Contains(page, floorSentence); got != tc.wantFloorSeen {
+				t.Errorf("audit-floor wording present = %v, want %v:\n%s", got, tc.wantFloorSeen, page)
+			}
+		})
+	}
+}
+
 func TestRunDetailNotFoundAndErrors(t *testing.T) {
 	cases := []struct {
 		name   string

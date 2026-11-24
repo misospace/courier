@@ -3101,8 +3101,9 @@ gates: phase eligibility, the retention marker, the phase retention window and
 the expiry it implies, report settlement, outstanding CI settlement or park
 release, an outstanding retry, and the capacity-recovery ownership hold whose
 unsafe-workspace case the controller itself records. The per-repository audit
-floor compares other runs and is not derivable per run, so the page says so
-rather than implying an empty hold list. The console still probes the read API's
+floor compares other runs and is never derivable per run; the payload states
+whether the run's phase is governed by it, and the page names it only for those
+phases rather than implying a hold that cannot apply. The console still probes the read API's
 `/healthz` path for the page backend note when `--backend-url` is configured.
 The console additionally carries a bounded
 contribution form, a mutating, credentialed

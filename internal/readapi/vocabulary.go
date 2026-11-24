@@ -153,7 +153,7 @@ func phaseIsTerminal(phase courierv1alpha1.Phase) bool {
 	return false
 }
 
-// capacityExhaustionCategories mirrors isCapacityExhaustionRun in
+// capacityExhaustionCategories mirrors IsCapacityExhaustionRun in
 // internal/controller/capacity_recovery.go: the terminal diagnostic categories
 // that put a BlockedExternal run in the operator's capacity-recovery path.
 var capacityExhaustionCategories = map[courierv1alpha1.TerminalDiagnosticCategory]bool{
@@ -163,23 +163,39 @@ var capacityExhaustionCategories = map[courierv1alpha1.TerminalDiagnosticCategor
 	courierv1alpha1.TerminalDiagnosticCategoryModelTransportError: true,
 }
 
-// phaseIsCapacityExhaustion mirrors the controller's capacity-exhaustion gate:
-// a BlockedExternal run whose terminal diagnostic names a failure the operator
+// IsCapacityExhaustionRun mirrors the controller's capacity-exhaustion gate: a
+// BlockedExternal run whose terminal diagnostic names a failure the operator
 // must settle before it releases ownership of the attempt's partial work.
-func phaseIsCapacityExhaustion(run *courierv1alpha1.CoderRun) bool {
+// Exported so internal/controller can pin this mirror against its own gate.
+func IsCapacityExhaustionRun(run *courierv1alpha1.CoderRun) bool {
 	return run != nil && run.Status.Phase == courierv1alpha1.PhaseBlockedExternal &&
 		run.Status.TerminalDiagnostic != nil &&
 		capacityExhaustionCategories[run.Status.TerminalDiagnostic.Category]
 }
 
+// AuditFloorGovernsPhase mirrors auditFloorPhase in internal/controller/reap.go:
+// exactly Failed and NeedsHuman consume a slot of the per-repository audit floor.
+// Done and AlreadyDone are exempt (their source work already resolved) and
+// review-parked or unreaped phases never reach it. Exported so the controller can
+// pin the mirror and so a page can say whether an unexplained retention is
+// plausibly the floor rather than implying a floor applies where none can.
+func AuditFloorGovernsPhase(phase courierv1alpha1.Phase) bool {
+	switch phase {
+	case courierv1alpha1.PhaseFailed, courierv1alpha1.PhaseNeedsHuman:
+		return true
+	}
+	return false
+}
+
 // CapacityRecovery condition reasons, mirrored from
 // internal/controller/capacity_recovery.go so the read model can name the
-// operator's own settlement states. The controller remains the sole writer.
+// operator's own settlement states. The controller remains the sole writer, and
+// internal/controller pins these values against its own constants.
 const (
-	capacityRecoverySettled     = "Settled"
-	capacityRecoveryUnsupported = "Unsupported"
-	capacityRecoveryStale       = "Stale"
-	capacityRecoveryUnsafeWork  = "UnsafeWork"
+	CapacityRecoverySettled     = "Settled"
+	CapacityRecoveryUnsupported = "Unsupported"
+	CapacityRecoveryStale       = "Stale"
+	CapacityRecoveryUnsafeWork  = "UnsafeWork"
 )
 
 // Timeline source-of-truth vocabularies. Source names the run-object field

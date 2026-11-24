@@ -436,6 +436,51 @@ func TestServerRunDetailRetentionWindowServed(t *testing.T) {
 	}
 }
 
+// TestServerRunDetailUsesConfiguredRetentionWindows pins the wiring the projected
+// expiry depends on: the read API must state the retention windows its caller
+// configured, not the mirrored defaults. A deployment that runs
+// --done-retention=1h while the page shows a 5-minute window would send an
+// operator away from a run the reaper is still holding for an hour.
+func TestServerRunDetailUsesConfiguredRetentionWindows(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := courierv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add scheme: %v", err)
+	}
+	markerAt := time.Now().Add(-30 * time.Minute).UTC().Truncate(time.Second)
+	run := runFixture("configured", "github-label", "local", courierv1alpha1.PhaseDone, markerAt.Add(-time.Hour))
+	run.Annotations = map[string]string{AnnotationDoneAt: markerAt.Format(time.RFC3339)}
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&run).Build()
+	server, err := NewServer(ServerConfig{
+		Reader:        reader,
+		Token:         testToken,
+		Bind:          ":0",
+		Namespace:     "courier",
+		DoneRetention: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	handler := server.Handler()
+
+	envelope, _ := envelopeOf(t, get(handler, "/v1/runs/configured"))
+	var detail RunDetail
+	if err := json.Unmarshal(envelope.Payload, &detail); err != nil {
+		t.Fatalf("detail payload: %v", err)
+	}
+	if detail.Reap.RetentionWindowSeconds == nil || *detail.Reap.RetentionWindowSeconds != 3600 {
+		t.Fatalf("served window = %v, want the configured 3600s", detail.Reap.RetentionWindowSeconds)
+	}
+	wantExpiry := markerAt.Add(time.Hour)
+	if detail.Reap.RetentionExpiresAt == nil || !detail.Reap.RetentionExpiresAt.Time.Equal(wantExpiry) {
+		t.Fatalf("served expiry = %v, want %s", detail.Reap.RetentionExpiresAt, wantExpiry)
+	}
+	// Thirty minutes into an hour-long window the run is still held; under the
+	// mirrored 5-minute default it would read as expired and unheld.
+	if fmt.Sprint(detail.Reap.Holds) != "[retention window still open]" {
+		t.Errorf("served holds = %v, want the window hold", detail.Reap.Holds)
+	}
+}
+
 // TestServerRedactionEndToEnd pushes a fully populated run through the HTTP
 // surface and requires every sensitive substring to be absent from the
 // response body.
