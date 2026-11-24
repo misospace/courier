@@ -688,3 +688,90 @@ func TestOwnershipGateAcceptsSharedLaneClaimantThroughTheLifecycle(t *testing.T)
 		}
 	}
 }
+
+// capableRebaseOwnershipTaskBody is the Dispatch-shaped next-task response for
+// one queued rebase-marked handout under a capability-only (#886) intake
+// acknowledgment — contract v1, no scope — carrying the claimant evidence.
+func capableRebaseOwnershipTaskBody(fixType, claimant string) map[string]any {
+	body := ownershipTaskBody(claimant)
+	body["prFixItem"].(map[string]any)["fixType"] = fixType
+	body["intake"] = rebaseCapableIntakeAckBody()
+	return body
+}
+
+// #886: on a rebase-capable connector the lane-equality arm is NOT dropped.
+// A REBASE-marked handout whose claimant is bound to a different queue lane is
+// declined by ownership — never accepted, released through the fenced waiting
+// -external mark, poll stays clean — so the work stays discoverable for the
+// connector that owns the claimant.
+func TestOwnershipGateDeclinesCrossLaneRebaseOfferOnRebaseCapableConnector(t *testing.T) {
+	server, marks := ownershipServer(t, func() map[string]any {
+		return capableRebaseOwnershipTaskBody("REBASE", "frontier")
+	})
+	client := newOwnershipClient(t, server.URL, "normal", map[string]string{"local": "normal", "frontier": "frontier"})
+	client.WithRebaseCapable(true)
+	counter := attachOwnershipDiagnostics(t, client)
+	items, err := client.Discover(context.Background())
+	if items != nil || err != nil {
+		t.Fatalf("items = %#v err = %v, want the cross-lane handout declined without failing the poll", items, err)
+	}
+	if got := counter(reasonOwnershipLaneMismatch); got != 1 {
+		t.Fatalf("diagnostic %s = %v, want exactly one", reasonOwnershipLaneMismatch, got)
+	}
+	if len(*marks) != 1 || (*marks)[0]["status"] != "WAITING_EXTERNAL" {
+		t.Fatalf("marks = %#v, want exactly one waiting-external release", *marks)
+	}
+}
+
+// The owning-lane rule holds at every lifecycle boundary on a rebase-capable
+// connector: a REBASE-marked attempt whose claimant is bound to this lane
+// passes the claim, the hand-out acknowledgement, and the pre-launch
+// revalidation; a cross-lane one is refused at the claim with the full
+// ownership verdict (#886).
+func TestOwnershipGateKeepsRebaseOnOwningLaneThroughTheLifecycleOnCapableConnector(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client := newOwnershipClient(t, server.URL, "normal", map[string]string{"local": "normal"})
+	client.WithRebaseCapable(true)
+	id := EncodeWorkID(Task{
+		Type:        "followup-pr",
+		PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42},
+		PRFixItem:   &PRFixItem{ID: "fix-9", Generation: 4, HandoutToken: "hand-4", FixType: "REBASE", OriginalClaimant: "local"},
+	})
+	if _, err := client.ClaimWithReceipt(context.Background(), id, ""); err != nil {
+		t.Fatalf("ClaimWithReceipt() error = %v, want the owning-lane acceptance", err)
+	}
+	if err := client.AckHandout(context.Background(), source.WorkItem{ID: id}); err != nil {
+		t.Fatalf("AckHandout() error = %v, want the owning-lane acceptance", err)
+	}
+	if err := client.PreLaunch(context.Background(), id); err != nil {
+		t.Fatalf("PreLaunch() error = %v, want the owning-lane acceptance", err)
+	}
+	for _, path := range paths {
+		if path == "/api/pr-fix-queue/mark" {
+			t.Fatalf("paths = %#v, want no release for an authorized attempt", paths)
+		}
+	}
+}
+
+func TestOwnershipGateRefusesCrossLaneRebaseAttemptOnCapableConnector(t *testing.T) {
+	server, marks := ownershipServer(t, func() map[string]any { return ownershipTaskBody("local") })
+	client := newOwnershipClient(t, server.URL, "normal", map[string]string{"local": "frontier"})
+	client.WithRebaseCapable(true)
+	id := EncodeWorkID(Task{
+		Type:        "followup-pr",
+		PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42},
+		PRFixItem:   &PRFixItem{ID: "fix-9", Generation: 4, HandoutToken: "hand-4", FixType: "REBASE", OriginalClaimant: "local"},
+	})
+	_, err := client.ClaimWithReceipt(context.Background(), id, "")
+	if !errors.Is(err, ErrOwnershipDeclined) || !errors.Is(err, source.ErrStaleWork) {
+		t.Fatalf("ClaimWithReceipt() error = %v, want the terminal ownership refusal", err)
+	}
+	if len(*marks) != 1 || (*marks)[0]["status"] != "WAITING_EXTERNAL" || (*marks)[0]["generation"] != float64(4) {
+		t.Fatalf("marks = %#v, want exactly one exact-receipt release", *marks)
+	}
+}

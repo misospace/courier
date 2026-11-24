@@ -130,6 +130,40 @@ func validateRebaseIntake(raw json.RawMessage) (ok bool, reason string) {
 	return false, reasonRebaseCapabilityMissing
 }
 
+// validateRebaseCapableIntake evaluates the intake acknowledgment of an
+// unscoped rebase-capable poll (#886). The poll declared only the
+// rebase-executor capability, so the only claim under review is the
+// capability verdict: contract version 1 with rebase-executor granted at the
+// requested version. The poll declared no work scope, so an acknowledgment
+// asserting a scope is a protocol error, not a grant. reason is a bounded
+// diagnostic reason from the connector vocabulary for every other shape,
+// fail-closed like validateRebaseIntake.
+func validateRebaseCapableIntake(raw json.RawMessage) (ok bool, reason string) {
+	if len(raw) == 0 {
+		return false, reasonRebaseCapabilityMissing
+	}
+	var ack rebaseIntakeAck
+	if err := json.Unmarshal(raw, &ack); err != nil {
+		return false, reasonRebaseCapabilityInvalid
+	}
+	if ack.Version != rebaseCapabilityVersion {
+		return false, reasonRebaseCapabilityVersion
+	}
+	if ack.Scope != "" {
+		return false, reasonRebaseScopeWrong
+	}
+	for _, capability := range ack.Capabilities {
+		if capability.Name != rebaseCapabilityName {
+			continue
+		}
+		if !capability.Granted || capability.Requested != rebaseCapabilityVersion {
+			return false, reasonRebaseCapabilityDenied
+		}
+		return true, reasonRebaseCapabilityOK
+	}
+	return false, reasonRebaseCapabilityMissing
+}
+
 // declineHandout is the shared receipt-fenced decline core behind
 // declineRebase and declineOwnership. It emits no diagnostics — each wrapper
 // owns its own vocabulary reason — and keeps the exact decline semantics for

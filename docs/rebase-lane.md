@@ -162,6 +162,53 @@ while every non-rebase lane keeps operating with older Dispatch deployments
 (they send no intake declaration at all — their discovery bytes are
 unchanged).
 
+## Owning-lane rebase (#886)
+
+A dedicated rebase connector is not the only safe place for a mechanical
+rebase. The lane that owns a conflicted pull request already has its branch,
+goal, and claim, so a normal binding can run the rebase itself. An operator
+marks such a binding **rebase-capable**:
+
+```
+--dispatch-rebase-capable <agent identity>
+```
+
+or, in the chart, `rebaseCapable: true` on the lane entry (which needs an
+explicit `agentName`). A rebase-capable binding differs from a rebase
+executor in one thing: it declares `capabilities=rebase-executor:1` on every
+`next-task` call **without** `work_scope=rebase-only`. Dispatch (misospace/
+dispatch#1532) reads the capability as the proof this client can execute a
+mechanical rebase and may hand it REBASE followups — for that, the binding's
+agent must also be in the server-side `DISPATCH_REBASE_AGENTS` pool — while
+the unscoped poll keeps serving the lane's ordinary work.
+
+The rules that stay closed:
+
+- A REBASE offer on a rebase-capable connector is accepted only on an intake
+  acknowledgment with contract version 1 that grants `rebase-executor` at the
+  requested version. A missing, malformed, wrong-version, ungranted, or
+  scope-asserting acknowledgment fails closed: the offer is declined through
+  the same receipt-fenced release path, never mapped onto fix-pr, and never
+  retried per generation.
+- Ownership keeps full lane equality for that work: the handout is admitted
+  only when its original claimant is bound to this connector's own queue
+  lane. The lane that owns the claimant does the rebase; a foreign-lane
+  capable connector declines it, and every lifecycle boundary revalidates
+  the same verdict.
+- One rebase per branch never comes from here. Dispatch enforces
+  concurrency one on the rebase lane with a serialized admission gate, and
+  the claim stays generation-pinned, so two connectors cannot hold the same
+  rebase, including after a reclaim sweep. Publication stays the
+  head-lease force-push to the observed admission head.
+- A binding cannot be both designations at once. The manager stops at
+  startup when one agent names itself both `--dispatch-rebase-executor` and
+  `--dispatch-rebase-capable`, and each designation must resolve to exactly
+  one configured binding.
+
+Both modes coexist: a dedicated rebase executor still accepts pool-routed
+REBASE work across lanes (#787), and every undeclared binding still declines
+it.
+
 ## Operator enablement
 
 No production configuration changes with this feature. To enable the lane when

@@ -61,18 +61,23 @@ func originalClaimantEvidence(task Task) string {
 // never the claimant.
 //
 // The lane-equality arm is the one exception for rebase work (#787): when
-// this connector negotiated the rebase-executor contract and the item is
-// REBASE-marked, the verdict is known-claimant membership alone. Per
+// this connector negotiated the rebase-executor intake contract as a
+// dedicated rebase-only executor and the item is REBASE-marked, the verdict
+// is known-claimant membership alone. Per
 // misospace/dispatch#1327 a REBASE item's exclusivity is the
-// DISPATCH_REBASE_AGENTS local-only pool, not the queue-lane column — the
-// claimant is the original fixer on its own lane while the rebase connector
-// polls on its own — so lane equality could never hold and would decline
-// every pool-routed handout. Evidence stays required: an absent claimant or
-// one outside the configured bindings is still declined on the rebase path,
-// and every other attempt — ordinary fix-pr work anywhere, and a REBASE-marked
-// offer reaching a connector that never negotiated the capability, which the
-// rebase classification declines on top of this gate — keeps full lane
-// equality.
+// DISPATCH_REBASE_AGENTS local-only pool, not the queue-lane column —
+// the claimant is the original fixer on its own lane while the rebase connector
+// polls on its own — so lane equality could never hold there, and would decline
+// every pool-routed rebase handout. Evidence stays required: an absent claimant or
+// one outside the configured bindings is still declined on the rebase path.
+// A rebase-capable connector (#886) — one that declared the capability
+// without the rebase-only scope — is not this exception: REBASE-marked work
+// keeps full lane equality there, so the handout is admitted only by the
+// connector whose queue lane owns the claimant, and every other attempt —
+// ordinary fix-pr work anywhere, and a REBASE-marked offer reaching a
+// connector that never declared the capability, which the rebase
+// classification declines on top of this gate — keeps full lane
+// equality too.
 //
 // An empty reason means the attempt is authorized for this connector.
 func (c *HTTPClient) ownershipVerdict(claimant, fixType string) (reason, why string) {

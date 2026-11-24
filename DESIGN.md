@@ -1970,16 +1970,22 @@ matching applies. The claimant stays the only ownership evidence — it is never
 inferred from the recipient, author, branch, or fix type — and the fix type
 only selects the shape of the lane arm. The lane comparison is dropped for one
 case (#787): on a connector that negotiated the rebase-executor intake
-contract, the verdict for a REBASE-marked item is known-claimant membership
-alone. REBASE exclusivity is the `DISPATCH_REBASE_AGENTS` local-only pool, not
-the queue-lane column (misospace/dispatch#1327): the claimant is the original
+contract as a dedicated rebase-only executor, the verdict for a REBASE-marked
+item is known-claimant membership alone. REBASE exclusivity is the
+`DISPATCH_REBASE_AGENTS` local-only pool, not the queue-lane column
+(misospace/dispatch#1327): the claimant is the original
 fixer on its own lane while the rebase connector polls on its own, so lane
 equality could never hold there, and enforcing it declined every pool-routed
 rebase handout and drove the fail-closed waiting-external park loop (#786).
+A rebase-capable connector (#886) — one that declares the `rebase-executor:1`
+capability without the rebase-only work scope, so the owning lane can execute
+the mechanical rebase alongside its ordinary work — is not that exception:
+REBASE-marked work keeps full lane equality there, so the handout is admitted
+only by the connector whose queue lane owns the claimant.
 Evidence stays required on that path — a REBASE-marked offer whose claimant is
 absent or outside the bindings is still declined by ownership — and every
 other attempt keeps full lane equality: a REBASE-marked offer reaching a
-connector that never negotiated the capability keeps the full verdict, so a
+connector that never declared the capability keeps the full verdict, so a
 cross-lane or evidence-less claimant is declined by ownership first and a
 same-lane one passes ownership only to meet the rebase classification's
 unsupported decline.
@@ -3691,6 +3697,18 @@ resolves a queue lane only when that lane carries exactly one binding, and the
 two forms cannot be combined. A binding that reads like a rebase executor but
 was not declared as one produces a startup warning, because it declines every
 REBASE handout and the lane looks idle.
+
+A lane can also own its rebase work (#886): `--dispatch-rebase-capable` names
+a binding whose lane may execute mechanical rebase work alongside its ordinary
+queue. That binding declares `rebase-executor:1` without the rebase-only work
+scope, so Dispatch treats the poll as a capable REBASE recipient (for pool
+members) while its ordinary queue is unchanged; a REBASE offer is accepted
+only on a v1 acknowledgment granting the capability, and only when the
+claimant is bound to that connector's own queue lane — full lane equality,
+not the dedicated executor's membership-only verdict. A designation that
+resolves to nothing fails startup like the executor form; one agent cannot
+carry both designations. Concurrency one per rebase is Dispatch's serialized
+lane admission plus the generation-pinned claim, not the connector count.
 
 Model-assisted conflict resolution (#732) is an explicit operator-selected
 capability, off by default. When enabled, the engine hands the episode's first
