@@ -633,7 +633,7 @@ type TerminalContainerDiagnostic struct {
 // is the workload/infrastructure split: an infrastructure failure is the
 // relaunch/resume case bounded by the crashloop counter (HARNESS.md §8), not
 // a terminal verdict on the work.
-// +kubebuilder:validation:Enum=published;no_change;needs_human;blocked_external;capacity_exhausted;workload_failed;infrastructure_failed
+// +kubebuilder:validation:Enum=published;no_change;needs_human;blocked_external;capacity_exhausted;budget_exhausted;workload_failed;infrastructure_failed
 type NativeResultKind string
 
 const (
@@ -655,6 +655,13 @@ const (
 	// NativeResultCapacityExhausted: confirmed execution-capacity exhaustion
 	// (#320/#327); a recoverable wait on an external resource.
 	NativeResultCapacityExhausted NativeResultKind = "capacity_exhausted"
+	// NativeResultBudgetExhausted: the run's declared coordination budget
+	// (#901) — total tool calls or wall clock — was exhausted and the
+	// coordinator never declared an outcome inside the enforced grace. This
+	// is a terminal verdict on the run's coordination, distinct from an
+	// infrastructure failure (a crash relaunches) and from a success; the
+	// exhausted budget is a lane configuration the operator adjusts.
+	NativeResultBudgetExhausted NativeResultKind = "budget_exhausted"
 	// NativeResultWorkloadFailed: the run's work failed — an undeclared
 	// ending, a declared changes with nothing integrated, or another ending
 	// that is a verdict on the work, never on the infrastructure.
@@ -693,6 +700,8 @@ func NativeResultReason(kind NativeResultKind) string {
 		return "coordinator blocked on an external prerequisite"
 	case NativeResultCapacityExhausted:
 		return "execution capacity was confirmed exhausted"
+	case NativeResultBudgetExhausted:
+		return "coordinator exhausted the run's coordination budget"
 	case NativeResultWorkloadFailed:
 		return "coordinator reported a workload failure"
 	case NativeResultInfrastructureFailed:

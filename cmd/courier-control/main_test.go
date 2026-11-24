@@ -505,6 +505,193 @@ func TestCompactionSinkEmitsSessionCompacted(t *testing.T) {
 	}
 }
 
+// TestBudgetSinkEmitsSessionBudgetExhausted pins #901's telemetry contract:
+// the harness's single budget-trip event reaches the run's structured log as
+// one session.budget_exhausted line carrying the exhausted axis, the observed
+// count, the declared limit, and the tripping role — the counts the issue
+// requires operators to read without inferring them from the terminal result.
+// Like session.compacted, the event marks itself Verbose and sets no Status:
+// the trip is observability, and the budget_exhausted terminal kind remains
+// the classification surface.
+func TestBudgetSinkEmitsSessionBudgetExhausted(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	sink := budgetSink{
+		emitter: courierlog.NewEmitter(&stdout, courierlog.LevelInfo),
+		stderr:  &stderr,
+		invocation: executor.Invocation{
+			RunName: "run-1",
+			Repo:    "owner/name",
+			Ref:     7,
+			Mode:    courierv1alpha1.ModeResolveIssue,
+		},
+	}
+	sink.BudgetExhausted(harness.BudgetExhaustedEvent{
+		Axis:  "tool_calls",
+		Count: 41,
+		Limit: 40,
+		Role:  "coordinator",
+	})
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want a clean emission", stderr.String())
+	}
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("emitted %d lines, want exactly one: %q", len(lines), stdout.String())
+	}
+	var event map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &event); err != nil {
+		t.Fatalf("emitted line is not JSON: %v: %q", err, lines[0])
+	}
+	if event["event"] != courierlog.EventSessionBudgetExhausted {
+		t.Fatalf("event = %v, want %q", event["event"], courierlog.EventSessionBudgetExhausted)
+	}
+	if event["run_id"] != "run-1" || event["repo"] != "owner/name" {
+		t.Fatalf("run identity = %v/%v, want the invocation's", event["run_id"], event["repo"])
+	}
+	if event["role"] != "coordinator" {
+		t.Fatalf("role = %v, want coordinator", event["role"])
+	}
+	if _, ok := event["status"]; ok {
+		t.Fatalf("session.budget_exhausted carries status %v; the trip is observability, never status", event["status"])
+	}
+	detail, ok := event["detail"].(map[string]any)
+	if !ok {
+		t.Fatalf("detail = %v, want the verbose counts at info level", event["detail"])
+	}
+	if detail["budget"] != "tool_calls" || detail["count"] != float64(41) || detail["limit"] != float64(40) {
+		t.Fatalf("detail = %v, want budget tool_calls with count 41 and limit 40", detail)
+	}
+}
+
+// TestBudgetSinkEmitsSessionBudgetWarning pins the near-limit half of #901's
+// telemetry contract: the warning event reaches the run's structured log as
+// one session.budget_warning line carrying the warning axis, the observed
+// count, the declared limit, and the crossing role — the line that shows an
+// operator a run approaching its ceiling before it binds. Verbose, no
+// Status, exactly like the trip line.
+func TestBudgetSinkEmitsSessionBudgetWarning(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	sink := budgetSink{
+		emitter: courierlog.NewEmitter(&stdout, courierlog.LevelInfo),
+		stderr:  &stderr,
+		invocation: executor.Invocation{
+			RunName: "run-1",
+			Repo:    "owner/name",
+			Ref:     7,
+			Mode:    courierv1alpha1.ModeResolveIssue,
+		},
+	}
+	sink.BudgetNearLimit(harness.BudgetWarningEvent{
+		Axis:  "wall_clock",
+		Count: 240,
+		Limit: 300,
+		Role:  "coordinator",
+	})
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want a clean emission", stderr.String())
+	}
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("emitted %d lines, want exactly one: %q", len(lines), stdout.String())
+	}
+	var event map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &event); err != nil {
+		t.Fatalf("emitted line is not JSON: %v: %q", err, lines[0])
+	}
+	if event["event"] != courierlog.EventSessionBudgetWarning {
+		t.Fatalf("event = %v, want %q", event["event"], courierlog.EventSessionBudgetWarning)
+	}
+	if event["role"] != "coordinator" {
+		t.Fatalf("role = %v, want coordinator", event["role"])
+	}
+	if _, ok := event["status"]; ok {
+		t.Fatalf("session.budget_warning carries status %v; the warning is observability, never status", event["status"])
+	}
+	detail, ok := event["detail"].(map[string]any)
+	if !ok {
+		t.Fatalf("detail = %v, want the verbose counts at info level", event["detail"])
+	}
+	if detail["budget"] != "wall_clock" || detail["count"] != float64(240) || detail["limit"] != float64(300) {
+		t.Fatalf("detail = %v, want budget wall_clock with count 240 and limit 300", detail)
+	}
+}
+
+// TestEmitRunBudgetPinsConsumptionLine pins the per-run budget-consumption
+// half of #901's telemetry contract: one run.budget line carrying the tool
+// calls reserved against the declared ceiling, the elapsed seconds against
+// the declared wall clock, and the trip state. Absent bounds are omitted,
+// never zero-valued claims; no Status; Verbose like model.telemetry.
+func TestEmitRunBudgetPinsConsumptionLine(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	emitter := courierlog.NewEmitter(&stdout, courierlog.LevelInfo)
+	emitRunBudget(emitter, executor.Invocation{
+		RunName: "run-1",
+		Repo:    "owner/name",
+		Ref:     7,
+		Mode:    courierv1alpha1.ModeResolveIssue,
+	}, harness.BudgetConsumption{
+		ToolCalls:        33,
+		MaxToolCalls:     40,
+		ElapsedSeconds:   100,
+		WallClockSeconds: 300,
+		Tripped:          true,
+		TripAxis:         "tool_calls",
+	})
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want a clean emission", stderr.String())
+	}
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("emitted %d lines, want exactly one: %q", len(lines), stdout.String())
+	}
+	var event map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &event); err != nil {
+		t.Fatalf("emitted line is not JSON: %v: %q", err, lines[0])
+	}
+	if event["event"] != courierlog.EventRunBudget {
+		t.Fatalf("event = %v, want %q", event["event"], courierlog.EventRunBudget)
+	}
+	if event["run_id"] != "run-1" || event["repo"] != "owner/name" {
+		t.Fatalf("run identity = %v/%v, want the invocation's", event["run_id"], event["repo"])
+	}
+	if _, ok := event["status"]; ok {
+		t.Fatalf("run.budget carries status %v; the consumption is observability, never status", event["status"])
+	}
+	detail, ok := event["detail"].(map[string]any)
+	if !ok {
+		t.Fatalf("detail = %v, want the verbose counts at info level", event["detail"])
+	}
+	want := map[string]any{
+		"tool_calls":         float64(33),
+		"max_tool_calls":     float64(40),
+		"elapsed_seconds":    float64(100),
+		"wall_clock_seconds": float64(300),
+		"tripped":            true,
+		"trip_axis":          "tool_calls",
+	}
+	for key, value := range want {
+		if detail[key] != value {
+			t.Fatalf("detail[%q] = %v, want %v", key, detail[key], value)
+		}
+	}
+	// A single-axis declaration omits the other axis entirely.
+	stdout.Reset()
+	emitRunBudget(emitter, executor.Invocation{RunName: "run-2"}, harness.BudgetConsumption{ToolCalls: 5, MaxToolCalls: 10})
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout.String())), &event); err != nil {
+		t.Fatal(err)
+	}
+	detail = event["detail"].(map[string]any)
+	if _, ok := detail["wall_clock_seconds"]; ok {
+		t.Fatalf("detail = %v, want no wall-clock field when the wall clock is undeclared", detail)
+	}
+	if _, ok := detail["trip_axis"]; ok {
+		t.Fatalf("detail = %v, want no trip axis on an untripped run", detail)
+	}
+	if detail["tripped"] != false {
+		t.Fatalf("detail = %v, want tripped false", detail)
+	}
+}
+
 // TestModelRequestSinkEmitsModelCall pins #738's per-request telemetry
 // contract: one model.call line per model request the native harness sent,
 // carrying the run identity, the role and bound model, the request class and

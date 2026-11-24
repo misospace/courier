@@ -31,8 +31,11 @@ Classification uses the strongest available evidence: a concrete category the
 executor emitted in its handoff wins; otherwise the trusted native terminal
 result (#127) — `status.nativeResult` when it fences to the terminated pod's
 incarnation, else the handoff's `result_kind` fallback — maps `needs_human`,
-`blocked_external`, `capacity_exhausted`, `workload_failed`, and
-`infrastructure_failed` onto their categories, ahead of every
+`blocked_external`, `capacity_exhausted`, `budget_exhausted` (a lane-declared
+coordination budget spent without a declaration inside the enforced grace,
+#901 — a verdict on the run's coordination, so it classifies as
+`workload-failure`, never recoverable provider capacity), `workload_failed`,
+and `infrastructure_failed` onto their categories, ahead of every
 runtime-failure and exit-code heuristic; otherwise causal
 Kubernetes/container
 failure evidence (`OOMKilled`, `ContainerStatusUnknown`, authoritative eviction,

@@ -488,6 +488,37 @@ func TestReconcileAllCarriesContextOntoSpec(t *testing.T) {
 	}
 }
 
+// TestReconcileAllCarriesBudgetOntoSpec pins the mirror direction for the
+// declared coordination budget (#901): what a profile configures is what the
+// managed LaneProfile carries, with nothing enforced or resolved on the way
+// through.
+func TestReconcileAllCarriesBudgetOntoSpec(t *testing.T) {
+	kubeClient := newBootstrapClient(t)
+	provider := &staticProvider{profiles: []Profile{{
+		Name:  "local",
+		Roles: map[string]string{"coordinator": "claude-sonnet-4-5"},
+		Budget: &courierv1alpha1.BudgetPolicy{
+			MaxToolCalls:     200,
+			WallClockSeconds: 3600,
+		},
+	}}}
+	r := &Reconciler{Client: kubeClient, Namespace: "courier", Provider: provider}
+	if err := r.ReconcileAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var got courierv1alpha1.LaneProfile
+	if err := kubeClient.Get(context.Background(), client.ObjectKey{Namespace: "courier", Name: "local"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	budget := got.Spec.Budget
+	if budget == nil {
+		t.Fatal("spec.budget is nil, want the declared policy")
+	}
+	if budget.MaxToolCalls != 200 || budget.WallClockSeconds != 3600 {
+		t.Fatalf("budget = %#v, want the declared bounds", budget)
+	}
+}
+
 // TestReconcileAllDoesNotChurnDefaultedContext closes the meet between the
 // parser's mirrored CRD default and the API server's default: a config that
 // omits the policy-level compactAtPercent, evaluated against a managed

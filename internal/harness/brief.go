@@ -188,6 +188,38 @@ func (r *BriefRegistry) Result(briefID string) (BriefResult, bool) {
 	return result, ok
 }
 
+// BriefHandoffEntry is one registered brief as the structured budget handoff
+// (#901) reads it: the brief's contract data plus, when one was recorded,
+// its result. A registered brief with no result and no cancellation tomb
+// ended unfinished; a tombstoned brief was deliberately cancelled.
+type BriefHandoffEntry struct {
+	ID        string
+	Role      string
+	Objective string
+	Decisions []Decision
+	Result    *BriefResult
+	Cancelled bool
+}
+
+// HandoffEntries snapshots the ledger in registration order for the budget
+// handoff renderer (#901). It reads the same state the checkpoint and the
+// soft-stop wait read; it advances nothing.
+func (r *BriefRegistry) HandoffEntries() []BriefHandoffEntry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entries := make([]BriefHandoffEntry, 0, len(r.order))
+	for _, id := range r.order {
+		brief := r.briefs[id]
+		_, tomb := r.tombs[id]
+		entry := BriefHandoffEntry{ID: brief.ID, Role: brief.Role, Objective: brief.Objective, Decisions: brief.Decisions, Cancelled: tomb}
+		if result, ok := r.results[id]; ok {
+			entry.Result = &result
+		}
+		entries = append(entries, entry)
+	}
+	return entries
+}
+
 // Register records a new brief. A duplicate ID is rejected without any
 // worker contact.
 func (r *BriefRegistry) Register(brief Brief) (Brief, error) {

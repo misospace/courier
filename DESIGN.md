@@ -52,7 +52,11 @@ judgment, instead of boxing it in with gates, caps, and one-shot pods.
   any mix. Courier is **local-capable, not local-constrained**. Its author runs
   it local-only; nothing in the design requires that of anyone else.
 - **No wall-clock deadlines.** Consumer hardware is slow; an 18-hour run that is
-  making progress is fine. Courier bounds *stuck*, not *duration*.
+  making progress is fine. Courier bounds *stuck*, not *duration*. The one
+  declared exception is opt-in and lane-scoped: an operator may bound a lane's
+  coordination on `LaneProfile.spec.budget` (#901), which the harness — never
+  the controller — enforces as a coordination budget ending `budget_exhausted`.
+  Nothing may bound a run's duration that its lane did not declare.
 
 ## Architecture
 
@@ -510,7 +514,8 @@ The native harness ends with an explicit, structured terminal result, not a
 bare exit code (#127; the full contract is HARNESS.md §8). Trusted control
 classifies every ending into a `status.nativeResult` kind — `published`,
 `no_change`, `needs_human`, `blocked_external`, `capacity_exhausted`,
-`workload_failed`, or `infrastructure_failed` — and persists it through the
+`budget_exhausted`, `workload_failed`, or `infrastructure_failed` — and
+persists it through the
 run's broker status path before the control process exits. The broker fences
 the write to the authenticated control incarnation, so a stale pod cannot
 record a result, and one incarnation's recorded result is final: an identical
@@ -864,7 +869,12 @@ added later.
 
 ## Liveness and stuck detection
 
-No wall-clock. Courier bounds *stuck*, never *duration*.
+No wall-clock deadlines imposed by the control plane. Courier bounds *stuck*,
+never *duration*. The only duration bound that exists is the one a lane opts
+into on `LaneProfile.spec.budget` (#901): the harness checks the coordinator
+session loop's wall clock at its step boundaries and ends an exhausted run
+`budget_exhausted`; a lane that declares no budget is bounded by liveness
+alone.
 
 The only safe progress signal is **successful model streaming or a completed
 tool call** — real activity. Commits are unsafe (opencode-style runs commit
@@ -2646,6 +2656,9 @@ spec:
     roles:
       coordinator: {maxInputTokens: 128000}
       coder: {maxInputTokens: 32000}
+  budget:                          # optional coordination budgets the harness enforces (#901)
+    maxToolCalls: 200              # total tool calls across the coordinator and every delegate session
+    wallClockSeconds: 3600         # coordinator-loop wall clock, checked at step boundaries
   resources:                       # optional CPU/memory sizing for this lane's pods
     requests: {cpu: 500m, memory: 1Gi}
     limits: {cpu: "4", memory: 8Gi}
