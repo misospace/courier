@@ -6,16 +6,17 @@ import (
 	"strings"
 )
 
-// App-mode git credential contract for the legacy coordinator pod (#871).
+// App-mode git credential contract for the legacy coordinator pod (#871,
+// enforced by #902).
 //
 // When the deployment configures the GitHub App installation minter, the
 // legacy launcher writes the run's installation-token document into the run's
 // credentials Secret (the same document shape and Secret key the secure
-// broker reads) and renders the coordinator pod with these variables instead
-// of the static COURIER_GIT_USERNAME/COURIER_GIT_TOKEN pair. The pod's git
-// credential helper (the executor binary's askpass mode) then resolves a
-// short-lived, repository-pinned token per prompt and never consults a static
-// credential: an App-enabled pod has no static fallback.
+// broker reads). The document is then served only by the pod's git egress
+// guard container — a loopback smart-HTTP boundary that injects the
+// credential upstream and refuses every push outside the run's approved work
+// ref — never by the model container, which carries no git credential and no
+// means to read one. An App-enabled pod has no static fallback.
 //
 // The names are literals here because internal/executor cannot import
 // internal/topology (topology imports executor); topology.CredentialsSecretName
@@ -66,9 +67,11 @@ const (
 	// helper trusts when EnvAPICertFile is unset.
 	DefaultAPICertPath = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 
-	// GitCredentialsTokenPath is the directory where an App-mode coordinator
-	// pod mounts its projected ServiceAccount token for the credentials read;
-	// COURIER_API_TOKEN_FILE names token <inside> it.
+	// GitCredentialsTokenPath is the directory where an App-mode pod mounts
+	// its projected ServiceAccount token for the credentials read;
+	// COURIER_API_TOKEN_FILE names the token file inside it. The mount
+	// belongs to the git egress guard and the observer, never the model
+	// container (#902).
 	GitCredentialsTokenPath = "/var/run/courier-git-credentials"
 )
 
