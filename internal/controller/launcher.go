@@ -148,10 +148,14 @@ type CoordinatorLauncher struct {
 	// before.
 	InstallationGit *InstallationGitOptions
 	// GitGuardEgressCIDRs enables the per-run git-guard egress policy for
-	// legacy App-mode coordinator pods (#908): each entry is an operator-
-	// provided forge CIDR the policy admits on TCP 443 — the pod's only 443
-	// destinations once set, so the operator must list every forge host the
-	// pod needs. Nil leaves every legacy launch byte-identical.
+	// legacy App-mode coordinator pods (#908): while set, the pod admits
+	// only DNS and TCP 443 to these operator-provided CIDRs and every other
+	// egress path is refused, so the list must cover every TCP-443
+	// destination the pod needs — the forge hosts, the model-provider
+	// endpoint, and the kubernetes Service ClusterIP the guard and observer
+	// read their credentials document through — and every non-443 path,
+	// notably the evidence-intake POST, is refused with it. Nil leaves every
+	// legacy launch byte-identical.
 	GitGuardEgressCIDRs []string
 }
 
@@ -524,15 +528,15 @@ func (l *CoordinatorLauncher) collisionReader() client.Reader {
 }
 
 // ensureGitGuardEgressPolicy provisions the run's opt-in git-guard egress
-// policy before the coordinator pod exists. A create is the normal path; a
-// collision is accepted only when the existing policy is owned by this run's
-// UID and its spec equals the rendered one — a foreign same-named policy, or
-// one whose admitted CIDRs no longer match the deployment's configuration,
-// must never be adopted as "idempotently live", because either would enforce
-// an egress boundary the deployment did not configure. An owned policy that
-// merely drifted is converged in place rather than refused, mirroring the
-// secure path's policy convergence, so a rendering change reaches runs
-// provisioned before it and no requeue loop wedges the launch.
+// policy before the coordinator pod exists. A create is the normal path. On
+// an AlreadyExists collision the existing policy is verified against the run:
+// a policy this run does not own is refused — a same-named foreign policy
+// must never be adopted or overwritten, because that would enforce an egress
+// boundary the deployment did not configure; an owned policy whose spec
+// equals the rendered one is accepted as idempotently live; and an owned
+// policy whose spec drifted is converged in place to the rendered spec,
+// mirroring the secure path's policy convergence, so a rendering change
+// reaches runs provisioned before it and no requeue loop wedges the launch.
 func (l *CoordinatorLauncher) ensureGitGuardEgressPolicy(ctx context.Context, run *courierv1alpha1.CoderRun) error {
 	if len(l.GitGuardEgressCIDRs) == 0 {
 		return secureNeedsHuman("GitGuardPolicyCIDRs", "legacy git-guard egress policy requires at least one CIDR")

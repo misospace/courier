@@ -13,11 +13,17 @@ import (
 // GitGuardEgressPolicy renders the opt-in legacy coordinator egress boundary
 // (#908): the policy admits DNS egress to cluster DNS, ingress from the
 // run's own pods (the reply path of a pod-originated connection), and TCP
-// 443 egress to the operator-provided forge CIDRs — the pod's only 443
-// destinations once the flag is set, so the operator's list must cover every
-// 443 destination the pod needs, the forge hosts and the cluster API server
-// the guard and observer read their credentials document through. Callers
-// must provide at least one parsed CIDR; the exclusion lists carry only the
+// 443 to the operator-provided CIDRs — and refuses every other egress path
+// of the pod while it selects it: not only every other 443 destination but
+// every non-443 path, notably the evidence-intake POST to its in-cluster
+// HTTP service (a lost bundle, not a failed run). The operator's list must
+// therefore cover every TCP-443 destination the pod needs — for example the
+// forge hosts, the model-provider endpoint, and the kubernetes Service
+// ClusterIP the guard and observer read their credentials document through —
+// plus any other HTTPS endpoint the deployment configures (MCP servers); an
+// endpoint on a non-443 port, an in-cluster model gateway among them, cannot
+// be admitted at all, so such deployments keep the flag unset. Callers must
+// provide at least one parsed CIDR; the exclusion lists carry only the
 // entries contained in the admitted CIDR, because the API server rejects an
 // except outside it.
 func GitGuardEgressPolicy(run *courier.CoderRun, cidrs []*net.IPNet) *networkingv1.NetworkPolicy {

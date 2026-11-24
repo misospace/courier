@@ -466,17 +466,50 @@ controllers:
         #                               placeholder filled with spec.repo
         #   --legacy-git-guard-egress-cidrs
         #                               Optional comma-separated CIDRs a legacy
-        #                               App-mode git-guard pod may reach on TCP
-        #                               443; the pod admits no other 443
-        #                               destination, so the list must cover
-        #                               every 443 host the pod needs: the forge
-        #                               (git and API, e.g. github.com and
-        #                               api.github.com) and the cluster API
-        #                               server the guard reads the run's
-        #                               credentials document through. The
-        #                               operator derives nothing from hostnames
-        #                               — CIDRs are operator-provided. Empty
-        #                               (the default) renders no per-run policy.
+        #                               App-mode git-guard pod may reach; while
+        #                               set the pod admits ONLY DNS (UDP and
+        #                               TCP 53) and TCP 443 to these CIDRs —
+        #                               every other destination and port is
+        #                               refused — so the list must cover every
+        #                               TCP-443 destination the pod needs: for
+        #                               example the forge (git and API, e.g.
+        #                               github.com and api.github.com), the
+        #                               model-provider endpoint, any other
+        #                               HTTPS endpoint the deployment
+        #                               configures (MCP servers), and the
+        #                               kubernetes Service ClusterIP
+        #                               (KUBERNETES_SERVICE_HOST) the guard
+        #                               and observer read the run's
+        #                               credentials document through — admit
+        #                               both that ClusterIP and the API-server
+        #                               endpoint behind it, because which of
+        #                               the two the fabric judges depends on
+        #                               the datapath. An endpoint on a non-443
+        #                               port — an in-cluster model gateway
+        #                               among them — cannot be admitted at
+        #                               all, so such deployments keep the flag
+        #                               unset. The operator derives nothing
+        #                               from hostnames — CIDRs are
+        #                               operator-provided. Non-443 egress is
+        #                               refused too, including the
+        #                               evidence-intake POST to the
+        #                               <release>-evidence Service (plain
+        #                               HTTP on the service port and the
+        #                               manager's intake port): the bundle is
+        #                               lost, not fatal, and the chart's own
+        #                               listener offers no TLS, so a
+        #                               deployment using evidence intake keeps
+        #                               this flag unset unless it fronts the
+        #                               intake itself. Under identity-based
+        #                               CNIs such as Cilium, ipBlock rules
+        #                               cannot match the API server's
+        #                               reserved identity (see the CNI note
+        #                               under secure), so the guard's
+        #                               credential read and the observer's read
+        #                               are refused there unless a companion
+        #                               CNI policy in the coordinator pods'
+        #                               namespace admits the path. Empty (the
+        #                               default) renders no per-run policy.
         #   --git-credential-secret    Secret with username/token keys for
         #                               git access; empty disables git injection
         #   --git-token-key             Optional key for the git token; defaults to token

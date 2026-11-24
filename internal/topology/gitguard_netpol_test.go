@@ -98,6 +98,54 @@ func TestGitGuardEgressPolicy(t *testing.T) {
 	}
 }
 
+// The #908 acceptance condition at the rendered-spec level: a direct forge
+// connection from the coordinator container is refused on every port the
+// policy does not name — SSH 22, the git protocol 9418, and plain HTTP (the
+// evidence intake's service and intake ports) are admitted by no rule —
+// while guard-routed git still works: the guard's loopback listener is
+// intra-pod and outside NetworkPolicy scope, and TCP 443 to the forge CIDRs
+// carries the guard's upstream TLS. The policy cannot distinguish containers
+// inside one pod, so a direct forge connection on 443 itself remains
+// fabric-admitted (DESIGN.md records that reduced scope); what the spec must
+// refuse is every other forge path. A rule with no ports, a port with no
+// number, or a named port matches every port or a port set — either would
+// reopen the refused paths — so every rule is pinned to named integer ports.
+func TestGitGuardEgressPolicyRefusesDirectForgePaths(t *testing.T) {
+	run := testRun("git-guard-direct")
+	cidrs, err := ParseGitGuardCIDRs([]string{"140.82.112.0/20", "185.199.108.0/22"})
+	if err != nil {
+		t.Fatalf("ParseGitGuardCIDRs: %v", err)
+	}
+	policy := GitGuardEgressPolicy(run, cidrs)
+	if len(policy.Spec.Egress) != 1+len(cidrs) {
+		t.Fatalf("egress rules = %d, want DNS plus one rule per CIDR", len(policy.Spec.Egress))
+	}
+	forge := map[string]bool{}
+	for _, cidr := range cidrs {
+		forge[cidr.String()] = true
+	}
+	for _, rule := range policy.Spec.Egress {
+		if len(rule.Ports) == 0 {
+			t.Fatalf("egress rule %+v carries no ports: that matches every port", rule)
+		}
+		for _, port := range rule.Ports {
+			if port.Port == nil || port.Port.Type != intstr.Int {
+				t.Fatalf("egress rule %+v carries port %v: only named integer ports are pinned", rule, port.Port)
+			}
+			switch port.Port.IntValue() {
+			case 22, 9418, 80, 8082:
+				t.Fatalf("egress rule admits port %d: a direct forge path or the evidence intake must be refused", port.Port.IntValue())
+			}
+		}
+		if len(rule.To) == 1 && rule.To[0].IPBlock != nil && forge[rule.To[0].IPBlock.CIDR] {
+			if len(rule.Ports) != 1 || *rule.Ports[0].Protocol != corev1.ProtocolTCP ||
+				*rule.Ports[0].Port != intstr.FromInt32(443) {
+				t.Fatalf("forge CIDR %q admits %+v, want TCP 443 only: the guard's upstream", rule.To[0].IPBlock.CIDR, rule.Ports)
+			}
+		}
+	}
+}
+
 func TestGitGuardEgressPolicyNarrowCIDRDropsInapplicableExcepts(t *testing.T) {
 	run := testRun("git-guard-narrow")
 	cidrs, err := ParseGitGuardCIDRs([]string{"140.82.112.0/20"})

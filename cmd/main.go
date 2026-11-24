@@ -173,7 +173,7 @@ func main() {
 	defaults := executor.DefaultPodConfig()
 	flag.StringVar(&executorImage, "executor-image", defaults.Image, "Coordinator image containing courier-executor, git, and opencode.")
 	flag.StringVar(&gitRemoteTemplate, "git-remote-template", defaults.GitRemoteURL, "Git remote URL template containing one %s repository placeholder.")
-	flag.StringVar(&legacyGitGuardEgressCIDRs, "legacy-git-guard-egress-cidrs", "", "Optional comma-separated CIDRs allowed for legacy App-mode git guard TLS egress; empty disables the per-run policy.")
+	flag.StringVar(&legacyGitGuardEgressCIDRs, "legacy-git-guard-egress-cidrs", "", "Optional comma-separated CIDRs a legacy App-mode git-guard pod may reach; while set the pod admits only DNS and TCP 443 to these CIDRs and every other egress is refused, so the list must cover every 443 destination the pod needs (the forge, the model-provider endpoint, MCP servers, and the kubernetes Service ClusterIP the guard and observer read their credentials document through); non-443 egress such as the evidence-intake POST is refused too, and under identity-based CNIs such as Cilium a companion CNI policy must admit the API-server path. Empty disables the per-run policy.")
 	flag.StringVar(&gitCredentialSecret, "git-credential-secret", "courier-github", "Secret containing username and token keys for private git access; empty disables git secret injection.")
 	flag.StringVar(&gitTokenKey, "git-token-key", "", "Optional key in the git credential Secret; empty defaults to token.")
 	flag.StringVar(&githubCredentialSecret, "github-credential-secret", "", "Optional Secret containing the GitHub API token; empty falls back to --git-credential-secret.")
