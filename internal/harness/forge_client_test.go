@@ -119,3 +119,54 @@ func TestBrokerForgeClientTransientUnavailableIsRetryable(t *testing.T) {
 		t.Fatalf("error = %#v, want retryable 503 classification", err)
 	}
 }
+
+// TestBrokerForgeClientStatusClassification pins how every status the forge
+// read route answers is classified on this side, and so whether control's retry
+// machinery may rerun the read. Only a failure a retry can change retries: an
+// answer too large to deliver (413) and a read the provider never implements
+// (501) would loop forever if they were retryable.
+func TestBrokerForgeClientStatusClassification(t *testing.T) {
+	cases := []struct {
+		name      string
+		status    int
+		wantRetry bool
+	}{
+		{"policy denial", http.StatusUnprocessableEntity, false},
+		{"answer too large", http.StatusRequestEntityTooLarge, false},
+		{"capability unsupported", http.StatusNotImplemented, false},
+		{"temporarily unavailable", http.StatusServiceUnavailable, true},
+		{"provider rate limited", http.StatusTooManyRequests, true},
+		{"request timed out", http.StatusGatewayTimeout, true},
+		{"broker failed", http.StatusInternalServerError, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, "provider-secret-response", tc.status)
+			}))
+			defer server.Close()
+			client := &BrokerForgeClient{BaseURL: server.URL, TokenSource: fixedForgeToken{value: "token"}, HTTP: server.Client()}
+			_, err := client.Call(context.Background(), "read-work-item", `{"repo":"org/repo","id":"1"}`)
+			callErr, ok := err.(*BrokerCallError)
+			if !ok {
+				t.Fatalf("error = %v, want a BrokerCallError", err)
+			}
+			if callErr.StatusCode != tc.status || callErr.Retryable != tc.wantRetry {
+				t.Fatalf("status %d classified retryable=%v, want retryable=%v", tc.status, callErr.Retryable, tc.wantRetry)
+			}
+			if strings.Contains(err.Error(), "provider-secret-response") {
+				t.Fatalf("error leaked the provider response: %v", err)
+			}
+		})
+	}
+}
+
+// TestBrokerForgeReadBudgetIsInsideClientTimeout pins the ordering that keeps a
+// heavy read answerable: the broker stops the read before this client gives up,
+// so a read the budget cut short arrives as a whole retryable status instead of
+// a client-side timeout on a body the broker was still writing.
+func TestBrokerForgeReadBudgetIsInsideClientTimeout(t *testing.T) {
+	if broker.ForgeReadBudget >= brokerForgeCallTimeout {
+		t.Fatalf("broker read budget %v must end before the client timeout %v", broker.ForgeReadBudget, brokerForgeCallTimeout)
+	}
+}

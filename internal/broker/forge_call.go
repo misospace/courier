@@ -16,6 +16,18 @@ import (
 
 const maxForgeCallResponseBytes = 4 << 20
 
+// ForgeReadBudget bounds one model-facing forge read request end to end. A
+// listing fans out into paginated provider requests, each with the provider's
+// own timeout, so an unbounded fan-out can outlive the listener's write deadline
+// and have its answer cut off mid-write. The budget starts when the route is
+// entered and ends inside that deadline with the response reserve left over, so
+// every phase — authentication, the bounded body read, and the read itself —
+// counts against it and the route always answers a whole status. A read that
+// cannot finish in budget is cancelled while it can still be answered. It is
+// exported so the harness client can pin its own timeout above it and below the
+// write deadline.
+const ForgeReadBudget = InboundWriteTimeout - 2*apiResponseReserve
+
 // ForgeReader is the broker's narrow, run-pinned model-facing forge read surface.
 type ForgeReader interface {
 	WorkItem(context.Context, string, string) (forge.WorkItem, error)
@@ -38,6 +50,8 @@ type forgeCallArguments struct {
 }
 
 func (s *Server) forgeCall(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), ForgeReadBudget)
+	defer cancel()
 	if _, ok := s.authenticate(w, r); !ok {
 		return
 	}
@@ -70,35 +84,35 @@ func (s *Server) forgeCall(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid request", http.StatusBadRequest)
 			return
 		}
-		value, err := s.forgeReader.WorkItem(r.Context(), args.Repo, strconv.Itoa(id))
+		value, err := s.forgeReader.WorkItem(ctx, args.Repo, strconv.Itoa(id))
 		respondForgeRead(w, value, err)
 	case "read-pull-request":
 		if !validForgePRArgs(args) {
 			http.Error(w, "invalid request", http.StatusBadRequest)
 			return
 		}
-		value, err := s.forgeReader.ReadPullRequest(r.Context(), args.Repo, *args.Number)
+		value, err := s.forgeReader.ReadPullRequest(ctx, args.Repo, *args.Number)
 		respondForgeRead(w, value, err)
 	case "list-reviews":
 		if !validForgePRArgs(args) {
 			http.Error(w, "invalid request", http.StatusBadRequest)
 			return
 		}
-		value, err := s.forgeReader.Reviews(r.Context(), args.Repo, *args.Number)
+		value, err := s.forgeReader.Reviews(ctx, args.Repo, *args.Number)
 		respondForgeRead(w, value, err)
 	case "list-comments":
 		if !validForgePRArgs(args) {
 			http.Error(w, "invalid request", http.StatusBadRequest)
 			return
 		}
-		value, err := s.forgeReader.Comments(r.Context(), args.Repo, *args.Number)
+		value, err := s.forgeReader.Comments(ctx, args.Repo, *args.Number)
 		respondForgeRead(w, value, err)
 	case "read-checks":
 		if !validForgePRNumber(args) || !couriergit.ValidOID(stringValue(args.HeadSHA)) {
 			http.Error(w, "invalid request", http.StatusBadRequest)
 			return
 		}
-		value, err := s.forgeReader.Checks(r.Context(), args.Repo, *args.Number, *args.HeadSHA)
+		value, err := s.forgeReader.Checks(ctx, args.Repo, *args.Number, *args.HeadSHA)
 		respondForgeRead(w, value, err)
 	}
 }
@@ -156,13 +170,29 @@ func strictDecodeReader(reader io.Reader, target any) error {
 	return nil
 }
 
+// respondForgeRead answers one model-facing forge read with the status that
+// says what happened, so the client retries only what a retry can change:
+//
+//	503  the read never happened — a transient provider failure, or a read the
+//	     route budget cut short. The world was not observed, so retrying is
+//	     legitimate.
+//	422  the read was refused, or completed and failed. A definite answer that
+//	     no retry changes.
+//	413  the answer outgrew the response bound. The same read outgrows it
+//	     again, so this never retries.
+//	501  the provider does not implement this read. Retrying a capability the
+//	     provider never had can only loop.
 func respondForgeRead(w http.ResponseWriter, value any, err error) {
 	if err != nil {
-		// A transient provider failure means the read never happened: the
-		// answer stays retryable so control's retry machinery reruns it. A
-		// definite refusal — policy, capability, or a completed-but-failed
-		// read — is a denial and never retries.
-		if forge.IsTransientAvailability(err) {
+		// A definite refusal — policy, capability, or a completed-but-failed
+		// read — is a denial and never retries. A capability the provider
+		// never had answers apart from a refusal so an operator can tell
+		// "not supported here" from "you may not have it".
+		if errors.Is(err, forge.ErrUnsupported) {
+			http.Error(w, "forge read is not supported", http.StatusNotImplemented)
+			return
+		}
+		if errors.Is(err, context.DeadlineExceeded) || forge.IsTransientAvailability(err) {
 			http.Error(w, "forge read is temporarily unavailable", http.StatusServiceUnavailable)
 			return
 		}
@@ -174,6 +204,10 @@ func respondForgeRead(w http.ResponseWriter, value any, err error) {
 	// copy is buffered; it does not bound the encoder's own marshal.
 	body := &forgeResponseBuffer{remaining: maxForgeCallResponseBytes}
 	if err := json.NewEncoder(body).Encode(value); err != nil {
+		if errors.Is(err, errForgeResponseOversize) {
+			http.Error(w, "forge read answer is too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "response unavailable", http.StatusInternalServerError)
 		return
 	}

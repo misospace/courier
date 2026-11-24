@@ -43,7 +43,9 @@ const (
 
 // BrokerCallError classifies one broker call failure. Transport-class and
 // 5xx/429/408 failures are retryable; other 4xx responses are definite
-// denials. A local credential-read failure is retryable too — the projected
+// denials. A 501 is the one 5xx exception: it states that the operation is not
+// supported rather than that it failed, and no retry gives a different answer.
+// A local credential-read failure is retryable too — the projected
 // token file comes back when kubelet finishes rotating it, and the run never
 // needs rebuilding to pick the new bytes up. A 401 is a denial except when
 // the projected credential has already been replaced since the refused
@@ -66,6 +68,11 @@ func brokerTransportError() *BrokerCallError {
 }
 
 func brokerStatusError(status int) *BrokerCallError {
+	// A 501 describes what the broker can never do, not a failure doing it:
+	// classifying it retryable would let an unsupported read loop forever.
+	if status == http.StatusNotImplemented {
+		return &BrokerCallError{StatusCode: status, Category: "does not support the operation"}
+	}
 	retryable := status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500
 	category := "denied the operation"
 	if retryable {

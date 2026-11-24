@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/misospace/courier/internal/forge"
 	"github.com/misospace/courier/internal/forge/forgetest"
@@ -122,11 +124,15 @@ func (r failingForgeReader) WorkItem(context.Context, string, string) (forge.Wor
 	return forge.WorkItem{}, r.err
 }
 
-// TestForgeCallAvailabilityClassification pins the retryability contract: a
-// transient provider failure means the read never happened and answers
-// retryable (503), while a completed-but-failed read is a definite denial
-// (422). The harness client classifies 5xx as retryable and 422 as definite.
-func TestForgeCallAvailabilityClassification(t *testing.T) {
+// TestForgeCallFailureClassification pins the status vocabulary a model-facing
+// read answers for each failure kind, and with it the retryability the harness
+// client derives from the status: only a failure a retry can change is
+// retryable. A transient provider failure and a read the route budget cut short
+// both mean the world was never observed (503). A policy refusal or a
+// completed-but-failed read is definite (422). A provider that never
+// implemented the read answers 501, and an answer too large to deliver answers
+// 413; neither changes on retry, so neither may retry.
+func TestForgeCallFailureClassification(t *testing.T) {
 	s, _ := serverForTest(t)
 	cases := []struct {
 		name string
@@ -134,6 +140,11 @@ func TestForgeCallAvailabilityClassification(t *testing.T) {
 		want int
 	}{
 		{"transient provider failure", transientForgeError{}, http.StatusServiceUnavailable},
+		{"wrapped transient provider failure", fmt.Errorf("listing comments: %w", transientForgeError{}), http.StatusServiceUnavailable},
+		{"route budget expired", context.DeadlineExceeded, http.StatusServiceUnavailable},
+		{"wrapped route budget expiry", fmt.Errorf("listing comments after 3 pages: %w", context.DeadlineExceeded), http.StatusServiceUnavailable},
+		{"provider lacks the capability", forge.ErrUnsupported, http.StatusNotImplemented},
+		{"wrapped missing capability", fmt.Errorf("read checks: %w", forge.ErrUnsupported), http.StatusNotImplemented},
 		{"definite read failure", errors.New("boom"), http.StatusUnprocessableEntity},
 	}
 	for _, tc := range cases {
@@ -146,38 +157,124 @@ func TestForgeCallAvailabilityClassification(t *testing.T) {
 			if rec.Code != tc.want {
 				t.Fatalf("status = %d, want %d; body %q", rec.Code, tc.want, rec.Body.String())
 			}
+			if strings.Contains(rec.Body.String(), "boom") {
+				t.Fatalf("failure detail leaked to the model: %q", rec.Body.String())
+			}
 		})
 	}
 }
 
 type oversizeForgeReader struct {
 	forgeCallReader
+	title string
 }
 
-func (oversizeForgeReader) WorkItem(context.Context, string, string) (forge.WorkItem, error) {
-	return forge.WorkItem{ID: "1", Repo: "org/repo", Title: strings.Repeat("x", maxForgeCallResponseBytes+1)}, nil
+func (r oversizeForgeReader) WorkItem(context.Context, string, string) (forge.WorkItem, error) {
+	return forge.WorkItem{ID: "1", Repo: "org/repo", Title: r.title}, nil
 }
 
-// TestForgeCallOversizeResponseBoundsEarly pins the response bound: a read
-// whose answer outgrows the bound answers a clean 500 with no partial JSON
-// body, never a truncated 200.
-func TestForgeCallOversizeResponseBoundsEarly(t *testing.T) {
+// TestForgeCallResponseBound pins the response bound in both directions: a read
+// whose answer outgrows the bound answers a clean, non-retryable 413 with no
+// partial JSON body — never a truncated 200 and never a retryable 5xx that a
+// permanently too-large read would loop on — while an answer that still fits is
+// delivered whole.
+func TestForgeCallResponseBound(t *testing.T) {
+	cases := []struct {
+		name       string
+		title      string
+		wantStatus int
+	}{
+		{"over the bound answers 413", strings.Repeat("x", maxForgeCallResponseBytes+1), http.StatusRequestEntityTooLarge},
+		{"under the bound is delivered", strings.Repeat("x", 1<<10), http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := serverForTest(t)
+			s.forgeReader = oversizeForgeReader{title: tc.title}
+			req := httptest.NewRequest(http.MethodPost, PathForgeCall, strings.NewReader(`{"operation":"read-work-item","arguments":{"repo":"org/repo","id":"1"}}`))
+			req.Header.Set("Authorization", "Bearer valid-token")
+			rec := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.wantStatus)
+			}
+			if tc.wantStatus == http.StatusOK {
+				var item forge.WorkItem
+				if err := json.Unmarshal(rec.Body.Bytes(), &item); err != nil || item.Title != tc.title {
+					t.Fatalf("fitting answer was not delivered whole: %v", err)
+				}
+				return
+			}
+			if rec.Body.Len() > 1<<10 {
+				t.Fatalf("oversize denial leaked a large body: %d bytes", rec.Body.Len())
+			}
+			var result map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &result); err == nil {
+				t.Fatalf("oversize denial unexpectedly returned JSON: %v", result)
+			}
+		})
+	}
+}
+
+// TestForgeCallEncodeFailureAnswersRetryable pins the branch the oversize split
+// leaves behind: a value the encoder cannot marshal at all is a broker fault, so
+// it answers a retryable 500 with a fixed body. Only an answer that merely
+// outgrows the bound is definite.
+func TestForgeCallEncodeFailureAnswersRetryable(t *testing.T) {
+	rec := httptest.NewRecorder()
+	respondForgeRead(rec, make(chan int), nil)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+	if strings.TrimSpace(rec.Body.String()) == "" {
+		t.Fatal("encode failure answered with no body at all")
+	}
+}
+
+// TestForgeReadBudgetFitsInsideWriteDeadline pins that the read budget ends
+// inside the listener's write deadline with the response reserve left over to
+// write the answer, so a read the budget cut short is still answered whole.
+func TestForgeReadBudgetFitsInsideWriteDeadline(t *testing.T) {
+	if ForgeReadBudget <= 0 {
+		t.Fatalf("forge read budget %v must be positive", ForgeReadBudget)
+	}
+	if reserve := InboundWriteTimeout - ForgeReadBudget; reserve < apiResponseReserve {
+		t.Fatalf("forge read budget %v leaves only %v of the %v write deadline for the answer", ForgeReadBudget, reserve, InboundWriteTimeout)
+	}
+}
+
+// TestForgeCallBoundsReadWithDeadline pins that the route hands the reader a
+// deadline rather than the bare request context, so a listing that fans out
+// into paginated provider requests is cancelled by the route budget instead of
+// running past the listener's write deadline.
+func TestForgeCallBoundsReadWithDeadline(t *testing.T) {
 	s, _ := serverForTest(t)
-	s.forgeReader = oversizeForgeReader{}
+	reader := &deadlineForgeReader{}
+	s.forgeReader = reader
 	req := httptest.NewRequest(http.MethodPost, PathForgeCall, strings.NewReader(`{"operation":"read-work-item","arguments":{"repo":"org/repo","id":"1"}}`))
 	req.Header.Set("Authorization", "Bearer valid-token")
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %q", rec.Code, rec.Body.String())
 	}
-	if rec.Body.Len() > 1<<10 {
-		t.Fatalf("oversize denial leaked a large body: %d bytes", rec.Body.Len())
+	if !reader.hasDeadline {
+		t.Fatal("the read reached the provider without a deadline")
 	}
-	var result map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &result); err == nil {
-		t.Fatalf("oversize denial unexpectedly returned JSON: %v", result)
+	if remaining := time.Until(reader.deadline); remaining <= 0 || remaining > InboundWriteTimeout {
+		t.Fatalf("read deadline leaves %v, which cannot answer inside the %v write deadline", remaining, InboundWriteTimeout)
 	}
+}
+
+type deadlineForgeReader struct {
+	forgeCallReader
+	hasDeadline bool
+	deadline    time.Time
+}
+
+func (r *deadlineForgeReader) WorkItem(ctx context.Context, repo, id string) (forge.WorkItem, error) {
+	r.deadline, r.hasDeadline = ctx.Deadline()
+	return forge.WorkItem{ID: id, Repo: repo}, nil
 }
 
 type capturingForgeReader struct {
