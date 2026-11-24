@@ -3767,22 +3767,41 @@ func TestChartOperatorConsoleContributeStatus(t *testing.T) {
 		}
 	}
 
-	// With tokenSecret set, a raw token-file arg keeps its own path, drops
-	// the values-derived canonical flag, and still gets the mount.
+	// With tokenSecret set, the Secret mount is the single canonical path,
+	// so a raw token-file arg naming any other path would point the binary
+	// at a file that is never mounted: the chart supports only the
+	// canonical path and fails the render otherwise, in both spellings.
+	for _, spellings := range [][]string{
+		{"--set-string", "controllers.console.containers.console.args[0]=--contribute-status-token-file=/custom/path"},
+		{"--set-string", "controllers.console.containers.console.args[0]=--contribute-status-token-file",
+			"--set-string", "controllers.console.containers.console.args[1]=/custom/path"},
+	} {
+		out, err = runHelmOutput(t, chartDir, operatorConsoleRenderArgs(append(
+			[]string{
+				"--set", "operatorConsole.contributeStatus.url=http://courier-contribute-api",
+				"--set", "operatorConsole.contributeStatus.tokenSecret=contribute-status-token",
+			},
+			spellings...)...)...)
+		if err == nil || !strings.Contains(out, "canonical path /etc/courier/console/contribute-status-token") {
+			t.Fatalf("non-canonical raw token-file arg with tokenSecret render error = %v, want the canonical-path guard:\n%s", err, out)
+		}
+	}
+
+	// A raw token-file arg naming the canonical path survives alongside
+	// tokenSecret without a duplicated flag, and the rendered Deployment and
+	// argv agree: the arg's path is exactly the mount path.
 	rawArgWithSecret := runHelm(t, chartDir, operatorConsoleRenderArgs(
 		"--set", "operatorConsole.contributeStatus.url=http://courier-contribute-api",
 		"--set", "operatorConsole.contributeStatus.tokenSecret=contribute-status-token",
-		"--set-string", "controllers.console.containers.console.args[0]=--contribute-status-token-file=/custom/path",
+		"--set-string", "controllers.console.containers.console.args[0]=--contribute-status-token-file=/etc/courier/console/contribute-status-token",
 	)...)
 	rawArgDeployment := findDocument(t, rawArgWithSecret, "kind: Deployment", "name: courier-console")
-	if !strings.Contains(rawArgDeployment, "--contribute-status-token-file=/custom/path") {
-		t.Fatal("raw token-file arg did not survive alongside tokenSecret")
+	if strings.Count(rawArgDeployment, "--contribute-status-token-file=") != 1 {
+		t.Fatalf("raw canonical token-file arg did not suppress the values-derived flag:\n%s", rawArgDeployment)
 	}
-	if strings.Contains(rawArgDeployment, "--contribute-status-token-file=/etc/courier/console/contribute-status-token") {
-		t.Fatal("tokenSecret injected a second token-file flag under a raw token-file arg")
-	}
-	if !strings.Contains(rawArgDeployment, "mountPath: /etc/courier/console/contribute-status-token") {
-		t.Fatal("raw token-file arg with tokenSecret omitted the Secret mount")
+	if !strings.Contains(rawArgDeployment, "mountPath: /etc/courier/console/contribute-status-token") ||
+		!strings.Contains(rawArgDeployment, "secretName: contribute-status-token") {
+		t.Fatalf("canonical raw token-file arg with tokenSecret did not mount the Secret at the arg's path:\n%s", rawArgDeployment)
 	}
 
 	// A values override that omits the contributeStatus block entirely must

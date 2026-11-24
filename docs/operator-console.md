@@ -350,8 +350,10 @@ that `contributeAPI.readKeySecret` names, and its entry key defaults to
 `token`. A raw `--contribute-status-url` or `--contribute-status-token-file`
 arg in `controllers.console.containers.console.args` wins over these values.
 The Secret is the only thing that puts the token file in the container, so a
-raw `--contribute-status-token-file` arg also needs `tokenSecret` set. Without
-it the chart fails the render. With no URL or token the page says it is not
+raw `--contribute-status-token-file` arg also needs `tokenSecret` set and must
+name `/etc/courier/console/contribute-status-token`, the only path the chart
+mounts the Secret at; without `tokenSecret`, or with any other path, the chart
+fails the render. With no URL or token the page says it is not
 configured and sends no request.
 
 ```sh

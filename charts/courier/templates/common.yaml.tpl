@@ -638,6 +638,7 @@ the pair guard below rather than an opaque template error. */}}
 {{- $consoleContributeStatusValues := $operatorConsole.contributeStatus | default (dict) }}
 {{- $effectiveContributeStatusURL := $consoleContributeStatusValues.url }}
 {{- $hasConsoleContributeStatusTokenFile := false }}
+{{- $effectiveContributeStatusTokenFilePath := "" }}
 {{- $effectiveContributeStatusToken := not (empty $consoleContributeStatusValues.tokenSecret) }}
 {{- $hasConsoleReadAPITokenFile := false }}
 {{- $hasConsoleBind := false }}
@@ -672,10 +673,11 @@ own parser also accepts, so the pair guard below sees what it will run. */}}
 {{- $hasConsoleContributeStatusURL = true }}
 {{- $effectiveContributeStatusURL = index $consoleArgs (add1 $i) }}
 {{- end }}
-{{- if hasPrefix "--contribute-status-token-file=" $arg }}{{- $hasConsoleContributeStatusTokenFile = true }}{{- $effectiveContributeStatusToken = true }}{{- end }}
+{{- if hasPrefix "--contribute-status-token-file=" $arg }}{{- $hasConsoleContributeStatusTokenFile = true }}{{- $effectiveContributeStatusToken = true }}{{- $effectiveContributeStatusTokenFilePath = trimPrefix "--contribute-status-token-file=" $arg }}{{- end }}
 {{- if and (eq $arg "--contribute-status-token-file") (lt (add1 $i) $consoleArgCount) (not (hasPrefix "-" (index $consoleArgs (add1 $i)))) }}
 {{- $hasConsoleContributeStatusTokenFile = true }}
 {{- $effectiveContributeStatusToken = true }}
+{{- $effectiveContributeStatusTokenFilePath = index $consoleArgs (add1 $i) }}
 {{- end }}
 {{- if hasPrefix "--readapi-token-file=" $arg }}{{- $hasConsoleReadAPITokenFile = true }}{{- end }}
 {{- if hasPrefix "--bind=" $arg }}{{- $hasConsoleBind = true }}{{- end }}
@@ -740,6 +742,15 @@ paired and exit reading a file that was never mounted. Fail the render for
 that half-supplied pair too. */}}
 {{- if and $hasConsoleContributeStatusTokenFile (empty $consoleContributeStatusValues.tokenSecret) }}
 {{- fail "operatorConsole.contributeStatus.tokenSecret must be set with a raw --contribute-status-token-file arg: the chart mounts the contribution status token only from that Secret" }}
+{{- end }}
+{{- /* The chart mounts the contribution status token Secret at exactly one
+path, so a raw token-file arg is only usable when it names that path: any
+other value completes the flag pair but points the binary at a file that is
+never mounted, and the console would exit at startup. Force the canonical
+path instead of rendering an unstartable pairing. */}}
+{{- $contributeStatusTokenPath := "/etc/courier/console/contribute-status-token" }}
+{{- if and $hasConsoleContributeStatusTokenFile (ne $effectiveContributeStatusTokenFilePath $contributeStatusTokenPath) }}
+{{- fail (printf "operatorConsole.contributeStatus: a raw --contribute-status-token-file arg must name the canonical path %s, the only path the chart mounts the token Secret at" $contributeStatusTokenPath) }}
 {{- end }}
 {{- if and $consoleContributeStatusValues.tokenSecret (hasKey $consoleContributeStatusValues "tokenSecretKey") (empty $consoleContributeStatusValues.tokenSecretKey) }}
 {{- fail "operatorConsole.contributeStatus.tokenSecretKey must name a Secret entry when tokenSecret is set" }}
