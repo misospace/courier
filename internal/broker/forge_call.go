@@ -16,16 +16,19 @@ import (
 
 const maxForgeCallResponseBytes = 4 << 20
 
-// ForgeReadBudget bounds one model-facing forge read request end to end. A
-// listing fans out into paginated provider requests, each with the provider's
-// own timeout, so an unbounded fan-out can outlive the listener's write deadline
-// and have its answer cut off mid-write. The budget starts when the route is
-// entered and ends inside that deadline with the response reserve left over, so
-// every phase — authentication, the bounded body read, and the read itself —
-// counts against it and the route always answers a whole status. A read that
-// cannot finish in budget is cancelled while it can still be answered. It is
-// exported so the harness client can pin its own timeout above it and below the
-// write deadline.
+// ForgeReadBudget bounds the provider read of one model-facing forge read
+// request. A listing fans out into paginated provider requests, each with the
+// provider's own timeout, so an unbounded fan-out can outlive the listener's
+// write deadline and have its answer cut off mid-write. The budget starts
+// before the read is dispatched and ends inside that deadline with the
+// response reserve left over, so the route always answers a whole status. The
+// phases before the read are bounded apart: authentication runs under the
+// bare request context and the body read under the socket's own read bound
+// (apiBodyReadBudget), a longer window that likewise ends inside the write
+// deadline, so a stalled body can outlive this budget but never push an
+// answer past the deadline. A read that cannot finish in budget is cancelled
+// while it can still be answered. It is exported so the harness client can
+// pin its own timeout above it and below the write deadline.
 const ForgeReadBudget = InboundWriteTimeout - 2*apiResponseReserve
 
 // ForgeReader is the broker's narrow, run-pinned model-facing forge read surface.
@@ -173,9 +176,10 @@ func strictDecodeReader(reader io.Reader, target any) error {
 // respondForgeRead answers one model-facing forge read with the status that
 // says what happened, so the client retries only what a retry can change:
 //
-//	503  the read never happened — a transient provider failure, or a read the
-//	     route budget cut short. The world was not observed, so retrying is
-//	     legitimate.
+//	503  the read never happened — a transient provider failure, a read
+//	     cancelled before it completed (client disconnect, shutdown, or the
+//	     caller), or a read the route budget cut short. The world was not
+//	     observed, so retrying is legitimate.
 //	422  the read was refused, or completed and failed. A definite answer that
 //	     no retry changes.
 //	413  the answer outgrew the response bound. The same read outgrows it
@@ -192,7 +196,11 @@ func respondForgeRead(w http.ResponseWriter, value any, err error) {
 			http.Error(w, "forge read is not supported", http.StatusNotImplemented)
 			return
 		}
-		if errors.Is(err, context.DeadlineExceeded) || forge.IsTransientAvailability(err) {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || forge.IsTransientAvailability(err) {
+			// DeadlineExceeded is the route's own budget; Canceled is the
+			// caller's context ending — a client disconnect, shutdown, or run
+			// teardown. Either way the read completed nothing, so the answer
+			// is not the definite denial a 422 claims.
 			http.Error(w, "forge read is temporarily unavailable", http.StatusServiceUnavailable)
 			return
 		}

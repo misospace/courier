@@ -127,8 +127,9 @@ func (r failingForgeReader) WorkItem(context.Context, string, string) (forge.Wor
 // TestForgeCallFailureClassification pins the status vocabulary a model-facing
 // read answers for each failure kind, and with it the retryability the harness
 // client derives from the status: only a failure a retry can change is
-// retryable. A transient provider failure and a read the route budget cut short
-// both mean the world was never observed (503). A policy refusal or a
+// retryable. A transient provider failure, a read cancelled before it
+// completed, and a read the route budget cut short all mean the world was
+// never observed (503). A policy refusal or a
 // completed-but-failed read is definite (422). A provider that never
 // implemented the read answers 501, and an answer too large to deliver answers
 // 413; neither changes on retry, so neither may retry.
@@ -143,6 +144,8 @@ func TestForgeCallFailureClassification(t *testing.T) {
 		{"wrapped transient provider failure", fmt.Errorf("listing comments: %w", transientForgeError{}), http.StatusServiceUnavailable},
 		{"route budget expired", context.DeadlineExceeded, http.StatusServiceUnavailable},
 		{"wrapped route budget expiry", fmt.Errorf("listing comments after 3 pages: %w", context.DeadlineExceeded), http.StatusServiceUnavailable},
+		{"read cancelled by client disconnect", context.Canceled, http.StatusServiceUnavailable},
+		{"wrapped cancelled read", fmt.Errorf("fetching page 2: %w", context.Canceled), http.StatusServiceUnavailable},
 		{"provider lacks the capability", forge.ErrUnsupported, http.StatusNotImplemented},
 		{"wrapped missing capability", fmt.Errorf("read checks: %w", forge.ErrUnsupported), http.StatusNotImplemented},
 		{"definite read failure", errors.New("boom"), http.StatusUnprocessableEntity},
