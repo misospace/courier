@@ -207,6 +207,21 @@ type ContextBudget struct {
 	OutputReservation int `json:"outputReservation,omitempty"`
 }
 
+// Coordination-budget maxima are the CRD bounds on the BudgetPolicy axes.
+// The wall-clock cap keeps WallClockSeconds inside the harness's
+// time.Duration conversion: seconds are multiplied by 1e9, so a declaration
+// above math.MaxInt64/time.Second (about 9.2e9) would overflow to a zero or
+// negative duration, fail the positive-declaration test, and silently
+// enforce nothing. The tool-call cap keeps the per-axis warning arithmetic
+// (count*100 against limit*80) exact. Both caps sit orders of magnitude
+// below their overflow points at operationally meaningful bounds: no lane
+// legitimately runs a day of wall clock or a million calls. The kubebuilder
+// markers on BudgetPolicy carry the same values literally; keep them in sync.
+const (
+	BudgetPolicyMaxToolCalls        = 1000000
+	BudgetPolicyMaxWallClockSeconds = 86400
+)
+
 // BudgetPolicy is a lane's declared coordination budget for the harness
 // (#901). It carries declared bounds only: internal/harness counts every
 // tool call the coordinator or a delegate session executes, checks the
@@ -218,12 +233,14 @@ type BudgetPolicy struct {
 	// MaxToolCalls bounds the total number of model tool calls a run
 	// executes across the coordinator session and every delegate session.
 	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=1000000
 	// +optional
 	MaxToolCalls int `json:"maxToolCalls,omitempty"`
 
 	// WallClockSeconds bounds the run's wall clock, measured from the start
 	// of the coordinator session loop to the next step boundary.
 	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=86400
 	// +optional
 	WallClockSeconds int `json:"wallClockSeconds,omitempty"`
 }

@@ -1667,8 +1667,12 @@ event, never status, and never lets a model assert liveness or completion.
 only one axis a lane must bound: an over-budget coordinator can also burn
 unbounded tool calls and wall-clock time. The lane declares the rest on
 `LaneProfile.spec.budget` — `maxToolCalls` (total across the coordinator
-session and every delegate session) and `wallClockSeconds` (coordinator loop,
-step-boundary checked, measured from the loop's start) — which travels the
+session and every delegate session, capped at 1,000,000) and
+`wallClockSeconds` (coordinator loop, step-boundary checked, measured from the
+loop's start, capped at 86,400) — caps that keep every schema-valid
+declaration exact through the harness's seconds-to-duration conversion, where
+an uncapped value near that bound would overflow to a zero or negative wall
+clock and silently enforce nothing. The budget travels the
 same trusted run-context environment as the context policy
 (`executor.Invocation.Budget`, `COURIER_BUDGET_JSON`), so a worker or model
 can never author it, and an absent budget enforces nothing. The budget is

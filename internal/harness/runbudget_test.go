@@ -91,6 +91,28 @@ func TestBudgetPolicyFromLaneConvertsNilToUnenforcedZero(t *testing.T) {
 	}
 }
 
+// TestBudgetPolicyFromLaneCapsConvertExactly pins why the CRD caps its axes:
+// the wall-clock bound converts through a seconds-to-duration multiply, so a
+// value near math.MaxInt64/time.Second would overflow to zero or negative,
+// fail the positive-declaration test, and silently enforce nothing. At the
+// CRD cap — the largest schema-valid declaration — the conversion must still
+// name exactly the bound the lane declared.
+func TestBudgetPolicyFromLaneCapsConvertExactly(t *testing.T) {
+	got := BudgetPolicyFromLane(&courierv1alpha1.BudgetPolicy{
+		MaxToolCalls:     courierv1alpha1.BudgetPolicyMaxToolCalls,
+		WallClockSeconds: courierv1alpha1.BudgetPolicyMaxWallClockSeconds,
+	})
+	if want := time.Duration(courierv1alpha1.BudgetPolicyMaxWallClockSeconds) * time.Second; got.WallClock != want {
+		t.Errorf("wall clock at the CRD cap = %v, want %v", got.WallClock, want)
+	}
+	if got.MaxToolCalls != courierv1alpha1.BudgetPolicyMaxToolCalls {
+		t.Errorf("max tool calls = %d, want %d", got.MaxToolCalls, courierv1alpha1.BudgetPolicyMaxToolCalls)
+	}
+	if !got.declares() {
+		t.Error("the cap-valued declaration must enforce, never overflow into unenforced")
+	}
+}
+
 func TestRunBudgetZeroValueEnforcesNothing(t *testing.T) {
 	clock := &fakeBudgetClock{t: time.Unix(0, 0)}
 	ledger := newRunBudgetLedger(RunBudget{}, clock.now, nil, nil)

@@ -89,7 +89,9 @@ func (b RunBudget) declares() bool {
 // budget into the harness budget (#901). A nil CRD policy converts to the
 // zero RunBudget: the lane declares nothing and the run enforces nothing —
 // the documented unenforced legacy behavior. Conversion only, no validation:
-// the CRD schema bounds the declared values.
+// the CRD schema bounds the declared values, and its caps sit below the
+// point where the seconds-to-duration multiply would overflow, so every
+// schema-valid declaration converts to exactly the bound it names.
 func BudgetPolicyFromLane(policy *courierv1alpha1.BudgetPolicy) RunBudget {
 	if policy == nil {
 		return RunBudget{}

@@ -3,8 +3,10 @@ package v1alpha1
 import (
 	"encoding/json"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestContextPolicyWire pins the persisted declaration schema: the wire keys
@@ -112,8 +114,12 @@ func TestCRDManifestContextSchema(t *testing.T) {
 
 // TestCRDManifestBudgetSchema pins the generated LaneProfile CRD to the
 // coordination-budget bounds (#901): both axes are optional positive
-// integers with minimum 1, so a zero-valued field declares no bound and a
-// lane can never pin a budget that stops the run before its first step.
+// integers, minimum 1 so a zero-valued field declares no bound and a lane
+// can never pin a budget that stops the run before its first step, and a
+// cap per axis so every schema-valid declaration survives the harness's
+// seconds-to-duration conversion exactly — an uncapped value near
+// math.MaxInt64/time.Second would overflow to zero or negative and silently
+// enforce nothing.
 func TestCRDManifestBudgetSchema(t *testing.T) {
 	manifest, err := os.ReadFile("../../charts/courier/crd-manifests/courier.misospace.dev_laneprofiles.yaml")
 	if err != nil {
@@ -145,6 +151,24 @@ func TestCRDManifestBudgetSchema(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Fatalf("spec.budget schema missing %q:\n%s", want, text)
 		}
+	}
+	// Each axis's cap must be its own and must match the exported constant —
+	// the kubebuilder marker carries the value literally, and the harness
+	// duration conversion is exact only while every schema-valid value stays
+	// below math.MaxInt64/time.Second.
+	callsBlock, clockBlock := text, text
+	if i := strings.Index(text, "wallClockSeconds:"); i >= 0 {
+		callsBlock = text[:i]
+		clockBlock = text[i:]
+	}
+	if want := "maximum: " + strconv.Itoa(BudgetPolicyMaxToolCalls); !strings.Contains(callsBlock, want) {
+		t.Fatalf("spec.budget.maxToolCalls missing %q:\n%s", want, text)
+	}
+	if want := "maximum: " + strconv.Itoa(BudgetPolicyMaxWallClockSeconds); !strings.Contains(clockBlock, want) {
+		t.Fatalf("spec.budget.wallClockSeconds missing %q:\n%s", want, text)
+	}
+	if int64(BudgetPolicyMaxWallClockSeconds)*int64(time.Second) <= 0 {
+		t.Fatal("wall-clock cap overflows the seconds-to-duration conversion")
 	}
 	if strings.Contains(text, "default:") {
 		t.Fatal("spec.budget defaults an axis; a zero-valued field must declare no bound")

@@ -72,12 +72,14 @@ spec:
                     description: |-
                       MaxToolCalls bounds the total number of model tool calls a run
                       executes across the coordinator session and every delegate session.
+                    maximum: 1000000
                     minimum: 1
                     type: integer
                   wallClockSeconds:
                     description: |-
                       WallClockSeconds bounds the run's wall clock, measured from the start
                       of the coordinator session loop to the next step boundary.
+                    maximum: 86400
                     minimum: 1
                     type: integer
                 type: object

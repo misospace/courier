@@ -267,18 +267,28 @@ func normalizeContext(name string, policy *courierv1alpha1.ContextPolicy) error 
 	return nil
 }
 
-// normalizeBudget validates a declared coordination budget (#901) against the
-// same bounds the CRD enforces: each axis is either absent (zero: that axis
-// enforces nothing) or at least one; a negative bound is configuration error.
-// A policy with no bound on either axis is accepted — it enforces nothing,
-// exactly like an absent policy, and an all-zero declaration must not churn
-// against the server-decoded nil differently than it reads.
+// normalizeBudget validates a declared coordination budget (#901) against
+// the same bounds the CRD enforces: each axis is either absent (zero: that
+// axis enforces nothing) or within the CRD's minimum and cap; a negative or
+// oversized bound is configuration error. Oversized means a lane whose
+// declared wall clock the harness duration conversion could not represent,
+// which the API server would refuse at admission — rejecting it at parse
+// keeps the managed spec from churning against a spec the server will not
+// accept. A policy with no bound on either axis is accepted — it enforces
+// nothing, exactly like an absent policy, and an all-zero declaration must
+// not churn against the server-decoded nil differently than it reads.
 func normalizeBudget(name string, policy *courierv1alpha1.BudgetPolicy) error {
 	if policy.MaxToolCalls < 0 {
 		return fmt.Errorf("bootstrap profile %q: budget.maxToolCalls must not be negative, got %d", name, policy.MaxToolCalls)
 	}
+	if policy.MaxToolCalls > courierv1alpha1.BudgetPolicyMaxToolCalls {
+		return fmt.Errorf("bootstrap profile %q: budget.maxToolCalls must not exceed %d, got %d", name, courierv1alpha1.BudgetPolicyMaxToolCalls, policy.MaxToolCalls)
+	}
 	if policy.WallClockSeconds < 0 {
 		return fmt.Errorf("bootstrap profile %q: budget.wallClockSeconds must not be negative, got %d", name, policy.WallClockSeconds)
+	}
+	if policy.WallClockSeconds > courierv1alpha1.BudgetPolicyMaxWallClockSeconds {
+		return fmt.Errorf("bootstrap profile %q: budget.wallClockSeconds must not exceed %d, got %d", name, courierv1alpha1.BudgetPolicyMaxWallClockSeconds, policy.WallClockSeconds)
 	}
 	return nil
 }
