@@ -89,6 +89,17 @@ type Invocation struct {
 	// incarnation and never mid-incarnation. A coordinator may read the
 	// policy but can never author it.
 	Context *courierv1alpha1.ContextPolicy
+	// Budget carries the lane's declared coordination budget (#901): the
+	// total tool-call bound and wall-clock bound the harness enforces on
+	// the run. It is declarations only — internal/harness counts, checks,
+	// and enforces them; nothing here is enforcement. Nil when the lane
+	// declares no budget, which enforces nothing. The value travels in the
+	// run-context environment (COURIER_BUDGET_JSON): within one control
+	// incarnation the pod env is fixed, so a restarted pod reconstructs the
+	// identical declared budget rather than re-reading the live
+	// LaneProfile. A coordinator may read the budget but can never author
+	// it.
+	Budget *courierv1alpha1.BudgetPolicy
 	// Skills is the bounded JSON envelope of the run's pinned skill bundles
 	// (#658): name and digest pairs resolved at admission against the
 	// deployment registry. Empty when the run pins no skills. The value is
@@ -225,6 +236,7 @@ var (
 	ErrMissingNamespace           = errors.New("executor: run namespace is required")
 	ErrMissingWorkspace           = errors.New("executor: workspace path is required")
 	ErrInvalidContextPolicy       = errors.New("executor: COURIER_CONTEXT_JSON is not a valid context policy")
+	ErrInvalidBudgetPolicy        = errors.New("executor: COURIER_BUDGET_JSON is not a valid budget policy")
 	ErrInvalidSkills              = errors.New("executor: COURIER_SKILLS_JSON is not valid skill pins")
 	ErrMissingCommandName         = errors.New("executor: command name is required")
 )
@@ -710,6 +722,7 @@ func newInvocation(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.LaneProf
 		Workspace:        workspace,
 		Debug:            run.Spec.Debug,
 		Context:          lane.Spec.Context.DeepCopy(),
+		Budget:           lane.Spec.Budget.DeepCopy(),
 	}, nil
 }
 
@@ -761,6 +774,20 @@ func RunContextEnvironment(inv Invocation) []EnvVar {
 		}
 		values = append(values, EnvVar{Name: EnvContextPolicy, Value: string(contextJSON)})
 	}
+	// The lane's declared coordination budget travels beside the context it
+	// bounds (#901), and only when one is pinned: absence is meaningful to
+	// the reconstruction boundary — an old invocation or a lane with no
+	// budget enforces nothing rather than an empty stand-in. As with the
+	// context above, a marshal failure (unreachable for this declared-only
+	// shape) degrades to a value that reconstructs as "the lane declares
+	// nothing", never to a partially written policy.
+	if inv.Budget != nil {
+		budgetJSON, err := json.Marshal(inv.Budget)
+		if err != nil {
+			budgetJSON = []byte("{}")
+		}
+		values = append(values, EnvVar{Name: EnvBudgetPolicy, Value: string(budgetJSON)})
+	}
 	// The pinned criterion envelope travels beside the run context it
 	// belongs to, but only when a set is pinned: fix-pr runs and
 	// pre-contract policies carry no envelope, so its absence is meaningful
@@ -805,6 +832,16 @@ const EnvCriteria = "COURIER_CRITERIA"
 // them against gateway-verified limits, and a worker or model can never set
 // it.
 const EnvContextPolicy = "COURIER_CONTEXT_JSON"
+
+// EnvBudgetPolicy is the trusted environment key carrying the lane's
+// declared coordination budget to a coordinator (#901): the LaneProfile's
+// spec.budget declarations as operator-authored pod-env JSON. Exported so
+// the operator's pod rendering (RunContextEnvironment) and the native
+// control's reconstruction (InvocationFromEnv) name the same variable and
+// cannot drift. The value is declarations only; internal/harness counts
+// tool calls and checks the wall clock against them, and a worker or model
+// can never set it.
+const EnvBudgetPolicy = "COURIER_BUDGET_JSON"
 
 // EnvSkills is the trusted environment key carrying the run's pinned skill
 // bundles to a coordinator (#658): the name and digest pairs resolved at
@@ -1076,6 +1113,19 @@ func InvocationFromEnv(get func(string) string) (Invocation, error) {
 			return Invocation{}, fmt.Errorf("%w: %v", ErrInvalidContextPolicy, err)
 		}
 		inv.Context = &policy
+	}
+	// The lane's declared coordination budget reconstructs like the context
+	// policy it rides beside (#901): present means parse-or-fail — a
+	// malformed budget is a configuration failure the control pod must fail
+	// closed on, never a session that silently runs unbudgeted — and absent
+	// means the lane declares no budget.
+	budgetJSON := get(EnvBudgetPolicy)
+	if strings.TrimSpace(budgetJSON) != "" {
+		var budget courierv1alpha1.BudgetPolicy
+		if err := json.Unmarshal([]byte(budgetJSON), &budget); err != nil {
+			return Invocation{}, fmt.Errorf("%w: %v", ErrInvalidBudgetPolicy, err)
+		}
+		inv.Budget = &budget
 	}
 	// The run's pinned skill envelope reconstructs like the context policy
 	// it rides beside (#658): present means parse-or-fail — a malformed

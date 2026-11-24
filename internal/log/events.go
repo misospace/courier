@@ -120,6 +120,31 @@ const (
 	// observability, never status, and lets operators see compaction in run
 	// telemetry instead of inferring it from gateway failover.
 	EventSessionCompacted = "session.compacted"
+	// EventSessionBudgetExhausted reports the single trip of a run's
+	// declared coordination budget (#901): the exhausted axis (tool_calls
+	// or wall_clock) with the observed count and the declared limit, in the
+	// role whose boundary tripped it. Like session.compacted it is
+	// observability, never status, and lets operators see the budget bind
+	// in run telemetry instead of inferring it from the terminal result.
+	// The detail is Verbose so the counts reach the log store at info
+	// level, matching session.compacted.
+	EventSessionBudgetExhausted = "session.budget_exhausted"
+	// EventSessionBudgetWarning reports one axis of a run's declared
+	// coordination budget reaching its warning share (#901): the axis, the
+	// observed count, and the declared limit, in the role whose boundary
+	// crossed it. It fires at most once per axis and never after that
+	// axis's trip, so the line means "this run is approaching its
+	// ceiling." Like the trip event it is observability, never status. The
+	// detail is Verbose, matching session.budget_exhausted.
+	EventSessionBudgetWarning = "session.budget_warning"
+	// EventRunBudget reports one finished run's coordination-budget
+	// consumption (#901): tool calls reserved against the declared
+	// ceiling, elapsed seconds against the declared wall clock, and
+	// whether (and on which axis) the budget tripped. Emitted once next to
+	// model.telemetry on runs whose lane declared a budget, so operators
+	// see how close a run came to its ceiling without reading the terminal
+	// result. Observability, never status; the detail is Verbose.
+	EventRunBudget = "run.budget"
 	// EventRunRetry reports one explicit operator-authorized retry-request
 	// transition on a terminal CoderRun (#97/#606): the request ID and the
 	// settled reason ride in the detail, and the status field carries the state

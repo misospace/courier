@@ -713,3 +713,148 @@ func TestRebaseOutcomeReportPreservesReceipt(t *testing.T) {
 		t.Fatalf("prFixItem = %#v, want the exact receipt", body["prFixItem"])
 	}
 }
+
+// rebaseCapableIntakeAckBody is the intake acknowledgment Dispatch returns
+// for an unscoped rebase-capable poll (#886): contract version 1, no scope —
+// the poll declared none — and rebase-executor granted at the requested
+// version.
+func rebaseCapableIntakeAckBody() map[string]any {
+	return map[string]any{
+		"version": 1, "scope": nil, "scopeEnforced": true,
+		"capabilities": []map[string]any{
+			{"name": "rebase-executor", "requested": 1, "granted": true},
+			{"name": "pr-ownership-evidence", "requested": 1, "granted": true},
+		},
+	}
+}
+
+// newTestCapableClient builds a rebase-capable client (#886): it declares the
+// rebase-executor execution proof on every poll without the rebase-only work
+// scope, and keeps the same-lane ownership fixture so REBASE work claimed by
+// "local" is owned by this connector's lane.
+func newTestCapableClient(t *testing.T, serverURL string) *HTTPClient {
+	t.Helper()
+	client, err := newTestDispatchClient(serverURL, "worker", "rebase", "token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.WithPullRequestStateChecker(openPRChecker())
+	client.WithOwnershipBindings(map[string]string{"local": "rebase"})
+	client.WithRebaseCapable(true)
+	return client
+}
+
+// serveCapableOffer answers the next-task poll with one followup offer and the
+// given intake acknowledgment (nil means Dispatch sent none), asserting the
+// poll declared the rebase-executor capability WITHOUT any work scope — the
+// #886 declaration — and accepting the decline release the client issues.
+func serveCapableOffer(t *testing.T, intake map[string]any, offer map[string]any) http.HandlerFunc {
+	t.Helper()
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/pr-fix-queue/mark" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+			return
+		}
+		q := r.URL.Query()
+		if q.Has("work_scope") || q.Has("work_scope_version") {
+			t.Fatalf("rebase-capable poll must not declare a work scope: %s", r.URL.RawQuery)
+		}
+		if q.Get("capabilities") != "rebase-executor:1,pr-ownership-evidence:1" {
+			t.Fatalf("rebase-executor capability declaration missing or wrong: %s", r.URL.RawQuery)
+		}
+		if intake != nil {
+			offer["intake"] = intake
+		}
+		_ = json.NewEncoder(w).Encode(offer)
+	}
+}
+
+func capableRebaseOffer(claimant string) map[string]any {
+	return map[string]any{
+		"type": "followup-pr", "shouldRun": true,
+		"pullRequest": map[string]any{"repoFullName": "acme/widgets", "number": 42, "state": "open"},
+		"prFixItem":   map[string]any{"id": "fix-1", "generation": 3, "handoutToken": "hand-9", "fixType": "REBASE", "originalClaimant": claimant},
+	}
+}
+
+// #886: a rebase-capable connector declares the execution proof without the
+// rebase-only scope and accepts a REBASE offer on a matching capability-only
+// acknowledgment — as rebase mode, never fix-pr, with the full receipt kept.
+func TestRebaseCapableDiscoveryAcceptsRebaseWorkWithoutScope(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(serveCapableOffer(t, rebaseCapableIntakeAckBody(), capableRebaseOffer("local"))))
+	defer server.Close()
+	items, err := newTestCapableClient(t, server.URL).Discover(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Mode != "rebase" {
+		t.Fatalf("items = %#v, want one rebase-mode item", items)
+	}
+	d := decodeDescriptor(t, items[0].ID)
+	if d.Type != "followup-pr" || d.PRFixID != "fix-1" || d.Generation != 3 || d.FixType != "REBASE" {
+		t.Fatalf("descriptor = %#v", d)
+	}
+}
+
+// #886: an unscoped rebase-capable poll fails closed on the REBASE offer
+// itself when the intake acknowledgment is absent, malformed, at another
+// contract version, asserts a scope the poll never declared, or leaves the
+// capability ungranted — the offer is declined through the defined release
+// path, never accepted.
+func TestRebaseCapableDiscoveryFailsClosedOnRebaseIntake(t *testing.T) {
+	ungranted := map[string]any{
+		"version": 1, "scope": nil, "scopeEnforced": true,
+		"capabilities": []map[string]any{{"name": "rebase-executor", "requested": 1, "granted": false}},
+	}
+	wrongVersion := map[string]any{
+		"version": 2, "scope": nil, "scopeEnforced": true,
+		"capabilities": []map[string]any{{"name": "rebase-executor", "requested": 1, "granted": true}},
+	}
+	assertScope := map[string]any{
+		"version": 1, "scope": "rebase-only", "scopeEnforced": true,
+		"capabilities": []map[string]any{{"name": "rebase-executor", "requested": 1, "granted": true}},
+	}
+	for _, test := range []struct {
+		name   string
+		intake map[string]any
+		reason string
+	}{
+		{"missing", nil, "rebase-capability-missing"},
+		{"ungranted", ungranted, "rebase-capability-denied"},
+		{"wrong-version", wrongVersion, "rebase-capability-version"},
+		{"asserted-scope", assertScope, "rebase-scope-wrong"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(serveCapableOffer(t, test.intake, capableRebaseOffer("local"))))
+			defer server.Close()
+			items, err := newTestCapableClient(t, server.URL).Discover(context.Background())
+			if items != nil {
+				t.Fatalf("items = %#v, want the offer declined", items)
+			}
+			if err == nil || !strings.Contains(err.Error(), "rebase work declined") || !strings.Contains(err.Error(), test.reason) {
+				t.Fatalf("err = %v, want a rebase decline naming %s", err, test.reason)
+			}
+		})
+	}
+}
+
+// #886: the capability declaration never narrows the queue. A rebase-capable
+// connector on a Dispatch that predates the intake contract keeps executing
+// its ordinary same-lane fix-pr work — only REBASE-marked offers fail closed.
+func TestRebaseCapableDiscoveryKeepsOrdinaryWorkUnscoped(t *testing.T) {
+	body := map[string]any{
+		"type": "followup-pr", "shouldRun": true,
+		"pullRequest": map[string]any{"repoFullName": "acme/widgets", "number": 42, "state": "open"},
+		"prFixItem":   map[string]any{"id": "fix-9", "generation": 4, "handoutToken": "hand-4", "fixType": "ci-failure", "originalClaimant": "local"},
+	}
+	server := httptest.NewServer(http.HandlerFunc(serveCapableOffer(t, nil, body)))
+	defer server.Close()
+	items, err := newTestCapableClient(t, server.URL).Discover(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Mode != "fix-pr" {
+		t.Fatalf("items = %#v, want the ordinary handout accepted as fix-pr", items)
+	}
+}

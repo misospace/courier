@@ -52,7 +52,11 @@ judgment, instead of boxing it in with gates, caps, and one-shot pods.
   any mix. Courier is **local-capable, not local-constrained**. Its author runs
   it local-only; nothing in the design requires that of anyone else.
 - **No wall-clock deadlines.** Consumer hardware is slow; an 18-hour run that is
-  making progress is fine. Courier bounds *stuck*, not *duration*.
+  making progress is fine. Courier bounds *stuck*, not *duration*. The one
+  declared exception is opt-in and lane-scoped: an operator may bound a lane's
+  coordination on `LaneProfile.spec.budget` (#901), which the harness — never
+  the controller — enforces as a coordination budget ending `budget_exhausted`.
+  Nothing may bound a run's duration that its lane did not declare.
 
 ## Architecture
 
@@ -510,7 +514,8 @@ The native harness ends with an explicit, structured terminal result, not a
 bare exit code (#127; the full contract is HARNESS.md §8). Trusted control
 classifies every ending into a `status.nativeResult` kind — `published`,
 `no_change`, `needs_human`, `blocked_external`, `capacity_exhausted`,
-`workload_failed`, or `infrastructure_failed` — and persists it through the
+`budget_exhausted`, `workload_failed`, or `infrastructure_failed` — and
+persists it through the
 run's broker status path before the control process exits. The broker fences
 the write to the authenticated control incarnation, so a stale pod cannot
 record a result, and one incarnation's recorded result is final: an identical
@@ -864,7 +869,12 @@ added later.
 
 ## Liveness and stuck detection
 
-No wall-clock. Courier bounds *stuck*, never *duration*.
+No wall-clock deadlines imposed by the control plane. Courier bounds *stuck*,
+never *duration*. The only duration bound that exists is the one a lane opts
+into on `LaneProfile.spec.budget` (#901): the harness checks the coordinator
+session loop's wall clock at its step boundaries and ends an exhausted run
+`budget_exhausted`; a lane that declares no budget is bounded by liveness
+alone.
 
 The only safe progress signal is **successful model streaming or a completed
 tool call** — real activity. Commits are unsafe (opencode-style runs commit
@@ -1970,16 +1980,22 @@ matching applies. The claimant stays the only ownership evidence — it is never
 inferred from the recipient, author, branch, or fix type — and the fix type
 only selects the shape of the lane arm. The lane comparison is dropped for one
 case (#787): on a connector that negotiated the rebase-executor intake
-contract, the verdict for a REBASE-marked item is known-claimant membership
-alone. REBASE exclusivity is the `DISPATCH_REBASE_AGENTS` local-only pool, not
-the queue-lane column (misospace/dispatch#1327): the claimant is the original
+contract as a dedicated rebase-only executor, the verdict for a REBASE-marked
+item is known-claimant membership alone. REBASE exclusivity is the
+`DISPATCH_REBASE_AGENTS` local-only pool, not the queue-lane column
+(misospace/dispatch#1327): the claimant is the original
 fixer on its own lane while the rebase connector polls on its own, so lane
 equality could never hold there, and enforcing it declined every pool-routed
 rebase handout and drove the fail-closed waiting-external park loop (#786).
+A rebase-capable connector (#886) — one that declares the `rebase-executor:1`
+capability without the rebase-only work scope, so the owning lane can execute
+the mechanical rebase alongside its ordinary work — is not that exception:
+REBASE-marked work keeps full lane equality there, so the handout is admitted
+only by the connector whose queue lane owns the claimant.
 Evidence stays required on that path — a REBASE-marked offer whose claimant is
 absent or outside the bindings is still declined by ownership — and every
 other attempt keeps full lane equality: a REBASE-marked offer reaching a
-connector that never negotiated the capability keeps the full verdict, so a
+connector that never declared the capability keeps the full verdict, so a
 cross-lane or evidence-less claimant is declined by ownership first and a
 same-lane one passes ownership only to meet the rebase classification's
 unsupported decline.
@@ -2646,6 +2662,9 @@ spec:
     roles:
       coordinator: {maxInputTokens: 128000}
       coder: {maxInputTokens: 32000}
+  budget:                          # optional coordination budgets the harness enforces (#901)
+    maxToolCalls: 200              # total tool calls across the coordinator and every delegate session
+    wallClockSeconds: 3600         # coordinator-loop wall clock, checked at step boundaries
   resources:                       # optional CPU/memory sizing for this lane's pods
     requests: {cpu: 500m, memory: 1Gi}
     limits: {cpu: "4", memory: 8Gi}
@@ -3070,7 +3089,7 @@ The operator console (`internal/console`, served by the standalone
 chart) is a server-rendered interface for authenticated operators. It is
 deliberately independent of the manager and of the Kubernetes API: it imports
 only the standard library, never talks to a cluster, and reaches the operator
-read API only over a fixed allowlist of GET paths. The run explorer reads the
+read API over fixed GET paths plus one composed run-detail path. The run explorer reads the
 read API's paginated run projection (`/v1/runs`, issue #825) and renders it
 server-side, with no client-side JavaScript, so filters and pagination are GET
 query state and every view is a shareable URL. The overview page (#824)
@@ -3084,9 +3103,28 @@ projection cannot supply reads Unknown, Unsupported, or an explicit
 "no … recorded", and a failed projection states itself as an outage instead
 of an empty namespace. The page reloads on a bounded meta-refresh interval —
 never through JavaScript or a Kubernetes watch — and stops polling when the
-backend is unconfigured. The run-detail page stays scaffold; the console
-still probes the read API's `/healthz` path for the page backend note when
-`--backend-url` is configured. The console additionally carries a bounded
+backend is unconfigured. The run-detail page (#826) reads the single-run
+projection (`/v1/runs/{name}`, still one named Get behind the read API) and
+renders the run's identity, the allowlisted status blocks (heartbeat,
+admission, checkpoint, publication, CI park, lifecycle report, coordinator
+diagnostic, reap, workspace safety), and a bounded event timeline derived
+only from recorded status timestamps (at most the newest
+`readapi.MaxTimelineEntries` entries, omission explicit, truncation stated).
+Every entry carries its own source of truth — the run-object field path that
+holds the stamp and which authority writes it — and the payload states the
+projection's own observation instant separately, so "the event happened at X" is
+never read as "the read model observed the run at Y". A 404 is a not-found state
+with a link back, never an error box, and the reap block lists the single-object
+hold reasons a terminal run cannot be reaped yet, mirroring the controller's
+gates: phase eligibility, the retention marker, the phase retention window and
+the expiry it implies, report settlement, outstanding CI settlement or park
+release, an outstanding retry, and the capacity-recovery ownership hold whose
+unsafe-workspace case the controller itself records. The per-repository audit
+floor compares other runs and is never derivable per run; the payload states
+whether the run's phase is governed by it, and the page names it only for those
+phases rather than implying a hold that cannot apply. The console still probes the read API's
+`/healthz` path for the page backend note when `--backend-url` is configured.
+The console additionally carries a bounded
 contribution form, a mutating, credentialed
 outbound-HTTP surface that submits server-side through the operator's
 contribution admission API under a file-mounted bearer token. The form is
@@ -3128,16 +3166,20 @@ request (DNS or dial phase); timeouts and server errors stay "may have been
 admitted".
 
 The console decodes each projection into its own view types rather than
-importing `internal/readapi`, so the standard-library-only boundary holds and
-a projected field reaches a browser only through that decode. The read API
+importing `internal/readapi` — production code never imports that package;
+only tests pin the mirrored path and kind constants against it — so the
+standard-library-only boundary holds and a projected field reaches a browser
+only through that decode. The read API
 bearer token (`operatorConsole.readAPITokenSecret`, mounted as a file and
 passed as `--readapi-token-file`) is optional: with no token the console still
 serves its pages and the unauthenticated health probe, and the explorer states
 that it is not configured rather than sending an unauthenticated projection
-request. The backend path is a constant allowlist entry and only its query
-string varies, so a filter value can never redirect the request to another
-path or host. Secrets, including the contribution and read API tokens, travel
-as file paths read from mounted Secrets, never environment values.
+request. The list paths are constant allowlist entries and only the run-list
+query string varies; the run-detail path is composed only after the requested
+name passes DNS-subdomain validation, so no browser-controlled value can
+redirect a request to another path or host. Secrets, including the contribution
+and read API tokens, travel as file paths read from mounted Secrets, never
+environment values.
 
 One authorization model: every authenticated identity is an operator, and
 `IsOperator` in `internal/console/auth.go` is the single seam where a
@@ -3691,6 +3733,30 @@ resolves a queue lane only when that lane carries exactly one binding, and the
 two forms cannot be combined. A binding that reads like a rebase executor but
 was not declared as one produces a startup warning, because it declines every
 REBASE handout and the lane looks idle.
+
+A lane can also own its rebase work (#886): `--dispatch-rebase-capable` names
+a binding whose lane may execute mechanical rebase work alongside its ordinary
+queue. That binding declares `rebase-executor:1` without the rebase-only work
+scope, so Dispatch treats the poll as a capable REBASE recipient (for pool
+members) while its ordinary queue is unchanged; a REBASE offer is accepted
+only on a v1 acknowledgment granting the capability, and only when the
+claimant is bound to that connector's own queue lane — full lane equality,
+not the dedicated executor's membership-only verdict. The server-side pool
+form decides whether a dual-role lane survives: every bare name in
+`DISPATCH_REBASE_AGENTS` is also a dedicated-executor claimant exclusion
+for non-REBASE work (misospace/dispatch#1615), so a pool-named identity —
+the lane's own agent, or a separate same-lane identity, since the unscoped
+poll serves it ordinary work too — strands its own newly authored PR-fix
+claims. The bare `*` opt-in avoids the exclusion but deletes the
+fail-closed local-only allowlist, so it stays a debugging/backcompat
+choice, never a normal rollout. No pool form is a safe normal enablement
+until misospace/dispatch#1701 separates lane eligibility from the
+claimant exclusion; the client capability ships dark and
+`docs/rebase-lane.md` carries the rule.
+A designation that
+resolves to nothing fails startup like the executor form; one agent cannot
+carry both designations. Concurrency one per rebase is Dispatch's serialized
+lane admission plus the generation-pinned claim, not the connector count.
 
 Model-assisted conflict resolution (#732) is an explicit operator-selected
 capability, off by default. When enabled, the engine hands the episode's first

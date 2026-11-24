@@ -1,13 +1,12 @@
 // Package console implements the Courier operator console: a small,
 // server-rendered interface for authenticated operators. It is deliberately
 // independent of the operator binary and of the Kubernetes API — it imports
-// only the standard library and never talks to a cluster. The overview page
-// and the run explorer render the operator read API's allowlisted
-// projections over a fixed allowlist of GET paths; the read API client lives
-// in backend.go and decodes the projection JSON into its own view types
-// rather than importing the read API package, so the standard-library-only
-// invariant holds. Contributions submit through the operator's HTTP
-// admission API (#829). The run-detail page is still a scaffold.
+// only the standard library and never talks to a cluster. Its pages render the
+// operator read API's allowlisted projections over fixed or validated GET
+// paths; the read API client lives in backend.go and decodes the projection
+// JSON into its own view types rather than importing the read API package, so
+// the standard-library-only invariant holds. Contributions submit through the
+// operator's HTTP admission API (#829).
 package console
 
 import (
@@ -190,21 +189,6 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 // handleOverview renders the namespace overview over the read API's
 // summary, lane, and source projections. It lives in overview.go.
 
-// handleRun renders the run detail placeholder for the requested run name.
-// The run detail page is a separate concern (issue #826); the explorer links
-// to it. html/template escapes the name before it can reach the response.
-func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
-	if name == "" {
-		http.NotFound(w, r)
-		return
-	}
-	data := s.pageData(r, "Run "+name, "runs")
-	data.RunName = name
-	data.BackendErr = s.backendError(r)
-	s.render(w, http.StatusOK, "run", data)
-}
-
 // handleLogin renders the token form. In header mode there is nothing to
 // sign in to: identity comes from the trusted proxy, so the page redirects
 // to the overview.
@@ -277,8 +261,8 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 // backendError probes the operator read API and returns the error text for
-// the page's state box. A console without a backend URL is the expected
-// scaffold state, not an error, so it returns empty.
+// the overview page's backend status. A console without a backend URL is the
+// expected unconfigured state, not a probe failure.
 func (s *Server) backendError(r *http.Request) string {
 	err := s.backend.Health(r.Context())
 	if err == nil {
@@ -306,8 +290,11 @@ type pageData struct {
 	// BackendErr is the backend probe error, empty when healthy or when no
 	// backend is configured.
 	BackendErr string
-	// RunName is the requested run name on the detail page.
-	RunName string
+	// RunName is the validated requested run name on the detail page.
+	RunName     string
+	Run         *RunDetailResult
+	RunErr      string
+	RunNotFound bool
 
 	// Overview page view. Only the overview page populates these.
 

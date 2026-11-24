@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -575,6 +576,84 @@ func TestParseContextDefaultsWhenOmitted(t *testing.T) {
 	}
 	if ctx.OutputReservation != 0 || len(ctx.Roles) != 0 {
 		t.Fatalf("policy = %#v, want zero reservation and no role entries", ctx)
+	}
+}
+
+func TestParseAcceptsBudgetPolicy(t *testing.T) {
+	profiles, err := Parse([]byte(`profiles:
+  - name: local
+    roles:
+      coder: gpt-5
+    budget:
+      maxToolCalls: 200
+      wallClockSeconds: 3600
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	budget := profiles[0].Budget
+	if budget == nil {
+		t.Fatal("budget is nil, want the declared policy")
+	}
+	if budget.MaxToolCalls != 200 || budget.WallClockSeconds != 3600 {
+		t.Fatalf("budget = %#v, want the declared bounds", budget)
+	}
+}
+
+func TestParseBudgetAbsent(t *testing.T) {
+	profiles, err := Parse([]byte(`profiles:
+  - name: local
+    roles:
+      coder: gpt-5
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profiles[0].Budget != nil {
+		t.Fatalf("budget = %#v, want nil when the config declares none", profiles[0].Budget)
+	}
+}
+
+func TestParseRejectsUnknownBudgetKeys(t *testing.T) {
+	data := []byte("profiles:\n  - name: local\n    roles:\n      coder: gpt-5\n    budget:\n      maxToolCallsPct: 60\n")
+	if _, err := Parse(data); err == nil || !strings.Contains(err.Error(), "unknown field") {
+		t.Fatalf("error = %v, want unknown budget key rejected", err)
+	}
+}
+
+func TestParseRejectsNegativeBudgetBounds(t *testing.T) {
+	for _, content := range []string{
+		"profiles:\n  - name: local\n    roles:\n      coder: gpt-5\n    budget:\n      maxToolCalls: -1\n",
+		"profiles:\n  - name: local\n    roles:\n      coder: gpt-5\n    budget:\n      wallClockSeconds: -1\n",
+	} {
+		if _, err := Parse([]byte(content)); err == nil || !strings.Contains(err.Error(), "must not be negative") {
+			t.Fatalf("error = %v, want negative budget bound rejected: %s", err, content)
+		}
+	}
+}
+
+// TestParseRejectsBudgetBoundsAboveCRDCaps mirrors the CRD maxima in parse:
+// a profile whose bound the API server would refuse at admission must fail
+// here, not churn a managed spec the server will not accept. Oversized
+// wall-clock values are the safety case: the harness duration conversion
+// would overflow them into a silently unenforced bound.
+func TestParseRejectsBudgetBoundsAboveCRDCaps(t *testing.T) {
+	for _, content := range []string{
+		fmt.Sprintf("profiles:\n  - name: local\n    roles:\n      coder: gpt-5\n    budget:\n      maxToolCalls: %d\n", courierv1alpha1.BudgetPolicyMaxToolCalls+1),
+		fmt.Sprintf("profiles:\n  - name: local\n    roles:\n      coder: gpt-5\n    budget:\n      wallClockSeconds: %d\n", courierv1alpha1.BudgetPolicyMaxWallClockSeconds+1),
+	} {
+		if _, err := Parse([]byte(content)); err == nil || !strings.Contains(err.Error(), "must not exceed") {
+			t.Fatalf("error = %v, want over-cap budget bound rejected: %s", err, content)
+		}
+	}
+	// The cap itself is the largest accepted declaration.
+	for _, content := range []string{
+		fmt.Sprintf("profiles:\n  - name: local\n    roles:\n      coder: gpt-5\n    budget:\n      maxToolCalls: %d\n", courierv1alpha1.BudgetPolicyMaxToolCalls),
+		fmt.Sprintf("profiles:\n  - name: local\n    roles:\n      coder: gpt-5\n    budget:\n      wallClockSeconds: %d\n", courierv1alpha1.BudgetPolicyMaxWallClockSeconds),
+	} {
+		if _, err := Parse([]byte(content)); err != nil {
+			t.Fatalf("cap-valued bound rejected: %v: %s", err, content)
+		}
 	}
 }
 

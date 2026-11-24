@@ -204,7 +204,9 @@ is created.
 - **The world is the source of truth.** Git, the PR, and CI are ground truth;
   internal state is a hint reconciled toward the world.
 - **No wall-clock deadlines.** Bound *stuck* (via activity liveness), not
-  *duration*. Long runs on slow hardware are fine.
+  *duration*. Long runs on slow hardware are fine. The only duration bound is
+  the coordination budget a lane opts into on `spec.budget` (#901), enforced
+  by the harness.
 - **Thin harness.** Git for durable state, the log stack for transcripts,
   Kubernetes for lifecycle. Build only what nothing else provides.
 

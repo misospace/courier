@@ -421,7 +421,8 @@ func validTerminalResult(result *courier.NativeResult) error {
 	switch result.Kind {
 	case courier.NativeResultPublished, courier.NativeResultNoChange,
 		courier.NativeResultNeedsHuman, courier.NativeResultBlockedExternal,
-		courier.NativeResultCapacityExhausted, courier.NativeResultWorkloadFailed,
+		courier.NativeResultCapacityExhausted, courier.NativeResultBudgetExhausted,
+		courier.NativeResultWorkloadFailed,
 		courier.NativeResultInfrastructureFailed:
 	default:
 		return fmt.Errorf("terminal result kind is malformed")
