@@ -161,6 +161,18 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) == 2 && os.Args[1] == "git-egress" {
+		// The run's git egress guard (#902): the pod-local boundary that
+		// serves the installation credential and binds every write to the
+		// approved work ref. It is a long-running sidecar, not a run.
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+		defer stop()
+		if err := runGitEgress(ctx, os.Getenv, os.Stderr); err != nil {
+			fmt.Fprintln(os.Stderr, "courier: git egress guard failed:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if os.Getenv("COURIER_ASKPASS") == "1" {
 		os.Exit(askpassMode(os.Getenv, os.LookupEnv, os.Args[1:], os.Stdout, os.Stderr))
 	}

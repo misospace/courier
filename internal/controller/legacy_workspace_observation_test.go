@@ -83,3 +83,23 @@ func TestLegacyWorkspaceObservationTrustBoundary(t *testing.T) {
 	}
 }
 func ptrInt64(v int64) *int64 { return &v }
+
+// TestIsolatedObserverSpecAcceptsGuardPods pins the #902 render against the
+// observation trust boundary: the guard is a native sidecar, so an App-mode
+// pod keeps exactly the two app containers the boundary requires and its
+// evidence stays trusted.
+func TestIsolatedObserverSpecAcceptsGuardPods(t *testing.T) {
+	run := admissionRun("observed", "pool", courier.PhaseRunning)
+	run.UID = types.UID("run-uid")
+	lane := admissionLaneWithCoordinator("pool", 1)
+	config := executor.DefaultPodConfig()
+	config.InstallationGit = &executor.InstallationGitConfig{Owner: "acme", APIEndpoint: "https://api.github.com/", CredentialsSecret: "run-creds"}
+	pod, err := executor.BuildCoordinatorPod(run, lane, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isolatedObserverSpec(pod) {
+		t.Fatalf("App-mode guard pod rejected by the observer trust boundary: %d app containers, %d init containers",
+			len(pod.Spec.Containers), len(pod.Spec.InitContainers))
+	}
+}

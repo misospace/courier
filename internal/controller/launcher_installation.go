@@ -326,12 +326,15 @@ func legacyInstallationDocumentCovers(document topology.InstallationTokenDocumen
 }
 
 // ensureLegacyGitCredentialsResources provisions the run-scoped identity the
-// App-mode coordinator pod reads its credentials Secret with: a ServiceAccount
-// (only when the isolated observer is not already the pod's identity), a Role
-// granting exactly one get on the run's credentials Secret, and a RoleBinding
-// of that Role to the pod's effective ServiceAccount. All three are ensured
-// and ownership-verified before the coordinator pod can begin execution, with
-// the same fail-closed reuse-or-refuse semantics as the observer's identity.
+// App-mode pod's git egress guard reads its credentials Secret with: a
+// ServiceAccount (only when the isolated observer is not already the pod's
+// identity), a Role granting exactly one get on the run's credentials Secret,
+// and a RoleBinding of that Role to the pod's effective ServiceAccount. The
+// projected token that carries this identity is mounted only in the guard
+// container (#902): the model container holds neither the credential nor a
+// means to read it. All three are ensured and ownership-verified before the
+// coordinator pod can begin execution, with the same fail-closed
+// reuse-or-refuse semantics as the observer's identity.
 func (l *CoordinatorLauncher) ensureLegacyGitCredentialsResources(ctx context.Context, run *courierv1alpha1.CoderRun, pod *corev1.Pod) error {
 	name := legacyGitCredentialsResourceName(run.Name)
 	effective := name
@@ -439,9 +442,10 @@ func (l *CoordinatorLauncher) InstallationTokenRequeueDelay(ctx context.Context,
 
 // coordinatorUsesGitInstallation reports whether the run's coordinator pod
 // was rendered App-mode: a run-attributed, non-terminating coordinator whose
-// coordinator container carries the installation-contract environment. The
-// pod spec is authoritative here — an App-enabled pod never renders without
-// it, and a static pod never renders with it.
+// pod carries the App-mode git credential contract, in either the guard
+// shape or the pre-#902 askpass shape. The pod spec is authoritative here —
+// an App-enabled pod never renders without it, and a static pod never
+// renders with it.
 func (l *CoordinatorLauncher) coordinatorUsesGitInstallation(ctx context.Context, run *courierv1alpha1.CoderRun) bool {
 	var pods corev1.PodList
 	if err := l.Client.List(ctx, &pods,
@@ -459,10 +463,20 @@ func (l *CoordinatorLauncher) coordinatorUsesGitInstallation(ctx context.Context
 }
 
 // coordinatorRendersGitInstallation reports whether pod is the run's
-// coordinator container rendered with the App-mode git installation contract.
+// coordinator rendered with the App-mode git credential contract: the #902
+// egress-guard annotation and container, or — for pods launched before the
+// guard existed — the coordinator container's installation-contract
+// environment. Recognizing both keeps steady-state rotation running for an
+// in-flight pre-guard pod across an operator upgrade.
 func coordinatorRendersGitInstallation(pod *corev1.Pod) bool {
 	if pod == nil || !hasCoordinatorContainer(pod) || pod.DeletionTimestamp != nil {
 		return false
+	}
+	// The guard contract is recognized by presence, not by version match:
+	// a future contract-version bump must never silently stop steady-state
+	// rotation for pods that carry it.
+	if pod.Annotations[executor.GitEgressContractAnnotation] != "" {
+		return true
 	}
 	for _, container := range pod.Spec.Containers {
 		if container.Name != coordinatorContainerName {
