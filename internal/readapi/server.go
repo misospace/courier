@@ -110,6 +110,14 @@ type ServerConfig struct {
 	// The function is called per request and must be safe to call at any
 	// time; a nil result means no inventory beyond observed runs.
 	KnownSources func() []string
+	// DoneRetention, FailedRetention, and NeedsHumanRetention are the retention
+	// windows (phase TTLs) the reaper is configured with. They are process
+	// configuration the wiring supplies from the controller's own flags, so a
+	// projected retention expiry is the window the reaper will actually apply;
+	// a zero falls back to readapi's mirrored defaults.
+	DoneRetention       time.Duration
+	FailedRetention     time.Duration
+	NeedsHumanRetention time.Duration
 }
 
 // Server serves the read-only HTTP projection API over CoderRun and
@@ -130,13 +138,16 @@ type ServerConfig struct {
 // operator resolves a run's lane profile in the run's own namespace, so a
 // profile elsewhere governs nothing.
 type Server struct {
-	reader       ctrlclient.Reader
-	token        string
-	bind         string
-	namespace    string
-	knownSources func() []string
-	readSlots    chan struct{}
-	disabled     bool
+	reader              ctrlclient.Reader
+	token               string
+	bind                string
+	namespace           string
+	knownSources        func() []string
+	doneRetention       time.Duration
+	failedRetention     time.Duration
+	needsHumanRetention time.Duration
+	readSlots           chan struct{}
+	disabled            bool
 }
 
 // NewServer builds the server. An empty Bind disables it: the constructor
@@ -156,12 +167,15 @@ func NewServer(config ServerConfig) (*Server, error) {
 		return nil, errors.New("readapi: server requires a namespace")
 	}
 	return &Server{
-		reader:       config.Reader,
-		token:        config.Token,
-		bind:         strings.TrimSpace(config.Bind),
-		namespace:    strings.TrimSpace(config.Namespace),
-		knownSources: config.KnownSources,
-		readSlots:    make(chan struct{}, MaxConcurrentReads),
+		reader:              config.Reader,
+		token:               config.Token,
+		bind:                strings.TrimSpace(config.Bind),
+		namespace:           strings.TrimSpace(config.Namespace),
+		knownSources:        config.KnownSources,
+		doneRetention:       config.DoneRetention,
+		failedRetention:     config.FailedRetention,
+		needsHumanRetention: config.NeedsHumanRetention,
+		readSlots:           make(chan struct{}, MaxConcurrentReads),
 	}, nil
 }
 
@@ -553,7 +567,12 @@ func (s *Server) releaseReadSlot() {
 }
 
 func (s *Server) options() Options {
-	return Options{Now: time.Now()}
+	return Options{
+		Now:                 time.Now(),
+		DoneRetention:       s.doneRetention,
+		FailedRetention:     s.failedRetention,
+		NeedsHumanRetention: s.needsHumanRetention,
+	}
 }
 
 // sourceInventory returns the configured source-name inventory, nil when the
