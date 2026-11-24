@@ -1014,6 +1014,179 @@ func TestChartRejectsRebaseExecutorWithoutDispatchEnabled(t *testing.T) {
 	}
 }
 
+func TestChartRendersRebaseCapableBinding(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	out := runHelm(t, chartDir, "template", "courier", ".",
+		"--set", "dispatch.enabled=true",
+		"--set", "dispatch.baseURL=https://dispatch.example.test",
+		"--set", "dispatch.agentName=example-agent",
+		"--set", "dispatch.tokenSecret.name=dispatch-token-secret",
+		"--set", "dispatch.lanes[0].queueLane=normal",
+		"--set", "dispatch.lanes[0].laneProfile=default",
+		"--set", "dispatch.lanes[0].agentName=courier-local",
+		"--set", "dispatch.lanes[1].queueLane=normal",
+		"--set", "dispatch.lanes[1].laneProfile=courier-escalation",
+		"--set", "dispatch.lanes[1].agentName=courier-escalation",
+		"--set", "dispatch.lanes[1].rebaseCapable=true",
+	)
+	for _, want := range []string{
+		"--dispatch-lane-binding=normal:default:courier-local",
+		"--dispatch-lane-binding=normal:courier-escalation:courier-escalation",
+		"--dispatch-rebase-capable=courier-escalation",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("rebase-capable chart output is missing %q", want)
+		}
+	}
+	if strings.Contains(out, "--dispatch-rebase-executor") {
+		t.Fatal("rebase-capable chart output renders a rebase executor")
+	}
+	if strings.Contains(out, "--dispatch-rebase-capable=courier-local") {
+		t.Fatal("rebase-capable chart output names a binding that is not rebase capable")
+	}
+}
+
+func TestChartOperatorSuppliedRebaseCapableWins(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	out := runHelm(t, chartDir, "template", "courier", ".",
+		"--set", "dispatch.enabled=true",
+		"--set", "dispatch.baseURL=https://dispatch.example.test",
+		"--set", "dispatch.agentName=example-agent",
+		"--set", "dispatch.tokenSecret.name=dispatch-token-secret",
+		"--set", "dispatch.lanes[0].queueLane=normal",
+		"--set", "dispatch.lanes[0].laneProfile=courier-escalation",
+		"--set", "dispatch.lanes[0].agentName=courier-escalation",
+		"--set", "dispatch.lanes[0].rebaseCapable=true",
+		"--set-string", "controllers.main.containers.main.args[0]=--dispatch-rebase-capable=courier-other",
+	)
+	if !strings.Contains(out, "--dispatch-rebase-capable=courier-other") {
+		t.Fatalf("chart output is missing the operator-supplied rebase-capable binding")
+	}
+	if strings.Contains(out, "--dispatch-rebase-capable=courier-escalation") {
+		t.Fatal("chart output renders a values-derived rebase-capable binding next to an operator-supplied one")
+	}
+}
+
+func TestChartRejectsRebaseCapableWithoutAgentName(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	out, err := runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "dispatch.enabled=true",
+		"--set", "dispatch.baseURL=https://dispatch.example.test",
+		"--set", "dispatch.agentName=example-agent",
+		"--set", "dispatch.tokenSecret.name=dispatch-token-secret",
+		"--set", "dispatch.lanes[0].queueLane=normal",
+		"--set", "dispatch.lanes[0].laneProfile=default",
+		"--set", "dispatch.lanes[0].rebaseCapable=true",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template to fail for a rebase-capable binding without an agentName, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "rebaseCapable true requires an explicit agentName") {
+		t.Fatalf("helm template failed without the expected rebaseCapable message:\n%s", out)
+	}
+}
+
+func TestChartRejectsRebaseCapableWithRebaseExecutor(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	out, err := runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "dispatch.enabled=true",
+		"--set", "dispatch.baseURL=https://dispatch.example.test",
+		"--set", "dispatch.agentName=example-agent",
+		"--set", "dispatch.tokenSecret.name=dispatch-token-secret",
+		"--set", "dispatch.lanes[0].queueLane=rebase-lane",
+		"--set", "dispatch.lanes[0].laneProfile=courier-rebase",
+		"--set", "dispatch.lanes[0].agentName=courier-rebase",
+		"--set", "dispatch.lanes[0].rebaseExecutor=true",
+		"--set", "dispatch.lanes[0].rebaseCapable=true",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template to fail for a binding set both rebaseExecutor and rebaseCapable, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "cannot set both rebaseExecutor and rebaseCapable") {
+		t.Fatalf("helm template failed without the expected rebaseCapable message:\n%s", out)
+	}
+}
+
+func TestChartRejectsRebaseCapableWithOperatorSuppliedLaneBindings(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	out, err := runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "dispatch.enabled=true",
+		"--set", "dispatch.baseURL=https://dispatch.example.test",
+		"--set", "dispatch.agentName=example-agent",
+		"--set", "dispatch.tokenSecret.name=dispatch-token-secret",
+		"--set", "dispatch.lanes[0].queueLane=normal",
+		"--set", "dispatch.lanes[0].laneProfile=default",
+		"--set", "dispatch.lanes[0].agentName=courier-local",
+		"--set", "dispatch.lanes[0].rebaseCapable=true",
+		"--set-string", "controllers.main.containers.main.args[0]=--dispatch-lane-binding=other-lane:other-profile:other-agent",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template to fail for a rebase-capable binding with operator-supplied lane bindings, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "rebaseCapable cannot be combined with operator-supplied --dispatch-lane-binding args") {
+		t.Fatalf("helm template failed without the expected rebaseCapable message:\n%s", out)
+	}
+}
+
+func TestChartRejectsRebaseCapableWithoutDispatchEnabled(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	out, err := runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "dispatch.enabled=false",
+		"--set", "dispatch.lanes[0].queueLane=normal",
+		"--set", "dispatch.lanes[0].laneProfile=default",
+		"--set", "dispatch.lanes[0].agentName=courier-local",
+		"--set", "dispatch.lanes[0].rebaseCapable=true",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template to fail for a rebase-capable binding without Dispatch, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "rebaseCapable requires dispatch.enabled") {
+		t.Fatalf("helm template failed without the expected rebaseCapable message:\n%s", out)
+	}
+}
+
 func TestChartRendersSecureTopologyConfiguration(t *testing.T) {
 	if _, err := exec.LookPath("helm"); err != nil {
 		t.Skip("helm is not installed")

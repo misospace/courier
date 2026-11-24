@@ -54,6 +54,10 @@ dispatch:
   #    That entry needs an explicit agentName, because the rebase executor is
   #    named by its agent identity and must not change when the queue lane
   #    changes.
+  #    An entry with rebaseCapable: true names a binding whose agent may
+  #    execute mechanical rebase work for claimants on its own queue lane while
+  #    keeping ordinary work. It needs an explicit agentName for the same
+  #    reason, and cannot be combined with rebaseExecutor on one entry.
   lanes: []
   pollInterval: 30s
   httpTimeout: 30s

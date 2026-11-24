@@ -162,6 +162,100 @@ while every non-rebase lane keeps operating with older Dispatch deployments
 (they send no intake declaration at all — their discovery bytes are
 unchanged).
 
+## Owning-lane rebase (#886)
+
+A dedicated rebase connector is not the only safe place for a mechanical
+rebase. The lane that owns a conflicted pull request already has its branch,
+goal, and claim, so a normal binding can run the rebase itself. An operator
+marks such a binding **rebase-capable**:
+
+```
+--dispatch-rebase-capable <agent identity>
+```
+
+or, in the chart, `rebaseCapable: true` on the lane entry (which needs an
+explicit `agentName`). A rebase-capable binding differs from a rebase
+executor in one thing: it declares `capabilities=rebase-executor:1` on every
+`next-task` call **without** `work_scope=rebase-only`. Dispatch (misospace/
+dispatch#1532) reads the capability as the proof this client can execute a
+mechanical rebase and may hand it REBASE followups, while the unscoped poll
+keeps serving the lane's ordinary work.
+
+Server-side eligibility still runs through the `DISPATCH_REBASE_AGENTS`
+pool, and the pool form matters. The pool also marks every name it lists
+a dedicated rebase executor (misospace/dispatch#1615): Dispatch keeps
+pool names out of claimant resolution for non-REBASE work, and the handout
+gate refuses any non-REBASE item whose recorded claimant is a pool name.
+Naming an identity in the pool therefore puts that identity's ordinary
+fix work at risk, in either form:
+
+- **The lane's own agent in the pool.** One identity that is both the
+  lane's ordinary agent and a named pool member loses its ordinary
+  PR-fix routing: its claims are excluded at resolution and refused at
+  handout, so the lane rebases while its repair work stalls. This
+  direct form waits on a Dispatch change that separates lane eligibility
+  from the dedicated-executor claimant exclusion
+  (misospace/dispatch#1701).
+- **A separate same-lane identity in the pool.** A second binding with
+  its own agent identity (for example `courier-rebase`) on the owning
+  lane's queue lane keeps the ordinary agent outside the pool, but it
+  does not make the new identity safe. The binding declares no work
+  scope, so Dispatch serves it the lane's ordinary work too,
+  implementation tasks included. When that identity authors work and
+  becomes its claimant, its own non-REBASE PR-fix claims hit the same
+  exclusion and refusal, and the new work strands. The lane's existing
+  PRs stay routable; work the pool-named identity authors after
+  enablement does not. Do not deploy this form as a workaround.
+
+The bare `*` pool avoids the exclusion: it names no executor identities,
+so claimant resolution excludes nobody and the owning connector keeps its
+ordinary claims. But `DISPATCH_REBASE_AGENTS=*` is Dispatch's explicit
+unrestricted opt-in: every polling agent becomes lane-eligible and the
+fail-closed local-only allowlist (#1327) is gone. A REBASE handout still
+requires the client's `rebase-executor:1` declaration, but treat `*` as
+the debugging/backcompat option, never the normal rollout.
+
+No pool form is a safe normal enablement for owning-lane rebase today.
+The safe dual-role form needs misospace/dispatch#1701. What this change
+ships is the preparation slice: the `--dispatch-rebase-capable`
+declaration, the chart wiring, the startup validation, and the
+fail-closed acceptance rules below, all dark by default. No production
+configuration changes, and #886 stays open until the Dispatch change
+lands and this section can document a safe enablement. Before any
+enablement, re-check this section against Dispatch main: REBASE
+eligibility must still follow the `rebase-executor:1` declaration and
+not the poll's work scope — the next-task route gates a REBASE handout
+on the item's dispatched lane and the declared capability, so an
+unscoped poll that declares the capability can still receive REBASE
+work.
+
+The rules that stay closed:
+
+- A REBASE offer on a rebase-capable connector is accepted only on an intake
+  acknowledgment with contract version 1 that grants `rebase-executor` at the
+  requested version. A missing, malformed, wrong-version, ungranted, or
+  scope-asserting acknowledgment fails closed: the offer is declined through
+  the same receipt-fenced release path, never mapped onto fix-pr, and never
+  retried per generation.
+- Ownership keeps full lane equality for that work: the handout is admitted
+  only when its original claimant is bound to this connector's own queue
+  lane. The lane that owns the claimant does the rebase; a foreign-lane
+  capable connector declines it, and every lifecycle boundary revalidates
+  the same verdict.
+- One rebase per branch never comes from here. Dispatch enforces
+  concurrency one on the rebase lane with a serialized admission gate, and
+  the claim stays generation-pinned, so two connectors cannot hold the same
+  rebase, including after a reclaim sweep. Publication stays the
+  head-lease force-push to the observed admission head.
+- A binding cannot be both designations at once. The manager stops at
+  startup when one agent names itself both `--dispatch-rebase-executor` and
+  `--dispatch-rebase-capable`, and each designation must resolve to exactly
+  one configured binding.
+
+Both modes coexist: a dedicated rebase executor still accepts pool-routed
+REBASE work across lanes (#787), and every undeclared binding still declines
+it.
+
 ## Operator enablement
 
 No production configuration changes with this feature. To enable the lane when

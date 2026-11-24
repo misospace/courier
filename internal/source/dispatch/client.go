@@ -232,6 +232,19 @@ type HTTPClient struct {
 	// configuration returns them to the full gate at the next refusal
 	// boundary.
 	rebaseCapabilityEnabled bool
+	// rebaseCapableEnabled declares that THIS connector can execute
+	// mechanical rebase work on its own queue lane (#886): discovery sends
+	// capabilities=rebase-executor:1 on every next-task call but declares
+	// no work scope, so the connector keeps its ordinary work and Dispatch
+	// may hand it REBASE-marked followups (for agents the deployment added
+	// to the rebase worker pool). A REBASE offer on such a connector is
+	// accepted only on a version-matched intake acknowledgment that grants
+	// the capability, and the configured-ownership verdict keeps full lane
+	// equality for it: the lane that owns the claimant performs the rebase.
+	// It is mutually exclusive with rebaseCapabilityEnabled, which names a
+	// dedicated rebase-only executor; the manager rejects a binding that
+	// carries both designations.
+	rebaseCapableEnabled bool
 	// ownershipBindings is the configured-ownership authority for PR repair:
 	// claimant Dispatch agent name → configured Dispatch queue lane. A
 	// followup-pr handout is accepted only when its original claimant is
@@ -316,6 +329,33 @@ func (c *HTTPClient) WithPRFixExclusionLimit(limit int) *HTTPClient {
 // operational with Dispatch deployments that predate the contract.
 func (c *HTTPClient) WithRebaseCapability(enabled bool) *HTTPClient {
 	c.rebaseCapabilityEnabled = enabled
+	return c
+}
+
+// WithRebaseCapable declares this connector able to execute mechanical
+// rebase work on its own queue lane alongside its ordinary work (#886).
+// Enabled per Dispatch binding — never by default — discovery then declares
+// capabilities=rebase-executor:1 on every next-task call WITHOUT any work
+// scope, which is Dispatch's proof (misospace/dispatch#1532) that a
+// REBASE-marked followup may be handed to this poll. Enforced fail-closed:
+//
+//   - a REBASE-marked offer is accepted only on an intake acknowledgment
+//     with contract version 1 and rebase-executor granted at the requested
+//     version, and only as rebase mode — never mapped onto fix-pr; an
+//     absent or malformed acknowledgment declines the offer through the
+//     defined release path;
+//   - ordinary work is unaffected: the connector declares no scope, so it
+//     keeps the full ordinary queue under the unchanged configured-
+//     ownership gate;
+//   - the ownership verdict keeps full lane equality for REBASE-marked
+//     work, so only the connector whose queue lane owns the claimant
+//     accepts the rebase.
+//
+// A binding must not combine this option with WithRebaseCapability: a
+// rebase-only executor serves no ordinary work. The manager rejects the
+// combined designation at startup.
+func (c *HTTPClient) WithRebaseCapable(enabled bool) *HTTPClient {
+	c.rebaseCapableEnabled = enabled
 	return c
 }
 
@@ -508,6 +548,12 @@ func (c *HTTPClient) discover(ctx context.Context, query url.Values) (items []so
 		queryParts = append(queryParts,
 			workScopeQueryParam+"="+rebaseOnlyScope,
 			workScopeVersionQueryParam+"="+rebaseOnlyScopeVersion)
+	} else if c.rebaseCapableEnabled {
+		// A rebase-capable connector (#886) declares the execution proof
+		// without the rebase-only scope: the capability alone is what makes
+		// this poll eligible for a REBASE hand-out, while the unscoped poll
+		// keeps serving the lane's ordinary work.
+		capabilities = rebaseCapabilityRequest + "," + capabilities
 	}
 	queryParts = append(queryParts, capabilityQueryParam+"="+capabilities)
 	if query != nil {
@@ -547,6 +593,11 @@ func (c *HTTPClient) discover(ctx context.Context, query url.Values) (items []so
 			// answer the request at all, surface it once per process so an
 			// operator sees a rebase lane polling a peer that cannot speak
 			// the contract — without turning every idle poll into a failure.
+			// A rebase-capable poll is deliberately not surfaced here: its
+			// ordinary lane stays healthy with a pre-intake peer (which
+			// offers no REBASE work at all), and an unscoped poll that does
+			// meet a REBASE offer fails closed at the offer itself (#886),
+			// where the signal is actionable.
 			if negotiated, reason := validateRebaseIntake(response.Intake); !negotiated && reason == reasonRebaseCapabilityMissing {
 				c.diagnostics.Diagnostic(c.connectorName, connector.SignalProtocolError, reasonRebaseCapabilityMissing)
 			}
@@ -643,8 +694,21 @@ func (c *HTTPClient) discover(ctx context.Context, query url.Values) (items []so
 			// with a valid queue receipt; otherwise decline it through the
 			// defined release path and surface why — a silent fallback to
 			// fix-pr is the exact failure this contract exists to prevent.
-			if !c.rebaseCapabilityEnabled {
+			if !c.rebaseCapabilityEnabled && !c.rebaseCapableEnabled {
 				return nil, c.declineRebase(ctx, task, "rebase capability is not negotiated for this connector")
+			}
+			if c.rebaseCapableEnabled && !c.rebaseCapabilityEnabled {
+				// An unscoped rebase-capable poll validates the intake
+				// acknowledgment at the offer itself (#886): Dispatch only
+				// hands REBASE work to a poll it granted the capability, so
+				// a missing, foreign-version, or ungranted acknowledgment on
+				// a REBASE offer is failed negotiation, declined through the
+				// same release path — never accepted, and ordinary work on
+				// this connector is untouched by it.
+				if negotiated, reason := validateRebaseCapableIntake(response.Intake); !negotiated {
+					c.diagnostics.Diagnostic(c.connectorName, connector.SignalProtocolError, reason)
+					return nil, c.declineRebase(ctx, task, fmt.Sprintf("intake negotiation failed (%s)", reason))
+				}
 			}
 			if strings.TrimSpace(task.PRFixItem.ID) == "" || task.PRFixItem.Generation < 1 {
 				c.diagnostics.Diagnostic(c.connectorName, connector.SignalProtocolError, reasonRebaseTaskInvalid)
