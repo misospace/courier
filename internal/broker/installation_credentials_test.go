@@ -31,7 +31,7 @@ func installationDocument(now time.Time) topology.InstallationTokenDocument {
 		Owner:    "ExampleOrg",
 		Endpoint: "https://api.github.com/",
 		Entries: []topology.InstallationTokenEntry{
-			{Repository: "ExampleOrg/Repo", Token: sentinelInstallationToken, ExpiresAt: now.Add(time.Hour)},
+			{Repository: "ExampleOrg/Repo", Token: sentinelInstallationToken, ExpiresAt: now.Add(time.Hour), ReadToken: "read-" + sentinelInstallationToken, ReadExpiresAt: now.Add(time.Hour)},
 		},
 	}
 }
@@ -75,6 +75,42 @@ func newSourceForTest(t *testing.T, reader ctrlclient.Reader, expectedOwner stri
 		t.Fatal(err)
 	}
 	return source
+}
+
+func TestSecretInstallationTokenSourceProfiles(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	document := installationDocument(now)
+	source := newSourceForTest(t, installationSecretReader(t, document).Build(), "ExampleOrg", func() time.Time { return now })
+	writeToken, writeExpiry, err := source.InstallationToken(context.Background(), "ExampleOrg/Repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	readToken, readExpiry, err := source.ReadProfile().InstallationToken(context.Background(), "ExampleOrg/Repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if writeToken != sentinelInstallationToken || readToken != document.Entries[0].ReadToken || readToken == writeToken || !writeExpiry.Equal(document.Entries[0].ExpiresAt) || !readExpiry.Equal(document.Entries[0].ReadExpiresAt) {
+		t.Fatalf("write profile = %q %v, read profile = %q %v", writeToken, writeExpiry, readToken, readExpiry)
+	}
+	// ReadProfile shares no mutable state: the original source still serves
+	// the write-capable profile after the copy was taken.
+	againToken, _, err := source.InstallationToken(context.Background(), "ExampleOrg/Repo")
+	if err != nil || againToken != sentinelInstallationToken {
+		t.Fatalf("write profile after ReadProfile() = %q, %v", againToken, err)
+	}
+	for _, edit := range []func(*topology.InstallationTokenEntry){
+		func(entry *topology.InstallationTokenEntry) { entry.ReadToken = "" },
+		func(entry *topology.InstallationTokenEntry) {
+			entry.ReadExpiresAt = now.Add(2*time.Minute - time.Second)
+		},
+	} {
+		invalid := installationDocument(now)
+		edit(&invalid.Entries[0])
+		readSource := newSourceForTest(t, installationSecretReader(t, invalid).Build(), "ExampleOrg", func() time.Time { return now }).ReadProfile()
+		if token, expiry, err := readSource.InstallationToken(context.Background(), "ExampleOrg/Repo"); err == nil || token != "" || !expiry.IsZero() {
+			t.Fatalf("invalid read profile served %q, %v, %v", token, expiry, err)
+		}
+	}
 }
 
 func TestSecretInstallationTokenSourceValidation(t *testing.T) {

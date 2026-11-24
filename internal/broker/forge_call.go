@@ -17,6 +17,10 @@ import (
 const maxForgeCallResponseBytes = 4 << 20
 
 // ForgeReader is the broker's narrow, run-pinned model-facing forge read surface.
+// In App mode the broker wires this interface to the read-scoped
+// installation-token profile, so a route-vocabulary regression still cannot
+// reach a write-capable credential; static mode has a single deployment
+// credential for everything.
 type ForgeReader interface {
 	WorkItem(context.Context, string, string) (forge.WorkItem, error)
 	ReadPullRequest(context.Context, string, int) (forge.PullRequest, error)
