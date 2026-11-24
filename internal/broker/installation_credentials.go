@@ -24,12 +24,14 @@ import (
 // next call, and no credential is ever served from a prior, unaudited read.
 // The write-capable profile serves publication routes and git transport; the
 // read-scoped profile (via ReadProfile) serves the model-facing forge-read
-// path and refuses an entry without a read token. The operator mints one
-// token per pinned repository with only that repository's permissions, so a
+// path and refuses an entry whose read token is absent or aliases the write
+// token, so a drifted document can never serve the write credential to the
+// model-facing reader. The operator mints the tokens per pinned repository,
+// each carrying only that repository's permissions, so a
 // request against one repository can never carry a token scoped to another: a
 // repository with no entry in the document is a refusal. The tokens live only
-// in process memory: they never appear in
-// logs, error strings, or pod environment. Any unreadable, malformed,
+// in process memory: they never appear in logs, error strings, or pod
+// environment. Any unreadable, malformed,
 // stale-versioned, mismatched, or expired document is a refusal — App-mode
 // brokers have no static credential to fall back to. The source is immutable
 // after construction and safe for concurrent use.
@@ -109,7 +111,11 @@ func (s *SecretInstallationTokenSource) InstallationToken(ctx context.Context, r
 		return "", time.Time{}, errors.New("broker installation token document is unusable")
 	}
 	if s.readProfile {
-		if entry.ReadToken == "" || !entry.ReadExpiresAt.After(now.Add(2*time.Minute)) {
+		// The read profile is a distinct credential by document contract
+		// (topology.InstallationTokenCredentials refuses an aliased pair at
+		// render time); re-establish that invariant here so a drifted Secret
+		// never serves the write-capable token to the model-facing reader.
+		if entry.ReadToken == "" || entry.ReadToken == entry.Token || !entry.ReadExpiresAt.After(now.Add(2*time.Minute)) {
 			return "", time.Time{}, errors.New("broker installation token document is unusable")
 		}
 		return entry.ReadToken, entry.ReadExpiresAt, nil

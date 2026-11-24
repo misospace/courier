@@ -350,9 +350,18 @@ func TestEnsureInstallationTokenRefreshesIdentityMismatchedDocument(t *testing.T
 		name     string
 		owner    string
 		endpoint string
+		mutate   func(*topology.InstallationTokenDocument)
 	}{
-		{"owner drift", "SomeoneElse", "https://api.github.com/"},
-		{"endpoint drift", "Acme", "https://ghe.example.com/api/v3"},
+		{"owner drift", "SomeoneElse", "https://api.github.com/", nil},
+		{"endpoint drift", "Acme", "https://ghe.example.com/api/v3", nil},
+		{
+			name:  "read profile aliases the write token",
+			owner: "Acme", endpoint: "https://api.github.com/",
+			mutate: func(document *topology.InstallationTokenDocument) {
+				document.Entries[0].ReadToken = document.Entries[0].Token
+				document.Entries[0].ReadExpiresAt = now.Add(2 * time.Hour)
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			run := secureRun("installation-doc-drift")
@@ -367,13 +376,16 @@ func TestEnsureInstallationTokenRefreshesIdentityMismatchedDocument(t *testing.T
 					{Repository: "Acme/Widgets", Token: "drifted", ExpiresAt: now.Add(2 * time.Hour)},
 				},
 			}
+			if tc.mutate != nil {
+				tc.mutate(&staleDocument)
+			}
 			raw, err := json.Marshal(staleDocument)
 			if err != nil {
 				t.Fatal(err)
 			}
 			// Run-owned, so it may be overwritten — but a document bound to a
-			// different owner or endpoint is never served as this run's
-			// credential.
+			// different identity or carrying an aliased read profile is never
+			// served as this run's credential; it is re-minted instead.
 			owned := installationSecret(run, raw, controllerOwnerRef(run.Name, run.UID))
 			owned.OwnerReferences = append(owned.OwnerReferences,
 				metav1.OwnerReference{APIVersion: "v1", Kind: "Secret", Name: "a-previous-writer"})
@@ -393,7 +405,8 @@ func TestEnsureInstallationTokenRefreshesIdentityMismatchedDocument(t *testing.T
 			if document.Owner != "Acme" || document.Endpoint != registration.Endpoint || len(document.Entries) != 1 {
 				t.Fatalf("refreshed document = %+v", document)
 			}
-			if entry, ok := document.Entry("Acme/Widgets"); !ok || entry.Token != "refreshed-token-1" {
+			if entry, ok := document.Entry("Acme/Widgets"); !ok || entry.Token != "refreshed-token-1" ||
+				entry.ReadToken != "refreshed-token-2" || entry.ReadToken == entry.Token {
 				t.Fatalf("refreshed entry = %+v (found %v)", entry, ok)
 			}
 			// The refresh converges the owner references to the rendered
@@ -441,6 +454,45 @@ func TestEnsureInstallationTokenCreateRace(t *testing.T) {
 			wantErr: "different identity",
 		},
 		{
+			name: "owned winner with an aliased read profile",
+			winner: func(run *courier.CoderRun) *corev1.Secret {
+				document := topology.InstallationTokenDocument{
+					Version: topology.InstallationTokenDocumentVersion, Owner: "Acme",
+					Endpoint: "https://api.github.com/",
+					Entries: []topology.InstallationTokenEntry{
+						{Repository: "Acme/Widgets", Token: "winner-aliased", ExpiresAt: now.Add(2 * time.Hour), ReadToken: "winner-aliased", ReadExpiresAt: now.Add(2 * time.Hour)},
+					},
+				}
+				raw, err := json.Marshal(document)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return installationSecret(run, raw, controllerOwnerRef(run.Name, run.UID))
+			},
+			wantErr: "unusable credential profile",
+		},
+		{
+			name: "owned winner with an aliased work read profile",
+			work: "Acme/Gadgets",
+			winner: func(run *courier.CoderRun) *corev1.Secret {
+				document := topology.InstallationTokenDocument{
+					Version: topology.InstallationTokenDocumentVersion, Owner: "Acme",
+					Endpoint: "https://api.github.com/",
+					Entries: []topology.InstallationTokenEntry{
+						{Repository: "Acme/Widgets", Token: "winner-base", ExpiresAt: now.Add(2 * time.Hour), ReadToken: "winner-base-read", ReadExpiresAt: now.Add(2 * time.Hour)},
+						{Repository: "Acme/Gadgets", Token: "winner-work", ExpiresAt: now.Add(2 * time.Hour), ReadToken: "winner-work", ReadExpiresAt: now.Add(2 * time.Hour)},
+					},
+				}
+				raw, err := json.Marshal(document)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return installationSecret(run, raw, controllerOwnerRef(run.Name, run.UID))
+			},
+			wantErr:  "unusable credential profile",
+			wantMint: 4,
+		},
+		{
 			name: "well-bound winner",
 			winner: func(run *courier.CoderRun) *corev1.Secret {
 				document := topology.InstallationTokenDocument{
@@ -474,7 +526,7 @@ func TestEnsureInstallationTokenCreateRace(t *testing.T) {
 				}
 				return installationSecret(run, raw, controllerOwnerRef(run.Name, run.UID))
 			},
-			wantErr:  "different identity",
+			wantErr:  "unusable credential profile",
 			wantMint: 4,
 		},
 	} {

@@ -103,6 +103,11 @@ func TestSecretInstallationTokenSourceProfiles(t *testing.T) {
 		func(entry *topology.InstallationTokenEntry) {
 			entry.ReadExpiresAt = now.Add(2*time.Minute - time.Second)
 		},
+		// A drifted document whose read profile aliases the write token is
+		// malformed by the document contract: the read profile must refuse it
+		// rather than serve the write-capable credential to the forge-read
+		// path.
+		func(entry *topology.InstallationTokenEntry) { entry.ReadToken = entry.Token },
 	} {
 		invalid := installationDocument(now)
 		edit(&invalid.Entries[0])

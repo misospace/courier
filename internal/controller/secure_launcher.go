@@ -1256,9 +1256,11 @@ func (s *SecureControl) ensureInstallationTokenCredential(ctx context.Context, r
 			if err := json.Unmarshal(winner.Data[topology.CredKeyInstallationToken], &winnerDocument); err != nil ||
 				winnerDocument.Version != topology.InstallationTokenDocumentVersion ||
 				!strings.EqualFold(winnerDocument.Owner, baseOwner) ||
-				!installationEndpointMatches(winnerDocument.Endpoint, registration.Endpoint) ||
-				!installationDocumentCoversRepositories(winnerDocument, policy) {
+				!installationEndpointMatches(winnerDocument.Endpoint, registration.Endpoint) {
 				return errors.New("secure topology: installation-token credentials winner carries a document for a different identity")
+			}
+			if !installationDocumentCoversRepositories(winnerDocument, policy) {
+				return errors.New("secure topology: installation-token credentials winner carries an unusable credential profile")
 			}
 			return nil
 		}
@@ -1276,8 +1278,9 @@ func (s *SecureControl) ensureInstallationTokenCredential(ctx context.Context, r
 }
 
 // installationDocumentFresh reports that the stored document is the supported
-// version bound to this run's owner, endpoint, and pinned repositories, and
-// that every entry outlives the refresh window. Owner and endpoint are
+// version bound to this run's owner, endpoint, and pinned repositories, that
+// every entry carries a read profile distinct from its write token, and that
+// every credential outlives the refresh window. Owner and endpoint are
 // re-checked on the fast path so a document that drifted away from the run's
 // identity is refreshed rather than served.
 func installationDocumentFresh(raw []byte, policy *courier.PublicationPolicy, owner, endpoint string, now time.Time) bool {
@@ -1291,7 +1294,8 @@ func installationDocumentFresh(raw []byte, policy *courier.PublicationPolicy, ow
 	}
 	for _, repository := range []string{policy.BaseRepo, policy.WorkRepo} {
 		entry, ok := document.Entry(repository)
-		if !ok || entry.Token == "" || !entry.ExpiresAt.After(now.Add(installationTokenRefreshLead)) || entry.ReadToken == "" || !entry.ReadExpiresAt.After(now.Add(installationTokenRefreshLead)) {
+		if !ok || entry.Token == "" || !entry.ExpiresAt.After(now.Add(installationTokenRefreshLead)) ||
+			entry.ReadToken == "" || entry.ReadToken == entry.Token || !entry.ReadExpiresAt.After(now.Add(installationTokenRefreshLead)) {
 			return false
 		}
 	}
@@ -1299,13 +1303,15 @@ func installationDocumentFresh(raw []byte, policy *courier.PublicationPolicy, ow
 }
 
 // installationDocumentCoversRepositories reports that the document carries a
-// non-empty entry for every pinned repository, ignoring expiry. The create
-// race uses it so a winner owned by this run but missing a pinned repository
-// is refused rather than trusted until some later pass happens to notice.
+// non-empty entry for every pinned repository, with a read profile distinct
+// from its write token, ignoring expiry. The create race uses it so a winner
+// owned by this run but missing a pinned repository or carrying an aliased
+// read profile is refused rather than trusted until some later pass happens
+// to notice.
 func installationDocumentCoversRepositories(document topology.InstallationTokenDocument, policy *courier.PublicationPolicy) bool {
 	for _, repository := range []string{policy.BaseRepo, policy.WorkRepo} {
 		entry, ok := document.Entry(repository)
-		if !ok || entry.Token == "" || entry.ReadToken == "" {
+		if !ok || entry.Token == "" || entry.ReadToken == "" || entry.ReadToken == entry.Token {
 			return false
 		}
 	}
