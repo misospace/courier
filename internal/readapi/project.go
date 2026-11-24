@@ -19,13 +19,46 @@ const DefaultStaleWindow = 15 * time.Minute
 // DefaultPageSize is the page size a list projection uses when none is given.
 const DefaultPageSize = 50
 
+// MaxTimelineEntries bounds a run detail's event timeline; newest entries win.
+const MaxTimelineEntries = 32
+
+// Timeline labels are the closed vocabulary emitted by ProjectRunTimeline.
+const (
+	TimelineCreated           = "created"
+	TimelineAdmitted          = "admitted"
+	TimelineStarted           = "started"
+	TimelinePhase             = "phase"
+	TimelineHeartbeat         = "heartbeat"
+	TimelineCIParked          = "ci-parked"
+	TimelineFinished          = "finished"
+	TimelineCoordinatorExited = "coordinator-exited"
+	TimelineResultRecorded    = "result-recorded"
+	TimelineRetentionMarked   = "retention-marked"
+	TimelineCondition         = "condition"
+)
+
 // Options carries the pure-projection inputs that are not cluster objects.
 // Now is the observation instant (injected, never read from the wall clock);
-// StaleWindow bounds Fresh/Stale judgments.
+// StaleWindow bounds Fresh/Stale judgments. The retention windows are the
+// phase TTLs the reaper applies: the wiring passes the controller's own
+// configured values, and a zero falls back to the defaults mirrored from
+// internal/controller/reap.go, which are those flags' own defaults.
 type Options struct {
-	Now         time.Time
-	StaleWindow time.Duration
+	Now                 time.Time
+	StaleWindow         time.Duration
+	DoneRetention       time.Duration
+	FailedRetention     time.Duration
+	NeedsHumanRetention time.Duration
 }
+
+// Retention defaults mirrored from internal/controller/reap.go, which remains
+// the authority; the wiring supplies the configured values so a deployment that
+// overrides a flag never sees a projected expiry it cannot act on.
+const (
+	DefaultDoneRetention       = 5 * time.Minute
+	DefaultFailedRetention     = 168 * time.Hour
+	DefaultNeedsHumanRetention = 168 * time.Hour
+)
 
 func (o Options) now() time.Time {
 	if o.Now.IsZero() {
@@ -39,6 +72,28 @@ func (o Options) window() time.Duration {
 		return o.StaleWindow
 	}
 	return DefaultStaleWindow
+}
+
+// retentionWindowFor returns the retention window the reaper measures from the
+// marker for this phase, and whether the phase has one at all. Review-parked
+// terminal phases are exempt from reaping, so they have no window to state.
+func (o Options) retentionWindowFor(phase courierv1alpha1.Phase) (time.Duration, bool) {
+	switch phase {
+	case courierv1alpha1.PhaseDone, courierv1alpha1.PhaseAlreadyDone:
+		return positiveOrDefault(o.DoneRetention, DefaultDoneRetention), true
+	case courierv1alpha1.PhaseFailed:
+		return positiveOrDefault(o.FailedRetention, DefaultFailedRetention), true
+	case courierv1alpha1.PhaseNeedsHuman:
+		return positiveOrDefault(o.NeedsHumanRetention, DefaultNeedsHumanRetention), true
+	}
+	return 0, false
+}
+
+func positiveOrDefault(configured, fallback time.Duration) time.Duration {
+	if configured > 0 {
+		return configured
+	}
+	return fallback
 }
 
 // boundTruncate bounds s to max runes (DefaultTextBound when max <= 0),
@@ -180,30 +235,94 @@ func parsePRNumber(pr string) *int {
 	return nil
 }
 
-// reapMarker reports the run's present reap-marker annotation: its name and
-// parsed RFC3339 stamp. The names mirror internal/controller/reap.go exactly;
-// this package only reads them, the controller remains their sole writer. The
-// first present marker in a fixed order (done, already-done, failed,
-// needs-human) wins; the controller holds at most one, and a stable order
-// keeps the projection deterministic.
-func reapMarker(run *courierv1alpha1.CoderRun) (string, *metav1.Time) {
-	markers := []string{
-		AnnotationDoneAt,
-		AnnotationAlreadyDoneAt,
-		AnnotationFailedAt,
-		AnnotationNeedsHumanAt,
+// reapMarkerOrder is the fixed scan order of the retention markers, used so
+// historical enumeration stays deterministic. The names mirror
+// internal/controller/reap.go exactly; this package only reads them, the
+// controller remains their sole writer.
+var reapMarkerOrder = []string{
+	AnnotationDoneAt,
+	AnnotationAlreadyDoneAt,
+	AnnotationFailedAt,
+	AnnotationNeedsHumanAt,
+}
+
+// ReapMarkerForPhase names the retention marker the reaper measures from for
+// this phase, mirroring internal/controller/reap.go and coderun_controller.go's
+// terminal dispatch (exported so internal/controller can pin the mapping): Done reads done-at, AlreadyDone already-done-at, Failed
+// failed-at, NeedsHuman needs-human-at. No other phase is reaped, so it has no
+// marker to read. A run that transitioned between terminal phases can carry an
+// earlier outcome's marker; the reaper reads only the current phase's, so a
+// single scan across markers must not pick the clock up from another phase.
+func ReapMarkerForPhase(phase courierv1alpha1.Phase) string {
+	switch phase {
+	case courierv1alpha1.PhaseDone:
+		return AnnotationDoneAt
+	case courierv1alpha1.PhaseAlreadyDone:
+		return AnnotationAlreadyDoneAt
+	case courierv1alpha1.PhaseFailed:
+		return AnnotationFailedAt
+	case courierv1alpha1.PhaseNeedsHuman:
+		return AnnotationNeedsHumanAt
 	}
-	for _, key := range markers {
+	return ""
+}
+
+// CurrentReapMarker reports the marker the reaper reads for this run's phase and
+// its parsed stamp, using the controller's exact parse semantics (exported so
+// internal/controller can pin the semantics)
+// (internal/controller/reap.go's reapMarker): the named annotation parsed as
+// untrimmed RFC3339. Absent or malformed means false with no stamp — the
+// controller starts a fresh window from either, never an immediate delete. The
+// bool distinguishes "valid clock" from "no clock the reaper will honor" so the
+// reap block never reads another phase's or a hand-edited marker as this run's
+// retention expiry.
+func CurrentReapMarker(run *courierv1alpha1.CoderRun) (string, *metav1.Time, bool) {
+	marker := ReapMarkerForPhase(run.Status.Phase)
+	if marker == "" {
+		return "", nil, false
+	}
+	raw, ok := run.Annotations[marker]
+	if !ok {
+		return marker, nil, false
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return marker, nil, false
+	}
+	at := metav1.NewTime(t)
+	return marker, &at, true
+}
+
+// recordedReapMarkers enumerates every retention marker the run carries with a
+// valid untrimmed RFC3339 stamp, in the fixed scan order, for the historical
+// timeline. Unlike currentReapMarker this spans phases: an earlier outcome's
+// marker is a real recorded fact even when it no longer drives the clock.
+// Malformed values carry no trustworthy instant and are omitted; the reap block
+// names that case instead.
+func recordedReapMarkers(run *courierv1alpha1.CoderRun) []struct {
+	Annotation string
+	At         *metav1.Time
+} {
+	var out []struct {
+		Annotation string
+		At         *metav1.Time
+	}
+	for _, key := range reapMarkerOrder {
 		raw, ok := run.Annotations[key]
-		if !ok || strings.TrimSpace(raw) == "" {
+		if !ok {
 			continue
 		}
-		if t, err := time.Parse(time.RFC3339, strings.TrimSpace(raw)); err == nil {
-			at := metav1.NewTime(t)
-			return key, &at
+		t, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			continue
 		}
+		at := metav1.NewTime(t)
+		out = append(out, struct {
+			Annotation string
+			At         *metav1.Time
+		}{Annotation: key, At: &at})
 	}
-	return "", nil
+	return out
 }
 
 // retentionReasonFor names the retention outcome a marker implies, for ReapHealth.
@@ -218,6 +337,229 @@ func retentionReasonFor(marker string) string {
 	default:
 		return ""
 	}
+}
+
+// ProjectRunTimeline derives a bounded, deterministic timeline from recorded
+// status timestamps only. The observation instant plays no part: every entry
+// is a stamped fact the operator or the run's coordinator recorded on this
+// object, and each entry names where it was recorded (Source) and who records
+// it (Authority). RunDetail.TimelineObservedAt carries the read side
+// separately, so the two are never confused.
+func ProjectRunTimeline(run *courierv1alpha1.CoderRun) ([]TimelineView, bool) {
+	if run == nil {
+		return nil, false
+	}
+	var entries []TimelineView
+	add := func(at *metav1.Time, label, detail, source, authority string) {
+		if at == nil || at.Time.IsZero() {
+			return
+		}
+		entry := TimelineView{
+			At:        at.DeepCopy(),
+			Label:     label,
+			Source:    source,
+			Authority: authority,
+		}
+		if detail != "" {
+			entry.Detail = bound(detail)
+		}
+		entries = append(entries, entry)
+	}
+	add(&run.CreationTimestamp, TimelineCreated, "", TimelineSourceCreationTimestamp, TimelineAuthorityAPIServer)
+	add(run.Status.AdmittedAt, TimelineAdmitted, "", TimelineSourceAdmittedAt, TimelineAuthorityOperator)
+	add(run.Status.StartedAt, TimelineStarted, "", TimelineSourceStartedAt, TimelineAuthorityOperator)
+	if run.Status.Phase != "" {
+		add(run.Status.PhaseEnteredAt, TimelinePhase, string(run.Status.Phase), TimelineSourcePhaseEnteredAt, TimelineAuthorityOperator)
+	}
+	if hb := run.Status.Heartbeat; hb != nil {
+		add(&hb.At, TimelineHeartbeat, "", TimelineSourceHeartbeatAt, TimelineAuthorityCoordinator)
+	}
+	if park := run.Status.CIPark; park != nil {
+		add(&park.ParkedAt, TimelineCIParked, "", TimelineSourceCIParkParkedAt, TimelineAuthorityOperator)
+	}
+	add(run.Status.FinishedAt, TimelineFinished, "", TimelineSourceFinishedAt, TimelineAuthorityOperator)
+	if diag := run.Status.TerminalDiagnostic; diag != nil {
+		add(diag.ObservedAt, TimelineCoordinatorExited, "", TimelineSourceDiagnosticAt, TimelineAuthorityOperator)
+	}
+	if result := run.Status.NativeResult; result != nil {
+		add(&result.At, TimelineResultRecorded, "", TimelineSourceNativeResultAt, TimelineAuthorityCoordinator)
+	}
+	for _, marker := range recordedReapMarkers(run) {
+		add(marker.At, TimelineRetentionMarked, retentionReasonFor(marker.Annotation), TimelineSourceRetention+"/"+marker.Annotation, TimelineAuthorityOperator)
+	}
+	for i := range run.Status.Conditions {
+		cond := run.Status.Conditions[i]
+		if conditionAllowlist[cond.Type] {
+			add(&cond.LastTransitionTime, TimelineCondition, string(cond.Type)+"="+string(cond.Status),
+				TimelineSourceCondition+"["+cond.Type+"]", TimelineAuthorityOperator)
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if !entries[i].At.Equal(entries[j].At) {
+			return entries[i].At.Before(entries[j].At)
+		}
+		if entries[i].Label != entries[j].Label {
+			return entries[i].Label < entries[j].Label
+		}
+		return entries[i].Detail < entries[j].Detail
+	})
+	truncated := len(entries) > MaxTimelineEntries
+	if truncated {
+		entries = append([]TimelineView(nil), entries[len(entries)-MaxTimelineEntries:]...)
+	}
+	if len(entries) == 0 {
+		return nil, truncated
+	}
+	return entries, truncated
+}
+
+// These settlement reasons mirror internal/controller/coderun_controller.go's lifecycle report gate.
+const (
+	lifecycleReportPublishedReason        = "Published"
+	lifecycleReportSupersededReason       = "Superseded"
+	lifecycleReportPermanentRefusalReason = "PermanentRefusal"
+)
+
+// markerPresent reports whether the run carries the named retention annotation
+// at all, however unreadable, so the reap block can distinguish "no marker yet"
+// from "a marker the controller's parse refuses".
+func markerPresent(run *courierv1alpha1.CoderRun, marker string) bool {
+	if marker == "" {
+		return false
+	}
+	_, ok := run.Annotations[marker]
+	return ok
+}
+
+// reapHolds derives why a run cannot be reaped yet from this object alone,
+// mirroring the controller's gates (internal/controller/reap.go,
+// internal/controller/capacity_recovery.go and coderun_controller.go's terminal
+// dispatch). Only single-object facts are used: the per-repository audit floor
+// compares other runs and is never derivable here, and whether the floor governs
+// this run's phase is stated separately on ReapHealth. The ownership hold is
+// reported only under the phase exemption it belongs to: the controller's
+// Failed, NeedsHuman, Done, and AlreadyDone reap paths never consult workspace
+// evidence, so an eligible-phase run must not inherit one.
+func reapHolds(run *courierv1alpha1.CoderRun, marker string, markerAt *metav1.Time, markerValid bool, opts Options) []string {
+	if !phaseIsReapEligible(run.Status.Phase) {
+		holds := []string{"phase is not reap-eligible"}
+		// A capacity-exhaustion run is the case where the phase exemption has a
+		// reason behind it the operator needs: the object is retained because the
+		// operator still owns the attempt's partial work. Only BlockedExternal
+		// runs reach here, matching the controller, which settles ownership
+		// before releasing capacity and never routes such a run to the reaper.
+		if hold := capacityOwnershipHold(run); hold != "" {
+			holds = append(holds, hold)
+		}
+		return holds
+	}
+	var holds []string
+	switch {
+	case !markerValid && markerPresent(run, marker):
+		// The annotation exists but the controller's parse refuses it, which
+		// starts a fresh window rather than measuring from the stamped time.
+		holds = append(holds, "retention marker unreadable; the reaper will restart its window")
+	case !markerValid:
+		holds = append(holds, "no retention marker yet")
+	default:
+		if window, ok := opts.retentionWindowFor(run.Status.Phase); ok && markerAt != nil {
+			// The window is the phase TTL the reaper measures from the marker it
+			// actually reads. Until it passes, the reaper only requeues.
+			if opts.now().Before(markerAt.Time.Add(window)) {
+				holds = append(holds, "retention window still open")
+			}
+		}
+	}
+	// The report-settlement gate mirrors the controller's terminal dispatch
+	// (internal/controller/coderun_controller.go): Failed, NeedsHuman, and
+	// AlreadyDone runs are held until the LifecycleReported condition settles,
+	// but a Done run is reaped through resolveCompleted, which gates on the
+	// done-at marker and the source resolve instead, so an unsettled report
+	// must not read as a Done-run hold.
+	settled := false
+	for i := range run.Status.Conditions {
+		cond := run.Status.Conditions[i]
+		if cond.Type == courierv1alpha1.ConditionLifecycleReported && cond.Status == metav1.ConditionTrue &&
+			(cond.Reason == lifecycleReportPublishedReason || cond.Reason == lifecycleReportSupersededReason || cond.Reason == lifecycleReportPermanentRefusalReason) {
+			settled = true
+			break
+		}
+	}
+	if run.Status.Phase != courierv1alpha1.PhaseDone && !settled {
+		holds = append(holds, "source report not settled")
+	}
+	if run.Status.CISettlement != nil {
+		holds = append(holds, "ci settlement outstanding")
+	}
+	if run.Status.CIParkRelease != nil {
+		holds = append(holds, "ci park release outstanding")
+	}
+	if req := run.Status.RetryRequest; req != nil && req.State == courierv1alpha1.RetryRequestStateRequested {
+		holds = append(holds, "retry request outstanding")
+	}
+	return holds
+}
+
+// capacityOwnershipHold mirrors the operator's capacity-recovery ownership gate
+// (internal/controller/capacity_recovery.go). A capacity-exhaustion run sits in
+// BlockedExternal, which the reaper never collects, and what keeps it there is
+// the fenced settlement: the operator refuses to release ownership while the
+// attempt's partial work is not proven safely held remotely. UnsafeWork is the
+// controller's own stopping reason for exactly that, and workspace evidence the
+// controller's gate would not accept says the same thing here. A settlement that
+// has merely not run yet is reported as unsettled rather than as unsafe, and
+// Settled and Stale release the hold — the attempt settled, or a newer attempt
+// owns the work — leaving only the phase exemption, since a BlockedExternal run
+// is never reaped and never consumes an audit-floor slot. The reason vocabulary
+// mirrors the controller's; this package only reads it.
+func capacityOwnershipHold(run *courierv1alpha1.CoderRun) string {
+	if !IsCapacityExhaustionRun(run) {
+		return ""
+	}
+	const unsafe = "unsafe workspace evidence holds ownership of partial work"
+	for i := range run.Status.Conditions {
+		cond := run.Status.Conditions[i]
+		if cond.Type != courierv1alpha1.ConditionCapacityRecovery {
+			continue
+		}
+		switch cond.Reason {
+		case CapacityRecoveryUnsafeWork:
+			return unsafe
+		case CapacityRecoveryUnsupported:
+			return "capacity recovery is unsupported: an operator must settle this attempt"
+		case CapacityRecoveryStale:
+			return ""
+		case CapacityRecoverySettled:
+			if cond.Status == metav1.ConditionTrue {
+				return ""
+			}
+		}
+		break
+	}
+	if run.Status.WorkspaceSafety != nil && !capacityWorkspaceProvenSafe(run) {
+		return unsafe
+	}
+	return "capacity recovery has not settled this attempt"
+}
+
+// capacityWorkspaceProvenSafe mirrors safeCapacityWorkspace in
+// internal/controller/capacity_recovery.go exactly: "empty" proves nothing was
+// left behind, "pushed" only proves safety when the recorded remote head and
+// branch match the run's own, and anything else — including a state this
+// vocabulary does not yet know — fails closed.
+func capacityWorkspaceProvenSafe(run *courierv1alpha1.CoderRun) bool {
+	evidence := run.Status.WorkspaceSafety
+	if evidence == nil {
+		return false
+	}
+	switch evidence.State {
+	case "empty":
+		return true
+	case "pushed":
+		return evidence.RemoteHead != "" && evidence.Head != "" && evidence.RemoteHead == evidence.Head &&
+			evidence.Branch != "" && evidence.Branch == run.Status.Branch && run.Status.Branch != ""
+	}
+	return false
 }
 
 // ProjectRunSummary projects one run's list-row view.
@@ -254,6 +596,13 @@ func ProjectRunSummary(run *courierv1alpha1.CoderRun, opts Options) RunSummary {
 func ProjectRunDetail(run *courierv1alpha1.CoderRun, opts Options) RunDetail {
 	detail := RunDetail{
 		RunSummary: ProjectRunSummary(run, opts),
+	}
+	detail.Timeline, detail.TimelineTruncated = ProjectRunTimeline(run)
+	// The projection's own observation instant, kept apart from every entry's
+	// recorded stamp: it says when the read model read this object, not when
+	// anything happened.
+	if observed := metav1.NewTime(opts.now()); !observed.Time.IsZero() {
+		detail.TimelineObservedAt = &observed
 	}
 	if run == nil {
 		return detail
@@ -333,22 +682,35 @@ func ProjectRunDetail(run *courierv1alpha1.CoderRun, opts Options) RunDetail {
 		detail.Admission.Note = "admittedAt is stamped but phase is Pending: a released or wedged admission"
 	}
 
-	if marker, at := reapMarker(run); marker != "" {
-		detail.Reap = ReapHealth{
-			MarkerAnnotation: marker,
-			MarkerAt:         at,
-			Reason:           retentionReasonFor(marker),
-			EligibleByPhase:  phaseIsReapEligible(run.Status.Phase),
+	// The reap clock is the marker the reaper reads for this run's phase, parsed
+	// with the controller's semantics — never the first marker present in any
+	// order, which could measure the current phase from another outcome's stamp.
+	marker, at, markerValid := CurrentReapMarker(run)
+	detail.Reap = ReapHealth{
+		MarkerAnnotation:       marker,
+		MarkerAt:               at,
+		Reason:                 retentionReasonFor(marker),
+		EligibleByPhase:        phaseIsReapEligible(run.Status.Phase),
+		Holds:                  reapHolds(run, marker, at, markerValid, opts),
+		AuditFloorGovernsPhase: AuditFloorGovernsPhase(run.Status.Phase),
+	}
+	// The phase's retention window and the expiry the reaper reads off the
+	// durable marker: the page can then say how long a retained run is still
+	// held for, not only that it is held.
+	if window, ok := opts.retentionWindowFor(run.Status.Phase); ok {
+		detail.Reap.RetentionWindowSeconds = secondsOf(window)
+		if at != nil && !at.Time.IsZero() {
+			expires := metav1.NewTime(at.Time.Add(window))
+			detail.Reap.RetentionExpiresAt = &expires
 		}
-	} else {
-		detail.Reap = ReapHealth{EligibleByPhase: phaseIsReapEligible(run.Status.Phase)}
 	}
 
 	if safety := run.Status.WorkspaceSafety; safety != nil {
 		detail.WorkspaceSafety = &WorkspaceSafetyView{
-			State:  bound(safety.State),
-			Branch: bound(safety.Branch),
-			Head:   bound(safety.Head),
+			State:      bound(safety.State),
+			Branch:     bound(safety.Branch),
+			Head:       bound(safety.Head),
+			RemoteHead: bound(safety.RemoteHead),
 		}
 	}
 
