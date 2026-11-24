@@ -75,6 +75,11 @@ type Server struct {
 	// write deadline. It is apiBodyReadBudget in production; tests compress
 	// it so the regressions below do not wait a production window.
 	bodyReadBudget time.Duration
+	// forgeReadBudget bounds the forge-read route — authentication and the
+	// read together — inside the listener's write deadline. It is
+	// ForgeReadBudget in production; tests compress it so the slow-auth
+	// regression does not wait a production window.
+	forgeReadBudget time.Duration
 }
 
 func NewServer(config ServerConfig) (*Server, error) {
@@ -102,7 +107,7 @@ func NewServer(config ServerConfig) (*Server, error) {
 	if _, err := tls.LoadX509KeyPair(config.TLSCertFile, config.TLSKeyFile); err != nil {
 		return nil, fmt.Errorf("load broker TLS identity: %w", err)
 	}
-	s := &Server{policy: config.Policy, authenticator: config.Authenticator, importer: config.Importer, snapshot: config.Snapshot, scratchDir: config.ScratchDir, capabilities: config.Capabilities, forgeReader: config.ForgeReader, bodyReadBudget: apiBodyReadBudget}
+	s := &Server{policy: config.Policy, authenticator: config.Authenticator, importer: config.Importer, snapshot: config.Snapshot, scratchDir: config.ScratchDir, capabilities: config.Capabilities, forgeReader: config.ForgeReader, bodyReadBudget: apiBodyReadBudget, forgeReadBudget: ForgeReadBudget}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+PathPublish, s.publish)
 	if s.importer != nil {

@@ -290,6 +290,63 @@ func (r *capturingForgeReader) WorkItem(_ context.Context, repo, id string) (for
 	return forge.WorkItem{ID: id, Repo: repo}, nil
 }
 
+// stallingAuthenticator stands in for a slow identity backend: it answers only
+// once its context ends, so a route that reached it without a deadline would
+// hang the test instead of failing it.
+type stallingAuthenticator struct {
+	hasDeadline bool
+	deadline    time.Duration
+}
+
+func (a *stallingAuthenticator) Authenticate(ctx context.Context, _ string) (Identity, error) {
+	deadline, ok := ctx.Deadline()
+	a.hasDeadline, a.deadline = ok, time.Until(deadline)
+	<-ctx.Done()
+	return Identity{}, &IdentityUnavailableError{Err: ctx.Err()}
+}
+
+// TestForgeCallSlowAuthenticationRunsInsideRouteBudget pins that
+// authentication receives the route's budgeted context, not the bare request
+// context: a slow identity backend is cut short by ForgeReadBudget and
+// answered with the retryable 503 the unavailability path already promises,
+// so it can never consume the response reserve on its own.
+func TestForgeCallSlowAuthenticationRunsInsideRouteBudget(t *testing.T) {
+	s, _ := serverForTest(t)
+	stall := &stallingAuthenticator{}
+	s.authenticator = stall
+	s.forgeReadBudget = 100 * time.Millisecond
+	reader := &capturingForgeReader{}
+	s.forgeReader = reader
+	req := httptest.NewRequest(http.MethodPost, PathForgeCall, strings.NewReader(`{"operation":"read-work-item","arguments":{"repo":"org/repo","id":"1"}}`))
+	req.Header.Set("Authorization", "Bearer valid-token")
+	// The outer bound is the failure margin: against a route that handed
+	// authentication the bare request context, the deadline the test observes
+	// is this one — above the route budget — so the assertion fires instead
+	// of the test hanging on the defect it pins.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req = req.WithContext(ctx)
+	rec := httptest.NewRecorder()
+	started := time.Now()
+	s.Handler().ServeHTTP(rec, req)
+	elapsed := time.Since(started)
+	if !stall.hasDeadline {
+		t.Fatal("authentication reached the identity backend without a deadline")
+	}
+	if stall.deadline <= 0 || stall.deadline > s.forgeReadBudget {
+		t.Fatalf("authentication was given %v, outside the %v route budget", stall.deadline, s.forgeReadBudget)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("slow authentication took %v, past the compressed %v budget", elapsed, s.forgeReadBudget)
+	}
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; a backend that never answered is availability, not denial", rec.Code)
+	}
+	if reader.id != "" {
+		t.Fatal("a forge read was dispatched although authentication never succeeded")
+	}
+}
+
 // TestForgeCallCanonicalizesWorkItemID pins that a syntactically valid but
 // non-canonical model-supplied id ("007", "+5") is forwarded to the reader in
 // canonical decimal form, never as the raw string.
