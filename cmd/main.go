@@ -607,6 +607,9 @@ func main() {
 			KnownSources: func() []string {
 				return sources.ConfiguredSourceNames()
 			},
+			DoneRetention:       doneRetention,
+			FailedRetention:     failedRetention,
+			NeedsHumanRetention: needsHumanRetention,
 		})
 		if err != nil {
 			setupLog.Error(err, "unable to configure the read API")

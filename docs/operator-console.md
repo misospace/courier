@@ -4,13 +4,13 @@ The operator console (`courier-console`) is a small, server-rendered web UI
 for authenticated operators. It is a standalone Go binary, separate from the
 manager. The overview page shows source health, lane capacity, and admission
 wedges from the operator read API. The run explorer lists CoderRuns from the
-operator read API with server-side search and pagination. The run-detail page
-is still a placeholder. The console never talks to the Kubernetes API. It
-reads the operator read API over a fixed allowlist of GET paths: the
-`/healthz` probe, and the overview, lane, source, and run-list projections
-when `--backend-url` and a read API token are both configured. In token mode
-it can also submit contributions to the separate admission API, the only
-mutating surface.
+operator read API with server-side search and pagination, and each run has a
+read-only detail page with status and a bounded event timeline. The console
+never talks to the Kubernetes API. It reads the operator read API over a fixed
+allowlist of GET paths: the `/healthz` probe, and the overview, lane, source,
+run-list, and named run-detail projections when `--backend-url` and a read API
+token are both configured. In token mode it can also submit contributions to
+the separate admission API, the only mutating surface.
 
 ## Authentication modes
 
@@ -291,16 +291,28 @@ the read API refused the token.
 A read API that is down, busy, or that rejects the token shows its own message.
 An operator never reads an outage as an empty namespace.
 
-Each row links to that run's detail page (a separate view) and shows the run's
-phase, source, lane, age, pull-request number, and restart count. The console
+Each row links to that run's detail page and shows the run's phase, source,
+lane, age, pull-request number, and restart count. The detail page shows the
+allowlisted per-run status blocks, retention holds, and a bounded timeline of
+recorded timestamps. Each timeline entry names the run-object field that holds
+its timestamp and the authority that writes it — the operator, the run's
+coordinator, or the API server — and the page states separately when the read
+model observed the run, so a recorded event time and an observation time are
+never the same claim. The retention block states the phase's retention window and
+the instant it expires, and it names an unsafe-workspace or capacity-recovery
+hold when the operator is still holding that attempt's partial work. The
+per-repository audit floor is not a per-run fact, so the page mentions it only
+for the phases that consume a floor slot and never implies it elsewhere. The
+console
 escapes every value the read API returns, including a name or label that a
 repository or model authored. It shows the pull request as a number, not a
 link, because the run projection carries no repository URL to trust.
 
-The console reads only a fixed set of GET paths on the configured backend:
-`GET /healthz`, `GET /v1/overview`, `GET /v1/lanes`, `GET /v1/sources`, and
-`GET /v1/runs`. The path never comes from the browser, so a filter value
-cannot steer the request to another path or host. Only the query string of the
+The console reads a fixed set of GET paths on the configured backend:
+`GET /healthz`, `GET /v1/overview`, `GET /v1/lanes`, `GET /v1/sources`,
+`GET /v1/runs`, and `GET /v1/runs/{name}`. The detail name must pass
+DNS-subdomain validation before it is composed into the path; it cannot add a
+path segment or steer the request to another host. Only the query string of the
 run-list request varies, and the console bounds it before it leaves.
 
 The console reaches the read API inside the cluster, so the read API Service
@@ -320,6 +332,6 @@ change nothing.
 
 ## Non-goals
 
-The console does not include, yet: run-detail data, mutating controls beyond
-the contribution form, any JavaScript, or an Ingress. The run explorer reads
-the read API but changes nothing; other features grow alongside it.
+The console does not include, yet: mutating controls beyond the contribution
+form, any JavaScript, or an Ingress. The console reads the read API but changes
+nothing; other features grow alongside it.
