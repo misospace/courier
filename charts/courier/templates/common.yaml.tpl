@@ -734,22 +734,31 @@ path instead of rendering an unstartable pairing. */}}
 {{- if and $consoleContributeStatusValues.tokenSecret (hasKey $consoleContributeStatusValues "tokenSecretKey") (empty $consoleContributeStatusValues.tokenSecretKey) }}
 {{- fail "operatorConsole.contributeStatus.tokenSecretKey must name a Secret entry when tokenSecret is set" }}
 {{- end }}
-{{- /* The read key lives on the main controller, not the console, and the
-  status listener only serves GET /v1/contributions/<run> when it was given
-  one, so pointing the console at the status URL without a read key would
-  render a console that can only ever fail its status reads. The scan runs
-  over the manager args whether or not contributeAPI.enabled settled the
-  flags above, so the raw-arg path cannot bypass the guard; both spellings
-  count and an explicit empty value does not. */}}
+{{- /* The read key and the listener bind live on the main controller, not
+  the console, and the status listener only serves GET /v1/contributions/<run>
+  when the binary settled both a bind and a read key at startup
+  (cmd/main.go), so pointing the console at the status URL without them would
+  render a console that can only ever fail its status reads. The guard
+  derives the effective manager args the same way the flags resolve: the
+  values-derived pair counts only while contributeAPI.enabled keeps
+  injecting them, a raw arg overrides its values-derived twin in either
+  spelling, last occurrence wins, and an explicit empty value clears. The
+  scan runs whether or not contributeAPI.enabled settled the flags above,
+  so the raw-arg path cannot bypass the guard. */}}
 {{- if not (empty $effectiveContributeStatusURL) }}
 {{- $mainArgCount := len $args }}
-{{- $servesContributeStatusReads := and $contributeAPI.enabled (not (empty $contributeAPI.readKeySecret)) }}
+{{- $effectiveReadKeySecret := "" }}
+{{- if and $contributeAPI.enabled (not (empty $contributeAPI.readKeySecret)) }}{{- $effectiveReadKeySecret = $contributeAPI.readKeySecret }}{{- end }}
+{{- $effectiveAdmissionBind := "" }}
+{{- if $contributeAPI.enabled }}{{- $effectiveAdmissionBind = printf ":%d" (int $contributeAPI.port) }}{{- end }}
 {{- range $i, $arg := $args }}
-{{- if and (hasPrefix "--contribute-read-key-secret=" $arg) (ne (trimPrefix "--contribute-read-key-secret=" $arg) "") }}{{- $servesContributeStatusReads = true }}{{- end }}
-{{- if and (eq $arg "--contribute-read-key-secret") (lt (add1 $i) $mainArgCount) (not (hasPrefix "-" (index $args (add1 $i)))) (ne (index $args (add1 $i)) "") }}{{- $servesContributeStatusReads = true }}{{- end }}
+{{- if hasPrefix "--contribute-read-key-secret=" $arg }}{{- $effectiveReadKeySecret = trimPrefix "--contribute-read-key-secret=" $arg }}{{- end }}
+{{- if and (eq $arg "--contribute-read-key-secret") (lt (add1 $i) $mainArgCount) (not (hasPrefix "-" (index $args (add1 $i)))) }}{{- $effectiveReadKeySecret = index $args (add1 $i) }}{{- end }}
+{{- if hasPrefix "--contribute-admission-bind=" $arg }}{{- $effectiveAdmissionBind = trimPrefix "--contribute-admission-bind=" $arg }}{{- end }}
+{{- if and (eq $arg "--contribute-admission-bind") (lt (add1 $i) $mainArgCount) (not (hasPrefix "-" (index $args (add1 $i)))) }}{{- $effectiveAdmissionBind = index $args (add1 $i) }}{{- end }}
 {{- end }}
-{{- if not $servesContributeStatusReads }}
-{{- fail "operatorConsole.contributeStatus.url requires a manager read key (contributeAPI.enabled with contributeAPI.readKeySecret, or a raw --contribute-read-key-secret manager arg): the contribution listener only serves status reads when a read key is configured" }}
+{{- if or (empty $effectiveReadKeySecret) (empty $effectiveAdmissionBind) }}
+{{- fail "operatorConsole.contributeStatus.url requires the manager to serve status reads (contributeAPI.enabled with contributeAPI.readKeySecret, or raw --contribute-read-key-secret and --contribute-admission-bind manager args): the contribution listener only answers status reads with a read key on a started admission listener" }}
 {{- end }}
 {{- end }}
 {{- if and $consoleContributeStatusValues.url (not $hasConsoleContributeStatusURL) }}{{- $consoleArgs = append $consoleArgs (printf "--contribute-status-url=%s" $consoleContributeStatusValues.url) }}{{- end }}
