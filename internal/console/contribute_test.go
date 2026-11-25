@@ -1247,3 +1247,172 @@ func TestContributeBlockedAbandonThenNewContent(t *testing.T) {
 		t.Fatalf("post-abandon keys = %v; want a fresh key for the new content", keys)
 	}
 }
+
+// progressingContributeStatus serves a scripted progression of one
+// contribution's states so a test can follow a submission's status link
+// and watch the run move to publication. After the scripted states it
+// repeats the last one, as a page keeps polling a parked run.
+type progressingContributeStatus struct {
+	mu       sync.Mutex
+	calls    int
+	lastNS   string
+	statuses []contributionStatus
+}
+
+func (f *progressingContributeStatus) Status(_ context.Context, namespace, run string) (contributionStatus, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastNS = namespace
+	index := f.calls
+	if index >= len(f.statuses) {
+		index = len(f.statuses) - 1
+	}
+	f.calls++
+	status := f.statuses[index]
+	status.Run = run
+	return status, nil
+}
+
+// TestContributeSuccessPageStatusLink pins the deep link the success page
+// offers: with a contribution status backend configured, an accepted or
+// resumed submission links straight to the run's contribution status
+// page, pinning the response namespace when the response echoes a valid
+// one and linking unpinned when the echo is malformed. Without a status
+// backend there is no link to offer.
+func TestContributeSuccessPageStatusLink(t *testing.T) {
+	cases := []struct {
+		name            string
+		admissionStatus int
+		admissionBody   string
+		statusBackend   bool
+		wantHref        string
+		denyHref        string
+	}{
+		{
+			name:            "created pins the response namespace",
+			admissionStatus: http.StatusCreated,
+			admissionBody:   `{"run":"run-1","namespace":"courier","workItemId":"item-1"}`,
+			statusBackend:   true,
+			wantHref:        `href="/contributions/run-1?namespace=courier"`,
+		},
+		{
+			name:            "resumed pins the response namespace",
+			admissionStatus: http.StatusOK,
+			admissionBody:   `{"run":"run-1","namespace":"courier","workItemId":"item-1"}`,
+			statusBackend:   true,
+			wantHref:        `href="/contributions/run-1?namespace=courier"`,
+		},
+		{
+			name:            "no status backend offers no link",
+			admissionStatus: http.StatusCreated,
+			admissionBody:   `{"run":"run-1","namespace":"courier","workItemId":"item-1"}`,
+			statusBackend:   false,
+		},
+		{
+			name:            "malformed namespace links unpinned",
+			admissionStatus: http.StatusCreated,
+			admissionBody:   `{"run":"run-1","namespace":"Bad NS","workItemId":"item-1"}`,
+			statusBackend:   true,
+			wantHref:        `href="/contributions/run-1"`,
+			denyHref:        `/contributions/run-1?namespace`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.admissionStatus)
+				_, _ = w.Write([]byte(tc.admissionBody))
+			}))
+			defer api.Close()
+			server, base, client := newContributionTestServer(t, api.URL, time.Second)
+			server.contributions = nil
+			if tc.statusBackend {
+				server.contributions = &fakeContributeStatus{}
+			}
+			_, page := get(t, client, base+"/contribute")
+			csrf := findCSRFToken(t, page)
+			_, page = postContribution(t, client, base, csrf, contributionValues("goal"))
+			if !strings.Contains(page, "A run was") {
+				t.Fatalf("success state missing:\n%s", page)
+			}
+			if tc.wantHref == "" {
+				if strings.Contains(page, "/contributions/") {
+					t.Fatalf("a console without a status backend offered a status link:\n%s", page)
+				}
+				return
+			}
+			if !strings.Contains(page, tc.wantHref) {
+				t.Fatalf("success page missing %q:\n%s", tc.wantHref, page)
+			}
+			if tc.denyHref != "" && strings.Contains(page, tc.denyHref) {
+				t.Fatalf("success page pinned a namespace the admission response did not validly name (%q):\n%s", tc.denyHref, page)
+			}
+		})
+	}
+}
+
+// TestContributeSubmitTwiceThenFollowStatusLink is the reviewer's
+// integrated fixture: submit the same contribution twice against the fake
+// admission backend — created, then resumed, the same run and namespace —
+// and follow the status link the success page offers. The pinned status
+// page renders the run's progression from Pending through Running to a
+// published pull request, and every read keeps the namespace pin.
+func TestContributeSubmitTwiceThenFollowStatusLink(t *testing.T) {
+	var mu sync.Mutex
+	admissions := 0
+	admission := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		admissions++
+		created := admissions == 1
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if created {
+			w.WriteHeader(http.StatusCreated)
+		} else {
+			w.WriteHeader(http.StatusOK)
+		}
+		_, _ = w.Write([]byte(`{"run":"run-1","namespace":"courier","workItemId":"item-1"}`))
+	}))
+	defer admission.Close()
+
+	fresh := time.Now().UTC().Format(time.RFC3339)
+	statuses := &progressingContributeStatus{statuses: []contributionStatus{
+		{Run: "run-1", Namespace: "courier", Phase: "Pending", ObservedAt: fresh},
+		{Run: "run-1", Namespace: "courier", Phase: "Running", ObservedAt: fresh},
+		{Run: "run-1", Namespace: "courier", Phase: "AwaitingReview", ObservedAt: fresh,
+			Publication: &contributionPublication{
+				Branch:   "courier/run-1",
+				HeadRepo: "contributor/fork",
+				HeadSHA:  "0f4a9c8b",
+				PR:       "https://github.com/misospace/courier/pull/7",
+			}},
+	}}
+	server, base, client := newContributionTestServer(t, admission.URL, time.Second)
+	server.contributions = statuses
+
+	_, page := get(t, client, base+"/contribute")
+	csrf := findCSRFToken(t, page)
+	if _, page = postContribution(t, client, base, csrf, contributionValues("goal")); !strings.Contains(page, "A run was created") {
+		t.Fatalf("first submission was not created:\n%s", page)
+	}
+	if _, page = postContribution(t, client, base, csrf, contributionValues("goal")); !strings.Contains(page, "A run was resumed") {
+		t.Fatalf("second submission did not resume the same attempt:\n%s", page)
+	}
+	const link = `/contributions/run-1?namespace=courier`
+	if !strings.Contains(page, `href="`+link+`"`) {
+		t.Fatalf("success page missing the pinned status link:\n%s", page)
+	}
+
+	for _, want := range []string{"Admitted, waiting to start", "Executing", "Awaiting review"} {
+		if _, page = get(t, client, base+link); !strings.Contains(page, want) {
+			t.Fatalf("status page missing %q:\n%s", want, page)
+		}
+		if statuses.lastNS != "courier" {
+			t.Fatalf("status read lost the namespace pin: %q", statuses.lastNS)
+		}
+	}
+	if !strings.Contains(page, `href="https://github.com/misospace/courier/pull/7"`) {
+		t.Fatalf("the published run did not show its pull request:\n%s", page)
+	}
+}

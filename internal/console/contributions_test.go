@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/misospace/courier/internal/source/adhoc"
 )
@@ -214,6 +215,37 @@ func TestContributePhaseAge(t *testing.T) {
 	}
 }
 
+// TestContributionStatusDescribes pins the decode-boundary shape of a 200:
+// the run echo, the namespace pin, and a parseable observedAt. A pinned
+// request whose answer names another namespace — or omits the namespace —
+// describes a different contribution than the page asked about and fails;
+// an unpinned request accepts the endpoint's namespace echo.
+func TestContributionStatusDescribes(t *testing.T) {
+	const observed = "2026-11-20T09:00:00Z"
+	cases := []struct {
+		name   string
+		status contributionStatus
+		run    string
+		pinned string
+		want   bool
+	}{
+		{"echo matches pin", contributionStatus{Run: "courier-a", Namespace: "home", ObservedAt: observed}, "courier-a", "home", true},
+		{"unpinned accepts echo", contributionStatus{Run: "courier-a", Namespace: "elsewhere", ObservedAt: observed}, "courier-a", "", true},
+		{"unpinned accepts no echo", contributionStatus{Run: "courier-a", ObservedAt: observed}, "courier-a", "", true},
+		{"pinned other namespace", contributionStatus{Run: "courier-a", Namespace: "other", ObservedAt: observed}, "courier-a", "home", false},
+		{"pinned missing namespace", contributionStatus{Run: "courier-a", ObservedAt: observed}, "courier-a", "home", false},
+		{"other run", contributionStatus{Run: "courier-b", Namespace: "home", ObservedAt: observed}, "courier-a", "home", false},
+		{"malformed readtime", contributionStatus{Run: "courier-a", Namespace: "home", ObservedAt: "not-a-time"}, "courier-a", "home", false},
+		{"empty readtime", contributionStatus{Run: "courier-a", Namespace: "home"}, "courier-a", "home", false},
+		{"fractional readtime", contributionStatus{Run: "courier-a", Namespace: "home", ObservedAt: "2026-11-20T09:00:00.123456789Z"}, "courier-a", "home", true},
+	}
+	for _, tc := range cases {
+		if got := tc.status.describes(tc.run, tc.pinned); got != tc.want {
+			t.Errorf("%s: describes(%q, %q) = %v, want %v", tc.name, tc.run, tc.pinned, got, tc.want)
+		}
+	}
+}
+
 // --- client -----------------------------------------------------------------
 
 func TestNewHTTPContributeStatusClientRejectsBadURLs(t *testing.T) {
@@ -348,6 +380,10 @@ func TestContributeStatusClientUnexpectedBody(t *testing.T) {
 			_, _ = w.Write([]byte(`{"run":"some-other-run","observedAt":"2026-11-20T09:00:00Z"}`))
 		case strings.HasSuffix(r.URL.Path, "no-observed"):
 			_, _ = w.Write([]byte(`{"run":"courier-no-observed","phase":"Pending"}`))
+		case strings.HasSuffix(r.URL.Path, "bad-time"):
+			_, _ = w.Write([]byte(`{"run":"courier-bad-time","observedAt":"not-a-time"}`))
+		case strings.HasSuffix(r.URL.Path, "other-namespace"):
+			_, _ = w.Write([]byte(`{"run":"courier-other-namespace","namespace":"elsewhere","observedAt":"2026-11-20T09:00:00Z"}`))
 		default:
 			_, _ = w.Write([]byte("<html>not json</html>"))
 		}
@@ -357,10 +393,22 @@ func TestContributeStatusClientUnexpectedBody(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, run := range []string{"courier-ok", "courier-huge", "courier-empty-object", "courier-other-run", "courier-no-observed"} {
+	for _, run := range []string{"courier-ok", "courier-huge", "courier-empty-object", "courier-other-run", "courier-no-observed", "courier-bad-time"} {
 		if _, err := client.Status(context.Background(), "", run); !errors.Is(err, ErrContributeStatusUnexpected) {
 			t.Errorf("%s: err = %v, want ErrContributeStatusUnexpected", run, err)
 		}
+	}
+	// A request pinned to one namespace rejects an answer that names
+	// another: content about a different contribution must never render
+	// under this page's identity. The error also names itself, so the
+	// handler renders the localized mismatch message on this path too.
+	if _, err := client.Status(context.Background(), "home", "courier-other-namespace"); !errors.Is(err, ErrContributeStatusUnexpected) || !errors.Is(err, errContributeNamespaceMismatch) {
+		t.Errorf("pinned other-namespace: err = %v, want ErrContributeStatusUnexpected wrapping errContributeNamespaceMismatch", err)
+	}
+	// The same answer on an unpinned request is the endpoint's canonical
+	// namespace echo and reads as a valid status.
+	if status, err := client.Status(context.Background(), "", "courier-other-namespace"); err != nil || status.Namespace != "elsewhere" {
+		t.Errorf("unpinned namespace echo = %+v/%v, want the echoed namespace with no error", status, err)
 	}
 }
 
@@ -777,9 +825,10 @@ func TestContributionForgeLinks(t *testing.T) {
 // state with blank fields, keep an active refresh, or store a history entry.
 func TestContributionDetailWrongShape200RendersMisconfigured(t *testing.T) {
 	cases := map[string]contributionStatus{
-		"zero body":        {},
-		"other run":        {Run: "some-other-run", ObservedAt: "2026-11-20T09:00:00Z"},
-		"missing readtime": {Run: "courier-3f2a", Phase: "Pending"},
+		"zero body":          {},
+		"other run":          {Run: "some-other-run", ObservedAt: "2026-11-20T09:00:00Z"},
+		"missing readtime":   {Run: "courier-3f2a", Phase: "Pending"},
+		"malformed readtime": {Run: "courier-3f2a", Phase: "Pending", ObservedAt: "not-a-time"},
 	}
 	for name, status := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -803,6 +852,101 @@ func TestContributionDetailWrongShape200RendersMisconfigured(t *testing.T) {
 				if c.Name == contributeHistoryCookie {
 					t.Errorf("wrong-shape 200 stored a history entry: %+v", c)
 				}
+			}
+		})
+	}
+}
+
+// TestContributionDetailNamespaceMismatchRendersMismatch pins the handler's
+// re-check of the namespace pin: a status that answers a pinned request
+// about another namespace — or omits the namespace — is wrong-shape for
+// this page and renders the dedicated mismatch message instead. Like every
+// static misconfiguration state it shows no found fields, keeps no active
+// refresh, and stores no history entry.
+func TestContributionDetailNamespaceMismatchRendersMismatch(t *testing.T) {
+	cases := map[string]contributionStatus{
+		"other namespace":   {Run: "courier-3f2a", Namespace: "other", Phase: "Running", ObservedAt: "2026-11-20T09:00:00Z"},
+		"missing namespace": {Run: "courier-3f2a", Phase: "Running", ObservedAt: "2026-11-20T09:00:00Z"},
+	}
+	for name, status := range cases {
+		t.Run(name, func(t *testing.T) {
+			secrets := newTestSecrets(t)
+			_, base := newContributeServer(t, secrets, &fakeContributeStatus{status: status})
+			client := login(t, base, secrets.token)
+			resp, body := get(t, client, base+"/contributions/courier-3f2a?namespace=home")
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200 with a state message", resp.StatusCode)
+			}
+			if !strings.Contains(body, "different namespace") {
+				t.Errorf("namespace mismatch did not render the dedicated message:\n%s", body)
+			}
+			if strings.Contains(body, "Run identity") || strings.Contains(body, "Published</h2>") {
+				t.Errorf("namespace mismatch rendered found-state sections:\n%s", body)
+			}
+			if strings.Contains(body, `http-equiv="refresh"`) {
+				t.Errorf("namespace mismatch is a static state and must not self-refresh:\n%s", body)
+			}
+			for _, c := range resp.Cookies() {
+				if c.Name == contributeHistoryCookie {
+					t.Errorf("namespace mismatch stored a history entry: %+v", c)
+				}
+			}
+		})
+	}
+}
+
+// TestContributionDetailStaleSnapshotLabelsReplay pins the stale labeling:
+// the page's own refresh cadence tops out at the 300-second backoff
+// interval, so a snapshot stamped more than contributeStatusStaleAfter
+// before the console's clock means a cached replay upstream or a wrong
+// clock, and the page says so. Stale found stays found: normal content,
+// the normal refresh interval, and history still recorded. A fresh or
+// future stamp renders no warning.
+func TestContributionDetailStaleSnapshotLabelsReplay(t *testing.T) {
+	const staleWarning = "more than 15 minutes old"
+	now := time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name       string
+		observedAt string
+		wantWarn   bool
+	}{
+		{"two hours old", now.Add(-2 * time.Hour).Format(time.RFC3339), true},
+		{"just read", now.Add(-30 * time.Second).Format(time.RFC3339), false},
+		{"from the future", now.Add(time.Hour).Format(time.RFC3339), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			secrets := newTestSecrets(t)
+			stub := &fakeContributeStatus{status: contributionStatus{
+				Run: "courier-3f2a", Namespace: "contrib", Phase: "AwaitingReview",
+				PhaseEnteredAt: now.Add(-time.Hour).Format(time.RFC3339),
+				ObservedAt:     tc.observedAt,
+			}}
+			server, base := newContributeServer(t, secrets, stub)
+			server.auth.now = func() time.Time { return now }
+			client := login(t, base, secrets.token)
+			resp, body := get(t, client, base+"/contributions/courier-3f2a")
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200 with found content", resp.StatusCode)
+			}
+			// Stale found stays found: normal content and the normal
+			// interval for the phase.
+			for _, want := range []string{"Awaiting review", "Run identity", fmt.Sprintf("content=\"%d\"", contributeStatusParkedSeconds)} {
+				if !strings.Contains(body, want) {
+					t.Errorf("page missing %q:\n%s", want, body)
+				}
+			}
+			var history *http.Cookie
+			for _, c := range resp.Cookies() {
+				if c.Name == contributeHistoryCookie {
+					history = c
+				}
+			}
+			if history == nil || history.Value == "" {
+				t.Errorf("found state did not record history:\n%s", body)
+			}
+			if got := strings.Contains(body, staleWarning); got != tc.wantWarn {
+				t.Errorf("stale warning present = %v, want %v:\n%s", got, tc.wantWarn, body)
 			}
 		})
 	}

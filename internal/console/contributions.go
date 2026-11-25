@@ -68,6 +68,14 @@ const (
 	// retry path instead of hammering a backend that is down.
 	contributeStatusBackoffSeconds = 300
 
+	// contributeStatusStaleAfter bounds how old an "observed" snapshot
+	// may claim to be. The page's own refresh cadence tops out at the
+	// 300-second backoff interval, so a correctly stamped read can never
+	// be older than about five minutes plus clock error; more than this
+	// means a cached replay upstream or a wrong clock, so the page says
+	// so instead of claiming a current read.
+	contributeStatusStaleAfter = 15 * time.Minute
+
 	// contributeHistoryCookie holds this browser's recently viewed
 	// contributions: a signed list of namespace-and-run links, nothing else.
 	contributeHistoryCookie = "courier_console_contribute_history"
@@ -177,6 +185,19 @@ var ErrContributeStatusUnexpected = errors.New("contribution status API returned
 // renders: a static state, so a broken upstream never loops a retry.
 const contributeUnexpectedMessage = "The contribution status API answered, but not with a contribution status. Check that the console's contribution status URL points at the contribution listener."
 
+// contributeNamespaceMismatchMessage names the one wrong-shape 200 the
+// console can localize: a status that answers a namespace-pinned request
+// about a different namespace than the page asked for. The page renders
+// nothing of it, because content about another contribution under this
+// page's identity would be a lie.
+const contributeNamespaceMismatchMessage = "The contribution status API answered about a different namespace than this page asked for, so the page shows none of its content. Check that the console's contribution status URL points at the contribution listener for this namespace."
+
+// errContributeNamespaceMismatch wraps ErrContributeStatusUnexpected when
+// the wrong-shape 200 is specifically a pinned request answered about
+// another namespace, so the handler renders the localized message on the
+// client path exactly as the defensive re-check does.
+var errContributeNamespaceMismatch = errors.New("contribution status response named another namespace than requested")
+
 // ContributeStatusError reports a status reply that carried a non-200
 // status. It names the status only, never the response body, so an
 // operator-facing message can distinguish "not found" from "credential
@@ -280,26 +301,43 @@ func (c *httpContributeStatusClient) Status(ctx context.Context, namespace, run 
 	if err := json.Unmarshal(body, &status); err != nil {
 		return contributionStatus{}, fmt.Errorf("%w: %v", ErrContributeStatusUnexpected, err)
 	}
-	if !status.describes(run) {
-		// The endpoint always echoes the run's name and stamps the read's
-		// observedAt. A 200 that parses as JSON but does not — say a bare
-		// {} from a misconfigured status URL pointed at some other service —
-		// fails as the documented misconfiguration error instead of
-		// decoding to a zero status the page would render as an empty
-		// "found".
+	if !status.describes(run, namespace) {
+		// The endpoint always echoes the run's name and namespace and
+		// stamps the read's observedAt. A 200 that parses as JSON but
+		// does not — say a bare {} from a misconfigured status URL
+		// pointed at some other service, or an answer about another
+		// namespace than the one pinned — fails as the documented
+		// misconfiguration error instead of decoding to a zero status
+		// the page would render as an empty "found".
+		if status.Run == run && namespace != "" && status.Namespace != namespace {
+			return contributionStatus{}, fmt.Errorf("%w: %w", ErrContributeStatusUnexpected, errContributeNamespaceMismatch)
+		}
 		return contributionStatus{}, fmt.Errorf("%w: response does not describe the requested run", ErrContributeStatusUnexpected)
 	}
 	return status, nil
 }
 
-// describes reports whether the decoded body carries the two fields the
-// status endpoint always projects: the echo of the requested run's name and
-// the read's observedAt. The run name the endpoint echoes is the object name
-// it was addressed by — always the validated request name, never a
-// truncated form, because the projection's field cap exceeds the object-name
-// cap the request is validated against.
-func (s contributionStatus) describes(run string) bool {
-	return s.Run == run && s.ObservedAt != ""
+// describes reports whether the decoded body is the status of the
+// contribution the request addressed: the echo of the requested run's
+// name; the requested namespace when the request pinned one, since a
+// pinned answer that names another namespace — or omits the namespace —
+// describes a different contribution than the page asked about; and an
+// observedAt that parses as an RFC3339 timestamp, because the endpoint
+// always stamps the read time and every freshness claim downstream is
+// derived from it (time.RFC3339Nano also accepts plain RFC3339). The run
+// name the endpoint echoes is the object name it was addressed by —
+// always the validated request name, never a truncated form, because the
+// projection's field cap exceeds the object-name cap the request is
+// validated against.
+func (s contributionStatus) describes(run string, pinnedNamespace string) bool {
+	if s.Run != run {
+		return false
+	}
+	if pinnedNamespace != "" && s.Namespace != pinnedNamespace {
+		return false
+	}
+	_, err := time.Parse(time.RFC3339Nano, s.ObservedAt)
+	return err == nil
 }
 
 // validContributeRunName reports whether the name could address a run on the
@@ -334,6 +372,7 @@ type contributionData struct {
 	HistoryAvailable  bool
 
 	Status       contributionStatus
+	Stale        bool
 	PhaseLabel   string
 	PhaseClass   string
 	PhaseAge     string
@@ -412,7 +451,13 @@ func (s *Server) renderContributionStatus(w http.ResponseWriter, r *http.Request
 		case errors.Is(err, ErrContributeStatusUnexpected):
 			// A 200 that is not a contribution status is a misconfigured
 			// URL or a rewriting proxy: a static state, no point retrying.
-			data.ErrorMessage = contributeUnexpectedMessage
+			// The one localizable wrong shape — a pinned request answered
+			// about another namespace — names itself, as on the re-check.
+			if errors.Is(err, errContributeNamespaceMismatch) {
+				data.ErrorMessage = contributeNamespaceMismatchMessage
+			} else {
+				data.ErrorMessage = contributeUnexpectedMessage
+			}
 		default:
 			var statusErr *ContributeStatusError
 			if errors.As(err, &statusErr) {
@@ -445,20 +490,34 @@ func (s *Server) renderContributionStatus(w http.ResponseWriter, r *http.Request
 	}
 
 	// Defensive re-check of the decode boundary: the client rejects a body
-	// that does not describe the requested run, but "found" is the one
-	// state that renders backend content, so it validates here too. A
-	// status that echoes another run or carries no observedAt is the same
-	// misconfiguration as an unparseable body and renders as its static
-	// state — never blank fields, an active refresh, or a history entry.
-	if !status.describes(run) {
+	// that does not describe the requested run under the request's
+	// namespace pin, but "found" is the one state that renders backend
+	// content, so it validates here too. A status that echoes another
+	// run, answers a pinned request from another namespace, or carries no
+	// parseable observedAt is the same misconfiguration as an
+	// unparseable body and renders as its static state — never blank
+	// fields, an active refresh, or a history entry.
+	if !status.describes(run, namespace) {
 		data.State = "error"
-		data.ErrorMessage = contributeUnexpectedMessage
+		if namespace != "" && status.Namespace != namespace {
+			data.ErrorMessage = contributeNamespaceMismatchMessage
+		} else {
+			data.ErrorMessage = contributeUnexpectedMessage
+		}
 		s.renderContribution(w, http.StatusOK, "contribution", data)
 		return
 	}
 
 	data.State = "found"
 	data.Status = status
+	// The stale label: describes has guaranteed observedAt parses, so a
+	// read older than the bound means a cached replay upstream or a
+	// wrong clock, and the page says so instead of claiming a current
+	// read. A future timestamp is never stale. Stale found stays found:
+	// normal content, normal refresh interval, history still recorded.
+	if observed, err := time.Parse(time.RFC3339Nano, status.ObservedAt); err == nil {
+		data.Stale = s.auth.now().Sub(observed) > contributeStatusStaleAfter
+	}
 	// The response echoes the canonical namespace; the deep link and the
 	// history entry carry it, so a reload stays pinned even when the first
 	// read used the endpoint's default.

@@ -396,6 +396,12 @@ type contributeData struct {
 	Namespace      string
 	WorkItemID     string
 	Resumed        bool
+	// StatusLink deep-links the admitted run's contribution status page.
+	// Empty when the console has no status backend or the admission
+	// response named no run the status route could address; the
+	// namespace is pinned into it only when the response echoed a valid
+	// one.
+	StatusLink string
 }
 
 func (s *Server) contributePage(r *http.Request, sessionID string) contributeData {
@@ -548,6 +554,21 @@ func (s *Server) handleContributeSubmit(w http.ResponseWriter, r *http.Request) 
 		data.State, data.StateClass = "success", "state-ok"
 		data.Run, data.Namespace, data.WorkItemID = result.Run, result.Namespace, result.WorkItemID
 		data.Resumed = result.Outcome == outcomeResumed
+		// The run link on the success page goes to the run explorer; a
+		// console with a contribution status backend also gives the
+		// submitter the direct path to this contribution's status page.
+		// The response's namespace is pinned into the deep link only
+		// when it is a valid one; an unusable echo links unpinned, so
+		// the status page falls back to the endpoint's own default
+		// rather than carrying a malformed value. Without a status
+		// backend or a nameable run there is no link to offer.
+		if s.contributions != nil && validContributeRunName(result.Run) {
+			pinned := ""
+			if validContributeNamespace(result.Namespace) {
+				pinned = result.Namespace
+			}
+			data.StatusLink = contributionRunURL(result.Run, pinned)
+		}
 	case outcomeRefused:
 		s.minter.remember(sessionID, digest, key, s.auth.now())
 		s.settled.mark(key, s.auth.now())
