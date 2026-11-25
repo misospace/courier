@@ -34,6 +34,19 @@ A Kubernetes operator (Go, controller-runtime) plus a coordinator harness. The
 operator reconciles `CoderRun` objects; the harness runs the coordinator model
 that plans, delegates, and produces PRs. See DESIGN.md for the full architecture.
 
+## Repository independence
+
+Courier is an **optional connector to Dispatch**, and Dispatch is an optional
+control plane for Courier. Courier and Dispatch must remain independently
+mergeable, releasable, and deployable.
+
+- Neither repository's PR may block on the other's PR, issue, release, or deployment.
+- Cross-repository feature availability is **not** a merge gate. Breaking compatibility **is**.
+- Protocol changes are versioned and negotiated: declare the capability/field, gate behavior on the answer, and keep the previous behavior for a Dispatch that does not send it. A Courier change must not require a Dispatch change to ship first, or vice versa.
+- Exercise both release orders with **local fixtures** (recorded or hand-built dispatch responses), never by checking out or running the other repository.
+- Document enablement in terms of **compatible peers and valid capability grants**, never "wait for `dispatch#N`" or an issue-state check.
+- A shared umbrella/parent tracker may reference both halves, but it must not gate either implementation.
+
 ## Layout
 
 ```
@@ -110,3 +123,7 @@ PR when a documented architectural decision or capability changes.
 - Keep issues **bounded and file-scoped**. A task that sprawls across the whole
   codebase should be split; scoped-edit models converge on small briefs and
   thrash on open-ended ones.
+- **Never gate an issue on Dispatch.** Scope the done-condition to Courier's own
+  behavior and test it against local protocol fixtures; do not mark an issue
+  blocked, or record a dependency, because a Dispatch PR/issue/release is still
+  open. Versioned capability negotiation is what carries compatibility.
