@@ -32,10 +32,16 @@ type BrokerInstallationAuth struct {
 	Repositories []string
 	Endpoint     string
 	HTTPClient   *http.Client
+	// ReadOnly refuses a write method before any token is spent: the transport
+	// serves only GET and HEAD and the client's API layer only GET, so a
+	// model-facing read path cannot reach a write-capable request even if its
+	// route vocabulary regresses.
+	ReadOnly bool
 }
 
-// NewBrokerInstallationClient returns a write-capable client scoped to one
-// installation owner and API endpoint, with credentials supplied on demand.
+// NewBrokerInstallationClient returns a client scoped to one installation
+// owner and API endpoint, with credentials supplied on demand: write-capable
+// unless auth.ReadOnly restricts it to reads.
 func NewBrokerInstallationClient(auth BrokerInstallationAuth, source InstallationTokenSource) (*Client, error) {
 	if strings.TrimSpace(auth.Owner) == "" {
 		return nil, errors.New("GitHub App authentication requires an owner")
@@ -55,7 +61,7 @@ func NewBrokerInstallationClient(auth BrokerInstallationAuth, source Installatio
 		}
 		pinned = append(pinned, repository)
 	}
-	transport := brokerInstallationDoer{endpoint: endpoint, owner: strings.TrimSpace(auth.Owner), repositories: pinned, source: source, client: auth.HTTPClient}
+	transport := brokerInstallationDoer{endpoint: endpoint, owner: strings.TrimSpace(auth.Owner), repositories: pinned, source: source, client: auth.HTTPClient, readOnly: auth.ReadOnly}
 	if transport.client == nil {
 		transport.client = &http.Client{Timeout: defaultRequestTimeout}
 	}
@@ -65,6 +71,7 @@ func NewBrokerInstallationClient(auth BrokerInstallationAuth, source Installatio
 	}
 	client.endpointBound = true
 	client.appInstallation = true
+	client.readOnly = auth.ReadOnly
 	return client, nil
 }
 
@@ -74,6 +81,7 @@ type brokerInstallationDoer struct {
 	repositories []string
 	source       InstallationTokenSource
 	client       *http.Client
+	readOnly     bool
 }
 
 func (d brokerInstallationDoer) Do(req *http.Request) (*http.Response, error) {
@@ -99,7 +107,11 @@ func (d brokerInstallationDoer) Do(req *http.Request) (*http.Response, error) {
 		}
 	}
 	switch req.Method {
-	case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+	case http.MethodGet, http.MethodHead:
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		if d.readOnly {
+			return nil, errors.New("GitHub App read-scoped credential refused a write request")
+		}
 	default:
 		return nil, errors.New("GitHub App credential refused an unsupported request method")
 	}

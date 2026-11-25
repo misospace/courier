@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -11,8 +12,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/broker"
@@ -196,7 +203,7 @@ func TestNewProviderUsesRegisteredEndpoint(t *testing.T) {
 			document := &topology.BrokerPolicyDocument{
 				Provider: forge.Projection{Name: "primary", Type: "github", Endpoint: test.endpoint},
 			}
-			provider, err := newProvider(env, document, false, nil, nil)
+			provider, err := newProvider(env, document, false, nil, nil, false)
 			if err != nil {
 				t.Fatalf("newProvider: %v", err)
 			}
@@ -225,7 +232,7 @@ func TestNewProviderUsesRegisteredEndpoint(t *testing.T) {
 
 	env := &brokerEnv{providerName: "primary", providerType: "github", providerEndpt: "not a url", forgeAPIToken: "tok"}
 	document := &topology.BrokerPolicyDocument{Provider: forge.Projection{Name: "primary", Endpoint: "not a url"}}
-	if _, err := newProvider(env, document, false, nil, nil); err == nil {
+	if _, err := newProvider(env, document, false, nil, nil, false); err == nil {
 		t.Fatal("a malformed registered endpoint must fail closed, not fall back to the public API")
 	}
 }
@@ -351,5 +358,103 @@ func TestStatusListenerReclaimsIdleConnection(t *testing.T) {
 	// The close must be the idle bound firing, not an unrelated early close.
 	if elapsed := time.Since(start); elapsed < bound/2 {
 		t.Fatalf("connection closed after %v, before the %v idle bound could fire", elapsed, bound)
+	}
+}
+
+// TestAssembleForgeRoutesModelReadsThroughReadScopedCredential pins the
+// App-mode composition: the model-facing reader is served by the read-scoped
+// credential profile while publication routes keep the write-capable profile,
+// so the /v1/forge/call vocabulary cannot reach a write-capable token even if
+// the route vocabulary regresses.
+func TestAssembleForgeRoutesModelReadsThroughReadScopedCredential(t *testing.T) {
+	var mu sync.Mutex
+	auth := map[string]string{}
+	fixture := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		auth[r.Method+" "+r.URL.Path] = r.Header.Get("Authorization")
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/acme/widgets/pulls":
+			_, _ = io.WriteString(w, `{"number":1,"title":"t","body":"b","base":{"ref":"main","sha":"basesha","repo":{"full_name":"acme/widgets"}},"head":{"ref":"contribute/x","sha":"headsha","repo":{"full_name":"acme/widgets"}}}`)
+		case r.URL.Path == "/repos/acme/widgets/issues/5":
+			_, _ = io.WriteString(w, `{"number":5,"title":"t","body":"b","state":"open","html_url":"u"}`)
+		default:
+			_, _ = io.WriteString(w, `{"id":7,"full_name":"acme/widgets","default_branch":"main","owner":{"login":"acme"}}`)
+		}
+	}))
+	defer fixture.Close()
+
+	document, err := json.Marshal(topology.InstallationTokenDocument{
+		Version: topology.InstallationTokenDocumentVersion, Owner: "acme", Endpoint: fixture.URL,
+		Entries: []topology.InstallationTokenEntry{{
+			Repository: "acme/widgets", Token: "write-token", ExpiresAt: time.Now().Add(time.Hour),
+			ReadToken: "read-token", ReadExpiresAt: time.Now().Add(time.Hour),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "runs", Name: topology.CredentialsSecretName("run")},
+		Data:       map[string][]byte{topology.CredKeyInstallationToken: document},
+	}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	source, err := broker.NewSecretInstallationTokenSource(client, "runs", topology.CredentialsSecretName("run"),
+		topology.CredKeyInstallationToken, "acme", fixture.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := &brokerEnv{providerName: "primary", providerType: "github", providerEndpt: fixture.URL, providerHTTPClient: fixture.Client()}
+	policyDocument := &topology.BrokerPolicyDocument{
+		Provider:          forge.Projection{Name: "primary", Type: "github", Endpoint: fixture.URL},
+		PublicationPolicy: &courierv1alpha1.PublicationPolicy{BaseRepo: "acme/widgets", WorkRepo: "acme/widgets"},
+		InstallationToken: &topology.InstallationTokenSecretRef{SecretKey: topology.CredKeyInstallationToken},
+	}
+	policy := broker.Policy{Provider: "primary", BaseRepo: "acme/widgets", WorkRepo: "acme/widgets", BaseRef: "main", WorkRef: "contribute/x"}
+	wiring, err := assembleForge(context.Background(), env, policyDocument, true, source, source.ReadProfile(), []string{"acme/widgets"}, policy)
+	if err != nil {
+		t.Fatalf("assembleForge: %v", err)
+	}
+
+	if _, err := wiring.reader.WorkItem(context.Background(), "acme/widgets", "5"); err != nil {
+		t.Fatalf("model-facing read: %v", err)
+	}
+	issuesKey := http.MethodGet + " /repos/acme/widgets/issues/5"
+	mu.Lock()
+	readAuth := auth[issuesKey]
+	mu.Unlock()
+	if readAuth != "Bearer read-token" {
+		t.Fatalf("model-facing read authorization = %q, want the read-scoped profile", readAuth)
+	}
+
+	base, err := wiring.provider.ResolveRepository(context.Background(), policy.BaseRepo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publication, err := broker.NewForgeAdapter(policy, wiring.provider, wiring.provider, base, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := publication.WorkItem(context.Background(), "acme/widgets", "5"); err != nil {
+		t.Fatalf("publication read: %v", err)
+	}
+	if _, err := wiring.provider.CreatePullRequest(context.Background(), forge.CreatePullRequestInput{
+		Repo: "acme/widgets", Head: "acme/widgets:contribute/x", Base: "main", Title: "t",
+	}); err != nil {
+		t.Fatalf("publication write: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if writeAuth := auth[issuesKey]; writeAuth != "Bearer write-token" {
+		t.Fatalf("publication read authorization = %q, want the write-capable profile", writeAuth)
+	}
+	if auth[http.MethodPost+" /repos/acme/widgets/pulls"] != "Bearer write-token" {
+		t.Fatalf("publication write authorization = %q, want the write-capable profile", auth[http.MethodPost+" /repos/acme/widgets/pulls"])
 	}
 }

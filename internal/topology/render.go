@@ -360,7 +360,7 @@ func PolicySecret(run *courier.CoderRun, document BrokerPolicyDocument) (*corev1
 // InstallationTokenDocumentVersion is the schema version of
 // InstallationTokenDocument. A broker that does not know the version refuses
 // the document rather than guessing.
-const InstallationTokenDocumentVersion = 1
+const InstallationTokenDocumentVersion = 2
 
 // InstallationTokenDocument is the on-wire content of the per-run credentials
 // Secret's installation-token entry: one short-lived GitHub App installation
@@ -386,6 +386,15 @@ type InstallationTokenEntry struct {
 	Repository string    `json:"repository"`
 	Token      string    `json:"token"`
 	ExpiresAt  time.Time `json:"expiresAt"`
+	// ReadToken is the read-scoped profile minted for the same repository
+	// when the run's topology serves model-facing forge reads: its GitHub
+	// permissions exclude every write scope, so the /v1/forge/call path can
+	// never reach a write-capable credential even if its route vocabulary
+	// regresses. Legacy git-transport documents omit it.
+	ReadToken string `json:"readToken,omitempty"`
+	// ReadExpiresAt is ReadToken's expiry; zero when the entry carries no
+	// read profile.
+	ReadExpiresAt time.Time `json:"readExpiresAt,omitempty"`
 }
 
 // Entry returns the entry minted for the named repository, compared
@@ -446,6 +455,12 @@ func InstallationTokenCredentials(run *courier.CoderRun, document InstallationTo
 			return nil, errors.New("topology: installation-token document repeats a repository")
 		}
 		seen[key] = struct{}{}
+		if (entry.ReadToken == "") != entry.ReadExpiresAt.IsZero() {
+			return nil, errors.New("topology: installation-token read profile is incomplete")
+		}
+		if entry.ReadToken != "" && entry.ReadToken == entry.Token {
+			return nil, errors.New("topology: installation-token read profile must be a distinct credential")
+		}
 	}
 	endpoint, err := url.Parse(document.Endpoint)
 	if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" || endpoint.Opaque != "" {

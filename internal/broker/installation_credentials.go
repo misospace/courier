@@ -22,11 +22,16 @@ import (
 // endpoint, an entry for exactly the requested repository, and expiry lead —
 // so an operator rotation or any credential-binding drift takes effect on the
 // next call, and no credential is ever served from a prior, unaudited read.
-// The operator mints one token per pinned repository with only that
-// repository's permissions, so a request against one repository can never
-// carry a token scoped to another: a repository with no entry in the document
-// is a refusal. The tokens live only in process memory: they never appear in
-// logs, error strings, or pod environment. Any unreadable, malformed,
+// The write-capable profile serves publication routes and git transport; the
+// read-scoped profile (via ReadProfile) serves the model-facing forge-read
+// path and refuses an entry whose read token is absent or aliases the write
+// token, so a drifted document can never serve the write credential to the
+// model-facing reader. The operator mints the tokens per pinned repository,
+// each carrying only that repository's permissions, so a
+// request against one repository can never carry a token scoped to another: a
+// repository with no entry in the document is a refusal. The tokens live only
+// in process memory: they never appear in logs, error strings, or pod
+// environment. Any unreadable, malformed,
 // stale-versioned, mismatched, or expired document is a refusal — App-mode
 // brokers have no static credential to fall back to. The source is immutable
 // after construction and safe for concurrent use.
@@ -38,6 +43,7 @@ type SecretInstallationTokenSource struct {
 	expectedOwner    string
 	expectedEndpoint string
 	now              func() time.Time
+	readProfile      bool
 }
 
 // NewSecretInstallationTokenSource validates expectations once (expectedOwner
@@ -55,6 +61,21 @@ func NewSecretInstallationTokenSource(reader ctrlclient.Reader, namespace, secre
 		documentKey: documentKey, expectedOwner: expectedOwner,
 		expectedEndpoint: expectedEndpoint, now: now,
 	}, nil
+}
+
+// ReadProfile returns a source bound to the same Secret and expectations
+// that serves each repository's read-scoped token profile instead of its
+// write-capable token. The broker serves the model-facing forge-read path
+// from this profile, so a route-vocabulary regression cannot reach a
+// write-capable credential. The returned source shares no mutable state with
+// the receiver.
+func (s *SecretInstallationTokenSource) ReadProfile() *SecretInstallationTokenSource {
+	if s == nil {
+		return nil
+	}
+	read := *s
+	read.readProfile = true
+	return &read
 }
 
 // InstallationToken re-reads the Secret, parses the document, and validates
@@ -86,7 +107,20 @@ func (s *SecretInstallationTokenSource) InstallationToken(ctx context.Context, r
 	}
 	entry, ok := document.Entry(repository)
 	now := s.now()
-	if !ok || entry.Token == "" || !entry.ExpiresAt.After(now.Add(2*time.Minute)) {
+	if !ok {
+		return "", time.Time{}, errors.New("broker installation token document is unusable")
+	}
+	if s.readProfile {
+		// The read profile is a distinct credential by document contract
+		// (topology.InstallationTokenCredentials refuses an aliased pair at
+		// render time); re-establish that invariant here so a drifted Secret
+		// never serves the write-capable token to the model-facing reader.
+		if entry.ReadToken == "" || entry.ReadToken == entry.Token || !entry.ReadExpiresAt.After(now.Add(2*time.Minute)) {
+			return "", time.Time{}, errors.New("broker installation token document is unusable")
+		}
+		return entry.ReadToken, entry.ReadExpiresAt, nil
+	}
+	if entry.Token == "" || !entry.ExpiresAt.After(now.Add(2*time.Minute)) {
 		return "", time.Time{}, errors.New("broker installation token document is unusable")
 	}
 	return entry.Token, entry.ExpiresAt, nil

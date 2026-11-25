@@ -230,14 +230,23 @@ func installationSupersededEntries(stored map[string][]byte, replacement []topol
 	seen := make(map[string]bool, len(replacement))
 	for _, entry := range replacement {
 		seen[entry.Token] = true
+		seen[entry.ReadToken] = true
 	}
 	var superseded []topology.InstallationTokenEntry
 	collect := func(entries []topology.InstallationTokenEntry) {
 		for _, entry := range entries {
-			if entry.Token == "" || !entry.ExpiresAt.After(now) || seen[entry.Token] {
+			// An entry is recoverable while any credential it carries is live
+			// and not already collected: the write profile always exists, the
+			// read profile only on documents that mint one. Both are kept so
+			// the evidence intake can scrub every credential the pod could
+			// have held.
+			writeLive := entry.Token != "" && entry.ExpiresAt.After(now) && !seen[entry.Token]
+			readLive := entry.ReadToken != "" && entry.ReadExpiresAt.After(now) && !seen[entry.ReadToken]
+			if !writeLive && !readLive {
 				continue
 			}
 			seen[entry.Token] = true
+			seen[entry.ReadToken] = true
 			superseded = append(superseded, entry)
 		}
 	}
