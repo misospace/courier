@@ -553,13 +553,13 @@ func TestContributionDetailTerminalStopsRefreshing(t *testing.T) {
 	stub := &fakeContributeStatus{status: contributionStatus{
 		Run: "courier-3f2a", Namespace: "contrib", Phase: "Failed",
 		Cause:      &contributionCause{Category: "executor", Outcome: "blocked_external"},
-		FinishedAt: "2026-11-20T10:00:00Z",
-		ObservedAt: "2026-11-20T10:01:00Z",
+		FinishedAt: "2026-11-20T09:30:30Z",
+		ObservedAt: "2026-11-20T09:31:20Z",
 	}}
 	_, base := newContributeServer(t, secrets, stub)
 	client := login(t, base, secrets.token)
 	_, body := get(t, client, base+"/contributions/courier-3f2a")
-	for _, want := range []string{"Failed", "executor", "blocked_external", "2026-11-20T10:00:00Z"} {
+	for _, want := range []string{"Failed", "executor", "blocked_external", "2026-11-20T09:30:30Z"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("failed-run page missing %q:\n%s", want, body)
 		}
@@ -855,18 +855,40 @@ func TestContributionForgeLinks(t *testing.T) {
 // requested run — say what a bare {} decodes to, or another run's echo —
 // renders the documented misconfiguration state. It must not render found
 // state with blank fields, keep an active refresh, or store a history entry.
+// The stub stands in for the client, so these rows pin the handler-side
+// describes gate: a namespace echo that fights the request's pin, a missing
+// echo, and a stamp that is present but no stamp the clock understands.
 func TestContributionDetailWrongShape200RendersMisconfigured(t *testing.T) {
-	cases := map[string]contributionStatus{
+	cases := map[string]struct {
+		status contributionStatus
+		path   string
+	}{
 		"zero body":        {},
-		"other run":        {Run: "some-other-run", ObservedAt: "2026-11-20T09:00:00Z"},
-		"missing readtime": {Run: "courier-3f2a", Phase: "Pending"},
+		"other run":        {status: contributionStatus{Run: "some-other-run", ObservedAt: "2026-11-20T09:00:00Z"}},
+		"missing readtime": {status: contributionStatus{Run: "courier-3f2a", Phase: "Pending"}},
+		"unparseable readtime": {status: contributionStatus{
+			Run: "courier-3f2a", Namespace: "contrib", ObservedAt: "last tuesday",
+		}},
+		"empty namespace echo": {status: contributionStatus{
+			Run: "courier-3f2a", ObservedAt: "2026-11-20T09:00:00Z",
+		}},
+		"pinned namespace mismatch": {
+			status: contributionStatus{
+				Run: "courier-3f2a", Namespace: "elsewhere", ObservedAt: "2026-11-20T09:00:00Z",
+			},
+			path: "/contributions/courier-3f2a?namespace=contrib",
+		},
 	}
-	for name, status := range cases {
+	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			secrets := newTestSecrets(t)
-			_, base := newContributeServer(t, secrets, &fakeContributeStatus{status: status})
+			_, base := newContributeServer(t, secrets, &fakeContributeStatus{status: tc.status})
 			client := login(t, base, secrets.token)
-			resp, body := get(t, client, base+"/contributions/courier-3f2a")
+			path := tc.path
+			if path == "" {
+				path = "/contributions/courier-3f2a"
+			}
+			resp, body := get(t, client, base+path)
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("status = %d, want 200 with a state message", resp.StatusCode)
 			}
