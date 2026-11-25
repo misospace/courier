@@ -345,7 +345,12 @@ To turn the view on, the deployment already runs the contribution listener,
 then you point the console at it. Set `contributeAPI.enabled` with its
 `readKeySecret` first. Then set `operatorConsole.contributeStatus.url` and
 `operatorConsole.contributeStatus.tokenSecret` together. The chart fails the
-render when you set only one. The token Secret holds the same bearer token
+render when you set only one. The chart also fails the render when the URL is
+set, by value or by a raw arg, and the manager has no read key. The listener
+answers `GET /v1/contributions/<run>` only when a read key is configured, so
+the operator must enable it: `contributeAPI.enabled` with its `readKeySecret`,
+or the matching `--contribute-read-key-secret` manager arg. The token Secret
+holds the same bearer token
 that `contributeAPI.readKeySecret` names, and its entry key defaults to
 `token`. A raw `--contribute-status-url` or `--contribute-status-token-file`
 arg in `controllers.console.containers.console.args` wins over these values.
