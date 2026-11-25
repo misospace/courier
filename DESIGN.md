@@ -3216,6 +3216,25 @@ read-header/read/write/idle timeouts. With the chart's default values
 chart renders exactly what a headless release rendered before: no second
 controller, no console Service, no new flags, and no policy.
 
+The console adds a contribution status view that reads
+`GET /v1/contributions/<run>` on the contribution listener. It sends the
+separate status-read bearer token — the same token the Secret named by
+`contributeAPI.readKeySecret` holds — as `--contribute-status-token-file`
+beside `--contribute-status-url`, not the operator read API token or the
+admission token. A status-read token cannot
+admit a contribution, and an admission token cannot read status. The page
+renders recorded state only: each phase maps to one honest word, `unknown`
+stays unknown, and an unrecognized phase shows its raw word marked unknown. It
+never calls a published pull request or a `Done` run merged or successful,
+because Courier opens pull requests and does not track merges. It links a pull
+request only for a credential-free `https` URL and renders every other value,
+and every user or model string, as escaped text. A successful read stores a
+bounded history of namespace-and-run pairs in an HMAC-signed, `HttpOnly`,
+`SameSite=Lax` cookie of links only, and header mode has no session key so it
+keeps no history. A meta-refresh tag reloads the view: fast when active, slow
+when parked, off when terminal or static, and a slow backoff after a failed
+read.
+
 ## Reconcile loop
 
 Two operator releases may run side-by-side on one cluster (a native canary

@@ -103,7 +103,7 @@ func newHTTPServer(bind string, handler http.Handler) *http.Server {
 func parseFlags(args []string) (string, console.Config, error) {
 	flags := flag.NewFlagSet("courier-console", flag.ContinueOnError)
 	var bind, authMode, sessionKeyFile, operatorTokensFile, trustedHeader, backendURL string
-	var contributeURL, contributeTokenFile, readAPITokenFile string
+	var contributeURL, contributeStatusURL, contributeTokenFile, contributeStatusTokenFile, readAPITokenFile string
 	var backendTimeout, contributeTimeout time.Duration
 	var cookieSecure bool
 	flags.StringVar(&bind, "bind", defaultBind, "listen address")
@@ -113,6 +113,8 @@ func parseFlags(args []string) (string, console.Config, error) {
 	flags.StringVar(&trustedHeader, "trusted-header", "", "trusted upstream identity header (required in header mode)")
 	flags.StringVar(&backendURL, "backend-url", "", "base URL of the operator read API; empty renders the backend-unavailable states")
 	flags.StringVar(&readAPITokenFile, "readapi-token-file", "", "file holding the read API bearer token that enables the run explorer; empty leaves the explorer off")
+	flags.StringVar(&contributeStatusURL, "contribute-status-url", "", "base URL of the contribution status API (GET /v1/contributions/<run> on the contribution listener); empty renders the contribution pages' not-configured state")
+	flags.StringVar(&contributeStatusTokenFile, "contribute-status-token-file", "", "file holding the contribution status-read bearer token; required with --contribute-status-url, and it authenticates status reads only")
 	flags.DurationVar(&backendTimeout, "backend-timeout", defaultBackendTimeout, "timeout for each operator read API request (the health probe and the run explorer)")
 	flags.StringVar(&contributeURL, "contribute-url", "", "base URL of the contribution admission API")
 	flags.StringVar(&contributeTokenFile, "contribute-token-file", "", "file holding the contribution admission bearer token")
@@ -128,13 +130,14 @@ func parseFlags(args []string) (string, console.Config, error) {
 		return "", console.Config{}, fmt.Errorf("courier-console --contribute-timeout must be greater than zero and less than %s so the console write deadline can return the admission result", writeTimeout)
 	}
 	cfg := console.Config{
-		Mode:              console.AuthMode(authMode),
-		TrustedHeader:     trustedHeader,
-		BackendURL:        backendURL,
-		BackendTimeout:    backendTimeout,
-		ContributeURL:     contributeURL,
-		ContributeTimeout: contributeTimeout,
-		InsecureCookies:   !cookieSecure,
+		Mode:                console.AuthMode(authMode),
+		TrustedHeader:       trustedHeader,
+		BackendURL:          backendURL,
+		BackendTimeout:      backendTimeout,
+		ContributeURL:       contributeURL,
+		ContributeTimeout:   contributeTimeout,
+		ContributeStatusURL: contributeStatusURL,
+		InsecureCookies:     !cookieSecure,
 	}
 	if contributeTokenFile != "" {
 		token, err := readTrimmedFile(contributeTokenFile)
@@ -171,6 +174,16 @@ func parseFlags(args []string) (string, console.Config, error) {
 			return "", console.Config{}, err
 		}
 		cfg.BackendToken = token
+	}
+	if (contributeStatusURL == "") != (contributeStatusTokenFile == "") {
+		return "", console.Config{}, errors.New("courier-console contribution status reads require both --contribute-status-url and --contribute-status-token-file")
+	}
+	if contributeStatusTokenFile != "" {
+		token, err := readTrimmedFile(contributeStatusTokenFile)
+		if err != nil {
+			return "", console.Config{}, err
+		}
+		cfg.ContributeStatusToken = token
 	}
 	return bind, cfg, nil
 }

@@ -11,7 +11,7 @@
 {{if .Message}}<p class="state {{.StateClass}}">{{.Message}}</p>{{end}}
 {{if eq .State "success"}}
 <p class="state state-ok">{{if .Resumed}}A run was resumed{{else}}A run was created{{end}} — admitted; this is not a pull request. The run publishes one only when it succeeds.</p>
-<p>Run: <a href="/runs/{{.Run}}">{{.Run}}</a><br>Namespace: {{.Namespace}}<br>Work item: {{.WorkItemID}}</p>
+<p>Run: <a href="/runs/{{.Run}}">{{.Run}}</a>{{if .StatusLink}} · <a href="{{.StatusLink}}">Contribution status</a>{{end}}<br>Namespace: {{.Namespace}}<br>Work item: {{.WorkItemID}}</p>
 {{else}}
 <form method="post" action="/contribute" class="contribute">
   <input type="hidden" name="csrf" value="{{.CSRF}}">

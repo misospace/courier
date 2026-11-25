@@ -1,0 +1,35 @@
+{{define "content"}}
+<h1>Contributions</h1>
+
+{{if eq .State "invalid"}}
+<p class="state state-error">{{.ErrorMessage}}</p>
+{{end}}
+{{if not .BackendConfigured}}
+<p class="state">The contribution status API is not configured for this console, so a lookup will report that status is not configured.</p>
+{{end}}
+
+<form method="get" action="/contributions" class="filters">
+  <label>Run name
+    <input type="text" name="run" autocomplete="off" placeholder="the run name the contribution response returned">
+  </label>
+  <button type="submit">Look up</button>
+</form>
+
+<section>
+  <h2>Recently viewed</h2>
+  {{if not .HistoryAvailable}}
+  <p class="state-note">This console authenticates by trusted header, so it keeps no per-browser recent list. Status pages themselves work the same here.</p>
+  {{else if .History}}
+  <ul>
+    {{range .History}}
+    <li><a href="{{.Link}}">{{.Run}}</a>{{if .Namespace}} <span class="muted">in {{.Namespace}}</span>{{end}}</li>
+    {{end}}
+  </ul>
+  {{else}}
+  <p class="state-note">No contributions have been opened in this browser yet. A contribution appears here after its status page loads once.</p>
+  {{end}}
+  {{if .HistoryAvailable}}
+  <p class="state-note">The recent list is stored, signed, in this browser only. It holds links, no lifecycle data, and it is cleared on sign-out.</p>
+  {{end}}
+</section>
+{{end}}
