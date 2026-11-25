@@ -524,40 +524,39 @@ func toKubernetesEnv(values []EnvVar) []corev1.EnvVar {
 	return env
 }
 
-// GitGuardPodName derives the per-run guard pod's name. Pods are validated
-// as DNS-1123 subdomains, and the derived name is a single label, so the
-// whole name is held to the 63-character DNS-label bound: an overflowing run
-// name is truncated and digest-suffixed with a digest of the full run name,
-// the way the coordinator pod's name is bounded, so distinct run names stay
-// distinct and the launcher's create-or-verify address stays stable per run.
-// The label is also anchored to the RFC-1035 letter-first rule
-// GitGuardServiceName enforces: a DNS-1123 label admits a leading digit, but
-// the guard pod keeps the stricter scheme its Service already follows, so a
-// run name that does not begin with a lowercase letter is prefixed with an
-// "r" (or an "r"-anchored digest prefix when truncation applies) and the
-// derived name always satisfies both label schemes.
+// GitGuardPodName derives the per-run guard pod's name. The derived name is
+// a single label, so it is held to the 63-character DNS-label bound. It
+// shares the guard Service's RFC-1035 scheme — see gitGuardLabelName: the pod
+// and its Service are one pair per run, and holding the pod to the Service's
+// stricter label rule (DNS-1123 subdomains would admit a leading digit, the
+// way the coordinator pod's name does) keeps the pair equal per run and the
+// label valid under the strictest scheme either object answers to.
 func GitGuardPodName(runName string) string {
-	base := strings.ReplaceAll(strings.Trim(strings.ToLower(runName), "-."), ".", "-")
-	const suffix = "-git-guard"
-	if base == "" {
-		base = "run"
-	} else if base[0] < 'a' || base[0] > 'z' {
-		base = "r" + base
-	}
-	maxBase := 63 - len(suffix)
-	if len(base) > maxBase {
-		digest := sha256.Sum256([]byte(runName))
-		hash := hex.EncodeToString(digest[:])[:8]
-		base = strings.TrimRight(base[:maxBase-len(hash)-1], "-") + "-" + hash
-	}
-	return base + suffix
+	return gitGuardLabelName(runName)
 }
 
 // GitGuardServiceName derives the per-run guard Service's name on the
 // RFC-1035 DNS-label scheme topology's Services use (topology imports
 // executor, so the scheme lives here and topology aliases it — the same
-// single-producer arrangement as RunLabelValue, pinned by parity tests).
+// single-producer arrangement as RunLabelValue, pinned by parity tests). The
+// guard pod's name shares the scheme through gitGuardLabelName.
 func GitGuardServiceName(runName string) string {
+	return gitGuardLabelName(runName)
+}
+
+// gitGuardLabelName is the one producer behind the guard pod's and the guard
+// Service's names: one name per run on the RFC-1035 DNS-label scheme Services
+// are validated under — at most 63 characters, a lowercase letter first, only
+// lowercase alphanumerics and hyphens, an alphanumeric last. Run names are
+// DNS-1123 subdomains, so they may carry dots or begin with a digit, and they
+// may outgrow the label limit once the suffix is appended. A run name that is
+// already a valid label base within the limit passes through unchanged; every
+// other name maps deterministically to a normalized, letter-anchored prefix
+// plus an 8-hex digest of the full run name, the way topology's
+// serviceResourceName bounds its names — the digest keeps an anchored name
+// ("9digits" → r9digits-<digest>-git-guard) distinct from the passthrough a
+// run genuinely named "r9digits" takes, and distinct run names stay distinct.
+func gitGuardLabelName(runName string) string {
 	const suffix = "-git-guard"
 	base := strings.ToLower(runName)
 	if isDNSLabel(base) && len(base)+len(suffix) <= 63 {

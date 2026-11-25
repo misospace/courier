@@ -169,7 +169,19 @@ func TestBuildCoordinatorPodInstallationGitUsesGuardService(t *testing.T) {
 }
 
 func TestGitGuardPodNameValidityAndUniqueness(t *testing.T) {
-	names := []string{"simple", "name.with.dots", strings.Repeat("a", 80), "-leading", "trailing-", "a." + strings.Repeat("b", 70), "9digits", "9" + strings.Repeat("a", 70), strings.Repeat("a", 43) + "." + strings.Repeat("b", 40)}
+	names := []string{
+		"simple", "name.with.dots", strings.Repeat("a", 80), "-leading", "trailing-",
+		"a." + strings.Repeat("b", 70), strings.Repeat("a", 43) + "." + strings.Repeat("b", 40),
+		// A digit-leading name and the run its "r"-anchor would otherwise
+		// collide with; the digest the anchored path carries keeps them apart.
+		"9digits", "r9digits",
+		// The 53/54-character passthrough/digest transition.
+		strings.Repeat("a", 53), strings.Repeat("a", 54),
+		// Two long names sharing the truncated prefix stay distinct.
+		strings.Repeat("a", 44) + "x1", strings.Repeat("a", 44) + "x2",
+		// The "run" fallback and the run it must not collide with.
+		"", "-", "run",
+	}
 	seen := map[string]bool{}
 	for _, runName := range names {
 		name := GitGuardPodName(runName)
@@ -185,12 +197,18 @@ func TestGitGuardPodNameValidityAndUniqueness(t *testing.T) {
 			t.Fatalf("duplicate guard pod name %q", name)
 		}
 		seen[name] = true
+		if got, want := name, GitGuardServiceName(runName); got != want {
+			t.Fatalf("GitGuardPodName(%q) = %q, want the guard Service's %q", runName, got, want)
+		}
 	}
-	if got, want := GitGuardPodName("9digits"), "r9digits-git-guard"; got != want {
+	if got, want := GitGuardPodName("9digits"), "r9digits-dc582376-git-guard"; got != want {
 		t.Fatalf("GitGuardPodName(\"9digits\") = %q, want %q", got, want)
 	}
 	if got, want := GitGuardPodName("simple"), "simple-git-guard"; got != want {
 		t.Fatalf("GitGuardPodName(\"simple\") = %q, want %q", got, want)
+	}
+	if got, want := GitGuardPodName(strings.Repeat("a", 53)), strings.Repeat("a", 53)+"-git-guard"; got != want {
+		t.Fatalf("GitGuardPodName(53*a) = %q, want the unchanged passthrough %q", got, want)
 	}
 }
 
