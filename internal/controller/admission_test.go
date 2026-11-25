@@ -20,6 +20,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/executor"
@@ -911,11 +912,23 @@ func launcherClientForAdmission(t *testing.T, objects ...runtime.Object) client.
 	if err := rbacv1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add rbac scheme: %v", err)
 	}
-	return fake.NewClientBuilder().
+	base := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
+		WithStatusSubresource(&corev1.Pod{}).
 		WithRuntimeObjects(objects...).
 		Build()
+	return interceptor.NewClient(base, interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+		if err := c.Create(ctx, obj, opts...); err != nil {
+			return err
+		}
+		pod, ok := obj.(*corev1.Pod)
+		if ok && pod.Labels[executor.LabelComponent] == executor.GitGuardComponentName {
+			pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: executor.GitEgressContainerName, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}}
+			return c.Status().Update(ctx, pod)
+		}
+		return nil
+	}})
 }
 
 // launchFuncForAdmission adapts the production CoordinatorLauncher to a

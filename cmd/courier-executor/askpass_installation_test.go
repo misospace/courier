@@ -359,12 +359,28 @@ func TestInstallationAskpassUnknownRemoteRefusesBeforeAPI(t *testing.T) {
 	}
 }
 
+// TestObserverGuardRemoteNeedsNoCredentialProvider pins the guard-routed
+// observer contract: with no installation environment at all, the observer
+// selects no credential provider and runs its git unauthenticated against the
+// guard, which injects the credential upstream itself.
+func TestObserverGuardRemoteNeedsNoCredentialProvider(t *testing.T) {
+	provider, err := observerCredentials(func(name string) (string, bool) {
+		return "", false
+	}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("observerCredentials: %v", err)
+	}
+	if provider != nil {
+		t.Fatal("guard-routed observer unexpectedly selected credential provider")
+	}
+}
+
 // TestObserverInstallationCredentialsAcceptsRenderedEnvironment pins the
-// cross-package contract that once blocked App-mode observer pods: the
-// environment internal/executor renders for the seed and observer containers
-// must be exactly sufficient for observerInstallationCredentials. If either
-// side renames or drops a variable, this fails instead of every
-// observer-contract App pod failing at launch.
+// cross-package contract that once blocked App-mode observer pods, and that
+// still serves pods launched before the guard pod: the environment
+// internal/executor renders for a pre-#919 observer must be exactly
+// sufficient for observerInstallationCredentials. If either side renames or
+// drops a variable, this fails instead of every such pod failing at launch.
 func TestObserverInstallationCredentialsAcceptsRenderedEnvironment(t *testing.T) {
 	env := map[string]string{
 		executor.EnvGitInstallation:      "1",

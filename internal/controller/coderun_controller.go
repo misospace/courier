@@ -108,7 +108,8 @@ type CoderRunReconciler struct {
 	// Launch is injected by the coordinator launcher. It is optional while
 	// launch support is being assembled; admission still reserves capacity by
 	// moving Pending runs to Claimed.
-	Launch LaunchFunc
+	Launch           LaunchFunc
+	GitGuardTeardown func(context.Context, *courierv1alpha1.CoderRun) error
 
 	// Sources resolves the adapter named by CoderRun.Spec.Source. WorkItemID is
 	// passed through unchanged for every claim/release/transition call.
@@ -635,6 +636,11 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 // to Done grades the in-flight attempt through publication observation or the
 // terminal write, each of which settles or clears it.
 func (r *CoderRunReconciler) reconcileTerminal(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
+	if r.GitGuardTeardown != nil {
+		if err := r.GitGuardTeardown(ctx, run); err != nil {
+			log.FromContext(ctx).Error(err, "unable to tear down terminal legacy git guard", "run", run.Name)
+		}
+	}
 	// A run that terminalized before the terminal write began settling an
 	// in-flight repair attempt can still carry a live fence, and the source
 	// holds no expiry on an active deferral: it would defer its hand-out
@@ -1282,6 +1288,11 @@ func (r *CoderRunReconciler) terminateStuckTerminatingCollision(ctx context.Cont
 // refused can never succeed on retry, so holding the run retries nothing and
 // the clock starts instead (#664).
 func (r *CoderRunReconciler) resolveCompleted(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
+	if r.GitGuardTeardown != nil {
+		if err := r.GitGuardTeardown(ctx, run); err != nil {
+			log.FromContext(ctx).Error(err, "unable to tear down terminal legacy git guard", "run", run.Name)
+		}
+	}
 	if _, ok := doneAtMarker(run); !ok {
 		adapter, item, err := r.adapterAndWorkItem(run)
 		if err != nil {

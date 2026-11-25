@@ -52,7 +52,7 @@ func TestEnvtestGitGuardEgressPolicyConvergeIdempotent(t *testing.T) {
 	}
 
 	cidrs := mustParseCIDRs(t, []string{"140.82.112.0/20"})
-	launcher := &CoordinatorLauncher{Client: c, APIReader: c, GitGuardEgressCIDRs: []string{"140.82.112.0/20"}}
+	launcher := &CoordinatorLauncher{Client: c, APIReader: c, GitGuardEgressCIDRs: []string{"140.82.112.0/20"}, GitGuardKubernetesAPIIP: "10.96.0.1"}
 	policyKey := client.ObjectKey{Namespace: run.Namespace, Name: topology.GitGuardNetworkPolicyName(run.Name)}
 	readPolicy := func(t *testing.T) networkingv1.NetworkPolicy {
 		t.Helper()
@@ -69,7 +69,7 @@ func TestEnvtestGitGuardEgressPolicyConvergeIdempotent(t *testing.T) {
 		t.Fatalf("create ensureGitGuardEgressPolicy: %v", err)
 	}
 	live := readPolicy(t)
-	want := topology.GitGuardEgressPolicy(&storedRun, cidrs)
+	want := topology.GitGuardEgressPolicy(&storedRun, cidrs, parseGitGuardAPIIP("10.96.0.1"))
 	if !apiequality.Semantic.DeepEqual(want.Spec, live.Spec) {
 		t.Fatalf("stored spec = %+v, want the rendered spec %+v", live.Spec, want.Spec)
 	}

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -82,6 +83,22 @@ func (f *e2eForge) front(workRef string, remotes ...Remote) *httptest.Server {
 	server := httptest.NewServer(guard)
 	f.t.Cleanup(server.Close)
 	return server
+}
+
+func (f *e2eForge) frontOnListener(workRef string, listener net.Listener, remotes ...Remote) string {
+	f.t.Helper()
+	guard, err := New(Config{Remotes: remotes, WorkRef: workRef, Credentials: e2eProvider{}})
+	if err != nil {
+		f.t.Fatalf("New: %v", err)
+	}
+	server := &http.Server{Handler: guard}
+	f.t.Cleanup(func() { _ = server.Close() })
+	go func() {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			f.t.Errorf("guard Serve: %v", err)
+		}
+	}()
+	return "http://" + listener.Addr().String()
 }
 
 // upstreamURL turns a repository name into the upstream URL the guard pins.
@@ -320,6 +337,28 @@ func TestE2ECloneThroughGuard(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestE2ENonLoopbackBindCloneAndPush(t *testing.T) {
+	forge := e2eNewForge(t, "work")
+	listener, err := net.Listen("tcp", "127.0.0.2:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	front := forge.frontOnListener(e2eWorkRef, listener, forge.remote("work", "o/work", true))
+	dir, err := os.MkdirTemp(forge.work, "clone-nonloopback-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e2eRunGit(t, forge.env, forge.work, "clone", front+"/work.git", dir)
+	e2eRunGit(t, forge.env, dir, "checkout", "-B", "courier/run")
+	e2eCommit(t, forge.env, dir, "work.txt", "served on pod address\n")
+	head := strings.TrimSpace(e2eRunGit(t, forge.env, dir, "rev-parse", "--verify", "HEAD"))
+	e2eRunGit(t, forge.env, dir, "push", front+"/work.git", "HEAD:"+e2eWorkRef)
+	if got := forge.tip("work", e2eWorkRef); got != head {
+		t.Fatalf("push through 127.0.0.2 landed %s, want %s", got, head)
 	}
 }
 

@@ -890,6 +890,22 @@ func TestAlreadyDoneUnsettledCloseIsRepresented(t *testing.T) {
 // TestAlreadyDoneRetention checks the AlreadyDone reap window: a run with an
 // expired retention marker is deleted, and a run without a marker gets the
 // window stamped and retained for the Done retention period.
+func TestResolveCompletedTearsDownGitGuard(t *testing.T) {
+	run := doneRun("guard-teardown", time.Now(), time.Now())
+	kube := phaseClient(t, admissionLane("local", 1), run)
+	called := 0
+	r := &CoderRunReconciler{Client: kube, APIReader: kube, GitGuardTeardown: func(context.Context, *courierv1alpha1.CoderRun) error {
+		called++
+		return errors.New("teardown failure is best-effort")
+	}}
+	if _, err := r.resolveCompleted(context.Background(), run); err != nil {
+		t.Fatalf("resolveCompleted: %v", err)
+	}
+	if called != 1 {
+		t.Fatalf("GitGuardTeardown calls = %d, want 1", called)
+	}
+}
+
 func TestAlreadyDoneRetention(t *testing.T) {
 	t.Run("expired window deletes", func(t *testing.T) {
 		run := runWithNoChange("pod-1")

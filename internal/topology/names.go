@@ -25,6 +25,7 @@ const (
 	ComponentCoordinator = "coordinator"
 	ComponentBroker      = "broker"
 	ComponentWorker      = "worker"
+	ComponentGitGuard    = executor.GitGuardComponentName
 
 	labelAppManagedBy = "app.kubernetes.io/managed-by"
 	labelAppComponent = "app.kubernetes.io/component"
@@ -188,6 +189,8 @@ func WorkerSAName(runName string) string { return resourceName(runName, "-worker
 func BrokerServiceName(runName string) string { return serviceResourceName(runName, "-broker") }
 
 func WorkerServiceName(runName string) string { return serviceResourceName(runName, "-worker") }
+
+func GitGuardServiceName(runName string) string { return executor.GitGuardServiceName(runName) }
 
 func BrokerTLSSecretName(runName string) string { return resourceName(runName, "-broker-tls") }
 

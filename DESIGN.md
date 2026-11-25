@@ -2719,9 +2719,11 @@ limit, and the probe image's real usage (a shell doing DNS and network
 checks) peaks in the tens of MiB, far under the limit, so the limit cannot
 OOM-kill the probe and falsify the isolation result it exists to produce.
 Likewise the workspace-observer sidecar and its seed init container on the
-coordinator pod always carry the fixed small `DefaultObserverResources`
+coordinator pod, and the per-run git-guard pod's container, always carry the
+fixed small `DefaultObserverResources`
 (25m/64Mi requested, 1 CPU/512Mi limited) whatever the lane says: they are
-Courier-internal helpers — baseline capture and workspace observation — and
+Courier-internal helpers — baseline capture, workspace observation, and the
+git transport guard — and
 the lane sizes the work a model does, not the helper that hashes the
 workspace, so sizing them from the lane would multiply the pod's scheduler
 reservation for processes that never grow with it. Unsized, they were the one
@@ -4441,8 +4443,8 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   legacy git path performs no forge API writes with this credential — writes
   it to the run's credentials Secret under the same document the secure broker
   reads, and provisions a run-scoped identity whose only grant is one named
-  `get` on that Secret, bound to the coordinator pod's effective ServiceAccount
-  (the observer identity when the observer contract is on). Before any token
+  `get` on that Secret, bound to the per-run guard pod's ServiceAccount.
+  Before any token
   exists the launcher proves the mint identity: the base and head repositories
   must name one owner and the installation must sign for exactly that owner,
   so a cross-owner fork run is refused permanently at launch — a condition a
@@ -4454,14 +4456,24 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   the executor's forge-API reads are not the git transport this mode governs,
   so an App-mode pod receives it solely from an explicitly configured
   `GitHubCredentialSecret`. Every git operation the coordinator performs
-  goes through the run's loopback git egress guard (#902): the pod builder
-  rewrites both remotes to the guard's loopback origin, and the guard
-  container — the executor binary's `git-egress` mode, rendered as a native
-  sidecar the kubelet starts before every app container and stops once they
-  have all terminated, so the credential surface can never outlive the
-  coordinator it serves — re-reads the document through the API on every
+  goes through the run's git egress guard (#902, moved to a dedicated pod by
+  #919): the pod builder rewrites the coordinator's and the observer's remotes
+  to the run's guard Service DNS
+  name and port, and the guard pod — the executor binary's `git-egress` mode
+  in its own pod, provisioned by the launcher before the coordinator pod and
+  owned by the run — re-reads the document through the API on every
   operation, so a rotation or an expiry takes effect on the next
-  operation rather than at restart. The guard is
+  operation rather than at restart. The launcher creates the coordinator pod
+  only after the guard container is running, so the coordinator's first git
+  operation and the observer seed find a serving guard; a guard that never
+  runs holds the run in its claim, where the crashing pod is visible, instead
+  of failing runs one launch at a time. The guard survives coordinator
+  relaunches,
+  so a replacement coordinator attaches to a guard that is already serving,
+  and both the terminal reconcile and the Done settle tear the guard topology
+  down (pod, Service,
+  both policies) once the run settles; garbage collection removes whatever a
+  missed pass leaves behind. The guard is
   the boundary a prompt could never be: git tells an askpass helper nothing
   about the ref a push is about to update, but the guard sees the push
   request itself. It serves only the smart-HTTP service endpoints of the two
@@ -4471,15 +4483,15 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   ref deletion, the base repository as a push destination, and any non-git
   endpoint are refused before any credential is resolved or any byte leaves
   the guard. The guard injects the credential into the upstream request
-  itself, so the token never enters the model container's environment,
+  itself and serves no client authentication, so the token never enters the
+  model container's environment,
   mounts, or files: the coordinator container carries neither the static
-  pair nor the installation contract nor the projected token, and the only
-  readable credential source in the pod is a projected token the model
-  container cannot mount and a Secret the pod's single `get` grants only
-  through it. The isolated legacy
-  observer and its seed resolve the same document through their own projected
-  token, so workspace observation keeps working when no static git credential
-  exists. Rotation reuses the same refresh lead and mint-lifetime guard and runs
+  pair nor the installation contract, and the observer containers carry no
+  credential at all, because their git rides the same guard and the observer
+  keeps only its projected pod identity for its own API read. The
+  credential-read identity lives only on the guard pod. Workspace observation
+  keeps working when no static git credential
+  exists: the seed and the observer fetch through the guard. Rotation reuses the same refresh lead and mint-lifetime guard and runs
   at launch and from the legacy run's steady settle, gated on the coordinator
   pod actually rendering the App-mode marker — a static run never gains a
   Secret behind its pod's back, and an App run whose Secret is gone re-mints.
@@ -4495,41 +4507,48 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   credentials, the rebase force-push keeps its head-SHA compare-and-set lease
   unchanged under the new credential, and no merge capability is added
   anywhere. The residual trust model is stated rather than wished away. The
-  guard shares the pod's network namespace, so a compromised model can still
-  bypass it and open its own connection to the forge — and be refused
-  unauthenticated, because the credential lives only inside the guard and
-  the projected token the model container cannot reach; bypassing the guard
-  loses the operation, not merely the policy. The deployment can tighten the
-  pod's whole egress surface by opting in per run: the pod-scoped
-  `GitGuardEgressPolicy` — provisioned by the launcher only when
-  `--legacy-git-guard-egress-cidrs` is set — admits exactly DNS, ingress
-  from the run's own pods (the reply path of a pod-originated connection),
-  and TCP 443 to the operator-pinned CIDRs, and refuses every other
-  destination and port while it selects the pod, so the guard's loopback
-  origin stays the only path git can work through. The pinned CIDR list
-  must cover every TCP-443 destination the pod needs — for example the
-  forge hosts, the model-provider endpoint, any other HTTPS endpoint the
-  deployment configures (MCP servers), and the kubernetes Service ClusterIP
-  (KUBERNETES_SERVICE_HOST) the guard and observer read the credentials
-  document through, with the API-server endpoint behind it admitted too,
-  because which of the two the fabric judges depends on the datapath — and
-  every other egress path is refused with it, including every non-443 one:
+  guard runs in its own per-run pod, so the coordinator pod's egress policy
+  can refuse the forge outright. The guard pod's ingress policy is not opt-in:
+  every App-mode run renders it, and it admits only the run's own pods on the
+  guard port, because the guard Service fronts a plain-HTTP listener that
+  serves the run's git authority and the client set is the boundary. On a
+  fabric that does not enforce NetworkPolicy that boundary is advisory, and a
+  deployment that cannot accept the run's git authority being namespace-local
+  keeps the App-mode deployment shape it had before the guard pod. The guard
+  Service peer is a pod selector, the same shape the secure control's broker
+  path uses; a datapath that masquerades cross-node service traffic strips
+  the run-pod identity at the guard and needs the same datapath care the
+  secure topology's CNI notes describe. With
+  `--legacy-git-guard-egress-cidrs` set,
+  the launcher also provisions the coordinator policy. It selects the
+  coordinator pod and admits DNS, ingress from the run's own pods (the reply
+  path of a pod-originated connection), the run's guard Service on the guard
+  port, and TCP 443 to the Kubernetes API endpoint the observer reads its pod
+  through. The operator's forge CIDRs appear
+  only in the except lists of broad TCP-443 rules, so every other 443
+  destination (the model-provider endpoint, any other HTTPS endpoint the
+  deployment configures, MCP servers among them) stays admitted, mirroring
+  the secure broker's own 443 posture, and every non-443 path stays refused,
   notably the evidence-intake POST, whose bundle is lost (logged, not
-  fatal) because the intake is plain HTTP on a port no CIDR admits. Under
+  fatal) because the intake is plain HTTP on a port no rule admits. The
+  guard policy's egress renders with the same flag: DNS, the
+  forge CIDRs, and the Kubernetes API endpoint the guard reads the credentials
+  document
+  through. The launcher derives the API endpoint from the operator pod's own
+  service environment, so the operator pins only the forge CIDRs. Under
   identity-based CNIs such as Cilium the API server carries a reserved
   identity that vanilla ipBlock rules cannot match (the secure broker's
-  CNI note), so there the guard's credential read and the observer's read
-  need a companion CNI policy in the coordinator pods' namespace. The
-  policy cannot distinguish containers inside one pod — the forge CIDR
-  must be admitted for the guard's own upstream TLS — so this boundary
-  reduces blast radius rather than refusing direct forge connections: a
-  compromised container could still open an unauthenticated forge
-  connection on 443, while outside the admitted list and DNS it can reach
-  nothing, and the CIDRs are operator configuration because the operator,
-  not the coordinator, decides which hosts are the forge. Egress rules of
+  CNI note), so there the guard's credential read and the observer's pod read
+  need a companion CNI policy in the run namespace. The boundary claims
+  exactly the forge, not the whole internet: the coordinator container can
+  still open a non-forge HTTPS connection, and the forge CIDRs are operator
+  configuration because the operator, not the coordinator, decides which
+  hosts are the forge. Egress rules of
   policies selecting the same pod are unioned, so the deny is exact only
-  where this policy is the only policy selecting the pod. A deployment
-  that leaves the flag unset keeps the stated residual exactly as before.
+  where the coordinator policy is the only policy selecting the pod. A
+  deployment that leaves the flag unset keeps the coordinator pod
+  policy-free exactly as before; the guard pod carries only its ingress
+  boundary.
   An explicitly configured forge-API token (`GitHubCredentialSecret`) stays
   outside this boundary by design: it never served the git transport the
   guard governs, the guard neither mints nor relays it, and its scope is the
@@ -4537,8 +4556,9 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   exactly the git surface.
   The guard enforces the operator-pinned work ref and the run's two pinned
   repositories; it does not re-adjudicate the plan. The isolated observer
-  and its seed keep their own projected token and document read because
-  they are trusted containers that host no model process. Static-mode
+  and its seed keep their own projected token for their pod read because
+  they are trusted containers that host no model process, and their git
+  rides the same guard the coordinator uses. Static-mode
   pods, askpass semantics, and every render stay byte-identical; the
   askpass installation path survives only to serve pods launched before
   the guard, and steady-state rotation recognizes both pod shapes.

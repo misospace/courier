@@ -1,217 +1,121 @@
 package topology
 
 import (
+	"net"
 	"reflect"
+	"strings"
 	"testing"
 
-	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"github.com/misospace/courier/internal/executor"
 )
 
-func TestGitGuardEgressPolicy(t *testing.T) {
-	run := testRun("git-guard")
-	// A CIDR containing the link-local range carries the IPv4 exclusions; a
-	// narrow CIDR that cannot contain them carries none, because the API
-	// server rejects an except outside the admitted range. 0.0.0.0/0 spans
-	// every IPv4 range, so it keeps all three; the IPv6 forge CIDR
-	// 2606:50c0::/32 spans only itself, so it keeps none of its candidates.
-	cidrs, err := ParseGitGuardCIDRs([]string{"0.0.0.0/0", "2606:50c0::/32"})
+func testAPIIP() *net.IPNet {
+	_, ip, _ := net.ParseCIDR("10.96.0.1/32")
+	return ip
+}
+
+func TestGitGuardServiceNameParity(t *testing.T) {
+	for _, runName := range []string{"simple", "name.with.dots", strings.Repeat("long-name-", 8), strings.Repeat("a", 63) + ".tail", "-leading", "trailing-", "9digits", "a." + strings.Repeat("b", 70)} {
+		got, want := executor.GitGuardServiceName(runName), serviceResourceName(runName, "-git-guard")
+		if got != want {
+			t.Errorf("GitGuardServiceName(%q)=%q, want %q", runName, got, want)
+		}
+	}
+}
+
+func TestGitGuardIngressOnlyPolicyWithoutCIDRs(t *testing.T) {
+	policy := GitGuardPodNetworkPolicy(testRun("guard-no-cidrs"), nil, nil)
+	if policy == nil || !reflect.DeepEqual(policy.Spec.PolicyTypes, []networkingv1.PolicyType{networkingv1.PolicyTypeIngress}) || policy.Spec.Egress != nil {
+		t.Fatalf("ingress-only policy = %+v", policy)
+	}
+	if len(policy.Spec.Ingress) != 1 || len(policy.Spec.Ingress[0].From) != 1 || len(policy.Spec.Ingress[0].Ports) != 1 {
+		t.Fatalf("ingress rules = %+v", policy.Spec.Ingress)
+	}
+}
+
+func TestGitGuardPoliciesAndService(t *testing.T) {
+	run := testRun("guard-run")
+	cidrs, err := ParseGitGuardCIDRs([]string{"140.82.112.0/20", "2606:50c0::/32"})
 	if err != nil {
-		t.Fatalf("ParseGitGuardCIDRs: %v", err)
+		t.Fatal(err)
 	}
-	policy := GitGuardEgressPolicy(run, cidrs)
-	if policy.Name != "git-guard-git-guard-egress" {
-		t.Fatalf("policy name = %q", policy.Name)
+	apiIP := testAPIIP()
+	coordinator := GitGuardEgressPolicy(run, cidrs, apiIP)
+	guard := GitGuardPodNetworkPolicy(run, cidrs, apiIP)
+	if !reflect.DeepEqual(coordinator, GitGuardEgressPolicy(run, cidrs, apiIP)) || !reflect.DeepEqual(guard, GitGuardPodNetworkPolicy(run, cidrs, apiIP)) {
+		t.Fatal("policy rendering is not deterministic")
 	}
-	if GitGuardNetworkPolicyName(run.Name) != policy.Name {
-		t.Fatalf("name helper = %q, policy name = %q", GitGuardNetworkPolicyName(run.Name), policy.Name)
+	if coordinator.Name != GitGuardNetworkPolicyName(run.Name) || guard.Name != GitGuardPodNetworkPolicyName(run.Name) {
+		t.Fatalf("policy names: coordinator=%q guard=%q", coordinator.Name, guard.Name)
 	}
-	wantSelector := coordinatorSelector(run.Name)
-	if !reflect.DeepEqual(policy.Spec.PodSelector.MatchLabels, wantSelector) {
-		t.Fatalf("pod selector = %+v, want %+v", policy.Spec.PodSelector.MatchLabels, wantSelector)
+	if len(coordinator.Spec.Egress) != 5 {
+		t.Fatalf("coordinator egress rules=%d, want DNS, guard, API and two broad rules", len(coordinator.Spec.Egress))
 	}
-	// The selector must select an executor-built legacy coordinator pod and
-	// never a worker or broker pod of the same run.
-	coordinatorPod := map[string]string{
-		executor.LabelRun:                 executor.RunLabelValue(run.Name),
-		"courier.misospace.dev/component": ComponentCoordinator,
+	if coordinator.Spec.Egress[1].To[0].PodSelector.MatchLabels[executor.LabelComponent] != executor.GitGuardComponentName || coordinator.Spec.Egress[1].Ports[0].Port.IntValue() != executor.GitEgressPort {
+		t.Fatalf("guard peer rule=%+v", coordinator.Spec.Egress[1])
 	}
-	for key, value := range wantSelector {
-		if coordinatorPod[key] != value {
-			t.Fatalf("selector key %s=%q does not match an executor-built coordinator pod", key, value)
-		}
-	}
-	for _, component := range []string{ComponentWorker, ComponentBroker} {
-		if selectorSelectsComponent(wantSelector, component) {
-			t.Fatalf("selector matches %s pods", component)
-		}
-	}
-	if !reflect.DeepEqual(policy.Spec.PolicyTypes, []networkingv1.PolicyType{networkingv1.PolicyTypeEgress, networkingv1.PolicyTypeIngress}) {
-		t.Fatalf("policy types = %v", policy.Spec.PolicyTypes)
-	}
-	if len(policy.Spec.Egress) != 3 {
-		t.Fatalf("egress rules = %d, want DNS and one rule per CIDR", len(policy.Spec.Egress))
-	}
-	dns := policy.Spec.Egress[0]
-	if len(dns.To) != 1 || dns.To[0].NamespaceSelector == nil || dns.To[0].PodSelector == nil ||
-		dns.To[0].NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] != "kube-system" ||
-		dns.To[0].PodSelector.MatchLabels["k8s-app"] != "kube-dns" || len(dns.Ports) != 2 {
-		t.Fatalf("DNS rule = %+v", dns)
-	}
-	if *dns.Ports[0].Protocol != corev1.ProtocolUDP || dns.Ports[0].Port.IntValue() != 53 ||
-		*dns.Ports[1].Protocol != corev1.ProtocolTCP || dns.Ports[1].Port.IntValue() != 53 {
-		t.Fatalf("DNS ports = %+v", dns.Ports)
-	}
-	// A CIDR containing the link-local range carries the IPv4 exclusions; a
-	// narrow CIDR that cannot contain them carries none, because the API
-	// server rejects an except outside the admitted range.
-	// A CIDR containing the metadata ranges carries those exclusions; a
-	// narrow CIDR that cannot contain them carries none (nil slice), because
-	// the API server rejects an except outside the admitted range.
-	wantExcept := [][]string{
-		{"169.254.0.0/16", "127.0.0.0/8", "100.100.100.200/32"},
-		nil,
+	if coordinator.Spec.Egress[2].To[0].IPBlock.CIDR != apiIP.String() {
+		t.Fatalf("API peer rule=%+v", coordinator.Spec.Egress[2])
 	}
 	for i, cidr := range cidrs {
-		rule := policy.Spec.Egress[i+1]
-		if len(rule.To) != 1 || rule.To[0].IPBlock == nil || rule.To[0].IPBlock.CIDR != cidr.String() ||
-			!reflect.DeepEqual(rule.To[0].IPBlock.Except, wantExcept[i]) {
-			t.Fatalf("CIDR rule %q = %+v", cidr, rule)
+		rule := coordinator.Spec.Egress[3+i]
+		if rule.To[0].IPBlock.CIDR != map[bool]string{true: "0.0.0.0/0", false: "::/0"}[cidr.IP.To4() != nil] {
+			t.Fatalf("broad family rule=%+v", rule)
 		}
-		if len(rule.Ports) != 1 || rule.Ports[0].Protocol == nil || *rule.Ports[0].Protocol != corev1.ProtocolTCP ||
-			rule.Ports[0].Port == nil || *rule.Ports[0].Port != intstr.FromInt32(443) {
-			t.Fatalf("CIDR rule ports = %+v", rule.Ports)
+		if !hasCIDR(rule.To[0].IPBlock.Except, cidr.String()) {
+			t.Fatalf("broad rule %s does not except forge CIDR %s", rule.To[0].IPBlock.CIDR, cidr)
 		}
 	}
-	if len(policy.Spec.Ingress) != 1 || len(policy.Spec.Ingress[0].From) != 1 || len(policy.Spec.Ingress[0].Ports) != 0 {
-		t.Fatalf("ingress = %+v", policy.Spec.Ingress)
+	if len(guard.Spec.Ingress) != 1 || len(guard.Spec.Ingress[0].From) != 1 || guard.Spec.Ingress[0].From[0].PodSelector.MatchLabels[LabelRun] != RunLabelValue(run.Name) || guard.Spec.Ingress[0].Ports[0].Port.IntValue() != executor.GitEgressPort {
+		t.Fatalf("guard ingress=%+v", guard.Spec.Ingress)
 	}
-	peer := policy.Spec.Ingress[0].From[0]
-	if peer.PodSelector == nil || peer.NamespaceSelector != nil || !reflect.DeepEqual(peer.PodSelector.MatchLabels, map[string]string{LabelRun: RunLabelValue(run.Name)}) {
-		t.Fatalf("ingress peer = %+v", peer)
+	if len(guard.Spec.Egress) != 4 || guard.Spec.Egress[1].To[0].IPBlock.CIDR != cidrs[0].String() || guard.Spec.Egress[2].To[0].IPBlock.CIDR != cidrs[1].String() || guard.Spec.Egress[3].To[0].IPBlock.CIDR != apiIP.String() {
+		t.Fatalf("guard egress=%+v", guard.Spec.Egress)
 	}
-	if !reflect.DeepEqual(policy, GitGuardEgressPolicy(run, cidrs)) {
-		t.Fatal("policy render is not deterministic")
+	service := GitGuardService(run)
+	if service.Name != executor.GitGuardServiceName(run.Name) || service.Spec.Ports[0].Port != executor.GitEgressPort || service.Spec.Ports[0].TargetPort.IntValue() != executor.GitEgressPort || service.Spec.Selector[executor.LabelComponent] != executor.GitGuardComponentName {
+		t.Fatalf("guard Service=%+v", service)
 	}
-}
-
-// The #908 acceptance condition at the rendered-spec level: a direct forge
-// connection from the coordinator container is refused on every port the
-// policy does not name — SSH 22, the git protocol 9418, and plain HTTP (the
-// evidence intake's service and intake ports) are admitted by no rule —
-// while guard-routed git still works: the guard's loopback listener is
-// intra-pod and outside NetworkPolicy scope, and TCP 443 to the forge CIDRs
-// carries the guard's upstream TLS. The policy cannot distinguish containers
-// inside one pod, so a direct forge connection on 443 itself remains
-// fabric-admitted (DESIGN.md records that reduced scope); what the spec must
-// refuse is every other forge path. A rule with no ports, a port with no
-// number, or a named port matches every port or a port set — either would
-// reopen the refused paths — so every rule is pinned to named integer ports.
-func TestGitGuardEgressPolicyRefusesDirectForgePaths(t *testing.T) {
-	run := testRun("git-guard-direct")
-	cidrs, err := ParseGitGuardCIDRs([]string{"140.82.112.0/20", "185.199.108.0/22"})
-	if err != nil {
-		t.Fatalf("ParseGitGuardCIDRs: %v", err)
-	}
-	policy := GitGuardEgressPolicy(run, cidrs)
-	if len(policy.Spec.Egress) != 1+len(cidrs) {
-		t.Fatalf("egress rules = %d, want DNS plus one rule per CIDR", len(policy.Spec.Egress))
-	}
-	forge := map[string]bool{}
-	for _, cidr := range cidrs {
-		forge[cidr.String()] = true
-	}
-	for _, rule := range policy.Spec.Egress {
-		if len(rule.Ports) == 0 {
-			t.Fatalf("egress rule %+v carries no ports: that matches every port", rule)
-		}
-		for _, port := range rule.Ports {
-			if port.Port == nil || port.Port.Type != intstr.Int {
-				t.Fatalf("egress rule %+v carries port %v: only named integer ports are pinned", rule, port.Port)
-			}
-			switch port.Port.IntValue() {
-			case 22, 9418, 80, 8082:
-				t.Fatalf("egress rule admits port %d: a direct forge path or the evidence intake must be refused", port.Port.IntValue())
-			}
-		}
-		if len(rule.To) == 1 && rule.To[0].IPBlock != nil && forge[rule.To[0].IPBlock.CIDR] {
-			if len(rule.Ports) != 1 || *rule.Ports[0].Protocol != corev1.ProtocolTCP ||
-				*rule.Ports[0].Port != intstr.FromInt32(443) {
-				t.Fatalf("forge CIDR %q admits %+v, want TCP 443 only: the guard's upstream", rule.To[0].IPBlock.CIDR, rule.Ports)
+	for _, policy := range []*networkingv1.NetworkPolicy{coordinator, guard} {
+		for _, rule := range policy.Spec.Egress {
+			for _, port := range rule.Ports {
+				if port.Port == nil || port.Port.Type != intstr.Int {
+					t.Fatalf("unbounded port: %+v", port)
+				}
 			}
 		}
 	}
 }
 
-func TestGitGuardEgressPolicyNarrowCIDRDropsInapplicableExcepts(t *testing.T) {
-	run := testRun("git-guard-narrow")
-	cidrs, err := ParseGitGuardCIDRs([]string{"140.82.112.0/20"})
-	if err != nil {
-		t.Fatalf("ParseGitGuardCIDRs: %v", err)
+func TestGitGuardPolicyExceptBounds(t *testing.T) {
+	run := testRun("guard-wide")
+	cidrs, _ := ParseGitGuardCIDRs([]string{"0.0.0.0/0", "::/0"})
+	policy := GitGuardEgressPolicy(run, cidrs, testAPIIP())
+	if !reflect.DeepEqual(policy.Spec.Egress[3].To[0].IPBlock.Except, []string{"169.254.0.0/16", "127.0.0.0/8", "100.100.100.200/32", "0.0.0.0/0"}) {
+		t.Fatalf("IPv4 except=%v", policy.Spec.Egress[3].To[0].IPBlock.Except)
 	}
-	policy := GitGuardEgressPolicy(run, cidrs)
-	block := policy.Spec.Egress[1].To[0].IPBlock
-	if block.CIDR != "140.82.112.0/20" || len(block.Except) != 0 {
-		t.Fatalf("narrow-CIDR except = %+v, want none: an except outside the admitted range is refused by the API server", block.Except)
-	}
-}
-
-func TestGitGuardEgressPolicyMetadataSpanningCIDRKeepsExcepts(t *testing.T) {
-	run := testRun("git-guard-wide")
-	cidrs, err := ParseGitGuardCIDRs([]string{"0.0.0.0/0"})
-	if err != nil {
-		t.Fatalf("ParseGitGuardCIDRs: %v", err)
-	}
-	policy := GitGuardEgressPolicy(run, cidrs)
-	except := policy.Spec.Egress[1].To[0].IPBlock.Except
-	want := []string{"169.254.0.0/16", "127.0.0.0/8", "100.100.100.200/32"}
-	if !reflect.DeepEqual(except, want) {
-		t.Fatalf("wide-CIDR except = %v, want %v", except, want)
+	if !reflect.DeepEqual(policy.Spec.Egress[4].To[0].IPBlock.Except, []string{"fe80::/10", "fd00:ec2::254/128", "::/0"}) {
+		t.Fatalf("IPv6 except=%v", policy.Spec.Egress[4].To[0].IPBlock.Except)
 	}
 }
 
-func TestGitGuardEgressPolicyIPv6MetadataSpanningCIDRKeepsExcepts(t *testing.T) {
-	run := testRun("git-guard-wide6")
-	cidrs, err := ParseGitGuardCIDRs([]string{"::/0"})
-	if err != nil {
-		t.Fatalf("ParseGitGuardCIDRs: %v", err)
+func TestParseGitGuardCIDRs(t *testing.T) {
+	if _, err := ParseGitGuardCIDRs([]string{"bad"}); err == nil {
+		t.Fatal("malformed CIDR accepted")
 	}
-	policy := GitGuardEgressPolicy(run, cidrs)
-	except := policy.Spec.Egress[1].To[0].IPBlock.Except
-	want := []string{"fe80::/10", "fd00:ec2::254/128"}
-	if !reflect.DeepEqual(except, want) {
-		t.Fatalf("wide-IPv6-CIDR except = %v, want %v", except, want)
+	if got, err := ParseGitGuardCIDRs(nil); err != nil || got != nil {
+		t.Fatalf("empty parse=%v, %v", got, err)
 	}
 }
 
-func TestParseGitGuardCIDRsRejectsMalformed(t *testing.T) {
-	if _, err := ParseGitGuardCIDRs([]string{"140.82.112.0/20", "not-a-cidr"}); err == nil {
-		t.Fatal("ParseGitGuardCIDRs accepted a malformed CIDR")
+func hasCIDR(values []string, value string) bool {
+	for _, item := range values {
+		if item == value {
+			return true
+		}
 	}
-	if parsed, err := ParseGitGuardCIDRs(nil); err != nil || parsed != nil {
-		t.Fatalf("ParseGitGuardCIDRs(nil) = %v, %v", parsed, err)
-	}
-}
-
-func TestGitGuardEgressPolicyNilInputs(t *testing.T) {
-	run := testRun("git-guard-nil")
-	cidrs, err := ParseGitGuardCIDRs([]string{"10.0.0.0/8"})
-	if err != nil {
-		t.Fatalf("ParseGitGuardCIDRs: %v", err)
-	}
-	if GitGuardEgressPolicy(nil, cidrs) != nil {
-		t.Fatal("GitGuardEgressPolicy(nil run) must return nil")
-	}
-	if GitGuardEgressPolicy(run, nil) != nil {
-		t.Fatal("GitGuardEgressPolicy with no CIDRs must return nil")
-	}
-}
-
-// selectorSelectsComponent reports whether a selector that names the run's
-// component key would select a pod stamped with the given component value.
-func selectorSelectsComponent(selector map[string]string, component string) bool {
-	return selector["courier.misospace.dev/component"] == component
+	return false
 }

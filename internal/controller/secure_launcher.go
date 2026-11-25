@@ -94,12 +94,12 @@ const brokerVerdictGrace = 90 * time.Second
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=create;delete;get;list;update
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=create;delete;get;list
 // +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=create;delete;get;list
-// +kubebuilder:rbac:groups="",resources=services,verbs=create;delete;get;list
+// +kubebuilder:rbac:groups="",resources=services,verbs=create;delete;get;list;update
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=create;delete;get;list;update
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=create;delete;get;list
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=create;delete;get;list
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=create;delete;get;list;update
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,verbs=create;delete;get;list
 // +kubebuilder:rbac:groups=authorization.k8s.io,resources=subjectaccessreviews,verbs=create
 // +kubebuilder:rbac:groups=authorization.k8s.io,resources=selfsubjectaccessreviews,verbs=create

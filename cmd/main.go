@@ -95,6 +95,7 @@ func main() {
 	var executorImage string
 	var gitRemoteTemplate string
 	var legacyGitGuardEgressCIDRs string
+	gitGuardKubernetesAPIIP := strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_HOST"))
 	var gitCredentialSecret string
 	var gitTokenKey string
 	var githubCredentialSecret string
@@ -174,7 +175,7 @@ func main() {
 	defaults := executor.DefaultPodConfig()
 	flag.StringVar(&executorImage, "executor-image", defaults.Image, "Coordinator image containing courier-executor, git, and opencode.")
 	flag.StringVar(&gitRemoteTemplate, "git-remote-template", defaults.GitRemoteURL, "Git remote URL template containing one %s repository placeholder.")
-	flag.StringVar(&legacyGitGuardEgressCIDRs, "legacy-git-guard-egress-cidrs", "", "Optional comma-separated CIDRs a legacy App-mode git-guard pod may reach; while set the pod admits only DNS and TCP 443 to these CIDRs and every other egress is refused, so the list must cover every 443 destination the pod needs (the forge, the model-provider endpoint, MCP servers, and the kubernetes Service ClusterIP the guard and observer read their credentials document through); non-443 egress such as the evidence-intake POST is refused too, and under identity-based CNIs such as Cilium a companion CNI policy must admit the API-server path. Empty disables the per-run policy.")
+	flag.StringVar(&legacyGitGuardEgressCIDRs, "legacy-git-guard-egress-cidrs", "", "Optional comma-separated forge CIDRs the per-run App-mode git-guard pod may reach. The coordinator policy refuses these CIDRs while retaining other TCP 443 destinations; the Kubernetes API endpoint is admitted automatically for credential reads, and non-443 egress remains refused. Empty disables the per-run policies.")
 	flag.StringVar(&gitCredentialSecret, "git-credential-secret", "courier-github", "Secret containing username and token keys for private git access; empty disables git secret injection.")
 	flag.StringVar(&gitTokenKey, "git-token-key", "", "Optional key in the git credential Secret; empty defaults to token.")
 	flag.StringVar(&githubCredentialSecret, "github-credential-secret", "", "Optional Secret containing the GitHub API token; empty falls back to --git-credential-secret.")
@@ -1034,6 +1035,7 @@ func main() {
 		Scheme:                     mgr.GetScheme(),
 		APIReader:                  mgr.GetAPIReader(),
 		Launch:                     launcher.Launch,
+		GitGuardTeardown:           launcher.TeardownLegacyGitGuard,
 		Sources:                    sources,
 		StatusWriter:               status.KubePatchWriter{Client: mgr.GetClient()},
 		Observer:                   worldObserver,
@@ -1102,7 +1104,19 @@ func main() {
 			setupLog.Error(err, "unable to configure legacy git-guard egress policy")
 			os.Exit(1)
 		}
+		// The guard pod reads the run's credentials document through the
+		// Kubernetes API, so both rendered policies need that endpoint as an
+		// ipBlock peer. The operator pod's own injected service environment
+		// is the deployment's API endpoint; a deployment running outside a
+		// cluster (or with a non-IP endpoint) cannot render the boundary and
+		// fails here, at configuration time, rather than terminalizing runs
+		// one launch at a time.
+		if net.ParseIP(gitGuardKubernetesAPIIP) == nil {
+			setupLog.Error(fmt.Errorf("--legacy-git-guard-egress-cidrs requires the operator's in-cluster Kubernetes API endpoint IP (KUBERNETES_SERVICE_HOST); got %q", gitGuardKubernetesAPIIP), "unable to configure legacy git-guard egress policy")
+			os.Exit(1)
+		}
 		launcher.GitGuardEgressCIDRs = parsed
+		launcher.GitGuardKubernetesAPIIP = gitGuardKubernetesAPIIP
 	}
 	if !secureMode && installationTokenMinter != nil {
 		// Legacy App-mode git credentials (#871): the GitHub App minter on a

@@ -46,13 +46,6 @@ func observerVolumes() []corev1.Volume {
 
 func observerSeedContainer(config PodConfig, invocation Invocation, podName, runUID string) corev1.Container {
 	mounts := []corev1.VolumeMount{{Name: observerStateVolume, MountPath: ObserverStatePath}}
-	// App-mode seeding fetches the trusted remotes to pin the baseline, so
-	// the seed resolves installation credentials through the same projected
-	// token volume the observer container uses (#871). Static seeds never
-	// mount it.
-	if config.InstallationGit != nil {
-		mounts = append(mounts, corev1.VolumeMount{Name: observerTokenVolume, MountPath: ObserverTokenPath, ReadOnly: true})
-	}
 	return corev1.Container{
 		Name: "workspace-observer-seed", Image: config.Image, ImagePullPolicy: config.ImagePullPolicy,
 		Command: []string{config.BootstrapBinary}, Args: []string{"observe-seed"},
@@ -113,24 +106,6 @@ func observerEnvironment(config PodConfig, invocation Invocation, podName, runUI
 		if ref.Name == "COURIER_GIT_USERNAME" || ref.Name == "COURIER_GIT_TOKEN" {
 			envs = append(envs, corev1.EnvVar{Name: ref.Name, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: ref.Secret}, Key: ref.Key}}})
 		}
-	}
-	// App-mode git credentials (#871): the observer resolves the same
-	// run document through its own projected identity (the token volume
-	// it already mounts), bound to exactly the two configured remotes.
-	// The installation variables replace the static git pair; the seed
-	// gets the same repository identities and resolved Secret name the
-	// coordinator carries, because the binding is built from the remote
-	// URLs plus the pinned owner/name identities — without the head
-	// repository a fork run would serve the base token against the fork.
-	if config.InstallationGit != nil {
-		envs = append(envs,
-			corev1.EnvVar{Name: EnvGitInstallation, Value: "1"},
-			corev1.EnvVar{Name: EnvInstallationOwner, Value: config.InstallationGit.Owner},
-			corev1.EnvVar{Name: EnvInstallationEndpoint, Value: config.InstallationGit.APIEndpoint},
-			corev1.EnvVar{Name: EnvInstallationSecret, Value: config.InstallationGit.CredentialsSecret},
-			corev1.EnvVar{Name: "COURIER_REPO", Value: invocation.Repo},
-			corev1.EnvVar{Name: "COURIER_HEAD_REPO", Value: invocation.HeadRepo},
-		)
 	}
 	if observer {
 		envs = append(envs, corev1.EnvVar{Name: "COURIER_TOKEN_FILE", Value: ObserverTokenPath + "/token"}, corev1.EnvVar{Name: "COURIER_CA_FILE", Value: ObserverTokenPath + "/ca.crt"})
