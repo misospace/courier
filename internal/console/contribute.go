@@ -556,12 +556,15 @@ func (s *Server) handleContributeSubmit(w http.ResponseWriter, r *http.Request) 
 		data.Run, data.Namespace, data.WorkItemID = result.Run, result.Namespace, result.WorkItemID
 		data.Resumed = result.Outcome == outcomeResumed
 		// The run the admission response named is reachable on the status
-		// page from here, with the response's namespace pinned. An
-		// unpinned response namespace still links: the status page then
-		// carries the endpoint's default and pins the canonical echo.
-		if result.Run != "" && s.contributions != nil {
+		// page from here, with the response's namespace pinned — but only
+		// values the console's own request validators accept, so the link
+		// never ships a destination the status page would itself reject. A
+		// blank or hostile namespace drops the pin, not the link: the
+		// status page then carries the endpoint's default and pins the
+		// canonical echo.
+		if s.contributions != nil && validContributeRunName(result.Run) {
 			data.StatusLink = "/contributions/" + url.PathEscape(result.Run)
-			if result.Namespace != "" {
+			if result.Namespace != "" && validContributeNamespace(result.Namespace) {
 				data.StatusLink += "?namespace=" + url.QueryEscape(result.Namespace)
 			}
 		}
