@@ -170,15 +170,19 @@ func TestBuildCoordinatorPodInstallationGitUsesGuardService(t *testing.T) {
 
 func TestGitGuardPodNameValidityAndUniqueness(t *testing.T) {
 	names := []string{
-		"simple", "name.with.dots", strings.Repeat("a", 80), "-leading", "trailing-",
+		"simple", strings.Repeat("a", 80), "-leading", "trailing-",
 		"a." + strings.Repeat("b", 70), strings.Repeat("a", 43) + "." + strings.Repeat("b", 40),
 		// A digit-leading name and the run its "r"-anchor would otherwise
 		// collide with; the digest the anchored path carries keeps them apart.
 		"9digits", "r9digits",
+		// Dot- and hyphen-spelled spellings of the same base: the dot form
+		// takes the digest path, the hyphen form passes through.
+		"name.with.dots", "name-with-dots",
 		// The 53/54-character passthrough/digest transition.
 		strings.Repeat("a", 53), strings.Repeat("a", 54),
-		// Two long names sharing the truncated prefix stay distinct.
-		strings.Repeat("a", 44) + "x1", strings.Repeat("a", 44) + "x2",
+		// Two long names truncated to a shared prefix stay distinct through
+		// the digest of their full names.
+		strings.Repeat("a", 54) + "x1", strings.Repeat("a", 54) + "x2",
 		// The "run" fallback and the run it must not collide with.
 		"", "-", "run",
 	}
