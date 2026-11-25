@@ -6,6 +6,9 @@
     Recorded by Courier as of this read ({{.Status.ObservedAt}}).
     {{if .PhaseAge}}In this phase for about {{.PhaseAge}}.{{end}}
   </p>
+  {{if .Stale}}
+  <p class="state state-warn">This read is stale: the status API stamped it far from the moment this page was built, so it may have arrived from a cache or a stalled upstream rather than a live cluster read. The values below may not reflect the run as it is now.</p>
+  {{end}}
   <p><span class="{{.PhaseClass}}">{{.PhaseLabel}}</span></p>
   {{if .Status.CIParked}}
   <p class="state-note">This run waits in the CI park; verification continues when CI reports.</p>

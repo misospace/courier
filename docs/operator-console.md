@@ -327,9 +327,18 @@ could not be reached.
 The console tracks one contribution run at a time. Two pages serve it.
 `/contributions` looks a run up by name and lists the contributions this
 browser viewed most recently. `/contributions/<run>` shows one run's status.
-An operator adds `?namespace=` to pin the admission namespace. Every view is a
+An operator adds `?namespace=` to pin the admission namespace; a successful
+contribution submission links straight to its run's status page with the
+namespace from the admission response pinned, so an admitted or resumed run
+is one click from its status on any deployment that configures the status
+backend. Every view is a
 link, so a shared link opens the same view and a reload keeps it. The console
-renders these pages on the server and runs no client-side JavaScript.
+renders these pages on the server and runs no client-side JavaScript. If a
+read's `observedAt` sits far from the console's own clock — a cached or
+stalled upstream, or badly skewed clocks — the page keeps the values but
+labels the read stale; a same-name response from a different namespace, or a
+stamp that does not parse, is treated as a misconfiguration rather than
+rendered.
 
 The status comes from the contribution status API, not the operator read API.
 The console calls `GET /v1/contributions/<run>` on the manager's contribution

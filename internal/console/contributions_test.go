@@ -12,7 +12,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/misospace/courier/internal/source/adhoc"
 )
@@ -37,12 +39,19 @@ func (f *fakeContributeStatus) Status(_ context.Context, namespace, run string) 
 	return f.status, nil
 }
 
+// contributeTestNow is the pinned clock of every status test server. It sits
+// ten seconds after the fixtures' observedAt stamp, so the staleness window
+// reads the fixture answers as fresh; a test that wants a stale answer sets
+// observedAt itself relative to this instant.
+var contributeTestNow = time.Date(2026, 11, 20, 9, 31, 10, 0, time.UTC)
+
 // newContributeServer returns a logged-in token-mode console whose status
 // read is the stub, plus the base URL.
 func newContributeServer(t *testing.T, secrets *testSecrets, stub contributeStatusClient) (*Server, string) {
 	t.Helper()
 	server, base := newTestServer(t, secrets, "")
 	server.contributions = stub
+	server.auth.now = func() time.Time { return contributeTestNow }
 	return server, base
 }
 
@@ -361,6 +370,77 @@ func TestContributeStatusClientUnexpectedBody(t *testing.T) {
 		if _, err := client.Status(context.Background(), "", run); !errors.Is(err, ErrContributeStatusUnexpected) {
 			t.Errorf("%s: err = %v, want ErrContributeStatusUnexpected", run, err)
 		}
+	}
+}
+
+// TestContributeStatusWrongShapeNamespaceAndStamp pins the extended
+// wrong-shape boundary: with a pinned request, a namespace echo that differs
+// from the pin is not the requested run, a missing namespace echo is the same
+// misconfiguration as a bare {}, and a malformed observedAt is rejected even
+// though it is non-empty. Without a pin the mismatch cannot exist: the read
+// accepts whatever canonical echo the endpoint supplies, which is what the
+// detail page then pins and records.
+func TestContributeStatusWrongShapeNamespaceAndStamp(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "wrong-namespace"):
+			_, _ = w.Write([]byte(`{"run":"courier-wrong-namespace","namespace":"elsewhere","observedAt":"2026-11-20T09:00:00Z"}`))
+		case strings.HasSuffix(r.URL.Path, "no-namespace"):
+			_, _ = w.Write([]byte(`{"run":"courier-no-namespace","observedAt":"2026-11-20T09:00:00Z"}`))
+		case strings.HasSuffix(r.URL.Path, "bad-stamp"):
+			_, _ = w.Write([]byte(`{"run":"courier-bad-stamp","namespace":"contrib","observedAt":"last tuesday"}`))
+		default:
+			_, _ = w.Write([]byte(`{"run":"courier-healthy","namespace":"contrib","phase":"Pending","observedAt":"2026-11-20T09:00:00Z"}`))
+		}
+	}))
+	t.Cleanup(upstream.Close)
+	client, err := newHTTPContributeStatusClient(upstream.URL, []byte("t"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, run := range []string{"courier-wrong-namespace", "courier-no-namespace", "courier-bad-stamp"} {
+		if _, err := client.Status(context.Background(), "contrib", run); !errors.Is(err, ErrContributeStatusUnexpected) {
+			t.Errorf("%s pinned to contrib: err = %v, want ErrContributeStatusUnexpected", run, err)
+		}
+	}
+	if _, err := client.Status(context.Background(), "", "courier-wrong-namespace"); err != nil {
+		t.Errorf("unpinned wrong-namespace: err = %v, want the echoed namespace accepted", err)
+	}
+	if _, err := client.Status(context.Background(), "contrib", "courier-healthy"); err != nil {
+		t.Errorf("healthy: err = %v", err)
+	}
+}
+
+// TestContributionDetailStaleRead pins the stale-response handling #830
+// requires: a well-shaped read whose observedAt sits outside the staleness
+// window — old (a cached or stalled upstream) or ahead of the console's clock
+// (severe skew) — still renders, but is labelled stale instead of reading as
+// a live observation. A healthy stamp renders no label.
+func TestContributionDetailStaleRead(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		offset     time.Duration
+		wantStaled bool
+	}{
+		{"fresh", -10 * time.Second, false},
+		{"old", -10 * time.Minute, true},
+		{"future", 10 * time.Minute, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			secrets := newTestSecrets(t)
+			status := fullContributionStatus()
+			status.ObservedAt = contributeTestNow.Add(tc.offset).Format(time.RFC3339)
+			stub := &fakeContributeStatus{status: status}
+			_, base := newContributeServer(t, secrets, stub)
+			client := login(t, base, secrets.token)
+			resp, body := get(t, client, base+"/contributions/courier-3f2a")
+			if resp.StatusCode != http.StatusOK || stub.calls == nil {
+				t.Fatalf("status = %d, calls = %v", resp.StatusCode, stub.calls)
+			}
+			if got := strings.Contains(body, "This read is stale"); got != tc.wantStaled {
+				t.Errorf("stale label present = %v, want %v:\n%s", got, tc.wantStaled, body)
+			}
+		})
 	}
 }
 
@@ -918,5 +998,125 @@ func TestContributeHistoryClearedOnLogout(t *testing.T) {
 	}
 	if cleared == nil || cleared.Value != "" || cleared.MaxAge >= 0 {
 		t.Fatalf("logout did not clear the history cookie: %+v", cleared)
+	}
+}
+
+// TestContributeSubmitThenTrackStatus is the integrated #830 fixture: one
+// fake backend serves both the admission POST and the status GET, and one
+// console is wired to both. An accepted submission links its run's status
+// page pinned to the admission namespace; a repeat submission of unchanged
+// content resumes the same run and namespace and links the same page; and
+// following that link tracks the run from admitted through verifying to a
+// published pull request — the operator's whole path from submission to PR
+// without leaving the console. The correlation is the admission response
+// the console already holds; the status DTO never carries a submission key.
+func TestContributeSubmitThenTrackStatus(t *testing.T) {
+	const (
+		admittedRun = "courier-3f2a"
+		admittedNS  = "courier-contrib"
+	)
+	var mu sync.Mutex
+	var submissions int
+	phase := "Pending"
+	publication := ""
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/contributions":
+			mu.Lock()
+			submissions++
+			repeat := submissions > 1
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			if repeat {
+				w.WriteHeader(http.StatusOK)
+			} else {
+				w.WriteHeader(http.StatusCreated)
+			}
+			_, _ = fmt.Fprintf(w, `{"run":%q,"namespace":%q,"workItemId":"item-7"}`, admittedRun, admittedNS)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/contributions/"):
+			if got := r.URL.Query().Get("namespace"); got != admittedNS {
+				t.Errorf("status read namespace = %q, want the pinned admission namespace %q", got, admittedNS)
+			}
+			mu.Lock()
+			body := fmt.Sprintf(`{"run":%q,"namespace":%q,"phase":%q,"observedAt":%q`,
+				admittedRun, admittedNS, phase, time.Now().UTC().Format(time.RFC3339))
+			if publication != "" {
+				body += fmt.Sprintf(`,"publication":{"pr":%q}`, publication)
+			}
+			body += "}"
+			mu.Unlock()
+			_, _ = w.Write([]byte(body))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(backend.Close)
+
+	secrets := newTestSecrets(t)
+	server, err := NewServer(Config{
+		Mode:              AuthModeToken,
+		SessionKey:        []byte(secrets.sessionKey),
+		OperatorTokens:    [][]byte{[]byte(secrets.token)},
+		ContributeURL:     backend.URL,
+		ContributeToken:   []byte("admission-secret"),
+		ContributeTimeout: time.Second,
+		InsecureCookies:   true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.contributions, err = newHTTPContributeStatusClient(backend.URL, []byte("status-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(server.Handler())
+	t.Cleanup(httpServer.Close)
+	client := login(t, httpServer.URL, secrets.token)
+	base := httpServer.URL
+
+	statusHref := `href="/contributions/` + admittedRun + `?namespace=` + admittedNS + `"`
+	_, page := get(t, client, base+"/contribute")
+	csrf := findCSRFToken(t, page)
+	resp, page := postContribution(t, client, base, csrf, contributionValues("first goal"))
+	if resp.StatusCode != http.StatusOK || !strings.Contains(page, "A run was created") {
+		t.Fatalf("first submission: status = %d, page:\n%s", resp.StatusCode, page)
+	}
+	if !strings.Contains(page, statusHref) {
+		t.Fatalf("accepted submission missing the namespace-pinned status link:\n%s", page)
+	}
+
+	resp, page = postContribution(t, client, base, csrf, contributionValues("first goal"))
+	if resp.StatusCode != http.StatusOK || !strings.Contains(page, "A run was resumed") {
+		t.Fatalf("repeat submission: status = %d, page:\n%s", resp.StatusCode, page)
+	}
+	if !strings.Contains(page, statusHref) {
+		t.Fatalf("resumed submission missing the same namespace-pinned status link:\n%s", page)
+	}
+
+	_, detail := get(t, client, base+"/contributions/"+admittedRun+"?namespace="+admittedNS)
+	for _, want := range []string{"Admitted, waiting to start", admittedNS} {
+		if !strings.Contains(detail, want) {
+			t.Errorf("admitted status page missing %q:\n%s", want, detail)
+		}
+	}
+	if strings.Contains(detail, "This read is stale") {
+		t.Errorf("a fresh fixture read renders the stale label:\n%s", detail)
+	}
+
+	mu.Lock()
+	phase = "Verifying"
+	mu.Unlock()
+	_, detail = get(t, client, base+"/contributions/"+admittedRun+"?namespace="+admittedNS)
+	if !strings.Contains(detail, "Verifying") || strings.Contains(detail, "Admitted, waiting to start") {
+		t.Errorf("verifying progression:\n%s", detail)
+	}
+
+	mu.Lock()
+	phase = "AwaitingReview"
+	publication = "https://github.com/owner/base/pull/42"
+	mu.Unlock()
+	_, detail = get(t, client, base+"/contributions/"+admittedRun+"?namespace="+admittedNS)
+	if !strings.Contains(detail, `href="https://github.com/owner/base/pull/42"`) || !strings.Contains(detail, "Awaiting review") {
+		t.Errorf("published progression:\n%s", detail)
 	}
 }

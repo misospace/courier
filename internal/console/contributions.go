@@ -54,6 +54,15 @@ const (
 	// server-side; anything approaching this bound is a confused upstream.
 	maxContributeStatusBody = 64 * 1024
 
+	// contributeStatusStaleWindow bounds how far the read's observedAt may
+	// sit from the console's own clock before the page calls the answer
+	// stale (#830). The endpoint stamps observedAt as it answers from the
+	// cluster, so a healthy read is stamped moments before the page is
+	// built; the window covers request latency plus the clock skew of a
+	// correctly synchronized cluster, and nothing wider. It is display
+	// policy, never a claim about the endpoint's freshness contract.
+	contributeStatusStaleWindow = 30 * time.Second
+
 	// contributeStatusRefreshSeconds is the meta-refresh interval while a
 	// run is active (no phase yet, Pending, Claimed, Running, and an
 	// unparked Verifying).
@@ -280,7 +289,7 @@ func (c *httpContributeStatusClient) Status(ctx context.Context, namespace, run 
 	if err := json.Unmarshal(body, &status); err != nil {
 		return contributionStatus{}, fmt.Errorf("%w: %v", ErrContributeStatusUnexpected, err)
 	}
-	if !status.describes(run) {
+	if !status.describes(namespace, run) {
 		// The endpoint always echoes the run's name and stamps the read's
 		// observedAt. A 200 that parses as JSON but does not — say a bare
 		// {} from a misconfigured status URL pointed at some other service —
@@ -292,14 +301,24 @@ func (c *httpContributeStatusClient) Status(ctx context.Context, namespace, run 
 	return status, nil
 }
 
-// describes reports whether the decoded body carries the two fields the
-// status endpoint always projects: the echo of the requested run's name and
-// the read's observedAt. The run name the endpoint echoes is the object name
-// it was addressed by — always the validated request name, never a
-// truncated form, because the projection's field cap exceeds the object-name
-// cap the request is validated against.
-func (s contributionStatus) describes(run string) bool {
-	return s.Run == run && s.ObservedAt != ""
+// describes reports whether the decoded body carries what the status
+// endpoint always projects for the requested run: the echo of the run's
+// name, a non-empty canonical namespace that matches the namespace the
+// request pinned (an unpinned request accepts any echoed namespace and
+// the page pins the canonical echo), and a read stamp the RFC3339 parse
+// accepts. A same-name response from a different namespace is not the
+// requested run: rendering it would record the wrong namespace in the
+// history cookie and pin the deep link to the wrong object, so it fails
+// the same wrong-shape boundary as an empty stamp or a bare {}.
+func (s contributionStatus) describes(namespace, run string) bool {
+	if s.Run != run || s.Namespace == "" {
+		return false
+	}
+	if namespace != "" && s.Namespace != namespace {
+		return false
+	}
+	_, err := time.Parse(time.RFC3339, s.ObservedAt)
+	return err == nil
 }
 
 // validContributeRunName reports whether the name could address a run on the
@@ -334,6 +353,7 @@ type contributionData struct {
 	HistoryAvailable  bool
 
 	Status       contributionStatus
+	Stale        bool
 	PhaseLabel   string
 	PhaseClass   string
 	PhaseAge     string
@@ -450,7 +470,9 @@ func (s *Server) renderContributionStatus(w http.ResponseWriter, r *http.Request
 	// status that echoes another run or carries no observedAt is the same
 	// misconfiguration as an unparseable body and renders as its static
 	// state — never blank fields, an active refresh, or a history entry.
-	if !status.describes(run) {
+	// A stale observedAt stays renderable (below); only an unparseable one
+	// is wrong-shape.
+	if !status.describes(namespace, run) {
 		data.State = "error"
 		data.ErrorMessage = contributeUnexpectedMessage
 		s.renderContribution(w, http.StatusOK, "contribution", data)
@@ -459,6 +481,19 @@ func (s *Server) renderContributionStatus(w http.ResponseWriter, r *http.Request
 
 	data.State = "found"
 	data.Status = status
+	// Stale-response handling (#830): ObservedAt names the instant the
+	// status endpoint read from the cluster, so a healthy read is stamped
+	// moments before this page is built. A stamp farther away — old or in
+	// the future — means the answer arrived from something behind (a
+	// cache, a frozen proxy) or a badly skewed clock, so the page keeps
+	// the data but labels it stale instead of letting any non-empty stamp
+	// read as a fresh observation. The window is fixed display policy; the
+	// endpoint's contract stays unchanged.
+	if at, err := time.Parse(time.RFC3339, status.ObservedAt); err == nil {
+		if skew := s.auth.now().Sub(at); skew > contributeStatusStaleWindow || skew < -contributeStatusStaleWindow {
+			data.Stale = true
+		}
+	}
 	// The response echoes the canonical namespace; the deep link and the
 	// history entry carry it, so a reload stays pinned even when the first
 	// read used the endpoint's default.

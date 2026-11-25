@@ -1,15 +1,16 @@
 // Package console implements the Courier operator console: a small,
 // server-rendered interface for authenticated operators. It is deliberately
 // independent of the operator binary and of the Kubernetes API — it imports
-// only standard library and never talks cluster. pages render
-// operator read API's allowlisted projections over fixed or validated GET
-// paths; read API client lives in backend.go and decodes projection
-// JSON into its own view types rather importing read API package, so
-// standard-library-only invariant holds. Contributions submit through
-// operator's HTTP admission API (#829). contribution pages read one run's
-// lifecycle status from a second backend — the contribution listener's
-// status route — over a separate status-read credential, with the same
-// fixed-path discipline (contributions.go).
+// only the standard library and never talks to a cluster. Its pages render
+// the operator read API's allowlisted projections over fixed or validated
+// GET paths; the read API client lives in backend.go and decodes
+// projection JSON into its own view types rather than importing the read
+// API package, so the standard-library-only invariant holds. Contributions
+// submit through the operator's HTTP admission API (#829), and the
+// contribution pages read one run's lifecycle status from a second
+// backend — the contribution listener's status route — over a separate
+// status-read credential, with the same fixed-path discipline
+// (contributions.go).
 package console
 
 import (
@@ -401,9 +402,10 @@ func (s *Server) pageData(r *http.Request, title, active string) pageData {
 	return data
 }
 
-// render executes page through shared layout. Pages carry their own
-// view struct; layout reads only fields its chrome needs (title,
-// active nav, authentication, refresh), which every page view provides.
+// render executes the page through the shared layout. Pages carry their
+// own view struct; the layout reads only the fields its chrome needs
+// (title, active nav, authentication, refresh), which every page view
+// provides.
 func (s *Server) render(w http.ResponseWriter, status int, page string, data any) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
