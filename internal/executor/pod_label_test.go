@@ -39,8 +39,9 @@ func TestRunLabelValueDistinguishesRunsSharingAPrefix(t *testing.T) {
 }
 
 func TestRunLabelValueMatchesTopologyScheme(t *testing.T) {
-	// The two packages hold the bounded scheme in parallel (neither can
-	// import the other); controller readers rely on the values agreeing.
+	// topology.RunLabelValue delegates to the executor's scheme, and controller
+	// readers rely on the delegated value matching what topology objects are
+	// labelled with.
 	for _, name := range []string{
 		"short", "run.test", "Run_1.2", "Bad Name!", "__", "",
 		labelOverflowPrefix,
