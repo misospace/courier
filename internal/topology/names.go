@@ -136,38 +136,12 @@ func isDNSLabelBase(s string) bool {
 // All secure runs share one namespace, so the value must stay a correct run
 // selector: it is sanitized to a label-safe form and, when that overflows the
 // 63-character label cap, truncated and hash-suffixed with a digest of the
-// full run name so two runs sharing a long prefix do not collide.
+// full run name so two runs sharing a long prefix do not collide. The scheme
+// has a single implementation in internal/executor — which topology imports,
+// not the reverse — so the secure objects and the legacy executor pods cannot
+// be labelled by two copies that drift apart.
 func RunLabelValue(runName string) string {
-	sanitized := sanitizeLabelValue(runName)
-	const max = 63
-	if len(sanitized) <= max {
-		return sanitized
-	}
-	digest := sha256.Sum256([]byte(runName))
-	hash := hex.EncodeToString(digest[:])[:8]
-	cut := max - len(hash) - 1
-	return strings.TrimRight(sanitized[:cut], "-_.") + "-" + hash
-}
-
-// sanitizeLabelValue lowercases a value and replaces any character outside
-// the allowed label set with a hyphen, trimming the ends. It returns
-// "unknown" for an empty result.
-func sanitizeLabelValue(value string) string {
-	value = strings.ToLower(strings.TrimSpace(value))
-	var b strings.Builder
-	for _, char := range value {
-		switch {
-		case (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') || char == '-' || char == '_' || char == '.':
-			b.WriteRune(char)
-		default:
-			b.WriteByte('-')
-		}
-	}
-	value = strings.Trim(b.String(), "-_.")
-	if value == "" {
-		return "unknown"
-	}
-	return value
+	return executor.RunLabelValue(runName)
 }
 
 // ControlPodName, BrokerPodName, WorkerPodName and the rest name every

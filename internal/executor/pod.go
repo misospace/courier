@@ -630,11 +630,10 @@ func podName(runName string) string {
 // selector: it is sanitized to a label-safe form and, when that overflows
 // the 63-character label cap, truncated and hash-suffixed with a digest of
 // the full run name so two runs sharing a long prefix do not collide. The
-// scheme mirrors topology.RunLabelValue, which renders the same label on
-// secure pods; executor cannot import topology (topology imports executor),
-// so the two hold the construction in parallel, and controller readers
-// accept both schemes plus LegacyRunLabelValue, which pods created before
-// the digest scheme carry.
+// scheme has a single implementation here: topology.RunLabelValue delegates
+// to it (topology imports executor, not the reverse) and renders the same
+// label on secure pods, while controller readers also accept
+// LegacyRunLabelValue, which pods created before the digest scheme carry.
 func RunLabelValue(name string) string {
 	sanitized := sanitizeLabelValue(name)
 	const max = 63

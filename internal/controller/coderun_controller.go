@@ -2753,13 +2753,12 @@ func podBelongsToRun(pod *corev1.Pod, run *courierv1alpha1.CoderRun) bool {
 			return true
 		}
 	}
-	// Three run-label schemes are accepted: the digest-bounded executor and
-	// topology values, which agree by construction for every name, and the
-	// legacy pre-digest truncation that pods created before the digest
-	// scheme carry until they are replaced.
+	// Two run-label schemes are accepted: the digest-bounded executor value,
+	// which topology.RunLabelValue renders identically by delegating to it,
+	// and the legacy pre-digest truncation that pods created before the
+	// digest scheme carry until they are replaced.
 	label := pod.Labels[executor.LabelRun]
 	return label == executor.RunLabelValue(run.Name) ||
-		label == topology.RunLabelValue(run.Name) ||
 		label == executor.LegacyRunLabelValue(run.Name)
 }
 
