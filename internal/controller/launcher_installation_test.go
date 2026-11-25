@@ -4,12 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"reflect"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -119,6 +123,141 @@ func TestLaunchWithoutInstallationGitWritesNoCredentials(t *testing.T) {
 	// Today's observer identity is untouched behavior, still provisioned.
 	expectObserved := legacyObserverResourceName(run.Name)
 	getOrFail(t, c, nsKey(expectObserved), &corev1.ServiceAccount{})
+}
+
+func TestLaunchGitGuardPolicyLifecycle(t *testing.T) {
+	now := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+	cidrs := []string{"140.82.112.0/20"}
+
+	t.Run("policy precedes App-mode pod", func(t *testing.T) {
+		run := installationLegacyRun("guard-order")
+		created := []client.Object{}
+		base := launcherClientForAdmission(t, admissionLaneWithCoordinator("local", 1), run)
+		c := interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			created = append(created, obj.DeepCopyObject().(client.Object))
+			return c.Create(ctx, obj, opts...)
+		}})
+		launcher := installationLauncher(c, &fixedInstallationTokenMinter{token: "guard", expiresAt: now.Add(2 * time.Hour)}, now, plainExecutor{})
+		launcher.GitGuardEgressCIDRs = cidrs
+		if err := launcher.Launch(context.Background(), run); err != nil {
+			t.Fatalf("Launch: %v", err)
+		}
+		policyPosition, podPosition := -1, -1
+		for i, obj := range created {
+			switch obj.(type) {
+			case *networkingv1.NetworkPolicy:
+				policyPosition = i
+			case *corev1.Pod:
+				podPosition = i
+			}
+		}
+		if policyPosition < 0 || podPosition < 0 || policyPosition >= podPosition {
+			t.Fatalf("create order = %T sequence %v, policy position %d pod position %d", created, created, policyPosition, podPosition)
+		}
+	})
+
+	t.Run("flag requires App-mode before pod create", func(t *testing.T) {
+		run := installationLegacyRun("guard-static")
+		c := launcherClientForAdmission(t, admissionLaneWithCoordinator("local", 1), run)
+		launcher := &CoordinatorLauncher{Client: c, APIReader: c, Pod: executor.PodConfig{Image: "example/coordinator:test"}, Executor: plainExecutor{}, GitGuardEgressCIDRs: cidrs}
+		err := launcher.Launch(context.Background(), run)
+		expectNeedsHumanReason(t, err, "GitGuardPolicyApp")
+		expectAbsent(t, c, client.ObjectKey{Namespace: run.Namespace, Name: run.Name + "-coordinator"}, &corev1.Pod{})
+	})
+
+	t.Run("unset flag creates no policy", func(t *testing.T) {
+		run := installationLegacyRun("guard-disabled")
+		c := launcherClientForAdmission(t, admissionLaneWithCoordinator("local", 1), run)
+		launcher := installationLauncher(c, &fixedInstallationTokenMinter{token: "guard", expiresAt: now.Add(2 * time.Hour)}, now, plainExecutor{})
+		if err := launcher.Launch(context.Background(), run); err != nil {
+			t.Fatalf("Launch: %v", err)
+		}
+		expectAbsent(t, c, client.ObjectKey{Namespace: run.Namespace, Name: topology.GitGuardNetworkPolicyName(run.Name)}, &networkingv1.NetworkPolicy{})
+	})
+
+	t.Run("foreign same-name policy fails closed", func(t *testing.T) {
+		run := installationLegacyRun("guard-foreign")
+		foreign := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: topology.GitGuardNetworkPolicyName(run.Name)}}
+		c := launcherClientForAdmission(t, admissionLaneWithCoordinator("local", 1), run, foreign)
+		launcher := installationLauncher(c, &fixedInstallationTokenMinter{token: "guard", expiresAt: now.Add(2 * time.Hour)}, now, plainExecutor{})
+		launcher.GitGuardEgressCIDRs = cidrs
+		err := launcher.Launch(context.Background(), run)
+		expectNeedsHumanReason(t, err, "GitGuardPolicyOwnership")
+		expectAbsent(t, c, client.ObjectKey{Namespace: run.Namespace, Name: run.Name + "-coordinator"}, &corev1.Pod{})
+	})
+
+	t.Run("owned matching policy is adopted idempotently", func(t *testing.T) {
+		run := installationLegacyRun("guard-adopt")
+		seeded := topology.GitGuardEgressPolicy(run, mustParseCIDRs(t, cidrs))
+		seeded.OwnerReferences = runOwnerReferences(run)
+		c := launcherClientForAdmission(t, admissionLaneWithCoordinator("local", 1), run, seeded)
+		launcher := installationLauncher(c, &fixedInstallationTokenMinter{token: "guard", expiresAt: now.Add(2 * time.Hour)}, now, plainExecutor{})
+		launcher.GitGuardEgressCIDRs = cidrs
+		if err := launcher.Launch(context.Background(), run); err != nil {
+			t.Fatalf("Launch: %v", err)
+		}
+		getOrFail(t, c, client.ObjectKey{Namespace: run.Namespace, Name: topology.GitGuardNetworkPolicyName(run.Name)}, &networkingv1.NetworkPolicy{})
+	})
+
+	t.Run("owned drifted policy converges before the pod", func(t *testing.T) {
+		run := installationLegacyRun("guard-drift")
+		seeded := topology.GitGuardEgressPolicy(run, mustParseCIDRs(t, cidrs))
+		seeded.OwnerReferences = runOwnerReferences(run)
+		seeded.Spec.Egress = nil
+		c := launcherClientForAdmission(t, admissionLaneWithCoordinator("local", 1), run, seeded)
+		launcher := installationLauncher(c, &fixedInstallationTokenMinter{token: "guard", expiresAt: now.Add(2 * time.Hour)}, now, plainExecutor{})
+		launcher.GitGuardEgressCIDRs = cidrs
+		if err := launcher.Launch(context.Background(), run); err != nil {
+			t.Fatalf("Launch: %v", err)
+		}
+		var live networkingv1.NetworkPolicy
+		getOrFail(t, c, client.ObjectKey{Namespace: run.Namespace, Name: topology.GitGuardNetworkPolicyName(run.Name)}, &live)
+		want := topology.GitGuardEgressPolicy(run, mustParseCIDRs(t, cidrs))
+		if !apiequality.Semantic.DeepEqual(want.Spec, live.Spec) {
+			t.Fatalf("drifted policy did not converge to the rendered spec: %+v", live.Spec)
+		}
+	})
+
+	t.Run("created policy admits exactly the configured CIDRs", func(t *testing.T) {
+		run := installationLegacyRun("guard-content")
+		c := launcherClientForAdmission(t, admissionLaneWithCoordinator("local", 1), run)
+		launcher := installationLauncher(c, &fixedInstallationTokenMinter{token: "guard", expiresAt: now.Add(2 * time.Hour)}, now, plainExecutor{})
+		launcher.GitGuardEgressCIDRs = cidrs
+		if err := launcher.Launch(context.Background(), run); err != nil {
+			t.Fatalf("Launch: %v", err)
+		}
+		var live networkingv1.NetworkPolicy
+		getOrFail(t, c, client.ObjectKey{Namespace: run.Namespace, Name: topology.GitGuardNetworkPolicyName(run.Name)}, &live)
+		want := topology.GitGuardEgressPolicy(run, mustParseCIDRs(t, cidrs))
+		if !apiequality.Semantic.DeepEqual(want.Spec, live.Spec) {
+			t.Fatalf("created policy spec = %+v, want the rendered spec %+v", live.Spec, want.Spec)
+		}
+		if got := live.Labels["courier.misospace.dev/component"]; got != topology.ComponentCoordinator {
+			t.Fatalf("created policy component label = %q", got)
+		}
+	})
+}
+
+// runOwnerReferences is the controller OwnerReference the launcher's own
+// resources carry, so a test can seed a run-owned object.
+func runOwnerReferences(run *courierv1alpha1.CoderRun) []metav1.OwnerReference {
+	return []metav1.OwnerReference{{
+		APIVersion:         courierv1alpha1.GroupVersion.String(),
+		Kind:               "CoderRun",
+		Name:               run.Name,
+		UID:                run.UID,
+		Controller:         boolPtr(true),
+		BlockOwnerDeletion: boolPtr(true),
+	}}
+}
+
+func mustParseCIDRs(t *testing.T, raw []string) []*net.IPNet {
+	t.Helper()
+	parsed, err := topology.ParseGitGuardCIDRs(raw)
+	if err != nil {
+		t.Fatalf("ParseGitGuardCIDRs: %v", err)
+	}
+	return parsed
 }
 
 func TestLaunchInstallationGitSameRepo(t *testing.T) {

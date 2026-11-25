@@ -1645,6 +1645,43 @@ func TestValidateEvidenceFlags(t *testing.T) {
 	}
 }
 
+func TestParseGitGuardCIDRFlag(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		want    []string
+		wantErr string
+	}{
+		{name: "single", value: "140.82.112.0/20", want: []string{"140.82.112.0/20"}},
+		{name: "multiple with spaces", value: " 140.82.112.0/20, 185.199.108.0/22 ", want: []string{"140.82.112.0/20", "185.199.108.0/22"}},
+		{
+			name:  "host bits canonicalized",
+			value: "140.82.112.9/20",
+			want:  []string{"140.82.112.0/20"},
+		},
+		{name: "ipv6", value: "2606:50c0::/32", want: []string{"2606:50c0::/32"}},
+		{name: "malformed", value: "not-a-cidr", wantErr: "invalid --legacy-git-guard-egress-cidrs entry"},
+		{name: "empty entry", value: "10.0.0.0/8,,", wantErr: "invalid --legacy-git-guard-egress-cidrs entry"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseGitGuardCIDRFlag(test.value)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("parseGitGuardCIDRFlag(%q) error = %v, want it to contain %q", test.value, err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseGitGuardCIDRFlag(%q) error = %v, want nil", test.value, err)
+			}
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("parseGitGuardCIDRFlag(%q) = %v, want %v", test.value, got, test.want)
+			}
+		})
+	}
+}
+
 // stalledReader mimics an API server that accepts the connection but never
 // answers: every Get blocks until the caller's context ends.
 type stalledReader struct{ client.Reader }

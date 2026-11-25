@@ -4480,10 +4480,37 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   bypass it and open its own connection to the forge — and be refused
   unauthenticated, because the credential lives only inside the guard and
   the projected token the model container cannot reach; bypassing the guard
-  loses the operation, not merely the policy. Making bypass impossible
-  instead of useless needs deployment-level egress control that a
-  pod-scoped NetworkPolicy cannot express (a policy cannot distinguish
-  containers inside one pod), which remains deployment work, not core work.
+  loses the operation, not merely the policy. The deployment can tighten the
+  pod's whole egress surface by opting in per run: the pod-scoped
+  `GitGuardEgressPolicy` — provisioned by the launcher only when
+  `--legacy-git-guard-egress-cidrs` is set — admits exactly DNS, ingress
+  from the run's own pods (the reply path of a pod-originated connection),
+  and TCP 443 to the operator-pinned CIDRs, and refuses every other
+  destination and port while it selects the pod, so the guard's loopback
+  origin stays the only path git can work through. The pinned CIDR list
+  must cover every TCP-443 destination the pod needs — for example the
+  forge hosts, the model-provider endpoint, any other HTTPS endpoint the
+  deployment configures (MCP servers), and the kubernetes Service ClusterIP
+  (KUBERNETES_SERVICE_HOST) the guard and observer read the credentials
+  document through, with the API-server endpoint behind it admitted too,
+  because which of the two the fabric judges depends on the datapath — and
+  every other egress path is refused with it, including every non-443 one:
+  notably the evidence-intake POST, whose bundle is lost (logged, not
+  fatal) because the intake is plain HTTP on a port no CIDR admits. Under
+  identity-based CNIs such as Cilium the API server carries a reserved
+  identity that vanilla ipBlock rules cannot match (the secure broker's
+  CNI note), so there the guard's credential read and the observer's read
+  need a companion CNI policy in the coordinator pods' namespace. The
+  policy cannot distinguish containers inside one pod — the forge CIDR
+  must be admitted for the guard's own upstream TLS — so this boundary
+  reduces blast radius rather than refusing direct forge connections: a
+  compromised container could still open an unauthenticated forge
+  connection on 443, while outside the admitted list and DNS it can reach
+  nothing, and the CIDRs are operator configuration because the operator,
+  not the coordinator, decides which hosts are the forge. Egress rules of
+  policies selecting the same pod are unioned, so the deny is exact only
+  where this policy is the only policy selecting the pod. A deployment
+  that leaves the flag unset keeps the stated residual exactly as before.
   An explicitly configured forge-API token (`GitHubCredentialSecret`) stays
   outside this boundary by design: it never served the git transport the
   guard governs, the guard neither mints nor relays it, and its scope is the
