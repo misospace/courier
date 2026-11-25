@@ -895,6 +895,34 @@ func TestContributionDetailNamespaceMismatchRendersMismatch(t *testing.T) {
 	}
 }
 
+// TestContributionDetailClientPathNamespaceMismatch pins the composed
+// production path: the real status client rejects the pinned mismatch
+// before the handler re-check ever sees the body, and the wrapped
+// sentinel still maps to the dedicated message on the page.
+func TestContributionDetailClientPathNamespaceMismatch(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"run":"courier-3f2a","namespace":"elsewhere","phase":"Running","observedAt":"2026-11-20T09:00:00Z"}`))
+	}))
+	t.Cleanup(upstream.Close)
+	secrets := newTestSecrets(t)
+	client, err := newHTTPContributeStatusClient(upstream.URL, []byte("read-token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, base := newContributeServer(t, secrets, client)
+	httpClient := login(t, base, secrets.token)
+	resp, body := get(t, httpClient, base+"/contributions/courier-3f2a?namespace=home")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 with a state message", resp.StatusCode)
+	}
+	if !strings.Contains(body, "different namespace") {
+		t.Errorf("client-path namespace mismatch did not render the dedicated message:\n%s", body)
+	}
+	if strings.Contains(body, "Run identity") {
+		t.Errorf("client-path namespace mismatch rendered found-state sections:\n%s", body)
+	}
+}
+
 // TestContributionDetailStaleSnapshotLabelsReplay pins the stale labeling:
 // the page's own refresh cadence tops out at the 300-second backoff
 // interval, so a snapshot stamped more than contributeStatusStaleAfter
@@ -903,7 +931,7 @@ func TestContributionDetailNamespaceMismatchRendersMismatch(t *testing.T) {
 // the normal refresh interval, and history still recorded. A fresh or
 // future stamp renders no warning.
 func TestContributionDetailStaleSnapshotLabelsReplay(t *testing.T) {
-	const staleWarning = "more than 15 minutes old"
+	const staleWarning = "older than any refresh of this page can explain"
 	now := time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)
 	cases := []struct {
 		name       string

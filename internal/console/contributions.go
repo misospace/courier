@@ -499,7 +499,10 @@ func (s *Server) renderContributionStatus(w http.ResponseWriter, r *http.Request
 	// fields, an active refresh, or a history entry.
 	if !status.describes(run, namespace) {
 		data.State = "error"
-		if namespace != "" && status.Namespace != namespace {
+		// Same precedence as the client: the namespace mismatch is only
+		// the localized story when the run echo itself matched; a body
+		// wrong about both is just not a status for this page.
+		if status.Run == run && namespace != "" && status.Namespace != namespace {
 			data.ErrorMessage = contributeNamespaceMismatchMessage
 		} else {
 			data.ErrorMessage = contributeUnexpectedMessage

@@ -7,7 +7,7 @@
     {{if .PhaseAge}}In this phase for about {{.PhaseAge}}.{{end}}
   </p>
   {{if .Stale}}
-  <p class="state state-warn">This snapshot's read timestamp is more than 15 minutes old. The status may have been replayed from a cache, or a clock is wrong.</p>
+  <p class="state state-warn">This snapshot's read timestamp is older than any refresh of this page can explain. The status may have been replayed from a cache upstream, or a clock is wrong.</p>
   {{end}}
   <p><span class="{{.PhaseClass}}">{{.PhaseLabel}}</span></p>
   {{if .Status.CIParked}}
