@@ -423,7 +423,10 @@ operatorConsole:
     #    listener as the contribution admission API, GET
     #    /v1/contributions/<run>, served by the manager when
     #    contributeAPI.readKeySecret is set. url and tokenSecret must be set
-    #    together; both empty leaves the status view off.
+    #    together; both empty leaves the status view off. A url additionally
+    #    requires the manager to serve status reads: contributeAPI.enabled
+    #    with contributeAPI.readKeySecret, or a raw --contribute-read-key-secret
+    #    manager arg.
     url: ""
     # -- Name of a Secret in the release namespace whose tokenSecretKey entry
     #    holds the contribution status-read bearer token; the entry is

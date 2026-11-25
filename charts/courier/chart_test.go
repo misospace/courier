@@ -3456,8 +3456,10 @@ func TestChartRendersConsoleContributeForm(t *testing.T) {
 // wiring: operatorConsole.contributeStatus.url and tokenSecret inject
 // --contribute-status-url and --contribute-status-token-file and mount the
 // Secret in BOTH auth modes — the status view is mode-independent — while
-// half a pair fails the render, raw args win over the values-derived flags
-// and still count toward the pair guard in both spellings.
+// half a pair fails the render, a URL whose manager serves no status reads
+// (no contributeAPI.readKeySecret and no raw --contribute-read-key-secret
+// manager arg) fails the render, and raw args win over the values-derived
+// flags and still count toward the pair guard in both spellings.
 func TestChartOperatorConsoleContributeStatus(t *testing.T) {
 	if _, err := exec.LookPath("helm"); err != nil {
 		t.Skip("helm is not installed")
@@ -3474,10 +3476,17 @@ func TestChartOperatorConsoleContributeStatus(t *testing.T) {
 		}
 	}
 
-	configured := []string{
+	// The manager serves status reads only when it was given a read key,
+	// so every render that points the console at the status URL enables it.
+	statusReadKey := []string{
+		"--set", "contributeAPI.enabled=true",
+		"--set", "contributeAPI.keySecret=contribute-admission-key",
+		"--set", "contributeAPI.readKeySecret=contribute-read-key",
+	}
+	configured := append([]string{
 		"--set", "operatorConsole.contributeStatus.url=http://courier-contribute-api",
 		"--set", "operatorConsole.contributeStatus.tokenSecret=contribute-status-token",
-	}
+	}, statusReadKey...)
 	enabled := runHelm(t, chartDir, operatorConsoleRenderArgs(configured...)...)
 	for _, want := range []string{
 		"--contribute-status-url=http://courier-contribute-api",
@@ -3519,10 +3528,10 @@ func TestChartOperatorConsoleContributeStatus(t *testing.T) {
 		t.Fatal("raw contribution status URL override dropped the values-derived token-file flag")
 	}
 
-	rawURLWithValuesToken := runHelm(t, chartDir, operatorConsoleRenderArgs(
+	rawURLWithValuesToken := runHelm(t, chartDir, operatorConsoleRenderArgs(append(statusReadKey,
 		"--set", "operatorConsole.contributeStatus.tokenSecret=contribute-status-token",
 		"--set-string", "controllers.console.containers.console.args[0]=--contribute-status-url=http://operator-override",
-	)...)
+	)...)...)
 	if !strings.Contains(rawURLWithValuesToken, "--contribute-status-url=http://operator-override") || strings.Contains(rawURLWithValuesToken, "--contribute-status-url=http://courier-contribute-api") {
 		t.Fatal("raw contribution status URL plus values token did not render as a complete effective pair")
 	}
@@ -3567,11 +3576,11 @@ func TestChartOperatorConsoleContributeStatus(t *testing.T) {
 		t.Fatalf("bare raw URL without token error = %v, want effective-pair message:\n%s", err, out)
 	}
 
-	bareWithValue := runHelm(t, chartDir, operatorConsoleRenderArgs(
+	bareWithValue := runHelm(t, chartDir, operatorConsoleRenderArgs(append(statusReadKey,
 		"--set", "operatorConsole.contributeStatus.tokenSecret=contribute-status-token",
 		"--set-string", "controllers.console.containers.console.args[0]=--contribute-status-url",
 		"--set-string", "controllers.console.containers.console.args[1]=http://operator-override",
-	)...)
+	)...)...)
 	if !strings.Contains(bareWithValue, "--contribute-status-token-file=/etc/courier/console/contribute-status-token") {
 		t.Fatal("bare raw URL with a values token did not render the canonical token-file flag")
 	}
@@ -3617,11 +3626,11 @@ func TestChartOperatorConsoleContributeStatus(t *testing.T) {
 	// A raw token-file arg naming the canonical path survives alongside
 	// tokenSecret without a duplicated flag, and the rendered Deployment and
 	// argv agree: the arg's path is exactly the mount path.
-	rawArgWithSecret := runHelm(t, chartDir, operatorConsoleRenderArgs(
+	rawArgWithSecret := runHelm(t, chartDir, operatorConsoleRenderArgs(append(statusReadKey,
 		"--set", "operatorConsole.contributeStatus.url=http://courier-contribute-api",
 		"--set", "operatorConsole.contributeStatus.tokenSecret=contribute-status-token",
 		"--set-string", "controllers.console.containers.console.args[0]=--contribute-status-token-file=/etc/courier/console/contribute-status-token",
-	)...)
+	)...)...)
 	rawArgDeployment := findDocument(t, rawArgWithSecret, "kind: Deployment", "name: courier-console")
 	if strings.Count(rawArgDeployment, "--contribute-status-token-file=") != 1 {
 		t.Fatalf("raw canonical token-file arg did not suppress the values-derived flag:\n%s", rawArgDeployment)
@@ -3649,6 +3658,78 @@ func TestChartOperatorConsoleContributeStatus(t *testing.T) {
 	if err == nil || !strings.Contains(out, "operatorConsole.contributeStatus.tokenSecretKey must name a Secret entry") {
 		t.Fatalf("empty tokenSecretKey render error = %v, want the empty-entry guard:\n%s", err, out)
 	}
+
+	// The manager answers GET /v1/contributions/<run> only when it was
+	// given a read key, so a complete console-side pair whose manager has
+	// no read key must fail the render. Both effective-URL spellings share
+	// the dedicated guard.
+	out, err = runHelmOutput(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.contributeStatus.url=http://courier-contribute-api",
+		"--set", "operatorConsole.contributeStatus.tokenSecret=contribute-status-token",
+	)...)
+	if err == nil || !strings.Contains(out, "operatorConsole.contributeStatus.url requires a manager read key") || !strings.Contains(out, "contributeAPI.readKeySecret") {
+		t.Fatalf("status pair without a manager read key render error = %v, want the read-key guard:\n%s", err, out)
+	}
+
+	out, err = runHelmOutput(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.contributeStatus.tokenSecret=contribute-status-token",
+		"--set-string", "controllers.console.containers.console.args[0]=--contribute-status-url=http://operator-override",
+	)...)
+	if err == nil || !strings.Contains(out, "operatorConsole.contributeStatus.url requires a manager read key") {
+		t.Fatalf("raw status URL without a manager read key render error = %v, want the read-key guard:\n%s", err, out)
+	}
+
+	// contributeAPI.enabled with its readKeySecret satisfies the guard and
+	// renders the manager flag alongside the console-side pair.
+	readKeyEnabled := runHelm(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.contributeStatus.url=http://courier-contribute-api",
+		"--set", "operatorConsole.contributeStatus.tokenSecret=contribute-status-token",
+		"--set", "contributeAPI.enabled=true",
+		"--set", "contributeAPI.keySecret=contribute-admission-key",
+		"--set", "contributeAPI.readKeySecret=contribute-read-key",
+	)...)
+	if !strings.Contains(readKeyEnabled, "--contribute-read-key-secret=contribute-read-key") {
+		t.Fatalf("values-pair render with the read key enabled is missing the manager flag:\n%s", readKeyEnabled)
+	}
+
+	// A raw main-controller read-key arg satisfies the guard even with
+	// contributeAPI off, in both spellings, because the chart's own scan
+	// of the manager args runs regardless of contributeAPI.enabled.
+	rawReadKey := runHelm(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.contributeStatus.tokenSecret=contribute-status-token",
+		"--set-string", "controllers.console.containers.console.args[0]=--contribute-status-url=http://operator-override",
+		"--set-string", "controllers.console.containers.console.args[1]=--contribute-status-token-file=/etc/courier/console/contribute-status-token",
+		"--set-string", "controllers.main.containers.main.args[0]=--contribute-read-key-secret=courier-read-key",
+	)...)
+	if !strings.Contains(rawReadKey, "--contribute-read-key-secret=courier-read-key") || !strings.Contains(rawReadKey, "--contribute-status-url=http://operator-override") {
+		t.Fatalf("raw status pair with a raw main read-key arg did not render:\n%s", rawReadKey)
+	}
+
+	bareRawReadKey := runHelm(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.contributeStatus.tokenSecret=contribute-status-token",
+		"--set-string", "controllers.console.containers.console.args[0]=--contribute-status-url=http://operator-override",
+		"--set-string", "controllers.console.containers.console.args[1]=--contribute-status-token-file=/etc/courier/console/contribute-status-token",
+		"--set-string", "controllers.main.containers.main.args[0]=--contribute-read-key-secret",
+		"--set-string", "controllers.main.containers.main.args[1]=courier-read-key",
+	)...)
+	if !strings.Contains(bareRawReadKey, "--contribute-status-url=http://operator-override") {
+		t.Fatalf("bare raw main read-key arg did not satisfy the guard:\n%s", bareRawReadKey)
+	}
+
+	// An explicit empty value is not a read key, and a dash-prefixed next
+	// arg is not a value for the bare spelling.
+	out, err = runHelmOutput(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.contributeStatus.url=http://courier-contribute-api",
+		"--set", "operatorConsole.contributeStatus.tokenSecret=contribute-status-token",
+		"--set-string", "controllers.main.containers.main.args[0]=--contribute-read-key-secret=",
+	)...)
+	if err == nil || !strings.Contains(out, "operatorConsole.contributeStatus.url requires a manager read key") {
+		t.Fatalf("explicitly empty raw read-key arg render error = %v, want the read-key guard:\n%s", err, out)
+	}
+
+	// The read-key requirement never fires while the status view is off:
+	// the plain render above contains no contribution status flags and no
+	// manager read key.
 }
 
 // TestChartOperatorConsoleReadAPIToken covers the read API bearer-token

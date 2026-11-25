@@ -734,6 +734,24 @@ path instead of rendering an unstartable pairing. */}}
 {{- if and $consoleContributeStatusValues.tokenSecret (hasKey $consoleContributeStatusValues "tokenSecretKey") (empty $consoleContributeStatusValues.tokenSecretKey) }}
 {{- fail "operatorConsole.contributeStatus.tokenSecretKey must name a Secret entry when tokenSecret is set" }}
 {{- end }}
+{{- /* The read key lives on the main controller, not the console, and the
+  status listener only serves GET /v1/contributions/<run> when it was given
+  one, so pointing the console at the status URL without a read key would
+  render a console that can only ever fail its status reads. The scan runs
+  over the manager args whether or not contributeAPI.enabled settled the
+  flags above, so the raw-arg path cannot bypass the guard; both spellings
+  count and an explicit empty value does not. */}}
+{{- if not (empty $effectiveContributeStatusURL) }}
+{{- $mainArgCount := len $args }}
+{{- $servesContributeStatusReads := and $contributeAPI.enabled (not (empty $contributeAPI.readKeySecret)) }}
+{{- range $i, $arg := $args }}
+{{- if and (hasPrefix "--contribute-read-key-secret=" $arg) (ne (trimPrefix "--contribute-read-key-secret=" $arg) "") }}{{- $servesContributeStatusReads = true }}{{- end }}
+{{- if and (eq $arg "--contribute-read-key-secret") (lt (add1 $i) $mainArgCount) (not (hasPrefix "-" (index $args (add1 $i)))) (ne (index $args (add1 $i)) "") }}{{- $servesContributeStatusReads = true }}{{- end }}
+{{- end }}
+{{- if not $servesContributeStatusReads }}
+{{- fail "operatorConsole.contributeStatus.url requires a manager read key (contributeAPI.enabled with contributeAPI.readKeySecret, or a raw --contribute-read-key-secret manager arg): the contribution listener only serves status reads when a read key is configured" }}
+{{- end }}
+{{- end }}
 {{- if and $consoleContributeStatusValues.url (not $hasConsoleContributeStatusURL) }}{{- $consoleArgs = append $consoleArgs (printf "--contribute-status-url=%s" $consoleContributeStatusValues.url) }}{{- end }}
 {{- if and $consoleContributeStatusValues.tokenSecret (not $hasConsoleContributeStatusTokenFile) }}{{- $consoleArgs = append $consoleArgs "--contribute-status-token-file=/etc/courier/console/contribute-status-token" }}{{- end }}
 {{- if and $operatorConsole.readAPITokenSecret (not $hasConsoleReadAPITokenFile) }}
