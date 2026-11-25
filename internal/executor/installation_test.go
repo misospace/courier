@@ -169,7 +169,7 @@ func TestBuildCoordinatorPodInstallationGitUsesGuardService(t *testing.T) {
 }
 
 func TestGitGuardPodNameValidityAndUniqueness(t *testing.T) {
-	names := []string{"simple", "name.with.dots", strings.Repeat("a", 80), "-leading", "trailing-", "a." + strings.Repeat("b", 70)}
+	names := []string{"simple", "name.with.dots", strings.Repeat("a", 80), "-leading", "trailing-", "a." + strings.Repeat("b", 70), "9digits", "9" + strings.Repeat("a", 70), strings.Repeat("a", 43) + "." + strings.Repeat("b", 40)}
 	seen := map[string]bool{}
 	for _, runName := range names {
 		name := GitGuardPodName(runName)
@@ -185,6 +185,12 @@ func TestGitGuardPodNameValidityAndUniqueness(t *testing.T) {
 			t.Fatalf("duplicate guard pod name %q", name)
 		}
 		seen[name] = true
+	}
+	if got, want := GitGuardPodName("9digits"), "r9digits-git-guard"; got != want {
+		t.Fatalf("GitGuardPodName(\"9digits\") = %q, want %q", got, want)
+	}
+	if got, want := GitGuardPodName("simple"), "simple-git-guard"; got != want {
+		t.Fatalf("GitGuardPodName(\"simple\") = %q, want %q", got, want)
 	}
 }
 

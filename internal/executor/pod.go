@@ -530,18 +530,25 @@ func toKubernetesEnv(values []EnvVar) []corev1.EnvVar {
 // name is truncated and digest-suffixed with a digest of the full run name,
 // the way the coordinator pod's name is bounded, so distinct run names stay
 // distinct and the launcher's create-or-verify address stays stable per run.
+// The label is also anchored to the RFC-1035 letter-first rule
+// GitGuardServiceName enforces: a DNS-1123 label admits a leading digit, but
+// the guard pod keeps the stricter scheme its Service already follows, so a
+// run name that does not begin with a lowercase letter is prefixed with an
+// "r" (or an "r"-anchored digest prefix when truncation applies) and the
+// derived name always satisfies both label schemes.
 func GitGuardPodName(runName string) string {
-	base := strings.Trim(strings.ToLower(runName), "-")
+	base := strings.ReplaceAll(strings.Trim(strings.ToLower(runName), "-."), ".", "-")
 	const suffix = "-git-guard"
+	if base == "" {
+		base = "run"
+	} else if base[0] < 'a' || base[0] > 'z' {
+		base = "r" + base
+	}
 	maxBase := 63 - len(suffix)
 	if len(base) > maxBase {
 		digest := sha256.Sum256([]byte(runName))
 		hash := hex.EncodeToString(digest[:])[:8]
-		prefix := base[:maxBase-len(hash)-1]
-		prefix = strings.ReplaceAll(prefix, ".", "-")
-		base = strings.TrimRight(prefix, "-") + "-" + hash
-	} else {
-		base = strings.ReplaceAll(base, ".", "-")
+		base = strings.TrimRight(base[:maxBase-len(hash)-1], "-") + "-" + hash
 	}
 	return base + suffix
 }
