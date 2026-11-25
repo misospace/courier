@@ -1247,3 +1247,54 @@ func TestContributeBlockedAbandonThenNewContent(t *testing.T) {
 		t.Fatalf("post-abandon keys = %v; want a fresh key for the new content", keys)
 	}
 }
+
+// TestContributeStatusLinkValidatesAdmissionResponse pins that the success
+// page's status link ships only destinations the console's own request
+// validators would later accept: an admission response naming an
+// impossible run renders no link at all, and a response namespace the
+// validators reject (a blank space, say) drops the pin but keeps the link,
+// because an unpinned read still resolves through the endpoint's canonical
+// echo. The stale pinned-namespace deep link those values used to produce
+// would land on the static invalid page — or, for the whitespace pin, be
+// trimmed to unpinned at the destination, silently abandoning the pin the
+// page claims to carry.
+func TestContributeStatusLinkValidatesAdmissionResponse(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		response string
+		prefix   string // expected link prefix, empty means no link at all
+	}{
+		{"hostile run", `{"run":"Bad Run!","namespace":"courier","workItemId":"i"}`, ""},
+		{"blank namespace", `{"run":"courier-3f2a","namespace":" ","workItemId":"i"}`, `href="/contributions/courier-3f2a"`},
+		{"healthy", `{"run":"courier-3f2a","namespace":"courier","workItemId":"i"}`, `href="/contributions/courier-3f2a?namespace=courier"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			admission := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusCreated)
+				_, _ = w.Write([]byte(tc.response))
+			}))
+			t.Cleanup(admission.Close)
+			server, base, client := newContributionTestServer(t, admission.URL, time.Second)
+			server.contributions = &fakeContributeStatus{}
+			_, page := get(t, client, base+"/contribute")
+			csrf := findCSRFToken(t, page)
+			_, page = postContribution(t, client, base, csrf, contributionValues("goal"))
+			if !strings.Contains(page, "A run was created") {
+				t.Fatalf("submission did not succeed:\n%s", page)
+			}
+			if tc.prefix == "" {
+				if strings.Contains(page, `href="/contributions/`) {
+					t.Fatalf("impossible admission response shipped a status link:\n%s", page)
+				}
+				return
+			}
+			if !strings.Contains(page, tc.prefix) {
+				t.Fatalf("success page missing the expected status link %q:\n%s", tc.prefix, page)
+			}
+			if tc.name == "blank namespace" && strings.Contains(page, "?namespace=") {
+				t.Fatalf("rejected namespace should drop the pin, not forge it:\n%s", page)
+			}
+		})
+	}
+}
