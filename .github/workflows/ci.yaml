@@ -586,6 +586,7 @@ jobs:
         run: |
           GOBIN="$RUNNER_TEMP" go install github.com/google/go-licenses/v2@v2.0.1
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$RUNNER_TEMP/go-licenses" report ./cmd/... > "$RUNNER_TEMP/go-licenses.csv"
+          python3 hack/check-go-license-report.py "$RUNNER_TEMP/go-licenses.csv"
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: courier-source-and-go-licenses

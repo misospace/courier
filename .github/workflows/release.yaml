@@ -60,6 +60,12 @@ jobs:
           go-version: "1.27.4"
           cache: true
 
+      - name: Check linked Go dependency licenses
+        run: |
+          GOBIN="$RUNNER_TEMP" go install github.com/google/go-licenses/v2@v2.0.1
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$RUNNER_TEMP/go-licenses" report ./cmd/... > "$RUNNER_TEMP/go-licenses.csv"
+          python3 hack/check-go-license-report.py "$RUNNER_TEMP/go-licenses.csv"
+
       - name: Publish exact corresponding source before images
         env:
           GH_TOKEN: ${{ github.token }}
@@ -67,6 +73,12 @@ jobs:
           revision=$(git rev-parse HEAD)
           asset="courier-source-$revision.tar.gz"
           bash hack/package-corresponding-source.sh "$RUNNER_TEMP/$asset"
+          for attempt in {1..12}; do
+            if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 5
+          done
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -Fxq "$asset"; then
             mkdir -p "$RUNNER_TEMP/existing-source"
