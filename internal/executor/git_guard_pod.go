@@ -79,10 +79,13 @@ func BuildGitGuardPod(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.LaneP
 			OwnerReferences: []metav1.OwnerReference{{APIVersion: courierv1alpha1.GroupVersion.String(), Kind: "CoderRun", Name: run.Name, UID: run.UID, Controller: &controller, BlockOwnerDeletion: &controller}},
 		},
 		Spec: corev1.PodSpec{
-			ServiceAccountName: name, AutomountServiceAccountToken: boolPtr(false), RestartPolicy: corev1.RestartPolicyAlways,
-			SecurityContext: &corev1.PodSecurityContext{RunAsNonRoot: boolPtr(true), RunAsUser: int64Ptr(CoordinatorUID), RunAsGroup: int64Ptr(CoordinatorGID), FSGroup: int64Ptr(CoordinatorGID), SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}},
-			Volumes:         []corev1.Volume{gitCredentialsTokenVolume()},
-			Containers:      []corev1.Container{guardContainer},
+			ServiceAccountName:           name,
+			AutomountServiceAccountToken: boolPtr(false),
+			RuntimeClassName:             stringPtr(nonEmpty(config.RuntimeClassName)),
+			RestartPolicy:                corev1.RestartPolicyAlways,
+			SecurityContext:              &corev1.PodSecurityContext{RunAsNonRoot: boolPtr(true), RunAsUser: int64Ptr(CoordinatorUID), RunAsGroup: int64Ptr(CoordinatorGID), FSGroup: int64Ptr(CoordinatorGID), SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}},
+			Volumes:                      []corev1.Volume{gitCredentialsTokenVolume()},
+			Containers:                   []corev1.Container{guardContainer},
 		},
 	}, nil
 }

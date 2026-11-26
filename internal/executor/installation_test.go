@@ -227,6 +227,17 @@ func TestBuildGitGuardPod(t *testing.T) {
 	if pod.Name != GitGuardPodName(run.Name) || pod.Spec.ServiceAccountName != GitCredentialsServiceAccountName(run.Name) || pod.Spec.RestartPolicy != corev1.RestartPolicyAlways || pod.Spec.Containers[0].RestartPolicy != nil {
 		t.Fatalf("guard pod identity/spec: %+v", pod)
 	}
+	if pod.Spec.RuntimeClassName != nil {
+		t.Fatalf("unset runtime class rendered %q on the guard pod", *pod.Spec.RuntimeClassName)
+	}
+	config.RuntimeClassName = "kata"
+	pod, err = BuildGitGuardPod(run, installationTestLane(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pod.Spec.RuntimeClassName == nil || *pod.Spec.RuntimeClassName != "kata" {
+		t.Fatalf("runtime class = %v, want the coordinator pod's kata sandbox", pod.Spec.RuntimeClassName)
+	}
 	if len(pod.Spec.Containers) != 1 || pod.Spec.Containers[0].Name != GitEgressContainerName {
 		t.Fatalf("guard containers=%+v", pod.Spec.Containers)
 	}
