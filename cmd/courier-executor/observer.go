@@ -36,16 +36,11 @@ func observerMode(ctx context.Context, seed bool) error {
 		BaseBranch: os.Getenv("COURIER_BASE"), BaseRemoteURL: os.Getenv("COURIER_BASE_REPO_URL"),
 		Username: os.Getenv("COURIER_GIT_USERNAME"), Token: os.Getenv("COURIER_GIT_TOKEN"),
 	}
-	if _, ok := os.LookupEnv(executor.EnvGitInstallation); ok {
-		if os.Getenv(executor.EnvGitInstallation) != "1" {
-			return errors.New("observer: installation git credential mode is invalid")
-		}
-		provider, err := observerInstallationCredentials(os.Getenv)
-		if err != nil {
-			return err
-		}
-		options.Credentials = provider
+	provider, err := observerCredentials(os.LookupEnv, os.Getenv)
+	if err != nil {
+		return err
 	}
+	options.Credentials = provider
 	baselineFile := filepath.Join(private, "baseline")
 	if seed {
 		operation, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -123,6 +118,20 @@ func observerMode(ctx context.Context, seed bool) error {
 		return errors.New("observer: evidence exceeds termination budget")
 	}
 	return os.WriteFile(os.Getenv("COURIER_TERMINATION_FILE"), data, 0600)
+}
+
+func observerCredentials(lookupEnv func(string) (string, bool), getenv func(string) string) (func(context.Context, string) (string, string, error), error) {
+	if _, ok := lookupEnv(executor.EnvGitInstallation); !ok {
+		return nil, nil
+	}
+	if getenv(executor.EnvGitInstallation) != "1" {
+		return nil, errors.New("observer: installation git credential mode is invalid")
+	}
+	provider, err := observerInstallationCredentials(getenv)
+	if err != nil {
+		return nil, err
+	}
+	return provider, nil
 }
 
 // observerInstallationCredentials builds the App-mode credential provider for

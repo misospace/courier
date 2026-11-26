@@ -1660,8 +1660,8 @@ func TestParseGitGuardCIDRFlag(t *testing.T) {
 			want:  []string{"140.82.112.0/20"},
 		},
 		{name: "ipv6", value: "2606:50c0::/32", want: []string{"2606:50c0::/32"}},
-		{name: "malformed", value: "not-a-cidr", wantErr: "invalid --legacy-git-guard-egress-cidrs entry"},
-		{name: "empty entry", value: "10.0.0.0/8,,", wantErr: "invalid --legacy-git-guard-egress-cidrs entry"},
+		{name: "malformed", value: "not-a-cidr", wantErr: "invalid --git-guard-forge-cidrs entry"},
+		{name: "empty entry", value: "10.0.0.0/8,,", wantErr: "invalid --git-guard-forge-cidrs entry"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

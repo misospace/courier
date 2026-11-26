@@ -15,7 +15,7 @@ func gitEgressEnv(values map[string]string) func(string) string {
 
 func validGitEgressEnv() map[string]string {
 	return map[string]string{
-		executor.EnvGitEgressAddress:     executor.GitEgressAddress,
+		executor.EnvGitEgressAddress:     executor.GitGuardListenAddress,
 		executor.EnvInstallationOwner:    "acme",
 		executor.EnvInstallationEndpoint: "https://api.github.com/",
 		executor.EnvInstallationSecret:   "run-creds",

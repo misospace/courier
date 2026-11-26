@@ -10,6 +10,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -335,30 +336,23 @@ func legacyInstallationDocumentCovers(document topology.InstallationTokenDocumen
 }
 
 // ensureLegacyGitCredentialsResources provisions the run-scoped identity the
-// App-mode pod's git egress guard reads its credentials Secret with: a
-// ServiceAccount (only when the isolated observer is not already the pod's
-// identity), a Role granting exactly one get on the run's credentials Secret,
-// and a RoleBinding of that Role to the pod's effective ServiceAccount. The
-// projected token that carries this identity is mounted only in the guard
-// container (#902): the model container holds neither the credential nor a
-// means to read it. All three are ensured and ownership-verified before the
-// coordinator pod can begin execution, with the same fail-closed
-// reuse-or-refuse semantics as the observer's identity.
+// per-run git-guard pod reads the run's credentials Secret with (#902, #919):
+// a ServiceAccount, a Role granting exactly one get on the run's credentials
+// Secret, and a RoleBinding binding that Role only to the guard identity.
+// Neither coordinator nor observer can read the Secret. All three are ensured
+// and ownership-verified before either pod can begin execution.
 func (l *CoordinatorLauncher) ensureLegacyGitCredentialsResources(ctx context.Context, run *courierv1alpha1.CoderRun, pod *corev1.Pod) error {
 	name := legacyGitCredentialsResourceName(run.Name)
-	effective := name
-	if pod.Annotations[executor.ObserverContractAnnotation] == executor.ObserverContractVersion {
-		// The isolated observer already put its run-scoped ServiceAccount on
-		// the pod; the credential grant binds to that same identity rather
-		// than introducing a second one the pod never uses.
-		effective = legacyObserverResourceName(run.Name)
-	} else {
-		if err := l.ensureObserverObject(ctx, run.UID, &corev1.ServiceAccount{
-			ObjectMeta:                   metav1.ObjectMeta{Namespace: run.Namespace, Name: name, OwnerReferences: l.observerOwner(run)},
-			AutomountServiceAccountToken: boolPtr(false),
-		}); err != nil {
-			return err
-		}
+	// The guard pod always projects this identity, and a non-observer
+	// coordinator pod runs under it: the ServiceAccount must exist before
+	// either pod is admitted, or the API server refuses the pod outright.
+	if err := l.ensureObserverObject(ctx, run.UID, &corev1.ServiceAccount{
+		ObjectMeta:                   metav1.ObjectMeta{Namespace: run.Namespace, Name: name, OwnerReferences: l.observerOwner(run)},
+		AutomountServiceAccountToken: boolPtr(false),
+	}); err != nil {
+		return err
+	}
+	if pod.Annotations[executor.ObserverContractAnnotation] != executor.ObserverContractVersion {
 		// The identity must be on the pod before it is created; setting it
 		// afterwards would not persist, and the credential helper would read
 		// the namespace default ServiceAccount with no access to the Secret.
@@ -368,11 +362,31 @@ func (l *CoordinatorLauncher) ensureLegacyGitCredentialsResources(ctx context.Co
 	if err := l.ensureObserverObject(ctx, run.UID, role); err != nil {
 		return err
 	}
-	return l.ensureObserverObject(ctx, run.UID, &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: name, OwnerReferences: l.observerOwner(run)}, RoleRef: rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: name}, Subjects: []rbacv1.Subject{{Kind: rbacv1.ServiceAccountKind, Name: effective, Namespace: run.Namespace}}})
+	binding := &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: name, OwnerReferences: l.observerOwner(run)}, RoleRef: rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: name}, Subjects: []rbacv1.Subject{{Kind: rbacv1.ServiceAccountKind, Name: name, Namespace: run.Namespace}}}
+	if err := l.Client.Create(ctx, binding); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+		actual := &rbacv1.RoleBinding{}
+		if err := l.collisionReader().Get(ctx, client.ObjectKeyFromObject(binding), actual); err != nil {
+			return err
+		}
+		if !metav1.IsControlledBy(actual, run) {
+			return secureNeedsHuman("ObserverResourceOwnership", "RoleBinding %q is not controlled by this run", binding.Name)
+		}
+		if !apiequality.Semantic.DeepEqual(actual.Subjects, binding.Subjects) {
+			updated := actual.DeepCopy()
+			updated.Subjects = binding.Subjects
+			if err := l.Client.Update(ctx, updated); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func legacyGitCredentialsResourceName(runName string) string {
-	return "courier-gitcreds-" + executor.RunLabelValue(runName)
+	return executor.GitCredentialsServiceAccountName(runName)
 }
 
 // EnsureInstallationToken maintains the App-mode legacy run's installation-

@@ -75,12 +75,7 @@ func (r *CoderRunReconciler) reapTerminal(ctx context.Context, run *courierv1alp
 	if !ok {
 		// First eligible observation, or an unreadable marker: start (or
 		// restart) the retention window and never delete on the same pass.
-		before := run.DeepCopy()
-		if run.Annotations == nil {
-			run.Annotations = map[string]string{}
-		}
-		run.Annotations[marker] = now.UTC().Format(time.RFC3339)
-		if err := r.Patch(ctx, run, client.MergeFrom(before)); err != nil {
+		if err := r.stampReapMarker(ctx, run, marker); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: retention}, nil
@@ -293,6 +288,22 @@ func reapMarker(run *courierv1alpha1.CoderRun, marker string) (time.Time, bool) 
 		return time.Time{}, false
 	}
 	return at, true
+}
+
+// stampReapMarker records the durable per-phase retention marker on the run,
+// patching only the annotation and mirroring it into the caller's snapshot so
+// a same-pass reaper reads the window as started. Callers stamp at the first
+// observation whose marker is missing or malformed — a corrupt value is reset
+// the same way a missing one is — including paths, like a reap held on
+// unfinished guard teardown, that must not re-present the work the marker
+// stands for on every retry pass.
+func (r *CoderRunReconciler) stampReapMarker(ctx context.Context, run *courierv1alpha1.CoderRun, marker string) error {
+	before := run.DeepCopy()
+	if run.Annotations == nil {
+		run.Annotations = map[string]string{}
+	}
+	run.Annotations[marker] = r.clock().UTC().Format(time.RFC3339)
+	return r.Patch(ctx, run, client.MergeFrom(before))
 }
 
 // doneAtMarker parses the durable Done marker, preserving the original helper

@@ -9,7 +9,6 @@ rules:
   resources:
   - configmaps
   - serviceaccounts
-  - services
   verbs:
   - create
   - delete
@@ -42,6 +41,7 @@ rules:
   - ""
   resources:
   - secrets
+  - services
   verbs:
   - create
   - delete
@@ -107,10 +107,19 @@ rules:
   - rbac.authorization.k8s.io
   resources:
   - clusterrolebindings
-  - rolebindings
   - roles
   verbs:
   - create
   - delete
   - get
   - list
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - rolebindings
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - update

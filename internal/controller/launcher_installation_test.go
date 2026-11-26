@@ -139,33 +139,40 @@ func TestLaunchGitGuardPolicyLifecycle(t *testing.T) {
 		}})
 		launcher := installationLauncher(c, &fixedInstallationTokenMinter{token: "guard", expiresAt: now.Add(2 * time.Hour)}, now, plainExecutor{})
 		launcher.GitGuardEgressCIDRs = cidrs
+		launcher.GitGuardKubernetesAPIIP = "10.96.0.1"
 		if err := launcher.Launch(context.Background(), run); err != nil {
 			t.Fatalf("Launch: %v", err)
 		}
-		policyPosition, podPosition := -1, -1
+		positions := map[string]int{}
 		for i, obj := range created {
-			switch obj.(type) {
+			switch resource := obj.(type) {
 			case *networkingv1.NetworkPolicy:
-				policyPosition = i
+				positions["policy/"+resource.Name] = i
+			case *corev1.Service:
+				positions["service/"+resource.Name] = i
 			case *corev1.Pod:
-				podPosition = i
+				positions["pod/"+resource.Name] = i
 			}
 		}
-		if policyPosition < 0 || podPosition < 0 || policyPosition >= podPosition {
-			t.Fatalf("create order = %T sequence %v, policy position %d pod position %d", created, created, policyPosition, podPosition)
+		ordered := []string{"policy/" + topology.GitGuardNetworkPolicyName(run.Name), "policy/" + topology.GitGuardPodNetworkPolicyName(run.Name), "service/" + executor.GitGuardServiceName(run.Name), "pod/" + executor.GitGuardPodName(run.Name), "pod/" + run.Name + "-coordinator"}
+		for i, name := range ordered {
+			position, exists := positions[name]
+			if !exists || (i > 0 && positions[ordered[i-1]] >= position) {
+				t.Fatalf("create order violates %v: positions=%v", ordered, positions)
+			}
 		}
 	})
 
 	t.Run("flag requires App-mode before pod create", func(t *testing.T) {
 		run := installationLegacyRun("guard-static")
 		c := launcherClientForAdmission(t, admissionLaneWithCoordinator("local", 1), run)
-		launcher := &CoordinatorLauncher{Client: c, APIReader: c, Pod: executor.PodConfig{Image: "example/coordinator:test"}, Executor: plainExecutor{}, GitGuardEgressCIDRs: cidrs}
+		launcher := &CoordinatorLauncher{Client: c, APIReader: c, Pod: executor.PodConfig{Image: "example/coordinator:test"}, Executor: plainExecutor{}, GitGuardEgressCIDRs: cidrs, GitGuardKubernetesAPIIP: "10.96.0.1"}
 		err := launcher.Launch(context.Background(), run)
 		expectNeedsHumanReason(t, err, "GitGuardPolicyApp")
 		expectAbsent(t, c, client.ObjectKey{Namespace: run.Namespace, Name: run.Name + "-coordinator"}, &corev1.Pod{})
 	})
 
-	t.Run("unset flag creates no policy", func(t *testing.T) {
+	t.Run("unset flag creates guard ingress policy only", func(t *testing.T) {
 		run := installationLegacyRun("guard-disabled")
 		c := launcherClientForAdmission(t, admissionLaneWithCoordinator("local", 1), run)
 		launcher := installationLauncher(c, &fixedInstallationTokenMinter{token: "guard", expiresAt: now.Add(2 * time.Hour)}, now, plainExecutor{})
@@ -173,6 +180,11 @@ func TestLaunchGitGuardPolicyLifecycle(t *testing.T) {
 			t.Fatalf("Launch: %v", err)
 		}
 		expectAbsent(t, c, client.ObjectKey{Namespace: run.Namespace, Name: topology.GitGuardNetworkPolicyName(run.Name)}, &networkingv1.NetworkPolicy{})
+		var policy networkingv1.NetworkPolicy
+		getOrFail(t, c, client.ObjectKey{Namespace: run.Namespace, Name: topology.GitGuardPodNetworkPolicyName(run.Name)}, &policy)
+		if !reflect.DeepEqual(policy.Spec.PolicyTypes, []networkingv1.PolicyType{networkingv1.PolicyTypeIngress}) || policy.Spec.Egress != nil {
+			t.Fatalf("guard policy without CIDRs = %+v", policy.Spec)
+		}
 	})
 
 	t.Run("foreign same-name policy fails closed", func(t *testing.T) {
@@ -181,6 +193,7 @@ func TestLaunchGitGuardPolicyLifecycle(t *testing.T) {
 		c := launcherClientForAdmission(t, admissionLaneWithCoordinator("local", 1), run, foreign)
 		launcher := installationLauncher(c, &fixedInstallationTokenMinter{token: "guard", expiresAt: now.Add(2 * time.Hour)}, now, plainExecutor{})
 		launcher.GitGuardEgressCIDRs = cidrs
+		launcher.GitGuardKubernetesAPIIP = "10.96.0.1"
 		err := launcher.Launch(context.Background(), run)
 		expectNeedsHumanReason(t, err, "GitGuardPolicyOwnership")
 		expectAbsent(t, c, client.ObjectKey{Namespace: run.Namespace, Name: run.Name + "-coordinator"}, &corev1.Pod{})
@@ -188,11 +201,12 @@ func TestLaunchGitGuardPolicyLifecycle(t *testing.T) {
 
 	t.Run("owned matching policy is adopted idempotently", func(t *testing.T) {
 		run := installationLegacyRun("guard-adopt")
-		seeded := topology.GitGuardEgressPolicy(run, mustParseCIDRs(t, cidrs))
+		seeded := topology.GitGuardEgressPolicy(run, mustParseCIDRs(t, cidrs), parseGitGuardAPIIP("10.96.0.1"))
 		seeded.OwnerReferences = runOwnerReferences(run)
 		c := launcherClientForAdmission(t, admissionLaneWithCoordinator("local", 1), run, seeded)
 		launcher := installationLauncher(c, &fixedInstallationTokenMinter{token: "guard", expiresAt: now.Add(2 * time.Hour)}, now, plainExecutor{})
 		launcher.GitGuardEgressCIDRs = cidrs
+		launcher.GitGuardKubernetesAPIIP = "10.96.0.1"
 		if err := launcher.Launch(context.Background(), run); err != nil {
 			t.Fatalf("Launch: %v", err)
 		}
@@ -201,18 +215,19 @@ func TestLaunchGitGuardPolicyLifecycle(t *testing.T) {
 
 	t.Run("owned drifted policy converges before the pod", func(t *testing.T) {
 		run := installationLegacyRun("guard-drift")
-		seeded := topology.GitGuardEgressPolicy(run, mustParseCIDRs(t, cidrs))
+		seeded := topology.GitGuardEgressPolicy(run, mustParseCIDRs(t, cidrs), parseGitGuardAPIIP("10.96.0.1"))
 		seeded.OwnerReferences = runOwnerReferences(run)
 		seeded.Spec.Egress = nil
 		c := launcherClientForAdmission(t, admissionLaneWithCoordinator("local", 1), run, seeded)
 		launcher := installationLauncher(c, &fixedInstallationTokenMinter{token: "guard", expiresAt: now.Add(2 * time.Hour)}, now, plainExecutor{})
 		launcher.GitGuardEgressCIDRs = cidrs
+		launcher.GitGuardKubernetesAPIIP = "10.96.0.1"
 		if err := launcher.Launch(context.Background(), run); err != nil {
 			t.Fatalf("Launch: %v", err)
 		}
 		var live networkingv1.NetworkPolicy
 		getOrFail(t, c, client.ObjectKey{Namespace: run.Namespace, Name: topology.GitGuardNetworkPolicyName(run.Name)}, &live)
-		want := topology.GitGuardEgressPolicy(run, mustParseCIDRs(t, cidrs))
+		want := topology.GitGuardEgressPolicy(run, mustParseCIDRs(t, cidrs), parseGitGuardAPIIP("10.96.0.1"))
 		if !apiequality.Semantic.DeepEqual(want.Spec, live.Spec) {
 			t.Fatalf("drifted policy did not converge to the rendered spec: %+v", live.Spec)
 		}
@@ -223,19 +238,40 @@ func TestLaunchGitGuardPolicyLifecycle(t *testing.T) {
 		c := launcherClientForAdmission(t, admissionLaneWithCoordinator("local", 1), run)
 		launcher := installationLauncher(c, &fixedInstallationTokenMinter{token: "guard", expiresAt: now.Add(2 * time.Hour)}, now, plainExecutor{})
 		launcher.GitGuardEgressCIDRs = cidrs
+		launcher.GitGuardKubernetesAPIIP = "10.96.0.1"
 		if err := launcher.Launch(context.Background(), run); err != nil {
 			t.Fatalf("Launch: %v", err)
 		}
 		var live networkingv1.NetworkPolicy
 		getOrFail(t, c, client.ObjectKey{Namespace: run.Namespace, Name: topology.GitGuardNetworkPolicyName(run.Name)}, &live)
-		want := topology.GitGuardEgressPolicy(run, mustParseCIDRs(t, cidrs))
+		want := topology.GitGuardEgressPolicy(run, mustParseCIDRs(t, cidrs), parseGitGuardAPIIP("10.96.0.1"))
 		if !apiequality.Semantic.DeepEqual(want.Spec, live.Spec) {
 			t.Fatalf("created policy spec = %+v, want the rendered spec %+v", live.Spec, want.Spec)
 		}
 		if got := live.Labels["courier.misospace.dev/component"]; got != topology.ComponentCoordinator {
 			t.Fatalf("created policy component label = %q", got)
 		}
+		var guardPolicy networkingv1.NetworkPolicy
+		getOrFail(t, c, client.ObjectKey{Namespace: run.Namespace, Name: topology.GitGuardPodNetworkPolicyName(run.Name)}, &guardPolicy)
+		var service corev1.Service
+		getOrFail(t, c, client.ObjectKey{Namespace: run.Namespace, Name: executor.GitGuardServiceName(run.Name)}, &service)
+		var guardPod corev1.Pod
+		getOrFail(t, c, client.ObjectKey{Namespace: run.Namespace, Name: executor.GitGuardPodName(run.Name)}, &guardPod)
+		var coordinator corev1.Pod
+		getOrFail(t, c, client.ObjectKey{Namespace: run.Namespace, Name: run.Name + "-coordinator"}, &coordinator)
+		if guardPod.Spec.ServiceAccountName != executor.GitCredentialsServiceAccountName(run.Name) || coordinator.Spec.Containers[0].Env == nil || controllerEnvValue(coordinator.Spec.Containers[0].Env, "COURIER_REPO_URL") != "http://"+executor.GitGuardServiceDNS(run.Namespace, run.Name)+":18443/Acme/Widgets.git" {
+			t.Fatalf("guard topology mismatch: guard SA=%q coordinator remote=%q", guardPod.Spec.ServiceAccountName, controllerEnvValue(coordinator.Spec.Containers[0].Env, "COURIER_REPO_URL"))
+		}
 	})
+}
+
+func controllerEnvValue(envs []corev1.EnvVar, name string) string {
+	for _, env := range envs {
+		if env.Name == name {
+			return env.Value
+		}
+	}
+	return ""
 }
 
 // runOwnerReferences is the controller OwnerReference the launcher's own
@@ -501,16 +537,26 @@ func TestLaunchInstallationGitWithObserver(t *testing.T) {
 	credsName := legacyGitCredentialsResourceName(run.Name)
 	var binding rbacv1.RoleBinding
 	getOrFail(t, c, client.ObjectKey{Namespace: admissionNamespace, Name: credsName}, &binding)
-	if len(binding.Subjects) != 1 || binding.Subjects[0].Name != observerName {
-		t.Fatalf("credential RoleBinding subject = %+v, want the observer service account %q", binding.Subjects, observerName)
+	if !reflect.DeepEqual(binding.Subjects, []rbacv1.Subject{{Kind: rbacv1.ServiceAccountKind, Name: credsName, Namespace: run.Namespace}}) {
+		t.Fatalf("credential RoleBinding subjects = %+v, want only guard %q", binding.Subjects, credsName)
+	}
+	binding.Subjects = []rbacv1.Subject{{Kind: rbacv1.ServiceAccountKind, Name: observerName, Namespace: run.Namespace}}
+	if err := c.Update(context.Background(), &binding); err != nil {
+		t.Fatal(err)
+	}
+	if err := launcher.ensureLegacyGitCredentialsResources(context.Background(), run, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{executor.ObserverContractAnnotation: executor.ObserverContractVersion}}}); err != nil {
+		t.Fatalf("converge legacy binding: %v", err)
+	}
+	getOrFail(t, c, client.ObjectKey{Namespace: admissionNamespace, Name: credsName}, &binding)
+	if !reflect.DeepEqual(binding.Subjects, []rbacv1.Subject{{Kind: rbacv1.ServiceAccountKind, Name: credsName, Namespace: run.Namespace}}) {
+		t.Fatalf("converged subjects = %+v", binding.Subjects)
 	}
 	var pod corev1.Pod
 	getOrFail(t, c, client.ObjectKey{Namespace: admissionNamespace, Name: "app-observer-coordinator"}, &pod)
 	if pod.Spec.ServiceAccountName != observerName {
 		t.Fatalf("pod service account = %q, want the observer identity unchanged", pod.Spec.ServiceAccountName)
 	}
-	// The observer is already the pod identity: no second ServiceAccount.
-	expectAbsent(t, c, client.ObjectKey{Namespace: admissionNamespace, Name: credsName}, &corev1.ServiceAccount{})
+	// The observer and guard use separate run-scoped identities.
 	getOrFail(t, c, client.ObjectKey{Namespace: admissionNamespace, Name: topology.CredentialsSecretName(run.Name)}, &corev1.Secret{})
 }
 
