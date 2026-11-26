@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 
+	"github.com/misospace/courier/internal/sourceoffer"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -37,6 +38,6 @@ func NewServer(metricsURL string, scraper *Scraper) *mcp.Server {
 // HTTPHandler serves server over streamable HTTP, stateless and JSON-only:
 // one POST, one bounded scrape, no sessions to hold open.
 func HTTPHandler(server *mcp.Server) http.Handler {
-	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server },
-		&mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true})
+	return sourceoffer.Wrap(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server },
+		&mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true}))
 }

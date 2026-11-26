@@ -22,6 +22,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/misospace/courier/internal/sourceoffer"
 )
 
 //go:embed templates static
@@ -155,6 +157,7 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealth)
+	mux.HandleFunc("GET /source", sourceoffer.Serve)
 	mux.HandleFunc("GET /static/{path}", s.handleStatic)
 	mux.HandleFunc("GET /login", s.handleLogin)
 	mux.HandleFunc("POST /login", s.handleLoginSubmit)

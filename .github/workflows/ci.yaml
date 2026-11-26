@@ -259,6 +259,18 @@ jobs:
       - name: Validate manager image
         run: docker run --rm courier:ci --help
 
+      - name: Verify manager license files
+        run: bash hack/verify-image-licenses.sh courier:ci manager
+
+      - name: Inventory manager image licenses
+        uses: anchore/sbom-action@v0.24.4
+        with:
+          image: courier:ci
+          syft-version: v1.57.2
+          format: spdx-json
+          artifact-name: courier-manager.spdx.json
+          upload-release-assets: false
+
   image-coordinator:
     runs-on: ubuntu-latest
     needs: images-classify
@@ -319,6 +331,18 @@ jobs:
 
       - name: Test coordinator scratch boundary (image)
         run: COURIER_COORDINATOR_IMAGE=courier-coordinator:ci go test -run 'Scratch|Toolchain|ProcessTree' ./internal/executor
+
+      - name: Verify coordinator license files
+        run: bash hack/verify-image-licenses.sh courier-coordinator:ci toolchain
+
+      - name: Inventory coordinator image licenses
+        uses: anchore/sbom-action@v0.24.4
+        with:
+          image: courier-coordinator:ci
+          syft-version: v1.57.2
+          format: spdx-json
+          artifact-name: courier-coordinator.spdx.json
+          upload-release-assets: false
 
   image-harness:
     runs-on: ubuntu-latest
@@ -391,6 +415,30 @@ jobs:
         run: >-
           docker run --rm courier-harness:ci /usr/local/bin/courier-broker 2>&1
           | grep -q "requires address"
+
+      - name: Verify harness license files
+        run: bash hack/verify-image-licenses.sh courier-harness:ci toolchain
+
+      - name: Inventory harness image licenses
+        uses: anchore/sbom-action@v0.24.4
+        with:
+          image: courier-harness:ci
+          syft-version: v1.57.2
+          format: spdx-json
+          artifact-name: courier-harness.spdx.json
+          upload-release-assets: false
+
+      - name: Verify harness-go license files
+        run: bash hack/verify-image-licenses.sh courier-harness-go:ci toolchain
+
+      - name: Inventory harness-go image licenses
+        uses: anchore/sbom-action@v0.24.4
+        with:
+          image: courier-harness-go:ci
+          syft-version: v1.57.2
+          format: spdx-json
+          artifact-name: courier-harness-go.spdx.json
+          upload-release-assets: false
 
   image-coordinator-go:
     runs-on: ubuntu-latest
@@ -495,6 +543,18 @@ jobs:
           courier-go:ci
           sh /source/hack/verify-courier-go-runtime.sh --smoke
 
+      - name: Verify coordinator-go license files
+        run: bash hack/verify-image-licenses.sh courier-go:ci toolchain
+
+      - name: Inventory coordinator-go image licenses
+        uses: anchore/sbom-action@v0.24.4
+        with:
+          image: courier-go:ci
+          syft-version: v1.57.2
+          format: spdx-json
+          artifact-name: courier-coordinator-go.spdx.json
+          upload-release-assets: false
+
   images:
     runs-on: ubuntu-latest
     needs: [images-classify, image-manager, image-coordinator, image-coordinator-go, image-harness]
@@ -511,6 +571,27 @@ jobs:
             '${{ needs.image-coordinator.result }}' \
             '${{ needs.image-coordinator-go.result }}' \
             '${{ needs.image-harness.result }}'
+
+  license-inventory:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-go@v7.1.0
+        with:
+          go-version: "1.27.4"
+          cache: true
+      - name: Package and verify corresponding source
+        run: bash hack/package-corresponding-source.sh "$RUNNER_TEMP/courier-source.tar.gz"
+      - name: Inventory linked Go licenses
+        run: |
+          GOBIN="$RUNNER_TEMP" go install github.com/google/go-licenses/v2@v2.0.1
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$RUNNER_TEMP/go-licenses" report ./cmd/... > "$RUNNER_TEMP/go-licenses.csv"
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: courier-source-and-go-licenses
+          path: |
+            ${{ runner.temp }}/courier-source.tar.gz
+            ${{ runner.temp }}/go-licenses.csv
 
   vulnerability:
     runs-on: ubuntu-latest
@@ -548,7 +629,14 @@ jobs:
           helm dependency build charts/courier
           helm lint charts/courier
           helm template courier charts/courier --namespace courier-system > rendered.yaml
+          mkdir -p charts/courier/LICENSES
+          cp LICENSE NOTICE charts/courier/
+          cp LICENSES/Apache-2.0.txt charts/courier/LICENSES/
           helm package charts/courier --destination "$RUNNER_TEMP"
+          chart="$RUNNER_TEMP/courier-$(awk '$1 == "version:" { print $2; exit }' charts/courier/Chart.yaml).tgz"
+          for file in LICENSE NOTICE LICENSES/Apache-2.0.txt; do
+            tar -xOzf "$chart" "courier/$file" | cmp - "$file"
+          done
           test "$(grep -c '^kind: CustomResourceDefinition' rendered.yaml)" -eq 2
           app_version=$(awk '$1 == "appVersion:" { print $2; exit }' charts/courier/Chart.yaml)
           test "$(grep -c -F "image: ghcr.io/misospace/courier:${app_version}" rendered.yaml)" -eq 1

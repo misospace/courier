@@ -89,6 +89,9 @@ RUN set -eux; \
 	echo 'f61ffa245b9a353a8d32b1c6c22d92ccf9a888419edb850260ceb4ce1b2b3cae  /tmp/git.tar.gz' | sha256sum -c - && \
 	mkdir -p /tmp/git-src && \
 	tar -xzf /tmp/git.tar.gz -C /tmp/git-src --strip-components=1 && \
+	install -d /usr/share/doc/courier/third-party/git && \
+	install -m 0644 /tmp/git.tar.gz /usr/share/doc/courier/third-party/git/git-v2.47.3.tar.gz && \
+	install -m 0644 /tmp/git-src/COPYING /usr/share/doc/courier/third-party/git/COPYING && \
 	rm /tmp/git.tar.gz && \
 	make -j"$(nproc)" -C /tmp/git-src prefix=/usr/local NO_GETTEXT=YesPlease NO_TCLTK=YesPlease all && \
 	make -C /tmp/git-src prefix=/usr/local NO_GETTEXT=YesPlease NO_TCLTK=YesPlease install && \
