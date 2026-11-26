@@ -59,6 +59,11 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # invokes), and opencode in one image.
 # Debian (not alpine) because the opencode npm package ships glibc binaries.
 FROM node:26-bookworm-slim@sha256:3fcc4609776fc12c0079831ca6020e250ca109b8d46243d504625d0af7efda93 AS coordinator
+LABEL org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.source="https://github.com/misospace/courier"
+COPY LICENSE NOTICE /usr/share/doc/courier/
+COPY LICENSES/Apache-2.0.txt /usr/share/doc/courier/LICENSES/Apache-2.0.txt
+
 ARG OPENCODE_VERSION=1.18.31
 # mise is pinned because the repository development bootstrap contract (#414)
 # dispatches `mise run bootstrap` in the secure worker; the binary downloads at
@@ -208,6 +213,11 @@ USER 65532:65532
 # infrastructure binaries. Kept last so a bare `docker build .`
 # produces the operator image; build paths still pass --target explicitly.
 FROM gcr.io/distroless/static:nonroot@sha256:8ce6dd87e9823c5b48dcfb2c8604714ccb351ce59607327bcc4957448da279b5 AS manager
+LABEL org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.source="https://github.com/misospace/courier"
+COPY LICENSE NOTICE /usr/share/doc/courier/
+COPY LICENSES/Apache-2.0.txt /usr/share/doc/courier/LICENSES/Apache-2.0.txt
+
 WORKDIR /
 COPY --from=binaries /workspace/manager .
 COPY --from=binaries /workspace/courier-dependency-cache /usr/local/bin/courier-dependency-cache

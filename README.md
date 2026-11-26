@@ -231,4 +231,4 @@ kubectl annotate laneprofile local courier.misospace.dev/suspend-        # resum
 
 ## License
 
-Apache-2.0. See [LICENSE](./LICENSE).
+Courier is licensed under **AGPL-3.0-only**. See [LICENSE](./LICENSE), [NOTICE](./NOTICE), and [licensing and corresponding source](./docs/licensing.md). Earlier Apache-2.0 grants remain valid; the original license is preserved in [LICENSES/Apache-2.0.txt](./LICENSES/Apache-2.0.txt).

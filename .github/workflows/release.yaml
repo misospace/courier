@@ -239,7 +239,9 @@ jobs:
 
       - name: Package chart
         run: |
-          mkdir -p .release
+          mkdir -p .release charts/courier/LICENSES
+          cp LICENSE NOTICE charts/courier/
+          cp LICENSES/Apache-2.0.txt charts/courier/LICENSES/
           helm package charts/courier --destination .release
 
       - name: Log in to GHCR for Helm
