@@ -10,7 +10,6 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -208,28 +207,63 @@ func TestEnvtestTeardownLegacyGitGuardIsIdempotentAndOwnershipSafe(t *testing.T)
 	if err := launcher.Launch(ctx, run); err != nil {
 		t.Fatalf("second Launch: %v", err)
 	}
-	if err := launcher.TeardownLegacyGitGuard(ctx, run); err != nil {
-		t.Fatalf("first teardown: %v", err)
+	var guardPod corev1.Pod
+	guardKey := client.ObjectKey{Namespace: run.Namespace, Name: executor.GitGuardPodName(run.Name)}
+	if err := c.Get(ctx, guardKey, &guardPod); err != nil {
+		t.Fatal(err)
 	}
-	if err := launcher.TeardownLegacyGitGuard(ctx, run); err != nil {
-		t.Fatalf("second teardown: %v", err)
+	guardPod.Finalizers = append(guardPod.Finalizers, "courier.misospace.dev/test-hold")
+	if err := c.Update(ctx, &guardPod); err != nil {
+		t.Fatal(err)
 	}
-	for _, object := range []client.Object{
-		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: executor.GitGuardServiceName(run.Name)}},
-		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: topology.GitGuardNetworkPolicyName(run.Name)}},
-		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: topology.GitGuardPodNetworkPolicyName(run.Name)}},
-	} {
-		if err := c.Get(ctx, client.ObjectKeyFromObject(object), object); !apierrors.IsNotFound(err) {
-			t.Fatalf("object %T %s after teardown: err=%v, want NotFound", object, object.GetName(), err)
+	for i := 0; i < 2; i++ {
+		if err := launcher.TeardownLegacyGitGuard(ctx, run); !errors.Is(err, ErrGuardTeardownPending) {
+			t.Fatalf("teardown[%d]: %v, want ErrGuardTeardownPending", i, err)
+		}
+		if err := c.Get(ctx, guardKey, &guardPod); err != nil || guardPod.DeletionTimestamp == nil {
+			t.Fatalf("guard Pod after teardown[%d]: err=%v deletionTimestamp=%v", i, err, guardPod.DeletionTimestamp)
+		}
+		if err := c.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: executor.GitGuardServiceName(run.Name)}, &corev1.Service{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("guard Service after teardown[%d]: %v, want NotFound", i, err)
+		}
+		for _, name := range []string{topology.GitGuardNetworkPolicyName(run.Name), topology.GitGuardPodNetworkPolicyName(run.Name)} {
+			if err := c.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: name}, &networkingv1.NetworkPolicy{}); err != nil {
+				t.Fatalf("policy %s after teardown[%d]: %v, want present", name, i, err)
+			}
 		}
 	}
-	var pod corev1.Pod
-	podErr := c.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: executor.GitGuardPodName(run.Name)}, &pod)
-	if podErr == nil && pod.DeletionTimestamp == nil {
-		t.Fatal("guard Pod remains without a deletion timestamp")
+	guardPod.Finalizers = nil
+	if err := c.Update(ctx, &guardPod); err != nil {
+		t.Fatal(err)
 	}
-	if podErr != nil && !apierrors.IsNotFound(podErr) {
-		t.Fatalf("get guard Pod after teardown: %v", podErr)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := c.Get(ctx, guardKey, &corev1.Pod{})
+		if apierrors.IsNotFound(err) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("wait for guard Pod absence: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("guard Pod did not disappear after finalizer removal")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if err := launcher.TeardownLegacyGitGuard(ctx, run); err != nil {
+		t.Fatalf("teardown after guard absence: %v", err)
+	}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: topology.GitGuardPodNetworkPolicyName(run.Name)}, &networkingv1.NetworkPolicy{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("guard ingress policy after teardown: %v, want NotFound", err)
+	}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: topology.GitGuardNetworkPolicyName(run.Name)}, &networkingv1.NetworkPolicy{}); err != nil {
+		t.Fatalf("coordinator egress policy was not retained: %v", err)
+	}
+	if err := launcher.TeardownLegacyGitGuard(ctx, run); err != nil {
+		t.Fatalf("repeated teardown: %v", err)
+	}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: topology.GitGuardNetworkPolicyName(run.Name)}, &networkingv1.NetworkPolicy{}); err != nil {
+		t.Fatalf("coordinator egress policy after repeated teardown: %v", err)
 	}
 
 	foreignRun := envtestRun("gitguard-foreign", laneName)

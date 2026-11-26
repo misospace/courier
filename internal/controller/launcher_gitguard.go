@@ -80,18 +80,22 @@ func (l *CoordinatorLauncher) ensureGitGuardPod(ctx context.Context, run *courie
 	return nil
 }
 
-// TeardownLegacyGitGuard removes only run-owned guard resources after terminalization.
+// TeardownLegacyGitGuard requests deletion of run-owned guard resources, but an
+// accepted Pod delete is not termination: the guard ingress policy stays in
+// place until an authoritative read observes no pod carrying the guard's
+// labels — the exact set the policy protects, so a terminating or
+// same-label-named replacement keeps the boundary. UID preconditions prevent
+// deleting replacements between read and delete. A terminal run can still
+// carry a live or deliberately preserved coordinator, so the coordinator's
+// forge-refusal policy is never deleted here: it remains owned by the run and
+// garbage collection removes it with the run after retention.
 func (l *CoordinatorLauncher) TeardownLegacyGitGuard(ctx context.Context, run *courierv1alpha1.CoderRun) error {
 	if l == nil || l.Client == nil || run == nil {
 		return errors.New("legacy git guard teardown requires a launcher client and run")
 	}
-	objects := []client.Object{
-		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: executor.GitGuardPodName(run.Name)}},
-		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: executor.GitGuardServiceName(run.Name)}},
-		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: topology.GitGuardNetworkPolicyName(run.Name)}},
-		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: topology.GitGuardPodNetworkPolicyName(run.Name)}},
-	}
-	for _, object := range objects {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: executor.GitGuardPodName(run.Name)}}
+	service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: executor.GitGuardServiceName(run.Name)}}
+	for _, object := range []client.Object{pod, service} {
 		if err := l.collisionReader().Get(ctx, client.ObjectKeyFromObject(object), object); err != nil {
 			if apierrors.IsNotFound(err) {
 				continue
@@ -101,9 +105,42 @@ func (l *CoordinatorLauncher) TeardownLegacyGitGuard(ctx context.Context, run *c
 		if !resourceOwnedByUID(object.(metav1.Object), run.UID) {
 			continue
 		}
-		if err := l.Client.Delete(ctx, object); err != nil && !apierrors.IsNotFound(err) {
+		uid := object.GetUID()
+		if err := l.Client.Delete(ctx, object, client.Preconditions{UID: &uid}); err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
+	}
+
+	// The absence gate is the policy's own blast radius, not the guard pod's
+	// name: the ingress policy selects by run-and-component labels, so any
+	// pod carrying them — terminating, foreign, or merely labeled like the
+	// guard — keeps the boundary until an authoritative read sees none.
+	pods := &corev1.PodList{}
+	if err := l.collisionReader().List(ctx, pods,
+		client.InNamespace(run.Namespace),
+		client.MatchingLabels(map[string]string{
+			topology.LabelRun:       topology.RunLabelValue(run.Name),
+			executor.LabelComponent: executor.GitGuardComponentName,
+		})); err != nil {
+		return err
+	}
+	if len(pods.Items) > 0 {
+		return ErrGuardTeardownPending
+	}
+
+	policy := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: topology.GitGuardPodNetworkPolicyName(run.Name)}}
+	if err := l.collisionReader().Get(ctx, client.ObjectKeyFromObject(policy), policy); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+		return nil
+	}
+	if !resourceOwnedByUID(policy, run.UID) {
+		return nil
+	}
+	uid := policy.UID
+	if err := l.Client.Delete(ctx, policy, client.Preconditions{UID: &uid}); err != nil && !apierrors.IsNotFound(err) {
+		return err
 	}
 	return nil
 }

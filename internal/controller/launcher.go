@@ -77,6 +77,12 @@ var (
 	ErrProvisioningInFlight = errors.New("coordinator launcher: provisioning in flight; slot could not be verified as a live run-owned pod")
 )
 
+// ErrGuardTeardownPending reports a terminal run's guard teardown that has
+// requested the guard pod's deletion but has not yet observed its absence:
+// the caller must requeue and retry, because an accepted delete is not a
+// termination and the guard pod can still serve until the object is gone.
+var ErrGuardTeardownPending = errors.New("legacy git guard teardown is unfinished: the guard pod is still present")
+
 // ProvisioningCollisionError reports that Launch collided with a run-owned
 // coordinator pod whose deletion is already in flight (DeletionTimestamp
 // set) and which has not gone away. It satisfies errors.Is against

@@ -636,9 +636,20 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 // to Done grades the in-flight attempt through publication observation or the
 // terminal write, each of which settles or clears it.
 func (r *CoderRunReconciler) reconcileTerminal(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
+	// An unfinished teardown — a guard pod still present, or a teardown write
+	// that failed outright — holds the reap but never starves the dispatch's
+	// other duties: deleting the run would garbage-collect the guard's
+	// ingress boundary before the pod it bounds is conclusively gone, and the
+	// hold's requeue is what retries the teardown on the next wake.
+	teardownHeld := false
 	if r.GitGuardTeardown != nil {
 		if err := r.GitGuardTeardown(ctx, run); err != nil {
-			log.FromContext(ctx).Error(err, "unable to tear down terminal legacy git guard", "run", run.Name)
+			teardownHeld = true
+			if errors.Is(err, ErrGuardTeardownPending) {
+				log.FromContext(ctx).V(1).Info("guard pod still present; holding the terminal reap", "run", run.Name)
+			} else {
+				log.FromContext(ctx).Error(err, "terminal legacy git guard teardown failed; holding the reap", "run", run.Name)
+			}
 		}
 	}
 	// A run that terminalized before the terminal write began settling an
@@ -735,6 +746,11 @@ func (r *CoderRunReconciler) reconcileTerminal(ctx context.Context, run *courier
 				"lifecycleReported", lifecycleReportConditionState(run))
 			return ctrl.Result{}, nil
 		}
+		if teardownHeld {
+			// Keep the run until the guard is absent; run GC would otherwise remove its ingress boundary too early.
+			log.FromContext(ctx).V(1).Info("reap held until guard teardown observes the guard pod gone", "run", run.Name)
+			return ctrl.Result{RequeueAfter: provisioningInFlightRequeueDelay}, nil
+		}
 		return r.reapAlreadyDone(ctx, run)
 	}
 	if (run.Status.Phase == courierv1alpha1.PhaseFailed || run.Status.Phase == courierv1alpha1.PhaseNeedsHuman) && !isCapacityExhaustionRun(run) {
@@ -748,6 +764,11 @@ func (r *CoderRunReconciler) reconcileTerminal(ctx context.Context, run *courier
 			log.FromContext(ctx).V(1).Info("terminal run observed without a positively settled LifecycleReported; leaving for retention",
 				"phase", run.Status.Phase, "lifecycleReported", lifecycleReportConditionState(run))
 			return ctrl.Result{}, nil
+		}
+		if teardownHeld {
+			// Keep the run until the guard is absent; run GC would otherwise remove its ingress boundary too early.
+			log.FromContext(ctx).V(1).Info("reap held until guard teardown observes the guard pod gone", "run", run.Name)
+			return ctrl.Result{RequeueAfter: provisioningInFlightRequeueDelay}, nil
 		}
 		if run.Status.CISettlement != nil || run.Status.CIParkRelease != nil || retryHoldsReap(run) {
 			// The run still owes the source a park close, or an explicit retry
@@ -1288,9 +1309,19 @@ func (r *CoderRunReconciler) terminateStuckTerminatingCollision(ctx context.Cont
 // refused can never succeed on retry, so holding the run retries nothing and
 // the clock starts instead (#664).
 func (r *CoderRunReconciler) resolveCompleted(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
+	// An unfinished teardown — a guard pod still present, or a teardown write
+	// that failed outright — holds the reap for the same reason the terminal
+	// dispatch does; the resolve below still runs, and the hold's requeue
+	// retries the teardown.
+	teardownHeld := false
 	if r.GitGuardTeardown != nil {
 		if err := r.GitGuardTeardown(ctx, run); err != nil {
-			log.FromContext(ctx).Error(err, "unable to tear down terminal legacy git guard", "run", run.Name)
+			teardownHeld = true
+			if errors.Is(err, ErrGuardTeardownPending) {
+				log.FromContext(ctx).V(1).Info("guard pod still present; holding the Done reap", "run", run.Name)
+			} else {
+				log.FromContext(ctx).Error(err, "Done legacy git guard teardown failed; holding the reap", "run", run.Name)
+			}
 		}
 	}
 	if _, ok := doneAtMarker(run); !ok {
@@ -1305,6 +1336,18 @@ func (r *CoderRunReconciler) resolveCompleted(ctx context.Context, run *courierv
 			log.FromContext(ctx).Info("source resolve permanently refused; settling the Done run for retention",
 				"run", run.Name, "error", err.Error())
 		}
+		// The marker is stamped at the first settled resolve, not inside the
+		// reaper: a reap held on unfinished guard teardown must not
+		// re-present the source resolve on every retry pass. The stamp still
+		// follows the resolve — #664's resolve-before-clock rule — so a run
+		// the source never answered is never reaped.
+		if err := r.stampReapMarker(ctx, run, doneAtAnnotation); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if teardownHeld {
+		log.FromContext(ctx).V(1).Info("reap held until guard teardown observes the guard pod gone", "run", run.Name)
+		return ctrl.Result{RequeueAfter: provisioningInFlightRequeueDelay}, nil
 	}
 	return r.reapDone(ctx, run)
 }

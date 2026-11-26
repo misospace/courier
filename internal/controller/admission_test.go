@@ -360,6 +360,10 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 			Conditions                      []metav1.Condition                 `json:"conditions,omitempty"`
 			PublicationPolicy               *courierv1alpha1.PublicationPolicy `json:"publicationPolicy,omitempty"`
 			RetryRequest                    *courierv1alpha1.RetryRequest      `json:"retryRequest"`
+			// Raw messages: a merge patch clears these records with an
+			// explicit null, so presence must be distinguished from absence.
+			CIRepair     json.RawMessage `json:"ciRepair"`
+			CISettlement json.RawMessage `json:"ciSettlement"`
 		} `json:"status"`
 	}
 	if err := json.Unmarshal(patch, &document); err != nil {
@@ -439,6 +443,28 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 	// set on a Requeued record, which is never replaced.
 	if document.Status.RetryRequest != nil {
 		run.Status.RetryRequest = document.Status.RetryRequest
+	}
+	if document.Status.CIRepair != nil {
+		if string(document.Status.CIRepair) == "null" {
+			run.Status.CIRepair = nil
+		} else {
+			repair := &courierv1alpha1.CIRepairContext{}
+			if err := json.Unmarshal(document.Status.CIRepair, repair); err != nil {
+				return err
+			}
+			run.Status.CIRepair = repair
+		}
+	}
+	if document.Status.CISettlement != nil {
+		if string(document.Status.CISettlement) == "null" {
+			run.Status.CISettlement = nil
+		} else {
+			settlement := &courierv1alpha1.CISettlement{}
+			if err := json.Unmarshal(document.Status.CISettlement, settlement); err != nil {
+				return err
+			}
+			run.Status.CISettlement = settlement
+		}
 	}
 	return w.client.Status().Update(ctx, &run)
 }

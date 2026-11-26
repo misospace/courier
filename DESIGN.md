@@ -4469,11 +4469,28 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   runs holds the run in its claim, where the crashing pod is visible, instead
   of failing runs one launch at a time. The guard survives coordinator
   relaunches,
-  so a replacement coordinator attaches to a guard that is already serving,
-  and both the terminal reconcile and the Done settle tear the guard topology
-  down (pod, Service,
-  both policies) once the run settles; garbage collection removes whatever a
-  missed pass leaves behind. The guard is
+  so a replacement coordinator attaches to a guard that is already serving.
+  Terminal teardown is staged, because an accepted Pod delete is not a
+  termination: both the terminal reconcile and the Done settle request the
+  guard pod's and the guard Service's deletion with UID preconditions, keep
+  the guard pod's ingress policy until an authoritative read proves no pod
+  carries the guard's run-and-component labels — the exact set the policy
+  bounds, so a terminating guard can still hold the boundary while it serves,
+  and that policy is the unauthenticated listener's only client bound — and
+  never delete the coordinator's forge-refusal policy themselves. A terminal
+  run can
+  still carry a live or deliberately preserved coordinator pod, so the
+  coordinator policy stays owned by the run and garbage collection removes it
+  with the run after retention: the refusal holds for the coordinator pod's
+  whole retained life, and the one residual window is the reap cascade
+  itself, where the run object's deletion removes the policy and a still
+  terminating coordinator pod in unspecified order — the same accepted
+  owner-reference cascade that already removes the pod. A teardown that has
+  not yet observed the guard pod absent — or whose writes failed outright —
+  holds the reap and requeues while the dispatch's other terminal duties keep
+  running, and the reaper holds the run object until the guard topology is
+  conclusively gone, so the delete cascade never removes the ingress policy
+  before the pod it bounds. The guard is
   the boundary a prompt could never be: git tells an askpass helper nothing
   about the ref a push is about to update, but the guard sees the push
   request itself. It serves only the smart-HTTP service endpoints of the two
