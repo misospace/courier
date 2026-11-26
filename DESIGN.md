@@ -4490,7 +4490,14 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   holds the reap and requeues while the dispatch's other terminal duties keep
   running, and the reaper holds the run object until the guard topology is
   conclusively gone, so the delete cascade never removes the ingress policy
-  before the pod it bounds. The guard is
+  before the pod it bounds. The same staged teardown and absence gate guard
+  the two internal stale-work deletes — the outright claim refusal and the
+  pre-launch stale rejection — because a retryable launch rollback returns the
+  run to Pending with a live guard under its ownerRef, and a stale delete
+  issued then would cascade with no ordering between the policy and the pod it
+  bounds; while the guard survives, the refusal re-drives on the ordinary
+  workqueue path and the source-settlement semantics of stale work are
+  unchanged. The guard is
   the boundary a prompt could never be: git tells an askpass helper nothing
   about the ref a push is about to update, but the guard sees the push
   request itself. It serves only the smart-HTTP service endpoints of the two

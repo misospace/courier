@@ -498,7 +498,18 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				// refusal would leave the run Pending, holding its lane's
 				// capacity forever. The run is dropped the way the stale-work
 				// path drops it: the source keeps the attempt, released for
-				// the lane that owns it.
+				// the lane that owns it. The drop is gated on the guard being
+				// conclusively gone: a partially provisioned attempt leaves a
+				// live guard, and deleting the run hands garbage collection a
+				// cascade with no ordering between the ingress policy and the
+				// pod it bounds.
+				cleared, gateErr := r.guardClearedForDeletion(ctx, &run)
+				if gateErr != nil {
+					return ctrl.Result{}, gateErr
+				}
+				if !cleared {
+					return ctrl.Result{RequeueAfter: provisioningInFlightRequeueDelay}, nil
+				}
 				return ctrl.Result{}, r.Delete(ctx, &run)
 			}
 			return ctrl.Result{}, err
@@ -1105,7 +1116,17 @@ func (r *CoderRunReconciler) rejectClaim(ctx context.Context, run *courierv1alph
 		// the work — its settlement contract refuses outcome reports on
 		// stale work (classifyCIRefusal maps those refusals to
 		// ErrStaleWork) — and a deleted run has no status to carry durable
-		// retry intent.
+		// retry intent. The delete is gated on the guard being conclusively
+		// gone for the same reason the ClaimWithReceipt drop gates: an
+		// ungated cascade can remove the guard's ingress policy while the
+		// pod it bounds can still serve. While the guard survives, the run
+		// keeps its admission state and the joined error re-drives the pass:
+		// the next reconcile repeats the stale refusal and retries the
+		// staged teardown until the absence gate clears.
+		cleared, gateErr := r.guardClearedForDeletion(ctx, run)
+		if !cleared {
+			return errors.Join(cause, releaseErr, gateErr)
+		}
 		deleteErr := r.Delete(ctx, run)
 		return errors.Join(cause, releaseErr, deleteErr)
 	}
@@ -1138,6 +1159,33 @@ func (r *CoderRunReconciler) releaseClaim(ctx context.Context, run *courierv1alp
 	run.Status.HeadSHA = ""
 	statusErr := r.patchStatus(ctx, before, run)
 	return errors.Join(cause, releaseErr, statusErr)
+}
+
+// guardClearedForDeletion gates a run delete that bypasses the terminal
+// reap: it stages the guard teardown and reports whether the run may be
+// deleted now. A run deleted with a live guard cascades through garbage
+// collection, which applies no ordering between the guard's ingress policy
+// and the guard pod the policy bounds — the pod could serve after its
+// boundary is gone. The staged teardown's authoritative absence gate is
+// what makes the delete safe, so a pending teardown holds the delete and the
+// caller retries on the ordinary workqueue path. A deployment configured
+// without guard CIDRs (or a run that never provisioned one) has no guard
+// resources, and the teardown returns nil immediately: the delete proceeds
+// exactly as it did before the gate existed.
+func (r *CoderRunReconciler) guardClearedForDeletion(ctx context.Context, run *courierv1alpha1.CoderRun) (bool, error) {
+	if r.GitGuardTeardown == nil {
+		return true, nil
+	}
+	err := r.GitGuardTeardown(ctx, run)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, ErrGuardTeardownPending):
+		log.FromContext(ctx).V(1).Info("stale-work delete held until guard teardown observes the guard pod gone", "run", run.Name)
+		return false, nil
+	default:
+		return false, err
+	}
 }
 
 // abandonCIRepairAttempt ends a repair attempt that was still in flight when
