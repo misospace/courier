@@ -3095,8 +3095,10 @@ via a Link header (rel="source"). Official release manager and console binaries
 embed the revision-specific source archive URL; custom builds configure
 COURIER_SOURCE_URL. The endpoint exposes no operator state or credentials.
 See [licensing](docs/licensing.md). The console is
-deliberately independent of the manager and of the Kubernetes API: it imports
-only the standard library, never talks to a cluster, and reaches the operator
+deliberately independent of the manager and of the Kubernetes API: its only
+non-standard-library production import outside the console package is the
+standard-library-only `internal/sourceoffer` helper. It never talks to a
+cluster and reaches the operator
 read API over fixed GET paths plus one composed run-detail path. The run explorer reads the
 read API's paginated run projection (`/v1/runs`, issue #825) and renders it
 server-side, with no client-side JavaScript, so filters and pagination are GET
@@ -3176,7 +3178,7 @@ admitted".
 The console decodes each projection into its own view types rather than
 importing `internal/readapi` — production code never imports that package;
 only tests pin the mirrored path and kind constants against it — so the
-standard-library-only boundary holds and a projected field reaches a browser
+no-external-dependencies boundary holds and a projected field reaches a browser
 only through that decode. The read API
 bearer token (`operatorConsole.readAPITokenSecret`, mounted as a file and
 passed as `--readapi-token-file`) is optional: with no token the console still
