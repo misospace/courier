@@ -4536,7 +4536,7 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   path uses; a datapath that masquerades cross-node service traffic strips
   the run-pod identity at the guard and needs the same datapath care the
   secure topology's CNI notes describe. With
-  `--legacy-git-guard-egress-cidrs` set,
+  `--git-guard-forge-cidrs` set,
   the launcher also provisions the coordinator policy. It selects the
   coordinator pod and admits DNS, ingress from the run's own pods (the reply
   path of a pod-originated connection), the run's guard Service on the guard
@@ -4552,7 +4552,13 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   forge CIDRs, and the Kubernetes API endpoint the guard reads the credentials
   document
   through. The launcher derives the API endpoint from the operator pod's own
-  service environment, so the operator pins only the forge CIDRs. Under
+  service environment, so the operator pins only the forge CIDRs. The flag
+  replaces `--legacy-git-guard-egress-cidrs`, whose value once listed every
+  443 destination a sidecar guard needed — forge, model provider, MCP
+  servers, and the Kubernetes API. The per-run guard inverted that meaning
+  into a forge refusal, so a carried-over list would deny the coordinator its
+  own model provider; the old flag is therefore refused at startup, and the
+  deployment migrates by naming only the forge CIDRs. Under
   identity-based CNIs such as Cilium the API server carries a reserved
   identity that vanilla ipBlock rules cannot match (the secure broker's
   CNI note), so there the guard's credential read and the observer's pod read

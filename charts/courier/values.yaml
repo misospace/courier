@@ -482,23 +482,25 @@ controllers:
         #                               to the chart appVersion release tag
         #   --git-remote-template      forge remote URL template, one %s
         #                               placeholder filled with spec.repo
-        #   --legacy-git-guard-egress-cidrs
-        #                               Optional comma-separated forge CIDRs
-        #                               the per-run App-mode git-guard pod may
-        #                               reach. Every App-mode run renders the
-        #                               guard pod's ingress policy (only the
-        #                               run's own pods may use the guard
-        #                               Service); with the flag set the guard
-        #                               policy also admits DNS, TCP 443 to
-        #                               these CIDRs, and the Kubernetes API
-        #                               endpoint automatically for credential
-        #                               reads, and the coordinator policy
-        #                               refuses the forge CIDRs outright
-        #                               while preserving other TCP 443
-        #                               destinations; all non-443 coordinator
-        #                               egress stays refused. Empty (the
-        #                               default) renders no coordinator
-        #                               policy.
+        #   --git-guard-forge-cidrs    Optional comma-separated forge CIDRs
+        #                               for the per-run App-mode git guard.
+        #                               List only the forge CIDRs: the
+        #                               coordinator policy refuses these CIDRs
+        #                               while retaining other TCP 443
+        #                               destinations, and the guard pod may
+        #                               reach only DNS, these CIDRs, and the
+        #                               Kubernetes API endpoint (admitted
+        #                               automatically for credential reads);
+        #                               all non-443 coordinator egress stays
+        #                               refused. Empty (the default) renders no
+        #                               coordinator policy. Replaces
+        #                               --legacy-git-guard-egress-cidrs, which
+        #                               is refused at startup when set: its old
+        #                               value listed every 443 destination a
+        #                               sidecar guard needed (forge, model
+        #                               provider, MCP servers, the Kubernetes
+        #                               API), and carrying it over would deny
+        #                               the coordinator's own model provider.
         #   --git-credential-secret    Secret with username/token keys for
         #                               git access; empty disables git injection
         #   --git-token-key             Optional key for the git token; defaults to token
@@ -553,7 +555,7 @@ controllers:
           - --leader-elect
           - --git-remote-template=https://github.com/%s.git
           - --git-credential-secret=courier-github
-          # - --legacy-git-guard-egress-cidrs=140.82.112.0/20,185.199.108.0/22,140.82.114.0/20
+          # - --git-guard-forge-cidrs=140.82.112.0/20,185.199.108.0/22,140.82.114.0/20
           # - --github-credential-secret=courier-github-api
           # - --github-token-key=token
           # - --git-author-name=bot

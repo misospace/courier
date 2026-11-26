@@ -95,6 +95,7 @@ func main() {
 	var executorImage string
 	var gitRemoteTemplate string
 	var legacyGitGuardEgressCIDRs string
+	var gitGuardForgeCIDRs string
 	gitGuardKubernetesAPIIP := strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_HOST"))
 	var gitCredentialSecret string
 	var gitTokenKey string
@@ -175,7 +176,8 @@ func main() {
 	defaults := executor.DefaultPodConfig()
 	flag.StringVar(&executorImage, "executor-image", defaults.Image, "Coordinator image containing courier-executor, git, and opencode.")
 	flag.StringVar(&gitRemoteTemplate, "git-remote-template", defaults.GitRemoteURL, "Git remote URL template containing one %s repository placeholder.")
-	flag.StringVar(&legacyGitGuardEgressCIDRs, "legacy-git-guard-egress-cidrs", "", "Optional comma-separated forge CIDRs the per-run App-mode git-guard pod may reach. The coordinator policy refuses these CIDRs while retaining other TCP 443 destinations; the Kubernetes API endpoint is admitted automatically for credential reads, and non-443 egress remains refused. Empty omits the coordinator's forge-refusing egress policy; every App-mode run still receives the guard pod's ingress policy and the guard Service.")
+	flag.StringVar(&gitGuardForgeCIDRs, "git-guard-forge-cidrs", "", "Optional comma-separated forge CIDRs for the per-run App-mode git guard. List only the forge CIDRs: the coordinator policy refuses these CIDRs while retaining other TCP 443 destinations, and the guard pod may reach only DNS, these CIDRs, and the Kubernetes API endpoint (admitted automatically for credential reads); non-443 egress stays refused. Empty omits the coordinator's forge-refusing egress policy; every App-mode run still receives the guard pod's ingress policy and the guard Service. Replaces --legacy-git-guard-egress-cidrs, whose value once listed every 443 destination a sidecar guard needed (forge, model provider, MCP servers, the Kubernetes API); carrying that list over would refuse the model provider, so the old flag is refused at startup.")
+	flag.StringVar(&legacyGitGuardEgressCIDRs, "legacy-git-guard-egress-cidrs", "", "Deprecated and refused when set: the per-run guard pod (#919) inverted this flag's meaning, so a previously valid allowlist would deny the coordinator's own model provider. Use --git-guard-forge-cidrs with the forge CIDRs only.")
 	flag.StringVar(&gitCredentialSecret, "git-credential-secret", "courier-github", "Secret containing username and token keys for private git access; empty disables git secret injection.")
 	flag.StringVar(&gitTokenKey, "git-token-key", "", "Optional key in the git credential Secret; empty defaults to token.")
 	flag.StringVar(&githubCredentialSecret, "github-credential-secret", "", "Optional Secret containing the GitHub API token; empty falls back to --git-credential-secret.")
@@ -1091,17 +1093,27 @@ func main() {
 		reconciler.Secure = secure
 	}
 	if legacyGitGuardEgressCIDRs != "" {
+		// The fail-closed migration (#919): this flag's value once listed every
+		// 443 destination a sidecar guard needed, and the per-run guard pod
+		// inverted that meaning into a forge refusal. Accepting an old value
+		// here would deny the coordinator's own model provider on upgrade, so
+		// the deployment refuses to start until the operator migrates to
+		// --git-guard-forge-cidrs with the forge CIDRs alone.
+		setupLog.Error(fmt.Errorf("--legacy-git-guard-egress-cidrs is no longer accepted: with the per-run git guard its value would refuse, not admit, the listed destinations from the coordinator pod. Set --git-guard-forge-cidrs to the forge CIDRs only; do not carry over the old list, which also covered the model-provider endpoint, MCP servers, and the Kubernetes API"), "unable to configure git guard")
+		os.Exit(1)
+	}
+	if gitGuardForgeCIDRs != "" {
 		if secureMode {
-			setupLog.Error(fmt.Errorf("--legacy-git-guard-egress-cidrs applies to the legacy coordinator path; secure mode renders its own per-run policies"), "unable to configure legacy git-guard egress policy")
+			setupLog.Error(fmt.Errorf("--git-guard-forge-cidrs applies to the legacy coordinator path; secure mode renders its own per-run policies"), "unable to configure git guard")
 			os.Exit(1)
 		}
 		if installationTokenMinter == nil {
-			setupLog.Error(fmt.Errorf("--legacy-git-guard-egress-cidrs requires --github-app-id, --github-app-installation-id, --github-app-owner, and --github-app-private-key-secret: the policy only makes sense for pods that carry the git egress guard"), "unable to configure legacy git-guard egress policy")
+			setupLog.Error(fmt.Errorf("--git-guard-forge-cidrs requires --github-app-id, --github-app-installation-id, --github-app-owner, and --github-app-private-key-secret: the policy only makes sense for pods that carry the git egress guard"), "unable to configure git guard")
 			os.Exit(1)
 		}
-		parsed, err := parseGitGuardCIDRFlag(legacyGitGuardEgressCIDRs)
+		parsed, err := parseGitGuardCIDRFlag(gitGuardForgeCIDRs)
 		if err != nil {
-			setupLog.Error(err, "unable to configure legacy git-guard egress policy")
+			setupLog.Error(err, "unable to configure git guard")
 			os.Exit(1)
 		}
 		// The guard pod reads the run's credentials document through the
@@ -1112,7 +1124,7 @@ func main() {
 		// fails here, at configuration time, rather than terminalizing runs
 		// one launch at a time.
 		if net.ParseIP(gitGuardKubernetesAPIIP) == nil {
-			setupLog.Error(fmt.Errorf("--legacy-git-guard-egress-cidrs requires the operator's in-cluster Kubernetes API endpoint IP (KUBERNETES_SERVICE_HOST); got %q", gitGuardKubernetesAPIIP), "unable to configure legacy git-guard egress policy")
+			setupLog.Error(fmt.Errorf("--git-guard-forge-cidrs requires the operator's in-cluster Kubernetes API endpoint IP (KUBERNETES_SERVICE_HOST); got %q", gitGuardKubernetesAPIIP), "unable to configure git guard")
 			os.Exit(1)
 		}
 		launcher.GitGuardEgressCIDRs = parsed
@@ -1250,8 +1262,8 @@ func validateRebaseModelAssistFlags(enabled bool, gatewayURL string) error {
 	return nil
 }
 
-// parseGitGuardCIDRFlag splits the comma-separated
-// --legacy-git-guard-egress-cidrs value into its CIDRs. Every entry is
+// parseGitGuardCIDRFlag splits the comma-separated --git-guard-forge-cidrs
+// value into its CIDRs. Every entry is
 // canonicalized through its parsed network, so an operator spelling that
 // carries host bits ("140.82.112.9/20") cannot render a policy spec that
 // disagrees with its canonical form on a relaunch.
@@ -1261,7 +1273,7 @@ func parseGitGuardCIDRFlag(value string) ([]string, error) {
 		entry := strings.TrimSpace(raw)
 		_, parsed, err := net.ParseCIDR(entry)
 		if err != nil {
-			return nil, fmt.Errorf("invalid --legacy-git-guard-egress-cidrs entry %q: %w", raw, err)
+			return nil, fmt.Errorf("invalid --git-guard-forge-cidrs entry %q: %w", raw, err)
 		}
 		cidrs = append(cidrs, parsed.String())
 	}
