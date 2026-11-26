@@ -396,6 +396,13 @@ type contributeData struct {
 	Namespace      string
 	WorkItemID     string
 	Resumed        bool
+	// StatusLink points the admitted run's contribution page. It is set
+	// only when the status backend is configured and the admission response
+	// named a run; the namespace is percent-escaped into the query, pinned
+	// from the response the console already holds (the status DTO
+	// deliberately never carries the client submission key, so correlation
+	// stays on the admission side). Empty renders no link, never a guess.
+	StatusLink string
 }
 
 func (s *Server) contributePage(r *http.Request, sessionID string) contributeData {
@@ -548,6 +555,19 @@ func (s *Server) handleContributeSubmit(w http.ResponseWriter, r *http.Request) 
 		data.State, data.StateClass = "success", "state-ok"
 		data.Run, data.Namespace, data.WorkItemID = result.Run, result.Namespace, result.WorkItemID
 		data.Resumed = result.Outcome == outcomeResumed
+		// The run the admission response named is reachable on the status
+		// page from here, with the response's namespace pinned — but only
+		// values the console's own request validators accept, so the link
+		// never ships a destination the status page would itself reject. A
+		// blank or hostile namespace drops the pin, not the link: the
+		// status page then carries the endpoint's default and pins the
+		// canonical echo.
+		if s.contributions != nil && validContributeRunName(result.Run) {
+			data.StatusLink = "/contributions/" + url.PathEscape(result.Run)
+			if result.Namespace != "" && validContributeNamespace(result.Namespace) {
+				data.StatusLink += "?namespace=" + url.QueryEscape(result.Namespace)
+			}
+		}
 	case outcomeRefused:
 		s.minter.remember(sessionID, digest, key, s.auth.now())
 		s.settled.mark(key, s.auth.now())

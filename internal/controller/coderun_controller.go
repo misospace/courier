@@ -108,7 +108,8 @@ type CoderRunReconciler struct {
 	// Launch is injected by the coordinator launcher. It is optional while
 	// launch support is being assembled; admission still reserves capacity by
 	// moving Pending runs to Claimed.
-	Launch LaunchFunc
+	Launch           LaunchFunc
+	GitGuardTeardown func(context.Context, *courierv1alpha1.CoderRun) error
 
 	// Sources resolves the adapter named by CoderRun.Spec.Source. WorkItemID is
 	// passed through unchanged for every claim/release/transition call.
@@ -497,7 +498,18 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				// refusal would leave the run Pending, holding its lane's
 				// capacity forever. The run is dropped the way the stale-work
 				// path drops it: the source keeps the attempt, released for
-				// the lane that owns it.
+				// the lane that owns it. The drop is gated on the guard being
+				// conclusively gone: a partially provisioned attempt leaves a
+				// live guard, and deleting the run hands garbage collection a
+				// cascade with no ordering between the ingress policy and the
+				// pod it bounds.
+				cleared, gateErr := r.guardClearedForDeletion(ctx, &run)
+				if gateErr != nil {
+					return ctrl.Result{}, gateErr
+				}
+				if !cleared {
+					return ctrl.Result{RequeueAfter: provisioningInFlightRequeueDelay}, nil
+				}
 				return ctrl.Result{}, r.Delete(ctx, &run)
 			}
 			return ctrl.Result{}, err
@@ -635,6 +647,22 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 // to Done grades the in-flight attempt through publication observation or the
 // terminal write, each of which settles or clears it.
 func (r *CoderRunReconciler) reconcileTerminal(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
+	// An unfinished teardown — a guard pod still present, or a teardown write
+	// that failed outright — holds the reap but never starves the dispatch's
+	// other duties: deleting the run would garbage-collect the guard's
+	// ingress boundary before the pod it bounds is conclusively gone, and the
+	// hold's requeue is what retries the teardown on the next wake.
+	teardownHeld := false
+	if r.GitGuardTeardown != nil {
+		if err := r.GitGuardTeardown(ctx, run); err != nil {
+			teardownHeld = true
+			if errors.Is(err, ErrGuardTeardownPending) {
+				log.FromContext(ctx).V(1).Info("guard pod still present; holding the terminal reap", "run", run.Name)
+			} else {
+				log.FromContext(ctx).Error(err, "terminal legacy git guard teardown failed; holding the reap", "run", run.Name)
+			}
+		}
+	}
 	// A run that terminalized before the terminal write began settling an
 	// in-flight repair attempt can still carry a live fence, and the source
 	// holds no expiry on an active deferral: it would defer its hand-out
@@ -729,6 +757,11 @@ func (r *CoderRunReconciler) reconcileTerminal(ctx context.Context, run *courier
 				"lifecycleReported", lifecycleReportConditionState(run))
 			return ctrl.Result{}, nil
 		}
+		if teardownHeld {
+			// Keep the run until the guard is absent; run GC would otherwise remove its ingress boundary too early.
+			log.FromContext(ctx).V(1).Info("reap held until guard teardown observes the guard pod gone", "run", run.Name)
+			return ctrl.Result{RequeueAfter: provisioningInFlightRequeueDelay}, nil
+		}
 		return r.reapAlreadyDone(ctx, run)
 	}
 	if (run.Status.Phase == courierv1alpha1.PhaseFailed || run.Status.Phase == courierv1alpha1.PhaseNeedsHuman) && !isCapacityExhaustionRun(run) {
@@ -742,6 +775,11 @@ func (r *CoderRunReconciler) reconcileTerminal(ctx context.Context, run *courier
 			log.FromContext(ctx).V(1).Info("terminal run observed without a positively settled LifecycleReported; leaving for retention",
 				"phase", run.Status.Phase, "lifecycleReported", lifecycleReportConditionState(run))
 			return ctrl.Result{}, nil
+		}
+		if teardownHeld {
+			// Keep the run until the guard is absent; run GC would otherwise remove its ingress boundary too early.
+			log.FromContext(ctx).V(1).Info("reap held until guard teardown observes the guard pod gone", "run", run.Name)
+			return ctrl.Result{RequeueAfter: provisioningInFlightRequeueDelay}, nil
 		}
 		if run.Status.CISettlement != nil || run.Status.CIParkRelease != nil || retryHoldsReap(run) {
 			// The run still owes the source a park close, or an explicit retry
@@ -1078,7 +1116,17 @@ func (r *CoderRunReconciler) rejectClaim(ctx context.Context, run *courierv1alph
 		// the work — its settlement contract refuses outcome reports on
 		// stale work (classifyCIRefusal maps those refusals to
 		// ErrStaleWork) — and a deleted run has no status to carry durable
-		// retry intent.
+		// retry intent. The delete is gated on the guard being conclusively
+		// gone for the same reason the ClaimWithReceipt drop gates: an
+		// ungated cascade can remove the guard's ingress policy while the
+		// pod it bounds can still serve. While the guard survives, the run
+		// keeps its admission state and the joined error re-drives the pass:
+		// the next reconcile repeats the stale refusal and retries the
+		// staged teardown until the absence gate clears.
+		cleared, gateErr := r.guardClearedForDeletion(ctx, run)
+		if !cleared {
+			return errors.Join(cause, releaseErr, gateErr)
+		}
 		deleteErr := r.Delete(ctx, run)
 		return errors.Join(cause, releaseErr, deleteErr)
 	}
@@ -1111,6 +1159,33 @@ func (r *CoderRunReconciler) releaseClaim(ctx context.Context, run *courierv1alp
 	run.Status.HeadSHA = ""
 	statusErr := r.patchStatus(ctx, before, run)
 	return errors.Join(cause, releaseErr, statusErr)
+}
+
+// guardClearedForDeletion gates a run delete that bypasses the terminal
+// reap: it stages the guard teardown and reports whether the run may be
+// deleted now. A run deleted with a live guard cascades through garbage
+// collection, which applies no ordering between the guard's ingress policy
+// and the guard pod the policy bounds — the pod could serve after its
+// boundary is gone. The staged teardown's authoritative absence gate is
+// what makes the delete safe, so a pending teardown holds the delete and the
+// caller retries on the ordinary workqueue path. A deployment configured
+// without guard CIDRs (or a run that never provisioned one) has no guard
+// resources, and the teardown returns nil immediately: the delete proceeds
+// exactly as it did before the gate existed.
+func (r *CoderRunReconciler) guardClearedForDeletion(ctx context.Context, run *courierv1alpha1.CoderRun) (bool, error) {
+	if r.GitGuardTeardown == nil {
+		return true, nil
+	}
+	err := r.GitGuardTeardown(ctx, run)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, ErrGuardTeardownPending):
+		log.FromContext(ctx).V(1).Info("stale-work delete held until guard teardown observes the guard pod gone", "run", run.Name)
+		return false, nil
+	default:
+		return false, err
+	}
 }
 
 // abandonCIRepairAttempt ends a repair attempt that was still in flight when
@@ -1282,6 +1357,21 @@ func (r *CoderRunReconciler) terminateStuckTerminatingCollision(ctx context.Cont
 // refused can never succeed on retry, so holding the run retries nothing and
 // the clock starts instead (#664).
 func (r *CoderRunReconciler) resolveCompleted(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
+	// An unfinished teardown — a guard pod still present, or a teardown write
+	// that failed outright — holds the reap for the same reason the terminal
+	// dispatch does; the resolve below still runs, and the hold's requeue
+	// retries the teardown.
+	teardownHeld := false
+	if r.GitGuardTeardown != nil {
+		if err := r.GitGuardTeardown(ctx, run); err != nil {
+			teardownHeld = true
+			if errors.Is(err, ErrGuardTeardownPending) {
+				log.FromContext(ctx).V(1).Info("guard pod still present; holding the Done reap", "run", run.Name)
+			} else {
+				log.FromContext(ctx).Error(err, "Done legacy git guard teardown failed; holding the reap", "run", run.Name)
+			}
+		}
+	}
 	if _, ok := doneAtMarker(run); !ok {
 		adapter, item, err := r.adapterAndWorkItem(run)
 		if err != nil {
@@ -1294,6 +1384,18 @@ func (r *CoderRunReconciler) resolveCompleted(ctx context.Context, run *courierv
 			log.FromContext(ctx).Info("source resolve permanently refused; settling the Done run for retention",
 				"run", run.Name, "error", err.Error())
 		}
+		// The marker is stamped at the first settled resolve, not inside the
+		// reaper: a reap held on unfinished guard teardown must not
+		// re-present the source resolve on every retry pass. The stamp still
+		// follows the resolve — #664's resolve-before-clock rule — so a run
+		// the source never answered is never reaped.
+		if err := r.stampReapMarker(ctx, run, doneAtAnnotation); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if teardownHeld {
+		log.FromContext(ctx).V(1).Info("reap held until guard teardown observes the guard pod gone", "run", run.Name)
+		return ctrl.Result{RequeueAfter: provisioningInFlightRequeueDelay}, nil
 	}
 	return r.reapDone(ctx, run)
 }
@@ -2742,13 +2844,12 @@ func podBelongsToRun(pod *corev1.Pod, run *courierv1alpha1.CoderRun) bool {
 			return true
 		}
 	}
-	// Three run-label schemes are accepted: the digest-bounded executor and
-	// topology values, which agree by construction for every name, and the
-	// legacy pre-digest truncation that pods created before the digest
-	// scheme carry until they are replaced.
+	// Two run-label schemes are accepted: the digest-bounded executor value,
+	// which topology.RunLabelValue renders identically by delegating to it,
+	// and the legacy pre-digest truncation that pods created before the
+	// digest scheme carry until they are replaced.
 	label := pod.Labels[executor.LabelRun]
 	return label == executor.RunLabelValue(run.Name) ||
-		label == topology.RunLabelValue(run.Name) ||
 		label == executor.LegacyRunLabelValue(run.Name)
 }
 
@@ -2977,7 +3078,8 @@ func nativeResultKindOf(message terminationMessage) courierv1alpha1.NativeResult
 	switch kind := courierv1alpha1.NativeResultKind(strings.TrimSpace(message.ResultKind)); kind {
 	case courierv1alpha1.NativeResultPublished, courierv1alpha1.NativeResultNoChange,
 		courierv1alpha1.NativeResultNeedsHuman, courierv1alpha1.NativeResultBlockedExternal,
-		courierv1alpha1.NativeResultCapacityExhausted, courierv1alpha1.NativeResultWorkloadFailed,
+		courierv1alpha1.NativeResultCapacityExhausted, courierv1alpha1.NativeResultBudgetExhausted,
+		courierv1alpha1.NativeResultWorkloadFailed,
 		courierv1alpha1.NativeResultInfrastructureFailed:
 		return kind
 	default:

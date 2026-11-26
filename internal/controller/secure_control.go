@@ -60,6 +60,9 @@ func secureNeedsHuman(reason, format string, args ...any) *SecureNeedsHumanError
 // pinned to another node: its persistent causes (a digest collision in the
 // probe tag, a foreign pod holding the name) outlast a requeue, and the read
 // cannot tell them from a stray pod a later pass would clear.
+// GitGuardPodAdmission is the guard pod's own PodAdmission: the same
+// rendered-spec rejection, one pod later in the provisioning order, with the
+// same only-its-author-can-fix-it persistence.
 // BaseUnverified covers a fix-pr run whose launch could not verify the pinned
 // pull request's live base: the legacy launch path has no persisted policy to
 // fall back on, so an unverified base has no other answer, and launching
@@ -71,7 +74,7 @@ func terminalPreflightVerdict(err error) *SecureNeedsHumanError {
 		return nil
 	}
 	switch permanent.Reason {
-	case "PodAdmission", "ProbeIdentity", baseUnverifiedReason:
+	case "PodAdmission", "ProbeIdentity", "GitGuardPodAdmission", baseUnverifiedReason:
 		return permanent
 	}
 	return nil

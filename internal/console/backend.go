@@ -67,6 +67,10 @@ const (
 	// reads. It mirrors readapi.PathRuns; the console never imports that
 	// package, so this constant is the wire contract the two agree on.
 	backendRunsPath = "/v1/runs"
+	// backendRunDetailPrefix prefixes a validated single-run name. It mirrors
+	// readapi.PathRuns + "/"; the name validation and path allowlist prevent
+	// a requested name from steering the backend request.
+	backendRunDetailPrefix = "/v1/runs/"
 	// backendOverviewPath is the single-namespace summary the overview page
 	// reads. It mirrors readapi.PathOverview.
 	backendOverviewPath = "/v1/overview"
@@ -88,6 +92,8 @@ const (
 	// unexpected response, not an empty list. A test pins it against the
 	// read API's constant so the two cannot drift.
 	kindRunList = "RunSummaryList"
+	// kindRunDetail mirrors readapi.KindRunDetail.
+	kindRunDetail = "RunDetail"
 	// kindOverview mirrors readapi.KindOverview.
 	kindOverview = "Overview"
 	// kindLaneList mirrors readapi.KindLaneList.
@@ -110,6 +116,10 @@ type Backend interface {
 	// is a transport or decode failure. The returned result never carries
 	// the bearer token or the raw response body.
 	Runs(ctx context.Context, filter RunsFilter) (*RunListResult, error)
+	// Run fetches one validated run detail. The same error contract as Runs
+	// applies; an invalid DNS-subdomain name is reported as a 404 without a
+	// backend request.
+	Run(ctx context.Context, name string) (*RunDetailResult, error)
 	// Overview fetches the single-namespace summary. The same error contract
 	// as Runs applies.
 	Overview(ctx context.Context) (*OverviewResult, error)
@@ -163,6 +173,105 @@ type RunListResult struct {
 	Total     int
 	More      bool
 	Truncated bool
+}
+
+// RunDetailResult is the template-facing view of one decoded RunDetail payload.
+type RunDetailResult struct {
+	Name           string `json:"name"`
+	Namespace      string `json:"namespace"`
+	Phase          string `json:"phase"`
+	Terminal       bool   `json:"terminal"`
+	AgeSeconds     *int64 `json:"ageSeconds"`
+	CreatedAt      string `json:"createdAt"`
+	PhaseEnteredAt string `json:"phaseEnteredAt"`
+	Source         string `json:"source"`
+	Lane           string `json:"lane"`
+	PRNumber       *int   `json:"prNumber"`
+	Branch         string `json:"branch"`
+	HeadSHA        string `json:"headSHA"`
+	Restarts       int    `json:"restarts"`
+	TerminalReason string `json:"terminalReason"`
+	Heartbeat      struct {
+		HasHeartbeat    bool   `json:"hasHeartbeat"`
+		LastHeartbeatAt string `json:"lastHeartbeatAt"`
+		Freshness       string `json:"freshness"`
+	}
+	Admission struct {
+		AdmittedAt   string `json:"admittedAt"`
+		Disagreement bool   `json:"disagreement"`
+		Note         string `json:"note"`
+	}
+	Checkpoint struct {
+		Present    bool `json:"present"`
+		BriefCount int  `json:"briefCount"`
+	}
+	Publication struct {
+		LastCommit                string `json:"lastCommit"`
+		HasCheckFingerprint       bool   `json:"hasCheckFingerprint"`
+		HasFailedCheckFingerprint bool   `json:"hasFailedCheckFingerprint"`
+		DeclaredNoChange          bool   `json:"declaredNoChange"`
+	}
+	CIPark *struct {
+		Head        string `json:"head"`
+		ParkedAt    string `json:"parkedAt"`
+		Attempts    int    `json:"attempts"`
+		LastOutcome string `json:"lastOutcome"`
+	}
+	LifecycleReport struct {
+		ConditionPresent    bool   `json:"conditionPresent"`
+		ConditionStatus     string `json:"conditionStatus"`
+		ObservedAt          string `json:"observedAt"`
+		HasActiveRetryToken bool   `json:"hasActiveRetryToken"`
+		HasLastRetryToken   bool   `json:"hasLastRetryToken"`
+	}
+	Coordinator *struct {
+		Category   string `json:"category"`
+		ExitCode   *int32 `json:"exitCode"`
+		Outcome    string `json:"outcome"`
+		Reason     string `json:"reason"`
+		ObservedAt string `json:"observedAt"`
+		Freshness  string `json:"freshness"`
+		Container  *struct {
+			Name              string `json:"name"`
+			RestartCount      int32  `json:"restartCount"`
+			TerminationReason string `json:"terminationReason"`
+		} `json:"container"`
+	}
+	Reap struct {
+		MarkerAnnotation       string   `json:"markerAnnotation"`
+		MarkerAt               string   `json:"markerAt"`
+		Reason                 string   `json:"reason"`
+		EligibleByPhase        bool     `json:"eligibleByPhase"`
+		RetentionWindowSeconds *int64   `json:"retentionWindowSeconds"`
+		RetentionExpiresAt     string   `json:"retentionExpiresAt"`
+		AuditFloorGovernsPhase bool     `json:"auditFloorGovernsPhase"`
+		Holds                  []string `json:"holds"`
+	}
+	WorkspaceSafety *struct {
+		State      string `json:"state"`
+		Branch     string `json:"branch"`
+		Head       string `json:"head"`
+		RemoteHead string `json:"remoteHead"`
+	}
+	NativeResultKind string `json:"nativeResultKind"`
+	NativeResultAt   string `json:"nativeResultAt"`
+	Conditions       []struct {
+		Type       string `json:"type"`
+		Status     string `json:"status"`
+		ObservedAt string `json:"observedAt"`
+	} `json:"conditions"`
+	Timeline []struct {
+		At     string `json:"at"`
+		Label  string `json:"label"`
+		Detail string `json:"detail"`
+		// Source is the run-object field path that carries the stamp and
+		// Authority who writes it: the entry's source of truth, stated per
+		// entry rather than implied by the page.
+		Source    string `json:"source"`
+		Authority string `json:"authority"`
+	} `json:"timeline"`
+	TimelineTruncated  bool   `json:"timelineTruncated"`
+	TimelineObservedAt string `json:"timelineObservedAt"`
 }
 
 // OverviewResult is the decoded GET /v1/overview payload. Freshness,
@@ -348,7 +457,7 @@ func (b *HTTPBackend) Health(ctx context.Context) error {
 	if b.baseURL == "" {
 		return ErrBackendUnavailable
 	}
-	if !backendAllowlist[backendHealthPath] {
+	if !allowlistedBackendPath(backendHealthPath) {
 		return fmt.Errorf("backend path %q is not allowlisted", backendHealthPath)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.baseURL+backendHealthPath, nil)
@@ -369,6 +478,20 @@ func (b *HTTPBackend) Health(ctx context.Context) error {
 	return nil
 }
 
+// allowlistedBackendPath reports whether path is a backend path the console may
+// ever GET: a constant allowlist entry, or the run-detail prefix followed by a
+// run name that passes DNS-subdomain validation. Nothing else is ever
+// requestable, so no call site can steer the console to another path or host.
+func allowlistedBackendPath(path string) bool {
+	if backendAllowlist[path] {
+		return true
+	}
+	if !strings.HasPrefix(path, backendRunDetailPrefix) {
+		return false
+	}
+	return validRunName(strings.TrimPrefix(path, backendRunDetailPrefix))
+}
+
 // projection GETs an allowlisted projection path with the bearer token,
 // checks the envelope kind, and decodes the payload into out. Only rawQuery
 // varies per call; the path is a constant the caller passes and is re-checked
@@ -385,7 +508,7 @@ func (b *HTTPBackend) projection(ctx context.Context, path, rawQuery, wantKind s
 	if len(b.token) == 0 {
 		return ErrBackendTokenMissing
 	}
-	if !backendAllowlist[path] {
+	if !allowlistedBackendPath(path) {
 		return fmt.Errorf("backend path %q is not allowlisted", path)
 	}
 	target, err := url.Parse(b.baseURL + path)
@@ -438,6 +561,39 @@ func (b *HTTPBackend) projection(ctx context.Context, path, rawQuery, wantKind s
 	return nil
 }
 
+// validRunName mirrors k8s.io/apimachinery validation.IsDNS1123Subdomain
+// without importing Kubernetes: the name is at most 253 bytes, over the
+// charset [a-z0-9.-], with every '.'-separated label non-empty and starting
+// and ending alphanumeric ('-' only interior). Like the API server's object
+// name validation it bounds the total length only, never a single label, so
+// the console never reports a name the read API would serve as not found. A
+// validated name cannot add a path segment or escape the composed detail
+// endpoint.
+func validRunName(name string) bool {
+	if len(name) == 0 || len(name) > maxExplorerFilterLen {
+		return false
+	}
+	var previous byte
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z' || c >= '0' && c <= '9':
+		case c == '-':
+			if i == 0 || name[i-1] == '.' {
+				return false
+			}
+		case c == '.':
+			if i == 0 || name[i-1] == '.' || name[i-1] == '-' {
+				return false
+			}
+		default:
+			return false
+		}
+		previous = c
+	}
+	return previous != '-' && previous != '.'
+}
+
 // Runs GETs the allowlisted run-list projection with the validated filter's
 // query parameters. Only the query string varies; the path is the constant
 // allowlist entry, so a filter value never steers the request to another path
@@ -473,9 +629,29 @@ func (b *HTTPBackend) Runs(ctx context.Context, filter RunsFilter) (*RunListResu
 	}, nil
 }
 
+// Run fetches one run detail. Invalid names map to the read API's not-found
+// state locally, without a request; syntactically invalid names receive 404
+// there as well.
+func (b *HTTPBackend) Run(ctx context.Context, name string) (*RunDetailResult, error) {
+	if !validRunName(name) {
+		return nil, &BackendError{Status: http.StatusNotFound}
+	}
+	if b.baseURL == "" {
+		return nil, ErrBackendUnavailable
+	}
+	if len(b.token) == 0 {
+		return nil, ErrBackendTokenMissing
+	}
+	var detail RunDetailResult
+	if err := b.projection(ctx, backendRunDetailPrefix+name, "", kindRunDetail, &detail); err != nil {
+		return nil, err
+	}
+	return &detail, nil
+}
+
 // Overview GETs the allowlisted namespace summary. The projection carries no
-// query state: the read API serves exactly the namespace it is configured
-// for, so nothing from a browser can shape the request.
+// query state: the read API serves exactly the namespace it is configured for,
+// so nothing from a browser can shape the request.
 func (b *HTTPBackend) Overview(ctx context.Context) (*OverviewResult, error) {
 	var page overviewPage
 	if err := b.projection(ctx, backendOverviewPath, "", kindOverview, &page); err != nil {

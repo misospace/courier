@@ -10,64 +10,89 @@ import (
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 )
 
-// The enforced git write boundary for App-mode legacy pods (#902).
+// The enforced git write boundary for App-mode legacy runs (#902, #919).
 //
 // A git askpass helper can never bind a served token to the ref a push is
-// about to update — git does not tell the helper — so the credential
-// binding lives in a dedicated guard container instead: the coordinator pod
-// runs courier-executor in git-egress mode as a loopback git smart-HTTP
-// guard that injects the run's installation credentials itself and refuses
-// every push that does not update exactly the run's approved work ref. The
-// model container carries no credential and no means to read one: its git
-// remotes are loopback URLs into the guard, and the projected token that
-// reads the run's credentials Secret is mounted only in the guard container.
+// about to update — git does not tell the helper — so the credential binding
+// lives in a dedicated guard: since #919 a per-run guard POD (not a sidecar —
+// a sidecar would share the coordinator pod's network namespace and force
+// the forge CIDRs to stay fabric-admitted, the #908 residual), reached over
+// a run-scoped Service whose DNS name the App-mode coordinator's git remotes
+// are rewritten to. The guard injects the run's installation credentials
+// itself and refuses every push that does not update exactly the run's
+// approved work ref; the coordinator container carries no credential and no
+// means to read one — its remotes name only the guard Service, and the
+// projected token that reads the run's credentials Secret is mounted in the
+// guard pod and in the coordinator pod's observer containers, never in the
+// model container. The coordinator policy can therefore exclude the forge
+// CIDRs outright (internal/topology's GitGuardEgressPolicy); a direct forge
+// connection from the coordinator pod is refused by the fabric.
 const (
-	// GitEgressContainerName is the guard sidecar's container name. Its
-	// presence (or the annotation below) marks a pod as App-mode.
+	// GitEgressContainerName is the guard container's name, inside the guard
+	// pod. The pod-level App-mode marker is the annotation below; the
+	// container name is the executor binary's own contract.
 	GitEgressContainerName = "git-egress"
 
-	// GitEgressContractAnnotation marks a pod whose writes are bound by the
-	// git egress guard. Recognition is by presence; the version records the
-	// contract revision the pod builder renders.
-	GitEgressContractAnnotation = "courier.misospace.dev/git-egress"
-	GitEgressContractVersion    = "1"
+	// GitGuardComponentName is the component label value that selects the
+	// per-run guard pod (and only it) for policies, the guard Service, and
+	// the terminal teardown.
+	GitGuardComponentName = "git-guard"
 
-	// GitEgressAddress is the pod-local loopback address the guard serves
-	// and the App-mode coordinator's git remotes are rewritten to. Git over
-	// plain http to a loopback address is intentional: the transport is
-	// process-local, the guard terminates TLS to the real forge upstream,
-	// and the guard's authority — not a TLS chain — decides what the
-	// credential may do. The port sits below the Linux ephemeral range so
-	// no ordinary outbound socket can transiently squat the guard's address.
-	GitEgressAddress = "127.0.0.1:18443"
+	// GitEgressContractAnnotation marks a run's App-mode git credential
+	// contract. Recognition is by presence; the version records the contract
+	// revision the pod builders render — "2" is the dedicated guard pod, and
+	// the version bump must never gate recognition: readers judge presence,
+	// so pods rendered by an older contract keep working across an operator
+	// upgrade.
+	GitEgressContractAnnotation = "courier.misospace.dev/git-egress"
+	GitEgressContractVersion    = "2"
+
+	// GitEgressPort is the guard's fixed port: the guard pod listens on it
+	// and the per-run Service forwards it. The port sits below the Linux
+	// ephemeral range so no ordinary outbound socket can transiently squat
+	// it inside the guard pod.
+	GitEgressPort = 18443
+
+	// GitGuardListenAddress is the address the guard pod's container binds:
+	// every interface, because the Service forwards to the pod IP. Plain
+	// HTTP here is intentional, as it was for the loopback sidecar: the
+	// transport carries no credential — the guard injects the credential
+	// into its own upstream TLS — and the guard's authority, not a TLS
+	// chain, decides what the credential may do. What bounds who may dial
+	// the guard is the guard pod's ingress NetworkPolicy (the run's own
+	// pods), not the bind address; on a fabric that does not enforce
+	// policies the whole boundary is advisory and the CIDR flag stays unset.
+	GitGuardListenAddress = ":18443"
 
 	// EnvGitEgressAddress names the guard's listen address so one producer
 	// (the pod builder) decides it.
 	EnvGitEgressAddress = "COURIER_GIT_EGRESS_ADDRESS"
 )
 
-// loopbackRemotePlaceholder marks where the repository owner/name travels in
+// guardRemotePlaceholder marks where the repository owner/name travels in
 // the GitRemoteURL template while it is parsed and rewritten.
-const loopbackRemotePlaceholder = "courier-repo-placeholder"
+const guardRemotePlaceholder = "courier-repo-placeholder"
 
-// loopbackRemoteTemplate rewrites an https GitRemoteURL template to the
-// guard's loopback origin, preserving the path shape (and so the repository
-// path the guard pins). A template without the %s placeholder or with a
-// non-https scheme is a configuration refusal: App mode cannot prove the
-// guard fronts the real forge otherwise.
-func loopbackRemoteTemplate(template, address string) (string, error) {
+// guardRemoteTemplate rewrites an https GitRemoteURL template to a
+// guard-routed http origin — the per-run guard Service's DNS name and port
+// in production, a stand-in host where only the template's shape is being
+// validated — preserving the path shape (and so the repository path the
+// guard pins). A template without the %s placeholder or with a non-https
+// scheme is a configuration refusal: App mode cannot prove the guard fronts
+// the real forge otherwise.
+func guardRemoteTemplate(template, address string) (string, error) {
 	if !strings.Contains(template, "%s") {
 		return "", fmt.Errorf("executor: App-mode GitRemoteURL must carry the %%s repository placeholder: %q", template)
 	}
-	parsed, err := url.Parse(strings.Replace(template, "%s", loopbackRemotePlaceholder, 1))
+	parsed, err := url.Parse(strings.Replace(template, "%s", guardRemotePlaceholder, 1))
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.Opaque != "" ||
 		parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" ||
-		!strings.Contains(parsed.EscapedPath(), loopbackRemotePlaceholder) {
+		!strings.Contains(parsed.EscapedPath(), guardRemotePlaceholder) {
 		return "", fmt.Errorf("executor: App-mode GitRemoteURL must be an https URL whose path carries the %%s placeholder: %q", template)
 	}
 	parsed.Scheme = "http"
 	parsed.Host = address
-	return strings.Replace(parsed.String(), loopbackRemotePlaceholder, "%s", 1), nil
+	return strings.Replace(parsed.String(), guardRemotePlaceholder, "%s", 1), nil
 }
 
 // configuredRemotes resolves the run's absolute forge remotes from the
@@ -89,16 +114,12 @@ func configuredRemotes(config PodConfig, invocation Invocation) (string, string)
 	return work, base
 }
 
-// gitEgressContainer renders the guard as a native sidecar — an init
-// container with a restart policy — the only container that mounts the
-// projected token reading the run's credentials Secret, and the only process
-// that can serve the run's git credential. The kubelet starts it before
-// every app container and stops it once all of them have terminated, so the
-// credential surface is torn down with the coordinator instead of serving
-// until the pod is deleted. Its environment is the same installation
-// contract the pre-#902 coordinator container carried (owner, endpoint,
-// Secret name, projected token), plus the run's pinned remotes, repository
-// identities, and the approved work ref the guard enforces.
+// gitEgressContainer renders the guard container only — the executor binary
+// in git-egress mode with the run's pinned remotes, identities, approved
+// work branch, and credential-read environment. BuildGitGuardPod wraps it in
+// the dedicated pod; nothing else may embed it, because a container outside
+// the guard pod would put the credential-serving listener back inside a pod
+// whose policy must refuse the forge.
 func gitEgressContainer(config PodConfig, invocation Invocation) corev1.Container {
 	workRemote, baseRemote := configuredRemotes(config, invocation)
 	restartAlways := corev1.ContainerRestartPolicyAlways
@@ -110,7 +131,7 @@ func gitEgressContainer(config PodConfig, invocation Invocation) corev1.Containe
 		Args:            []string{"git-egress"},
 		RestartPolicy:   &restartAlways,
 		Env: []corev1.EnvVar{
-			{Name: EnvGitEgressAddress, Value: GitEgressAddress},
+			{Name: EnvGitEgressAddress, Value: GitGuardListenAddress},
 			{Name: EnvInstallationOwner, Value: config.InstallationGit.Owner},
 			{Name: EnvInstallationEndpoint, Value: config.InstallationGit.APIEndpoint},
 			{Name: EnvInstallationSecret, Value: config.InstallationGit.CredentialsSecret},
@@ -134,10 +155,7 @@ func gitEgressContainer(config PodConfig, invocation Invocation) corev1.Containe
 			ReadOnlyRootFilesystem:   boolPtr(true),
 			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 		},
-		// No readiness probe: the guard listens on loopback only — a
-		// pod-address listener would let any pod in the namespace borrow the
-		// run's credential — and a kubelet probe cannot reach a loopback
-		// bind. A guard that never comes up surfaces as the coordinator's
-		// own git transport failing, which is the loud, correct signal.
+		// No readiness probe: a guard that never comes up surfaces as the
+		// coordinator's git transport failing, which is the loud, correct signal.
 	}
 }

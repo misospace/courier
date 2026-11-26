@@ -150,7 +150,7 @@ func (r *CoderRunReconciler) recoverCapacityExhaustion(ctx context.Context, run 
 	}
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		if !podBelongsToRun(pod, run) {
+		if !podBelongsToRun(pod, run) || pod.Labels[executor.LabelComponent] == executor.GitGuardComponentName {
 			continue
 		}
 		if !pod.DeletionTimestamp.IsZero() || (pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed) {

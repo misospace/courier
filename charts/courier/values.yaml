@@ -54,6 +54,10 @@ dispatch:
   #    That entry needs an explicit agentName, because the rebase executor is
   #    named by its agent identity and must not change when the queue lane
   #    changes.
+  #    An entry with rebaseCapable: true names a binding whose agent may
+  #    execute mechanical rebase work for claimants on its own queue lane while
+  #    keeping ordinary work. It needs an explicit agentName for the same
+  #    reason, and cannot be combined with rebaseExecutor on one entry.
   lanes: []
   pollInterval: 30s
   httpTimeout: 30s
@@ -418,6 +422,20 @@ operatorConsole:
     tokenSecret: ""
     tokenSecretKey: token
 
+  contributeStatus:
+    # -- Points the console at the contribution status API — the same
+    #    listener as the contribution admission API, GET
+    #    /v1/contributions/<run>, served by the manager when
+    #    contributeAPI.readKeySecret is set. url and tokenSecret must be set
+    #    together; both empty leaves the status view off.
+    url: ""
+    # -- Name of a Secret in the release namespace whose tokenSecretKey entry
+    #    holds the contribution status-read bearer token; the entry is
+    #    presented server-side and the token never reaches the browser.
+    #    Required with contributeStatus.url; half a pair fails the render.
+    tokenSecret: ""
+    tokenSecretKey: token
+
 retention:
   # -- Terminal CoderRun retention (#287). The controller deletes terminal runs
   #    after these windows and always keeps the most recent `auditKeep` terminal
@@ -464,6 +482,25 @@ controllers:
         #                               to the chart appVersion release tag
         #   --git-remote-template      forge remote URL template, one %s
         #                               placeholder filled with spec.repo
+        #   --git-guard-forge-cidrs    Optional comma-separated forge CIDRs
+        #                               for the per-run App-mode git guard.
+        #                               List only the forge CIDRs: the
+        #                               coordinator policy refuses these CIDRs
+        #                               while retaining other TCP 443
+        #                               destinations, and the guard pod may
+        #                               reach only DNS, these CIDRs, and the
+        #                               Kubernetes API endpoint (admitted
+        #                               automatically for credential reads);
+        #                               all non-443 coordinator egress stays
+        #                               refused. Empty (the default) renders no
+        #                               coordinator policy. Replaces
+        #                               --legacy-git-guard-egress-cidrs, which
+        #                               is refused at startup when set: its old
+        #                               value listed every 443 destination a
+        #                               sidecar guard needed (forge, model
+        #                               provider, MCP servers, the Kubernetes
+        #                               API), and carrying it over would deny
+        #                               the coordinator's own model provider.
         #   --git-credential-secret    Secret with username/token keys for
         #                               git access; empty disables git injection
         #   --git-token-key             Optional key for the git token; defaults to token
@@ -518,6 +555,7 @@ controllers:
           - --leader-elect
           - --git-remote-template=https://github.com/%s.git
           - --git-credential-secret=courier-github
+          # - --git-guard-forge-cidrs=140.82.112.0/20,185.199.108.0/22,140.82.114.0/20
           # - --github-credential-secret=courier-github-api
           # - --github-token-key=token
           # - --git-author-name=bot
@@ -626,16 +664,13 @@ rbac:
           resources: [pods]
           verbs: [create, delete, get, list, watch]
         - apiGroups: [""]
-          resources: [secrets]
+          resources: [secrets, services]
           verbs: [create, delete, get, list, update]
         - apiGroups: [""]
           resources: [configmaps]
           verbs: [create, delete, get, list]
         - apiGroups: [""]
           resources: [serviceaccounts]
-          verbs: [create, delete, get, list]
-        - apiGroups: [""]
-          resources: [services]
           verbs: [create, delete, get, list]
         - apiGroups: [""]
           resources: [nodes]
@@ -651,7 +686,7 @@ rbac:
           verbs: [create, delete, get, list]
         - apiGroups: [rbac.authorization.k8s.io]
           resources: [rolebindings]
-          verbs: [create, delete, get, list]
+          verbs: [create, delete, get, list, update]
         - apiGroups: [rbac.authorization.k8s.io]
           resources: [clusterrolebindings]
           verbs: [create, delete, get, list]

@@ -887,6 +887,203 @@ func TestAlreadyDoneUnsettledCloseIsRepresented(t *testing.T) {
 	}
 }
 
+// TestResolveCompletedTearsDownGitGuard pins the Done settle's guard-teardown
+// contract: a teardown that did not observe the guard pod absent — pending or
+// failed outright — holds the reap and requeues without an error, the Done
+// marker is stamped at the first settled resolve so a held reap never
+// re-presents the source resolve, and a completed teardown proceeds to the
+// ordinary resolve-and-reap flow.
+func TestResolveCompletedTearsDownGitGuard(t *testing.T) {
+	t.Run("generic error holds the reap", func(t *testing.T) {
+		now := time.Now()
+		run := doneRun("guard-teardown-error", now, now.Add(-2*defaultDoneRetention))
+		kube := phaseClient(t, admissionLane("local", 1), run)
+		called := 0
+		r := &CoderRunReconciler{Client: kube, APIReader: kube, GitGuardTeardown: func(context.Context, *courierv1alpha1.CoderRun) error {
+			called++
+			return errors.New("teardown write refused")
+		}}
+		result, err := r.resolveCompleted(context.Background(), run)
+		if err != nil || result.RequeueAfter <= 0 {
+			t.Fatalf("resolveCompleted = (%#v, %v), want positive requeue without error", result, err)
+		}
+		stored := &courierv1alpha1.CoderRun{}
+		if err := kube.Get(context.Background(), admissionKey(run.Name), stored); err != nil {
+			t.Fatalf("run was reaped while guard teardown failed: %v", err)
+		}
+		if called != 1 {
+			t.Fatalf("GitGuardTeardown calls = %d, want 1", called)
+		}
+	})
+
+	t.Run("pending teardown holds reap", func(t *testing.T) {
+		now := time.Now()
+		run := doneRun("guard-teardown-pending", now, now.Add(-2*defaultDoneRetention))
+		kube := phaseClient(t, admissionLane("local", 1), run)
+		called := 0
+		r := &CoderRunReconciler{Client: kube, APIReader: kube, GitGuardTeardown: func(context.Context, *courierv1alpha1.CoderRun) error {
+			called++
+			return ErrGuardTeardownPending
+		}}
+		result, err := r.resolveCompleted(context.Background(), run)
+		if err != nil || result.RequeueAfter <= 0 {
+			t.Fatalf("resolveCompleted = (%#v, %v), want positive requeue", result, err)
+		}
+		stored := &courierv1alpha1.CoderRun{}
+		if err := kube.Get(context.Background(), admissionKey(run.Name), stored); err != nil {
+			t.Fatalf("run was reaped while guard teardown was pending: %v", err)
+		}
+		if called != 1 {
+			t.Fatalf("GitGuardTeardown calls = %d, want 1", called)
+		}
+	})
+
+	t.Run("held reap does not re-present the resolve", func(t *testing.T) {
+		now := time.Now()
+		run := admissionRun("guard-teardown-unresolved", "local", courierv1alpha1.PhaseDone)
+		run.Status.FinishedAt = &metav1.Time{Time: now}
+		kube := phaseClient(t, admissionLane("local", 1), run)
+		src := &resolveCountingSource{}
+		r := &CoderRunReconciler{
+			Client:    kube,
+			APIReader: kube,
+			Sources:   NewSourceRegistry(map[string]source.Adapter{"test": src}),
+			GitGuardTeardown: func(context.Context, *courierv1alpha1.CoderRun) error {
+				return ErrGuardTeardownPending
+			},
+		}
+		result, err := r.resolveCompleted(context.Background(), run)
+		if err != nil || result.RequeueAfter <= 0 {
+			t.Fatalf("first resolveCompleted = (%#v, %v), want positive requeue", result, err)
+		}
+		stored := &courierv1alpha1.CoderRun{}
+		if err := kube.Get(context.Background(), admissionKey(run.Name), stored); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := doneAtMarker(stored); !ok {
+			t.Fatal("Done marker was not stamped at the settled resolve")
+		}
+		if src.resolves != 1 {
+			t.Fatalf("Resolve calls after first pass = %d, want 1", src.resolves)
+		}
+		held := &courierv1alpha1.CoderRun{}
+		if err := kube.Get(context.Background(), admissionKey(run.Name), held); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.resolveCompleted(context.Background(), held); err != nil {
+			t.Fatalf("second resolveCompleted: %v", err)
+		}
+		if src.resolves != 1 {
+			t.Fatalf("Resolve calls after held retry = %d, want 1; the stamped marker must not re-present the resolve", src.resolves)
+		}
+	})
+
+	t.Run("nil teardown proceeds", func(t *testing.T) {
+		run := doneRun("guard-teardown-success", time.Now(), time.Now())
+		kube := phaseClient(t, admissionLane("local", 1), run)
+		called := 0
+		r := &CoderRunReconciler{Client: kube, APIReader: kube, GitGuardTeardown: func(context.Context, *courierv1alpha1.CoderRun) error {
+			called++
+			return nil
+		}}
+		if _, err := r.resolveCompleted(context.Background(), run); err != nil {
+			t.Fatalf("resolveCompleted: %v", err)
+		}
+		if called != 1 {
+			t.Fatalf("GitGuardTeardown calls = %d, want 1", called)
+		}
+	})
+}
+
+// resolveCountingSource counts Resolve calls, the only adapter method the Done
+// settle's guard-teardown tests exercise.
+type resolveCountingSource struct {
+	resolves int
+}
+
+func (s *resolveCountingSource) Discover(context.Context) ([]source.WorkItem, error) { return nil, nil }
+func (s *resolveCountingSource) Claim(context.Context, source.WorkItem) error        { return nil }
+func (s *resolveCountingSource) Release(context.Context, source.WorkItem) error      { return nil }
+func (s *resolveCountingSource) Transition(context.Context, source.WorkItem, source.State) error {
+	return nil
+}
+func (s *resolveCountingSource) Resolve(context.Context, source.WorkItem) error {
+	s.resolves++
+	return nil
+}
+
+// TestTerminalReconcileHoldsReapForGuardTeardown pins the Failed-phase reap
+// hold: a run whose retention window has expired and whose lifecycle report
+// has settled must still survive a reconcile whose guard teardown has not
+// observed the guard pod absent — deleting the run would garbage-collect the
+// guard's ingress boundary with it. The audit floor is disabled so the
+// survival is attributable to the hold, not the floor.
+func TestTerminalReconcileHoldsReapForGuardTeardown(t *testing.T) {
+	now := time.Now()
+	run := terminalReapRun("guard-hold-failed", courierv1alpha1.PhaseFailed, now)
+	run = withReapMarker(run, failedAtAnnotation, now.Add(-2*defaultFailedRetention))
+	kube := phaseClient(t, admissionLane("local", 1), run)
+	called := 0
+	r := &CoderRunReconciler{
+		Client:            kube,
+		APIReader:         kube,
+		TerminalAuditKeep: -1,
+		GitGuardTeardown: func(context.Context, *courierv1alpha1.CoderRun) error {
+			called++
+			return ErrGuardTeardownPending
+		},
+	}
+	result, err := r.reconcileTerminal(context.Background(), run)
+	if err != nil || result.RequeueAfter <= 0 {
+		t.Fatalf("reconcileTerminal = (%#v, %v), want positive requeue", result, err)
+	}
+	stored := &courierv1alpha1.CoderRun{}
+	if err := kube.Get(context.Background(), admissionKey(run.Name), stored); err != nil {
+		t.Fatalf("run was reaped while guard teardown was pending: %v", err)
+	}
+	if called != 1 {
+		t.Fatalf("GitGuardTeardown calls = %d, want 1", called)
+	}
+}
+
+// TestTerminalReconcileKeepsDutiesOnTeardownError pins the hard-error branch
+// of the terminal dispatch: a teardown write that fails outright must neither
+// abort the reconcile — the in-flight CI-repair settle still runs and
+// persists — nor reap, and it surfaces no error so the hold's requeue drives
+// the retry.
+func TestTerminalReconcileKeepsDutiesOnTeardownError(t *testing.T) {
+	now := time.Now()
+	run := terminalReapRun("guard-hold-error", courierv1alpha1.PhaseFailed, now)
+	run = withReapMarker(run, failedAtAnnotation, now.Add(-2*defaultFailedRetention))
+	run.Status.CIRepair = &courierv1alpha1.CIRepairContext{FenceToken: "fence-1", Attempt: 1}
+	kube := phaseClient(t, admissionLane("local", 1), run)
+	called := 0
+	r := &CoderRunReconciler{
+		Client:            kube,
+		APIReader:         kube,
+		StatusWriter:      fakeStatusWriter{client: kube},
+		TerminalAuditKeep: -1,
+		GitGuardTeardown: func(context.Context, *courierv1alpha1.CoderRun) error {
+			called++
+			return errors.New("teardown write refused")
+		},
+	}
+	result, err := r.reconcileTerminal(context.Background(), run)
+	if err != nil || result.RequeueAfter <= 0 {
+		t.Fatalf("reconcileTerminal = (%#v, %v), want positive requeue without error", result, err)
+	}
+	stored := &courierv1alpha1.CoderRun{}
+	if err := kube.Get(context.Background(), admissionKey(run.Name), stored); err != nil {
+		t.Fatalf("run was reaped while guard teardown failed: %v", err)
+	}
+	if stored.Status.CIRepair != nil || stored.Status.CISettlement == nil {
+		t.Fatalf("CI-repair settle did not run past the teardown error: CIRepair=%v CISettlement=%v", stored.Status.CIRepair, stored.Status.CISettlement)
+	}
+	if called != 1 {
+		t.Fatalf("GitGuardTeardown calls = %d, want 1", called)
+	}
+}
+
 // TestAlreadyDoneRetention checks the AlreadyDone reap window: a run with an
 // expired retention marker is deleted, and a run without a marker gets the
 // window stamped and retained for the Done retention period.

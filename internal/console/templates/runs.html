@@ -58,7 +58,7 @@
         {{if .Terminal}}<span class="tag tag-terminal">terminal</span>{{end}}
       </td>
       <td>{{.Phase}}</td>
-      <td>{{if .Source}}{{.Source}}{{else}}<span class="muted">—</span>{{end}}</td>
+      <td>{{if .Source}}{{.Source}}{{else}}<span class="muted">—</span>{{end}}{{if isAdhocSource .Source}} <a href="{{contributeStatusURL .Name .Namespace}}">status</a>{{end}}</td>
       <td>{{if .Lane}}{{.Lane}}{{else}}<span class="muted">—</span>{{end}}</td>
       <td>{{humanDuration .AgeSeconds}}</td>
       <td>{{if .PRNumber}}#{{.PRNumber}}{{else}}<span class="muted">—</span>{{end}}</td>

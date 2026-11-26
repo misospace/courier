@@ -233,3 +233,26 @@ section h2 { margin-bottom: 0.5rem; }
 .chip:hover { border-color: #0969da; }
 .chip-plain { color: #1c2128; }
 .sub-note { color: #57606a; font-size: 0.78rem; margin-top: 0.15rem; }
+.run-header { margin-bottom: 1.5rem; }
+.identity, .detail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+  gap: 0.65rem;
+  margin: 0;
+}
+.identity > div, .detail-grid > div {
+  padding: 0.55rem 0.7rem;
+  border: 1px solid #d0d7de;
+  border-radius: 5px;
+  background: #ffffff;
+  min-width: 0;
+}
+.identity dt, .detail-grid dt { color: #57606a; font-size: 0.78rem; }
+.identity dd, .detail-grid dd { margin: 0.15rem 0 0; overflow-wrap: anywhere; }
+.timeline { padding-left: 1.5rem; }
+.timeline li { padding: 0.35rem 0; }
+.timeline time { color: #57606a; font-variant-numeric: tabular-nums; }
+@media (max-width: 32rem) {
+  .identity, .detail-grid { grid-template-columns: 1fr; }
+  .identity > div, .detail-grid > div { padding: 0.45rem 0.55rem; }
+}

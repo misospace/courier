@@ -572,11 +572,12 @@ func (i *EvidenceIntake) credentialScanner(ctx context.Context, run *courierv1al
 		scanner.RegisterCredentials(map[string]string{ref.Name: value})
 	}
 
-	// Installation-token document (#871): in App mode the git credentials the
-	// pod actually holds are this run's per-repository installation tokens,
+	// Installation-token document (#871): in App mode the credentials the pod
+	// actually holds are this run's per-repository write and read profile tokens,
 	// which replace the static pair that CredentialEnvRefs deliberately omits
 	// in that mode. Register every entry, and every entry the last rotation
-	// superseded but GitHub may still honor, so a captured bundle is scrubbed
+	// superseded but GitHub may still honor (the superseded key is populated by
+	// the legacy rotation path), so a captured bundle is scrubbed
 	// against every credential that could have existed in the pod. An absent
 	// document Secret — every static run — registers nothing, and so does a
 	// credentials Secret that exists without the document key (the secure
@@ -603,10 +604,12 @@ func (i *EvidenceIntake) credentialScanner(ctx context.Context, run *courierv1al
 			entries = append(entries, superseded...)
 		}
 		for _, entry := range entries {
-			if entry.Token == "" {
-				continue
+			for _, credential := range []string{entry.Token, entry.ReadToken} {
+				if credential == "" {
+					continue
+				}
+				scanner.RegisterCredentials(map[string]string{evidenceInstallationTokenEnvName: credential})
 			}
-			scanner.RegisterCredentials(map[string]string{evidenceInstallationTokenEnvName: entry.Token})
 		}
 	} else if !apierrors.IsNotFound(err) {
 		return nil, fmt.Errorf("evidence intake: reading installation-token credentials: %w", err)

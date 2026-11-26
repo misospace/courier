@@ -138,6 +138,11 @@ func categoryForNativeResultKind(kind courierv1alpha1.NativeResultKind) courierv
 		return courierv1alpha1.TerminalDiagnosticCategoryBlockedExternal
 	case courierv1alpha1.NativeResultCapacityExhausted:
 		return courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion
+	// Budget exhaustion is not recoverable capacity exhaustion: it is the
+	// run's own coordination ending, classified as a workload failure
+	// rather than borrowing the capacity-exhaustion category.
+	case courierv1alpha1.NativeResultBudgetExhausted:
+		return courierv1alpha1.TerminalDiagnosticCategoryWorkloadFailure
 	case courierv1alpha1.NativeResultWorkloadFailed:
 		return courierv1alpha1.TerminalDiagnosticCategoryWorkloadFailure
 	case courierv1alpha1.NativeResultInfrastructureFailed:

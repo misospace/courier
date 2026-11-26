@@ -9,7 +9,8 @@ The OpenCode bootstrap remains the default,
 explicitly insecure legacy mode until a safe replacement is proven.
 
 DESIGN.md remains authoritative. In particular: inform, don't constrain model
-behavior; git, the PR, and CI are source of truth; no wall-clock run deadlines;
+behavior; git, the PR, and CI are source of truth; no wall-clock run deadlines
+except the coordination budget a lane opts into on `spec.budget` (#901);
 provider configuration is not a `LaneProfile` concern; and Courier can publish
 but never merge.
 
@@ -454,9 +455,9 @@ provider registration must use that endpoint for the operator to read it.
 
 This mode covers observation, secure admission reads, and secure brokers' forge and git credentials. Label settlement, legacy Git, and hosted GitHub MCP continue to use their existing credentials.
 
-When App mode is enabled, the operator mints one short-lived installation token for each secure run, scoped to the run's pinned base and work repositories, and stores it in the run's credentials Secret under `forge-installation-token`. The operator refreshes the token before expiry while the run is active. The broker reads the Secret through the API server; the token is never placed in pod environment variables, logs, or tool output. The App private key remains in the operator and is never mounted into a broker pod.
+When App mode is enabled, the operator mints one short-lived installation token for each secure run, scoped to the run's pinned base and work repositories, and stores it in the run's credentials Secret under `forge-installation-token`. Each pinned repository of a secure run gets a second, read-scoped token in the same document. The operator refreshes the tokens before expiry while the run is active. The broker reads the Secret through the API server; the tokens are never placed in pod environment variables, logs, or tool output. The App private key remains in the operator and is never mounted into a broker pod.
 
-Each token carries only the permissions its repository needs: the base-repository token grants read access to Administration, Checks, Contents, Metadata, and Commit statuses, and write access to Issues and Pull requests; the work-repository token grants write access to Contents plus read access to Administration and Metadata, because the broker must read the work ref's effective protection before it serves a push. The broker never issues a merge, and the forge vocabulary has no merge operation; the write permissions themselves do not remove GitHub-level merge authority, which is why merging stays a human gate. A run whose pinned base and work repositories have different owners cannot launch in App mode because one installation token cannot serve repositories across owners. The operator refreshes tokens only while a run is in its running phase; if minting or token use fails, the broker fails the affected operations and never falls back to static credentials. Switching a deployment between static and App mode requires draining in-flight runs: the credential Secret shape and the broker Role change, and the switch fails closed. Static deployments without App configuration retain their existing behavior.
+Each token carries only the permissions its repository needs: the base-repository token grants read access to Administration, Checks, Contents, Metadata, and Commit statuses, and write access to Issues and Pull requests; the work-repository token grants write access to Contents plus read access to Administration and Metadata, because the broker must read the work ref's effective protection before it serves a push. The read-scoped token carries read access only — no write scope — and the model-facing read route (`/v1/forge/call`) is served through a client bound to it that refuses write requests before it spends the token. The legacy git-transport document carries no read-scoped token. The broker never issues a merge, and the forge vocabulary has no merge operation; the write permissions themselves do not remove GitHub-level merge authority, which is why merging stays a human gate. A run whose pinned base and work repositories have different owners cannot launch in App mode because one installation token cannot serve repositories across owners. The operator refreshes tokens only while a run is in its running phase; if minting or token use fails, the broker fails the affected operations and never falls back to static credentials. Switching a deployment between static and App mode requires draining in-flight runs: the credential Secret shape and the broker Role change, and the switch fails closed. The same applies across operator upgrades that change the token document version: the operator rewrites each run's document in the new shape, and broker or coordinator pods still running the previous image refuse it, so their forge and git credentials fail closed until the topology is relaunched. Drain in-flight App-mode runs across such an upgrade. Static deployments without App configuration retain their existing behavior.
 
 ### Model-influenced forge operations
 
@@ -1661,6 +1662,46 @@ before/after token counts plus both the net savings (the user-facing
 tokens the digest replaced), so operators observe the behavior in run
 telemetry instead of inferring it from gateway failover alerts. It is a log
 event, never status, and never lets a model assert liveness or completion.
+
+**Coordination budget and the `budget_exhausted` ending (#901).** Context is
+only one axis a lane must bound: an over-budget coordinator can also burn
+unbounded tool calls and wall-clock time. The lane declares the rest on
+`LaneProfile.spec.budget` — `maxToolCalls` (total across the coordinator
+session and every delegate session, capped at 1,000,000) and
+`wallClockSeconds` (coordinator loop, step-boundary checked, measured from the
+loop's start, capped at 86,400) — caps that keep every schema-valid
+declaration exact through the harness's seconds-to-duration conversion, where
+an uncapped value near that bound would overflow to a zero or negative wall
+clock and silently enforce nothing. The budget travels the
+same trusted run-context environment as the context policy
+(`executor.Invocation.Budget`, `COURIER_BUDGET_JSON`), so a worker or model
+can never author it, and an absent budget enforces nothing. The budget is
+advisory to the model through framing and enforced by the runtime: a
+declaring lane pins its bounds into the coordinator transcript from the first
+request; delegate sessions learn the ceiling from the fixed refusal at their
+own calls. Enforcement lives in `internal/harness` beside the context seam: the
+tool pump reserves every requested call in every session before executing it —
+the bound is total for the run — and a call past the ceiling is refused with a
+fixed tool result so the transcript stays well-formed; the wall clock is
+checked at the coordinator loop's step boundaries. Each axis warns once at 80%
+of its declared bound through `session.budget_warning`, and every finished
+declaring run reports its consumption next to `model.telemetry` as one
+`run.budget` event, so operators see a run approaching its ceiling and where
+it ended relative to it. The first exhaustion trips once and sticks: it emits one
+`session.budget_exhausted` event (axis, count, limit, role — observability
+only, like `session.compacted`) and injects one fixed stop instruction that
+reuses the soft-stop contract (stop new work, let in-flight briefs finish and
+integrate, validate, publish, declare). A valid declaration inside the fixed
+grace is honored exactly like any other ending; when the grace runs out or the
+model declares invalidly while tripped, the harness ends the run with the
+`budget_exhausted` terminal kind after settling status obligations, its
+pre-exit handoff reason carrying a structured handoff (`budget_exhausted_handoff_v1`:
+the trip facts plus the decisions, findings, and unfinished work read from the
+brief ledger) — never a silent truncation, never a crash-shaped
+`infrastructure_failed`, and never a generic undeclared ending.
+The budget never preempts the operator soft-stop latch or a tripped workspace
+prerequisite, and an in-flight brief is never aborted by the trip: its calls
+meet the ceiling, and it reaches its terminal for integration.
 
 **Model-consumption telemetry (#738).** The native harness observes every
 provider request its turns send and reports the run's consumption shape as

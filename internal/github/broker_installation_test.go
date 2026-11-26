@@ -76,6 +76,54 @@ func TestBrokerInstallationClientRefusesBeforeTokenFetch(t *testing.T) {
 	}
 }
 
+func TestBrokerInstallationClientReadOnlyRefusesWrites(t *testing.T) {
+	var requests int
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if got := r.Header.Get("Authorization"); got != "Bearer read-token" {
+			t.Errorf("Authorization = %q, want read token", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	source := &testInstallationSource{token: "read-token"}
+	client, err := NewBrokerInstallationClient(BrokerInstallationAuth{Owner: "acme", Endpoint: server.URL, HTTPClient: server.Client(), ReadOnly: true}, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete} {
+		before := source.calls
+		request, _ := http.NewRequest(method, server.URL+"/repos/acme/demo/issues", strings.NewReader("{}"))
+		_, err := client.httpClient.Do(request)
+		if err == nil || !strings.Contains(err.Error(), "read-scoped credential refused a write request") {
+			t.Fatalf("%s refusal = %v", method, err)
+		}
+		if source.calls != before || requests != 0 {
+			t.Fatalf("%s refusal spent token or reached server: source=%d requests=%d", method, source.calls, requests)
+		}
+	}
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		request, _ := http.NewRequest(method, server.URL+"/repos/acme/demo/issues", nil)
+		if _, err := client.httpClient.Do(request); err != nil {
+			t.Fatalf("%s request refused: %v", method, err)
+		}
+	}
+	if source.calls != 2 || requests != 2 {
+		t.Fatalf("read requests: source calls=%d server requests=%d", source.calls, requests)
+	}
+	readOnlyClient, err := NewBrokerInstallationClient(BrokerInstallationAuth{Owner: "acme", Endpoint: server.URL, HTTPClient: server.Client(), ReadOnly: true}, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeRequests, beforeCalls := requests, source.calls
+	if _, err := readOnlyClient.CreatePullRequest(context.Background(), "acme", "demo", CreatePullRequestRequest{}); err == nil || !strings.Contains(err.Error(), "read-only API requests") {
+		t.Fatalf("Client API write refusal = %v", err)
+	}
+	if requests != beforeRequests || source.calls != beforeCalls {
+		t.Fatalf("Client API write reached transport: requests=%d source=%d", requests, source.calls)
+	}
+}
+
 func TestBrokerInstallationClientPassesMethodsAndFetchesCurrentToken(t *testing.T) {
 	var calls int
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

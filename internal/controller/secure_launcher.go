@@ -48,6 +48,13 @@ const installationTokenBrokerMargin = 2 * time.Minute
 // preflight requires to establish the work ref's effective protection before
 // it serves a push; no issue or pull-request write, because publication
 // mutations belong to the base. No merge permission is requested on either.
+// The forge-read profile is the separate, read-only mint the model-facing
+// /v1/forge/call path is served through: exactly the read surface that
+// vocabulary needs — issues for work items and conversation comments, pull
+// requests for pull-request, review, and comment reads, checks for CI reads,
+// and metadata read, which GitHub requires on every token — plus contents
+// read per the forge-read scoping in #894, and never a write scope, so a
+// regression in the route vocabulary cannot reach a write-capable credential.
 var (
 	baseRepoInstallationTokenPermissions = map[string]string{
 		"administration": "read",
@@ -62,6 +69,13 @@ var (
 		"administration": "read",
 		"contents":       "write",
 		"metadata":       "read",
+	}
+	forgeReadInstallationTokenPermissions = map[string]string{
+		"checks":        "read",
+		"contents":      "read",
+		"issues":        "read",
+		"metadata":      "read",
+		"pull_requests": "read",
 	}
 )
 
@@ -80,12 +94,12 @@ const brokerVerdictGrace = 90 * time.Second
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=create;delete;get;list;update
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=create;delete;get;list
 // +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=create;delete;get;list
-// +kubebuilder:rbac:groups="",resources=services,verbs=create;delete;get;list
+// +kubebuilder:rbac:groups="",resources=services,verbs=create;delete;get;list;update
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=create;delete;get;list;update
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=create;delete;get;list
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=create;delete;get;list
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=create;delete;get;list;update
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,verbs=create;delete;get;list
 // +kubebuilder:rbac:groups=authorization.k8s.io,resources=subjectaccessreviews,verbs=create
 // +kubebuilder:rbac:groups=authorization.k8s.io,resources=selfsubjectaccessreviews,verbs=create
@@ -341,12 +355,17 @@ func (s *SecureControl) InstallationTokenRequeueDelay(ctx context.Context, run *
 	}
 	delay := time.Duration(0)
 	for _, entry := range document.Entries {
-		entryDelay := entry.ExpiresAt.Add(-installationTokenRefreshLead).Sub(s.now())
-		if entryDelay <= 0 {
-			return secureRequeueDelay
-		}
-		if delay == 0 || entryDelay < delay {
-			delay = entryDelay
+		for _, expiry := range []time.Time{entry.ExpiresAt, entry.ReadExpiresAt} {
+			if expiry.IsZero() {
+				continue
+			}
+			entryDelay := expiry.Add(-installationTokenRefreshLead).Sub(s.now())
+			if entryDelay <= 0 {
+				return secureRequeueDelay
+			}
+			if delay == 0 || entryDelay < delay {
+				delay = entryDelay
+			}
 		}
 	}
 	if delay == 0 {
@@ -1165,10 +1184,9 @@ func (s *SecureControl) ensureInstallationTokenCredential(ctx context.Context, r
 		}
 	}
 
-	// One mint per pinned repository, each with only that repository's
-	// permissions. A same-repository run (work == base) is the one case where
-	// both capability classes genuinely target a single repository, and its
-	// mint carries the merge of the two profiles.
+	// One write-capable mint and one read-scoped mint per pinned repository.
+	// A same-repository run (work == base) merges the publication permissions
+	// for its write mint; the read mint remains a separate, read-only profile.
 	type credentialCapability struct {
 		repository  string
 		permissions map[string]string
@@ -1195,7 +1213,17 @@ func (s *SecureControl) ensureInstallationTokenCredential(ctx context.Context, r
 		if token == "" || !expiresAt.After(now.Add(installationTokenRefreshLead+installationTokenBrokerMargin)) {
 			return fmt.Errorf("secure topology: installation token mint for %s returned a credential shorter than the refresh window", capability.repository)
 		}
-		entries = append(entries, topology.InstallationTokenEntry{Repository: capability.repository, Token: token, ExpiresAt: expiresAt})
+		// The model-facing forge-read path gets its own token, minted with
+		// only read permissions, so a regression in the /v1/forge/call route
+		// vocabulary still cannot reach a write-capable credential.
+		readToken, readExpiresAt, err := s.Config.InstallationTokenMinter.Mint(ctx, []string{capability.repository}, cloneInstallationTokenPermissions(forgeReadInstallationTokenPermissions))
+		if err != nil {
+			return fmt.Errorf("secure topology: mint installation read token for %s: %w", capability.repository, err)
+		}
+		if readToken == "" || !readExpiresAt.After(now.Add(installationTokenRefreshLead+installationTokenBrokerMargin)) {
+			return fmt.Errorf("secure topology: installation read token mint for %s returned a credential shorter than the refresh window", capability.repository)
+		}
+		entries = append(entries, topology.InstallationTokenEntry{Repository: capability.repository, Token: token, ExpiresAt: expiresAt, ReadToken: readToken, ReadExpiresAt: readExpiresAt})
 	}
 	document := topology.InstallationTokenDocument{
 		Version:  topology.InstallationTokenDocumentVersion,
@@ -1228,9 +1256,11 @@ func (s *SecureControl) ensureInstallationTokenCredential(ctx context.Context, r
 			if err := json.Unmarshal(winner.Data[topology.CredKeyInstallationToken], &winnerDocument); err != nil ||
 				winnerDocument.Version != topology.InstallationTokenDocumentVersion ||
 				!strings.EqualFold(winnerDocument.Owner, baseOwner) ||
-				!installationEndpointMatches(winnerDocument.Endpoint, registration.Endpoint) ||
-				!installationDocumentCoversRepositories(winnerDocument, policy) {
+				!installationEndpointMatches(winnerDocument.Endpoint, registration.Endpoint) {
 				return errors.New("secure topology: installation-token credentials winner carries a document for a different identity")
+			}
+			if !installationDocumentCoversRepositories(winnerDocument, policy) {
+				return errors.New("secure topology: installation-token credentials winner carries an unusable credential profile")
 			}
 			return nil
 		}
@@ -1248,8 +1278,9 @@ func (s *SecureControl) ensureInstallationTokenCredential(ctx context.Context, r
 }
 
 // installationDocumentFresh reports that the stored document is the supported
-// version bound to this run's owner, endpoint, and pinned repositories, and
-// that every entry outlives the refresh window. Owner and endpoint are
+// version bound to this run's owner, endpoint, and pinned repositories, that
+// every entry carries a read profile distinct from its write token, and that
+// every credential outlives the refresh window. Owner and endpoint are
 // re-checked on the fast path so a document that drifted away from the run's
 // identity is refreshed rather than served.
 func installationDocumentFresh(raw []byte, policy *courier.PublicationPolicy, owner, endpoint string, now time.Time) bool {
@@ -1263,7 +1294,8 @@ func installationDocumentFresh(raw []byte, policy *courier.PublicationPolicy, ow
 	}
 	for _, repository := range []string{policy.BaseRepo, policy.WorkRepo} {
 		entry, ok := document.Entry(repository)
-		if !ok || entry.Token == "" || !entry.ExpiresAt.After(now.Add(installationTokenRefreshLead)) {
+		if !ok || entry.Token == "" || !entry.ExpiresAt.After(now.Add(installationTokenRefreshLead)) ||
+			entry.ReadToken == "" || entry.ReadToken == entry.Token || !entry.ReadExpiresAt.After(now.Add(installationTokenRefreshLead)) {
 			return false
 		}
 	}
@@ -1271,13 +1303,15 @@ func installationDocumentFresh(raw []byte, policy *courier.PublicationPolicy, ow
 }
 
 // installationDocumentCoversRepositories reports that the document carries a
-// non-empty entry for every pinned repository, ignoring expiry. The create
-// race uses it so a winner owned by this run but missing a pinned repository
-// is refused rather than trusted until some later pass happens to notice.
+// non-empty entry for every pinned repository, with a read profile distinct
+// from its write token, ignoring expiry. The create race uses it so a winner
+// owned by this run but missing a pinned repository or carrying an aliased
+// read profile is refused rather than trusted until some later pass happens
+// to notice.
 func installationDocumentCoversRepositories(document topology.InstallationTokenDocument, policy *courier.PublicationPolicy) bool {
 	for _, repository := range []string{policy.BaseRepo, policy.WorkRepo} {
 		entry, ok := document.Entry(repository)
-		if !ok || entry.Token == "" {
+		if !ok || entry.Token == "" || entry.ReadToken == "" || entry.ReadToken == entry.Token {
 			return false
 		}
 	}

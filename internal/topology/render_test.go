@@ -346,8 +346,8 @@ func TestInstallationTokenTopologyContracts(t *testing.T) {
 		Owner:    "org",
 		Endpoint: "https://api.github.com/",
 		Entries: []InstallationTokenEntry{
-			{Repository: "org/widgets", Token: "secret-value", ExpiresAt: expires},
-			{Repository: "org/gadgets", Token: "other-value", ExpiresAt: expires.Add(time.Hour)},
+			{Repository: "org/widgets", Token: "secret-value", ExpiresAt: expires, ReadToken: "read-secret-value", ReadExpiresAt: expires},
+			{Repository: "org/gadgets", Token: "other-value", ExpiresAt: expires.Add(time.Hour), ReadToken: "read-other-value", ReadExpiresAt: expires.Add(time.Hour)},
 		},
 	}
 	secret, err := InstallationTokenCredentials(run, document)
@@ -391,6 +391,15 @@ func TestInstallationTokenTopologyContracts(t *testing.T) {
 		}},
 		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: document.Endpoint, Entries: []InstallationTokenEntry{
 			entry, {Repository: "ORG/widgets", Token: "second", ExpiresAt: expires},
+		}},
+		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: document.Endpoint, Entries: []InstallationTokenEntry{
+			{Repository: "org/widgets", Token: "token", ExpiresAt: expires, ReadToken: "read"},
+		}},
+		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: document.Endpoint, Entries: []InstallationTokenEntry{
+			{Repository: "org/widgets", Token: "token", ExpiresAt: expires, ReadExpiresAt: expires},
+		}},
+		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: document.Endpoint, Entries: []InstallationTokenEntry{
+			{Repository: "org/widgets", Token: "token", ExpiresAt: expires, ReadToken: "token", ReadExpiresAt: expires},
 		}},
 		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: "http://api.github.com", Entries: []InstallationTokenEntry{entry}},
 		{Version: InstallationTokenDocumentVersion, Owner: "org", Endpoint: "https://user@api.github.com", Entries: []InstallationTokenEntry{entry}},

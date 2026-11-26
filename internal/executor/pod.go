@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -124,15 +125,15 @@ type PodConfig struct {
 	ModelGatewayKeyName string
 	// InstallationGit opts the deployment into App-mode git credentials for
 	// legacy coordinator pods (#871): the pod renders a git egress guard
-	// container that serves the run's installation-token document and binds
-	// every write to the run's approved work ref (#902), the coordinator
-	// container's git remotes are rewritten to the guard, and the launcher
-	// provisions the run-scoped identity the guard reads the run's
-	// installation-token document with. Nil keeps the static pair exactly
-	// as before; non-nil suppresses the git pair even when
+	// pod that serves the run's installation-token document and binds every
+	// write to the run's approved work ref (#902), the coordinator container's
+	// git remotes are rewritten to the guard Service, and the launcher
+	// provisions the run-scoped identity the guard uses to read the token. Nil
+	// keeps the static pair exactly as before; non-nil suppresses the git pair even when
 	// GitCredentialSecret is configured, because an App-enabled run must
 	// not hold a static git credential to fall back to.
-	InstallationGit *InstallationGitConfig
+	InstallationGit            *InstallationGitConfig
+	GitGuardServiceAccountName string
 }
 
 // DefaultPodConfig is suitable for the temporary OpenCode shim image. The
@@ -234,18 +235,16 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 	if err != nil {
 		return nil, fmt.Errorf("executor: marshal OpenCode config: %w", err)
 	}
-	// App-mode coordinator containers talk to the git egress guard, never
-	// to the forge directly (#902): the remote template is rewritten to the
-	// guard's loopback origin so every model-driven clone, fetch, push, and
-	// rebase passes the ref-and-operation boundary. The guard container and
-	// the observer keep the absolute forge remotes.
+	// App-mode coordinator containers talk to the per-run git egress Service,
+	// never to the forge directly (#902). The guard pod and observer keep the
+	// absolute forge remotes.
 	coordinatorConfig := config
 	if config.InstallationGit != nil {
-		loopback, err := loopbackRemoteTemplate(config.GitRemoteURL, GitEgressAddress)
+		remote, err := guardRemoteTemplate(config.GitRemoteURL, GitGuardServiceDNS(run.Namespace, run.Name)+":"+strconv.Itoa(GitEgressPort))
 		if err != nil {
 			return nil, err
 		}
-		coordinatorConfig.GitRemoteURL = loopback
+		coordinatorConfig.GitRemoteURL = remote
 	}
 
 	labels := map[string]string{
@@ -349,20 +348,8 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 			}},
 		},
 	}
-	// The enforced git write boundary (#902): the projected token that
-	// reads the run's credentials Secret is mounted only in the guard
-	// container — never in the model container, which now holds neither a
-	// credential nor a means to read one. The guard container carries the
-	// installation contract and refuses every push outside the approved
-	// work ref; the annotation records the contract for the operator's
-	// rotation gate. It renders as a native sidecar (init container with a
-	// restart policy) so the kubelet starts it before every app container
-	// and stops it once all of them have terminated: the credential surface
-	// can never outlive the coordinator it serves.
 	if config.InstallationGit != nil {
-		pod.Spec.Volumes = append(pod.Spec.Volumes, gitCredentialsTokenVolume())
 		pod.Annotations[GitEgressContractAnnotation] = GitEgressContractVersion
-		pod.Spec.InitContainers = append(pod.Spec.InitContainers, gitEgressContainer(config, invocation))
 	}
 	// A 45-second grace only exists to fit the evidence capture deadline; a
 	// run that does not capture keeps the kubelet's default.
@@ -370,8 +357,8 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 	if observerEnabled {
 		pod.Annotations[ObserverContractAnnotation] = ObserverContractVersion
 		pod.Spec.Volumes = append(pod.Spec.Volumes, observerVolumes()...)
-		pod.Spec.InitContainers = append(pod.Spec.InitContainers, observerSeedContainer(config, invocation, pod.Name, string(run.UID)))
-		pod.Spec.Containers = append(pod.Spec.Containers, observerContainer(config, invocation, pod.Name, string(run.UID)))
+		pod.Spec.InitContainers = append(pod.Spec.InitContainers, observerSeedContainer(coordinatorConfig, invocation, pod.Name, string(run.UID)))
+		pod.Spec.Containers = append(pod.Spec.Containers, observerContainer(coordinatorConfig, invocation, pod.Name, string(run.UID)))
 		// The pod-level fsGroup (65532) owns the shared emptyDir roots; the
 		// observer's distinct UID/GID (65533) needs that group as a
 		// supplement or it cannot create its private state directory. For
@@ -491,9 +478,9 @@ func podEnvironment(invocation Invocation, executorName string, config PodConfig
 	// App-mode pods (#871 as enforced by #902) carry neither the installation
 	// contract nor any projected token here: the model container holds no
 	// git credential and no means to read one. Its remotes were already
-	// rewritten to the git egress guard by the pod builder, and the guard
-	// container — not this one — reads the run's installation-token document
-	// and binds every write to the approved work ref.
+	// rewritten to the git egress Service, and the guard pod — not this one —
+	// reads the run's installation-token document and binds every write to
+	// the approved work ref.
 	// Per-key credential references come from the shared helper so the pod
 	// builder and the evidence intake can never enumerate the same Secret keys
 	// differently.
@@ -537,6 +524,94 @@ func toKubernetesEnv(values []EnvVar) []corev1.EnvVar {
 	return env
 }
 
+// GitGuardPodName derives the per-run guard pod's name. The derived name is
+// a single label, so it is held to the 63-character DNS-label bound. It
+// shares the guard Service's RFC-1035 scheme — see gitGuardLabelName: the pod
+// and its Service are one pair per run, and holding the pod to the Service's
+// stricter label rule (DNS-1123 subdomains would admit a leading digit, the
+// way the coordinator pod's name does) keeps the pair equal per run and the
+// label valid under the strictest scheme either object answers to.
+func GitGuardPodName(runName string) string {
+	return gitGuardLabelName(runName)
+}
+
+// GitGuardServiceName derives the per-run guard Service's name on the
+// RFC-1035 DNS-label scheme topology's Services use (topology imports
+// executor, so the scheme lives here and topology aliases it — the same
+// single-producer arrangement as RunLabelValue, pinned by parity tests). The
+// guard pod's name shares the scheme through gitGuardLabelName.
+func GitGuardServiceName(runName string) string {
+	return gitGuardLabelName(runName)
+}
+
+// gitGuardLabelName is the one producer behind the guard pod's and the guard
+// Service's names: one name per run on the RFC-1035 DNS-label scheme Services
+// are validated under — at most 63 characters, a lowercase letter first, only
+// lowercase alphanumerics and hyphens, an alphanumeric last. Run names are
+// DNS-1123 subdomains, so they may carry dots or begin with a digit, and they
+// may outgrow the label limit once the suffix is appended. A run name that is
+// already a valid label base within the limit passes through unchanged; every
+// other name maps deterministically to a normalized, letter-anchored prefix
+// plus an 8-hex digest of the full run name, the way topology's
+// serviceResourceName bounds its names — the digest keeps an anchored name
+// ("9digits" → r9digits-<digest>-git-guard) distinct from the passthrough a
+// run genuinely named "r9digits" takes, and distinct run names stay distinct.
+func gitGuardLabelName(runName string) string {
+	const suffix = "-git-guard"
+	base := strings.ToLower(runName)
+	if isDNSLabel(base) && len(base)+len(suffix) <= 63 {
+		return base + suffix
+	}
+	digest := sha256.Sum256([]byte(runName))
+	hash := hex.EncodeToString(digest[:])[:8]
+	maxBase := 63 - len(suffix) - len(hash) - 1
+	base = strings.ReplaceAll(strings.ToLower(runName), ".", "-")
+	if base == "" || base[0] < 'a' || base[0] > 'z' {
+		maxBase--
+	}
+	if len(base) > maxBase {
+		base = base[:maxBase]
+	}
+	base = strings.Trim(base, "-.")
+	if base == "" {
+		base = "run"
+	} else if base[0] < 'a' || base[0] > 'z' {
+		base = "r" + base
+	}
+	return base + "-" + hash + suffix
+}
+
+// GitGuardServiceDNS returns the in-cluster DNS name of the run's guard
+// Service — the only address the App-mode coordinator's git remotes are
+// rewritten to (#902 as reworked by #919).
+func GitGuardServiceDNS(namespace, runName string) string {
+	return GitGuardServiceName(runName) + "." + namespace + ".svc.cluster.local"
+}
+
+// GitCredentialsServiceAccountName is the run-scoped identity the guard pod
+// reads the run's credentials Secret under, and the coordinator pod's own
+// identity when the isolated observer is not. One producer: the launcher
+// provisions the Role and RoleBinding under the same name.
+func GitCredentialsServiceAccountName(runName string) string {
+	return "courier-gitcreds-" + RunLabelValue(runName)
+}
+
+// isDNSLabelBase reports whether s is a usable body of a DNS-1035 label:
+// non-empty, lowercase alphanumeric and hyphen characters only, a lowercase
+// letter first, and an alphanumeric last.
+func isDNSLabel(value string) bool {
+	if value == "" || value[0] < 'a' || value[0] > 'z' || value[len(value)-1] == '-' {
+		return false
+	}
+	for i := range value {
+		c := value[i]
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
 func podName(runName string) string {
 	base := strings.Trim(strings.ToLower(runName), "-")
 	const suffix = "-coordinator"
@@ -555,11 +630,10 @@ func podName(runName string) string {
 // selector: it is sanitized to a label-safe form and, when that overflows
 // the 63-character label cap, truncated and hash-suffixed with a digest of
 // the full run name so two runs sharing a long prefix do not collide. The
-// scheme mirrors topology.RunLabelValue, which renders the same label on
-// secure pods; executor cannot import topology (topology imports executor),
-// so the two hold the construction in parallel, and controller readers
-// accept both schemes plus LegacyRunLabelValue, which pods created before
-// the digest scheme carry.
+// scheme has a single implementation here: topology.RunLabelValue delegates
+// to it (topology imports executor, not the reverse) and renders the same
+// label on secure pods, while controller readers also accept
+// LegacyRunLabelValue, which pods created before the digest scheme carry.
 func RunLabelValue(name string) string {
 	sanitized := sanitizeLabelValue(name)
 	const max = 63
@@ -710,7 +784,7 @@ func (c PodConfig) Validate() error {
 	// An App-mode deployment must be able to rewrite its remote template to
 	// the guard's loopback origin: fail at configuration time, not per pod.
 	if c.InstallationGit != nil {
-		if _, err := loopbackRemoteTemplate(c.GitRemoteURL, GitEgressAddress); err != nil {
+		if _, err := guardRemoteTemplate(c.GitRemoteURL, "git-guard.invalid:"+strconv.Itoa(GitEgressPort)); err != nil {
 			return err
 		}
 	}

@@ -130,14 +130,14 @@ func TestEnsureInstallationTokenCredential(t *testing.T) {
 		t.Fatalf("installation token document = %+v", document)
 	}
 	entry, ok := document.Entry(policy.BaseRepo)
-	if !ok || entry.Token != "initial-token-1" || entry.ExpiresAt != minter.expiresAt {
+	if !ok || entry.Token != "initial-token-1" || entry.ExpiresAt != minter.expiresAt || entry.ReadToken != "initial-token-2" || entry.ReadExpiresAt != minter.expiresAt {
 		t.Fatalf("installation token entry = %+v (found %v)", entry, ok)
 	}
 	// A same-repository run is the one case where both capability classes
 	// genuinely target one repository: exactly one mint with the merged
 	// profile — the base profile's writes and reads plus contents write.
-	if minter.calls != 1 || len(minter.mints) != 1 {
-		t.Fatalf("mint calls = %d mints %+v, want 1", minter.calls, minter.mints)
+	if minter.calls != 2 || len(minter.mints) != 2 {
+		t.Fatalf("mint calls = %d mints %+v, want 2", minter.calls, minter.mints)
 	}
 	if len(minter.mints[0].repositories) != 1 || minter.mints[0].repositories[0] != policy.BaseRepo {
 		t.Fatalf("mint repositories = %v", minter.mints[0].repositories)
@@ -148,6 +148,18 @@ func TestEnsureInstallationTokenCredential(t *testing.T) {
 	}
 	if !reflect.DeepEqual(minter.mints[0].permissions, wantMerged) {
 		t.Fatalf("same-repo merged permissions = %+v, want %+v", minter.mints[0].permissions, wantMerged)
+	}
+	wantRead := map[string]string{
+		"checks": "read", "contents": "read", "issues": "read",
+		"metadata": "read", "pull_requests": "read",
+	}
+	if !reflect.DeepEqual(minter.mints[1].permissions, wantRead) || reflect.DeepEqual(minter.mints[0].permissions, minter.mints[1].permissions) {
+		t.Fatalf("read permissions = %+v, want distinct all-read profile %+v", minter.mints[1].permissions, wantRead)
+	}
+	for _, level := range minter.mints[1].permissions {
+		if level == "write" {
+			t.Fatalf("read profile contains write permission: %+v", minter.mints[1].permissions)
+		}
 	}
 	role := topology.BrokerRoleWithInstallationToken(run)
 	if len(role.Rules) != 5 || role.Rules[4].Resources[0] != "secrets" {
@@ -170,8 +182,8 @@ func TestEnsureInstallationTokenCredential(t *testing.T) {
 	if err := control.ensureCredentialsCopy(context.Background(), run); err != nil {
 		t.Fatalf("fresh ensureCredentialsCopy: %v", err)
 	}
-	if minter.calls != 1 {
-		t.Fatalf("fresh credential caused %d mints, want 1", minter.calls)
+	if minter.calls != 2 {
+		t.Fatalf("fresh credential caused %d mints, want 2", minter.calls)
 	}
 
 	now = entry.ExpiresAt.Add(-installationTokenRefreshLead + time.Minute)
@@ -181,12 +193,12 @@ func TestEnsureInstallationTokenCredential(t *testing.T) {
 	if err := control.ensureCredentialsCopy(context.Background(), run); err != nil {
 		t.Fatalf("refresh ensureCredentialsCopy: %v", err)
 	}
-	if minter.calls != 2 {
-		t.Fatalf("refresh mint calls = %d, want 2", minter.calls)
+	if minter.calls != 4 {
+		t.Fatalf("refresh mint calls = %d, want 4", minter.calls)
 	}
 	secret = readInstallationSecret(t, c, run)
 	document = decodeInstallationDocument(t, secret.Data[topology.CredKeyInstallationToken])
-	if entry, ok := document.Entry(policy.BaseRepo); !ok || entry.Token != "rotated-token-2" || len(secret.Data) != 1 {
+	if entry, ok := document.Entry(policy.BaseRepo); !ok || entry.Token != "rotated-token-3" || entry.ReadToken != "rotated-token-4" || len(secret.Data) != 1 {
 		t.Fatalf("rotated credential document = %+v; keys %v", document, secret.Data)
 	}
 }
@@ -212,14 +224,18 @@ func TestEnsureInstallationTokenMintsPerRepository(t *testing.T) {
 	// token's permissions to every repository it names, so the base token
 	// must not gain contents write and the work token must not gain the
 	// publication surfaces.
-	if len(minter.mints) != 2 {
-		t.Fatalf("mint calls = %d mints %+v, want 2", minter.calls, minter.mints)
+	if len(minter.mints) != 4 {
+		t.Fatalf("mint calls = %d mints %+v, want 4", minter.calls, minter.mints)
 	}
 	wantBase := map[string]string{
 		"administration": "read", "checks": "read", "contents": "read",
 		"issues": "write", "metadata": "read", "pull_requests": "write", "statuses": "read",
 	}
 	wantWork := map[string]string{"administration": "read", "contents": "write", "metadata": "read"}
+	wantRead := map[string]string{
+		"checks": "read", "contents": "read", "issues": "read",
+		"metadata": "read", "pull_requests": "read",
+	}
 	if !reflect.DeepEqual(minter.mints[0].repositories, []string{"Acme/Widgets"}) ||
 		!reflect.DeepEqual(minter.mints[0].permissions, wantBase) {
 		t.Fatalf("base mint = %+v, want repositories [Acme/Widgets] permissions %+v", minter.mints[0], wantBase)
@@ -227,14 +243,20 @@ func TestEnsureInstallationTokenMintsPerRepository(t *testing.T) {
 	if minter.mints[0].permissions["contents"] == "write" {
 		t.Fatal("base-repository token carries contents write")
 	}
-	if !reflect.DeepEqual(minter.mints[1].repositories, []string{"Acme/Gadgets"}) ||
-		!reflect.DeepEqual(minter.mints[1].permissions, wantWork) {
-		t.Fatalf("work mint = %+v, want repositories [Acme/Gadgets] permissions %+v", minter.mints[1], wantWork)
+	if !reflect.DeepEqual(minter.mints[1].repositories, []string{"Acme/Widgets"}) || !reflect.DeepEqual(minter.mints[1].permissions, wantRead) || reflect.DeepEqual(minter.mints[0].permissions, minter.mints[1].permissions) {
+		t.Fatalf("base read mint = %+v, want repositories [Acme/Widgets] permissions %+v", minter.mints[1], wantRead)
 	}
-	if _, has := minter.mints[1].permissions["issues"]; has {
+	if !reflect.DeepEqual(minter.mints[2].repositories, []string{"Acme/Gadgets"}) ||
+		!reflect.DeepEqual(minter.mints[2].permissions, wantWork) {
+		t.Fatalf("work mint = %+v, want repositories [Acme/Gadgets] permissions %+v", minter.mints[2], wantWork)
+	}
+	if !reflect.DeepEqual(minter.mints[3].repositories, []string{"Acme/Gadgets"}) || !reflect.DeepEqual(minter.mints[3].permissions, wantRead) || reflect.DeepEqual(minter.mints[2].permissions, minter.mints[3].permissions) {
+		t.Fatalf("work read mint = %+v, want repositories [Acme/Gadgets] permissions %+v", minter.mints[3], wantRead)
+	}
+	if _, has := minter.mints[2].permissions["issues"]; has {
 		t.Fatal("work-repository token carries issues permission")
 	}
-	if _, has := minter.mints[1].permissions["pull_requests"]; has {
+	if _, has := minter.mints[2].permissions["pull_requests"]; has {
 		t.Fatal("work-repository token carries pull_requests permission")
 	}
 
@@ -247,11 +269,11 @@ func TestEnsureInstallationTokenMintsPerRepository(t *testing.T) {
 		t.Fatalf("document = %+v", document)
 	}
 	baseEntry, ok := document.Entry("Acme/Widgets")
-	if !ok || baseEntry.Token != "scoped-token-1" {
+	if !ok || baseEntry.Token != "scoped-token-1" || baseEntry.ReadToken != "scoped-token-2" || baseEntry.ReadToken == baseEntry.Token {
 		t.Fatalf("base entry = %+v (found %v)", baseEntry, ok)
 	}
 	workEntry, ok := document.Entry("acme/gadgets")
-	if !ok || workEntry.Token != "scoped-token-2" || workEntry.Token == baseEntry.Token {
+	if !ok || workEntry.Token != "scoped-token-3" || workEntry.ReadToken != "scoped-token-4" || workEntry.ReadToken == workEntry.Token || workEntry.Token == baseEntry.Token {
 		t.Fatalf("work entry = %+v (found %v)", workEntry, ok)
 	}
 
@@ -260,8 +282,8 @@ func TestEnsureInstallationTokenMintsPerRepository(t *testing.T) {
 	if err := control.ensureCredentialsCopy(context.Background(), run); err != nil {
 		t.Fatalf("fresh ensureCredentialsCopy: %v", err)
 	}
-	if minter.calls != 2 {
-		t.Fatalf("fresh document caused %d mint calls, want 2", minter.calls)
+	if minter.calls != 4 {
+		t.Fatalf("fresh document caused %d mint calls, want 4", minter.calls)
 	}
 }
 
@@ -328,9 +350,18 @@ func TestEnsureInstallationTokenRefreshesIdentityMismatchedDocument(t *testing.T
 		name     string
 		owner    string
 		endpoint string
+		mutate   func(*topology.InstallationTokenDocument)
 	}{
-		{"owner drift", "SomeoneElse", "https://api.github.com/"},
-		{"endpoint drift", "Acme", "https://ghe.example.com/api/v3"},
+		{"owner drift", "SomeoneElse", "https://api.github.com/", nil},
+		{"endpoint drift", "Acme", "https://ghe.example.com/api/v3", nil},
+		{
+			name:  "read profile aliases the write token",
+			owner: "Acme", endpoint: "https://api.github.com/",
+			mutate: func(document *topology.InstallationTokenDocument) {
+				document.Entries[0].ReadToken = document.Entries[0].Token
+				document.Entries[0].ReadExpiresAt = now.Add(2 * time.Hour)
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			run := secureRun("installation-doc-drift")
@@ -345,13 +376,16 @@ func TestEnsureInstallationTokenRefreshesIdentityMismatchedDocument(t *testing.T
 					{Repository: "Acme/Widgets", Token: "drifted", ExpiresAt: now.Add(2 * time.Hour)},
 				},
 			}
+			if tc.mutate != nil {
+				tc.mutate(&staleDocument)
+			}
 			raw, err := json.Marshal(staleDocument)
 			if err != nil {
 				t.Fatal(err)
 			}
 			// Run-owned, so it may be overwritten — but a document bound to a
-			// different owner or endpoint is never served as this run's
-			// credential.
+			// different identity or carrying an aliased read profile is never
+			// served as this run's credential; it is re-minted instead.
 			owned := installationSecret(run, raw, controllerOwnerRef(run.Name, run.UID))
 			owned.OwnerReferences = append(owned.OwnerReferences,
 				metav1.OwnerReference{APIVersion: "v1", Kind: "Secret", Name: "a-previous-writer"})
@@ -363,15 +397,16 @@ func TestEnsureInstallationTokenRefreshesIdentityMismatchedDocument(t *testing.T
 			if err := control.ensureCredentialsCopy(context.Background(), run); err != nil {
 				t.Fatalf("ensureCredentialsCopy: %v", err)
 			}
-			if minter.calls != 1 {
-				t.Fatalf("identity-drifted document minted %d tokens, want 1", minter.calls)
+			if minter.calls != 2 {
+				t.Fatalf("identity-drifted document minted %d tokens, want 2", minter.calls)
 			}
 			secret := readInstallationSecret(t, c, run)
 			document := decodeInstallationDocument(t, secret.Data[topology.CredKeyInstallationToken])
 			if document.Owner != "Acme" || document.Endpoint != registration.Endpoint || len(document.Entries) != 1 {
 				t.Fatalf("refreshed document = %+v", document)
 			}
-			if entry, ok := document.Entry("Acme/Widgets"); !ok || entry.Token != "refreshed-token-1" {
+			if entry, ok := document.Entry("Acme/Widgets"); !ok || entry.Token != "refreshed-token-1" ||
+				entry.ReadToken != "refreshed-token-2" || entry.ReadToken == entry.Token {
 				t.Fatalf("refreshed entry = %+v (found %v)", entry, ok)
 			}
 			// The refresh converges the owner references to the rendered
@@ -419,13 +454,52 @@ func TestEnsureInstallationTokenCreateRace(t *testing.T) {
 			wantErr: "different identity",
 		},
 		{
+			name: "owned winner with an aliased read profile",
+			winner: func(run *courier.CoderRun) *corev1.Secret {
+				document := topology.InstallationTokenDocument{
+					Version: topology.InstallationTokenDocumentVersion, Owner: "Acme",
+					Endpoint: "https://api.github.com/",
+					Entries: []topology.InstallationTokenEntry{
+						{Repository: "Acme/Widgets", Token: "winner-aliased", ExpiresAt: now.Add(2 * time.Hour), ReadToken: "winner-aliased", ReadExpiresAt: now.Add(2 * time.Hour)},
+					},
+				}
+				raw, err := json.Marshal(document)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return installationSecret(run, raw, controllerOwnerRef(run.Name, run.UID))
+			},
+			wantErr: "unusable credential profile",
+		},
+		{
+			name: "owned winner with an aliased work read profile",
+			work: "Acme/Gadgets",
+			winner: func(run *courier.CoderRun) *corev1.Secret {
+				document := topology.InstallationTokenDocument{
+					Version: topology.InstallationTokenDocumentVersion, Owner: "Acme",
+					Endpoint: "https://api.github.com/",
+					Entries: []topology.InstallationTokenEntry{
+						{Repository: "Acme/Widgets", Token: "winner-base", ExpiresAt: now.Add(2 * time.Hour), ReadToken: "winner-base-read", ReadExpiresAt: now.Add(2 * time.Hour)},
+						{Repository: "Acme/Gadgets", Token: "winner-work", ExpiresAt: now.Add(2 * time.Hour), ReadToken: "winner-work", ReadExpiresAt: now.Add(2 * time.Hour)},
+					},
+				}
+				raw, err := json.Marshal(document)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return installationSecret(run, raw, controllerOwnerRef(run.Name, run.UID))
+			},
+			wantErr:  "unusable credential profile",
+			wantMint: 4,
+		},
+		{
 			name: "well-bound winner",
 			winner: func(run *courier.CoderRun) *corev1.Secret {
 				document := topology.InstallationTokenDocument{
 					Version: topology.InstallationTokenDocumentVersion, Owner: "Acme",
 					Endpoint: "https://api.github.com/",
 					Entries: []topology.InstallationTokenEntry{
-						{Repository: "Acme/Widgets", Token: "winner-fine", ExpiresAt: now.Add(2 * time.Hour)},
+						{Repository: "Acme/Widgets", Token: "winner-fine", ExpiresAt: now.Add(2 * time.Hour), ReadToken: "winner-read", ReadExpiresAt: now.Add(2 * time.Hour)},
 					},
 				}
 				raw, err := json.Marshal(document)
@@ -452,8 +526,8 @@ func TestEnsureInstallationTokenCreateRace(t *testing.T) {
 				}
 				return installationSecret(run, raw, controllerOwnerRef(run.Name, run.UID))
 			},
-			wantErr:  "different identity",
-			wantMint: 2,
+			wantErr:  "unusable credential profile",
+			wantMint: 4,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -525,7 +599,7 @@ func TestEnsureInstallationTokenCreateRace(t *testing.T) {
 			}
 			wantMint := tc.wantMint
 			if wantMint == 0 {
-				wantMint = 1
+				wantMint = 2
 			}
 			if minter.calls != wantMint {
 				t.Fatalf("race mint calls = %d, want %d", minter.calls, wantMint)
@@ -613,8 +687,8 @@ func TestLaunchSecureWithInstallationTokenCompletes(t *testing.T) {
 	if result.Requeue || result.RequeueAfter > 0 {
 		t.Fatalf("App-mode provisioning returned a requeue: %#v", result)
 	}
-	if minter.calls == 0 {
-		t.Fatalf("LaunchSecure never minted the run's installation token")
+	if minter.calls != 2 {
+		t.Fatalf("LaunchSecure minted %d tokens, want write and read profiles", minter.calls)
 	}
 	secret := &corev1.Secret{}
 	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.CredentialsSecretName(run.Name)}, secret); err != nil {
@@ -698,6 +772,20 @@ func TestInstallationTokenRequeueDelay(t *testing.T) {
 	if delay := control.InstallationTokenRequeueDelay(context.Background(), run); delay != 65*time.Minute {
 		t.Fatalf("delay for the earliest entry = %v, want 65m", delay)
 	}
+	entries.Entries[0].ReadExpiresAt = now.Add(80 * time.Minute)
+	entries.Entries[0].ReadToken = "read-soonest"
+	raw, err = json.Marshal(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh = readInstallationSecret(t, c, run)
+	fresh.Data = map[string][]byte{topology.CredKeyInstallationToken: raw}
+	if err := c.Update(context.Background(), fresh); err != nil {
+		t.Fatal(err)
+	}
+	if delay := control.InstallationTokenRequeueDelay(context.Background(), run); delay != 55*time.Minute {
+		t.Fatalf("delay for earliest read profile = %v, want 55m", delay)
+	}
 
 	// Inside the window the next pass is immediate churn, which mints.
 	expired := topology.InstallationTokenDocument{
@@ -774,7 +862,7 @@ func TestInstallationTokenRejectsShortMint(t *testing.T) {
 		t.Fatalf("short mint err = %v, want a retryable refusal", err)
 	}
 	if minter.calls != 1 {
-		t.Fatalf("short mint calls = %d, want 1", minter.calls)
+		t.Fatalf("short write mint calls = %d, want 1", minter.calls)
 	}
 	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.CredentialsSecretName(run.Name)}, &corev1.Secret{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("short mint wrote a credential Secret: %v", err)

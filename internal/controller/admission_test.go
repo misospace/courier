@@ -10,6 +10,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -19,6 +20,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/executor"
@@ -358,6 +360,10 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 			Conditions                      []metav1.Condition                 `json:"conditions,omitempty"`
 			PublicationPolicy               *courierv1alpha1.PublicationPolicy `json:"publicationPolicy,omitempty"`
 			RetryRequest                    *courierv1alpha1.RetryRequest      `json:"retryRequest"`
+			// Raw messages: a merge patch clears these records with an
+			// explicit null, so presence must be distinguished from absence.
+			CIRepair     json.RawMessage `json:"ciRepair"`
+			CISettlement json.RawMessage `json:"ciSettlement"`
 		} `json:"status"`
 	}
 	if err := json.Unmarshal(patch, &document); err != nil {
@@ -437,6 +443,28 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 	// set on a Requeued record, which is never replaced.
 	if document.Status.RetryRequest != nil {
 		run.Status.RetryRequest = document.Status.RetryRequest
+	}
+	if document.Status.CIRepair != nil {
+		if string(document.Status.CIRepair) == "null" {
+			run.Status.CIRepair = nil
+		} else {
+			repair := &courierv1alpha1.CIRepairContext{}
+			if err := json.Unmarshal(document.Status.CIRepair, repair); err != nil {
+				return err
+			}
+			run.Status.CIRepair = repair
+		}
+	}
+	if document.Status.CISettlement != nil {
+		if string(document.Status.CISettlement) == "null" {
+			run.Status.CISettlement = nil
+		} else {
+			settlement := &courierv1alpha1.CISettlement{}
+			if err := json.Unmarshal(document.Status.CISettlement, settlement); err != nil {
+				return err
+			}
+			run.Status.CISettlement = settlement
+		}
 	}
 	return w.client.Status().Update(ctx, &run)
 }
@@ -904,14 +932,29 @@ func launcherClientForAdmission(t *testing.T, objects ...runtime.Object) client.
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add core scheme: %v", err)
 	}
+	if err := networkingv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add networking scheme: %v", err)
+	}
 	if err := rbacv1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add rbac scheme: %v", err)
 	}
-	return fake.NewClientBuilder().
+	base := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
+		WithStatusSubresource(&corev1.Pod{}).
 		WithRuntimeObjects(objects...).
 		Build()
+	return interceptor.NewClient(base, interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+		if err := c.Create(ctx, obj, opts...); err != nil {
+			return err
+		}
+		pod, ok := obj.(*corev1.Pod)
+		if ok && pod.Labels[executor.LabelComponent] == executor.GitGuardComponentName {
+			pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: executor.GitEgressContainerName, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}}
+			return c.Status().Update(ctx, pod)
+		}
+		return nil
+	}})
 }
 
 // launchFuncForAdmission adapts the production CoordinatorLauncher to a

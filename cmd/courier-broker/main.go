@@ -124,34 +124,25 @@ func run(ctx context.Context, config runConfig) error {
 	}
 
 	var tokenSource couriergithub.InstallationTokenSource
+	var readSource couriergithub.InstallationTokenSource
 	if appMode {
 		owner := repositoryOwner(policy.BaseRepo)
-		tokenSource, err = broker.NewSecretInstallationTokenSource(liveClient, env.namespace,
+		installationTokenSource, sourceErr := broker.NewSecretInstallationTokenSource(liveClient, env.namespace,
 			topology.CredentialsSecretName(run.Name), document.InstallationToken.SecretKey,
 			owner, env.providerEndpt, time.Now)
-		if err != nil {
-			return fmt.Errorf("courier-broker: configure installation token source: %w", err)
+		if sourceErr != nil {
+			return fmt.Errorf("courier-broker: configure installation token source: %w", sourceErr)
 		}
+		tokenSource = installationTokenSource
+		readSource = installationTokenSource.ReadProfile()
 	}
 	pinnedRepositories := []string{policy.BaseRepo}
 	if policy.WorkRepo != policy.BaseRepo {
 		pinnedRepositories = append(pinnedRepositories, policy.WorkRepo)
 	}
-	provider, err := newProvider(env, document, appMode, tokenSource, pinnedRepositories)
+	wiring, err := assembleForge(ctx, env, document, appMode, tokenSource, readSource, pinnedRepositories, policy)
 	if err != nil {
 		return err
-	}
-	baseRepo, err := provider.ResolveRepository(ctx, policy.BaseRepo)
-	if err != nil {
-		return fmt.Errorf("courier-broker: base repository resolution failed: %w", err)
-	}
-	workRepo, err := provider.ResolveRepository(ctx, policy.WorkRepo)
-	if err != nil {
-		return fmt.Errorf("courier-broker: work repository resolution failed: %w", err)
-	}
-	adapter, err := broker.NewForgeAdapter(policy, provider, provider, baseRepo, workRepo)
-	if err != nil {
-		return fmt.Errorf("courier-broker: forge adapter rejected the pinned policy: %w", err)
 	}
 
 	gitBroker, err := couriergit.NewBroker(ctx, config.scratchDir)
@@ -167,7 +158,7 @@ func run(ctx context.Context, config runConfig) error {
 	if err != nil {
 		return fmt.Errorf("courier-broker: git transport rejected the pinned policy: %w", err)
 	}
-	engine, err := broker.NewPolicyEngineWithSnapshotter(policy, adapter, pusher, pusher)
+	engine, err := broker.NewPolicyEngineWithSnapshotter(policy, wiring.publication, pusher, pusher)
 	if err != nil {
 		return fmt.Errorf("courier-broker: policy engine rejected the pinned policy: %w", err)
 	}
@@ -176,7 +167,7 @@ func run(ctx context.Context, config runConfig) error {
 	// here, with the broker's credential, before it serves. A broker that
 	// cannot write the pinned destinations is a capability-health failure,
 	// not a degraded launch.
-	if err := verifyCredentialBoundPolicy(ctx, adapter, policy); err != nil {
+	if err := verifyCredentialBoundPolicy(ctx, wiring.publication, policy); err != nil {
 		return err
 	}
 
@@ -188,7 +179,7 @@ func run(ctx context.Context, config runConfig) error {
 	if err != nil {
 		return fmt.Errorf("courier-broker: status writer configuration failed: %w", err)
 	}
-	trustedStatus, err := broker.NewTrustedStatusHandler(authenticator, statusWriter, lastCommitValidator(adapter, policy))
+	trustedStatus, err := broker.NewTrustedStatusHandler(authenticator, statusWriter, lastCommitValidator(wiring.publication, policy))
 	if err != nil {
 		return fmt.Errorf("courier-broker: trusted status handler rejected: %w", err)
 	}
@@ -197,7 +188,7 @@ func run(ctx context.Context, config runConfig) error {
 		Authenticator: authenticator,
 		Importer:      gitBroker,
 		Snapshot:      engine,
-		ForgeReader:   adapter,
+		ForgeReader:   wiring.reader,
 		ScratchDir:    config.scratchDir,
 		TLSCertFile:   config.certFile,
 		TLSKeyFile:    config.keyFile,
@@ -206,7 +197,7 @@ func run(ctx context.Context, config runConfig) error {
 			provider:   document.Provider.Type,
 			endpoint:   document.Provider.Endpoint,
 			git:        document.Provider.GitTemplate,
-			operations: provider.Capabilities(),
+			operations: wiring.provider.Capabilities(),
 		},
 	})
 	if err != nil {
@@ -244,6 +235,9 @@ type brokerEnv struct {
 	gitUsername    string
 	gitToken       string
 	apiTokenFile   string
+	// providerHTTPClient optionally replaces the forge client's transport, so
+	// a fixture server can be trusted; nil keeps the default bounded client.
+	providerHTTPClient *http.Client
 }
 
 // pinnedCapabilities is the immutable capability report captured at broker
@@ -424,18 +418,71 @@ func policyMatches(resolved broker.Policy, persisted *courier.PublicationPolicy)
 	return nil
 }
 
-func newProvider(env *brokerEnv, document *topology.BrokerPolicyDocument, appMode bool, source couriergithub.InstallationTokenSource, pinnedRepositories []string) (interface {
+// forgeProvider is the provider facet set every broker forge client carries.
+type forgeProvider = interface {
 	forge.Provider
 	forge.RepositoryPolicyProvider
 	forge.PullRequestHeadLister
-}, error) {
+}
+
+// forgeWiring is the assembled forge surface: the publication provider and
+// adapter over the write-capable credential, and the model-facing reader.
+type forgeWiring struct {
+	provider    forgeProvider
+	publication *broker.ForgeAdapter
+	reader      broker.ForgeReader
+}
+
+// assembleForge resolves the pinned repositories and builds the publication
+// adapter plus the model-facing reader. In App mode the reader is a separate
+// adapter over a read-scoped credential profile and a read-only transport, so
+// the /v1/forge/call vocabulary's reads-only guarantee has a credential-level
+// barrier behind it: even a route-vocabulary regression cannot reach a
+// write-capable token. Static mode has a single deployment credential for
+// everything, so the reader is the publication adapter.
+func assembleForge(ctx context.Context, env *brokerEnv, document *topology.BrokerPolicyDocument, appMode bool, tokenSource, readSource couriergithub.InstallationTokenSource, pinnedRepositories []string, policy broker.Policy) (forgeWiring, error) {
+	provider, err := newProvider(env, document, appMode, tokenSource, pinnedRepositories, false)
+	if err != nil {
+		return forgeWiring{}, err
+	}
+	baseRepo, err := provider.ResolveRepository(ctx, policy.BaseRepo)
+	if err != nil {
+		return forgeWiring{}, fmt.Errorf("courier-broker: base repository resolution failed: %w", err)
+	}
+	workRepo, err := provider.ResolveRepository(ctx, policy.WorkRepo)
+	if err != nil {
+		return forgeWiring{}, fmt.Errorf("courier-broker: work repository resolution failed: %w", err)
+	}
+	publication, err := broker.NewForgeAdapter(policy, provider, provider, baseRepo, workRepo)
+	if err != nil {
+		return forgeWiring{}, fmt.Errorf("courier-broker: forge adapter rejected the pinned policy: %w", err)
+	}
+	reader := broker.ForgeReader(publication)
+	if appMode {
+		readProvider, err := newProvider(env, document, appMode, readSource, pinnedRepositories, true)
+		if err != nil {
+			return forgeWiring{}, err
+		}
+		readAdapter, err := broker.NewForgeAdapter(policy, readProvider, readProvider, baseRepo, workRepo)
+		if err != nil {
+			return forgeWiring{}, fmt.Errorf("courier-broker: read forge adapter rejected the pinned policy: %w", err)
+		}
+		reader = readAdapter
+	}
+	return forgeWiring{provider: provider, publication: publication, reader: reader}, nil
+}
+
+// newProvider binds an App-mode client to the selected token profile; readOnly
+// also blocks write methods at the client and transport boundaries.
+func newProvider(env *brokerEnv, document *topology.BrokerPolicyDocument, appMode bool, source couriergithub.InstallationTokenSource, pinnedRepositories []string, readOnly bool) (forgeProvider, error) {
 	cfg := forge.ProviderConfig{Name: document.Provider.Name, Endpoint: env.providerEndpt}
 	switch env.providerType {
 	case "github":
 		if appMode {
 			owner := repositoryOwner(document.PublicationPolicy.BaseRepo)
 			client, err := couriergithub.NewBrokerInstallationClient(couriergithub.BrokerInstallationAuth{
-				Owner: owner, Repositories: pinnedRepositories, Endpoint: env.providerEndpt,
+				Owner: owner, Repositories: pinnedRepositories, Endpoint: env.providerEndpt, ReadOnly: readOnly,
+				HTTPClient: env.providerHTTPClient,
 			}, source)
 			if err != nil {
 				return nil, fmt.Errorf("courier-broker: forge client rejected its configuration: %w", err)

@@ -321,6 +321,7 @@ func TestNativeResultReasonContract(t *testing.T) {
 		NativeResultNeedsHuman,
 		NativeResultBlockedExternal,
 		NativeResultCapacityExhausted,
+		NativeResultBudgetExhausted,
 		NativeResultWorkloadFailed,
 		NativeResultInfrastructureFailed,
 	}
@@ -341,6 +342,53 @@ func TestNativeResultReasonContract(t *testing.T) {
 	}
 	if NativeResultReason("") != "" {
 		t.Fatal("the empty kind produced a durable reason")
+	}
+}
+
+// TestCRDManifestNativeResultKindEnum pins the generated CoderRun CRD to the
+// trusted terminal-kind vocabulary (#127, #901): every declared kind —
+// including budget_exhausted — is an accepted enum value, so a control
+// incarnation can persist the verdict the API declares and no other.
+func TestCRDManifestNativeResultKindEnum(t *testing.T) {
+	manifest, err := os.ReadFile("../../charts/courier/crd-manifests/courier.misospace.dev_coderruns.yaml")
+	if err != nil {
+		t.Fatalf("read CRD manifest: %v", err)
+	}
+	lines := strings.Split(string(manifest), "\n")
+	var block []string
+	inResult := false
+	indent := ""
+	for _, line := range lines {
+		if !inResult {
+			if i := strings.Index(line, "nativeResult:"); i >= 0 {
+				inResult = true
+				indent = line[:i]
+			}
+			continue
+		}
+		// A sibling key at the same indent ends the nativeResult block.
+		if strings.HasPrefix(line, indent) && len(line) > len(indent) && line[len(indent)] != ' ' {
+			break
+		}
+		block = append(block, line)
+	}
+	if !inResult {
+		t.Fatal("CRD manifest has no status.nativeResult schema")
+	}
+	text := strings.Join(block, "\n")
+	for _, kind := range []NativeResultKind{
+		NativeResultPublished,
+		NativeResultNoChange,
+		NativeResultNeedsHuman,
+		NativeResultBlockedExternal,
+		NativeResultCapacityExhausted,
+		NativeResultBudgetExhausted,
+		NativeResultWorkloadFailed,
+		NativeResultInfrastructureFailed,
+	} {
+		if want := "- " + string(kind); !strings.Contains(text, want) {
+			t.Fatalf("status.nativeResult.kind enum missing %q:\n%s", string(kind), text)
+		}
 	}
 }
 

@@ -368,6 +368,117 @@ func TestServerRunDetailNotFoundAndEnvelope(t *testing.T) {
 	if envelope.APIVersion != APIVersion || envelope.Kind != KindRunDetail {
 		t.Errorf("envelope = %s/%s, want %s/%s", envelope.APIVersion, envelope.Kind, APIVersion, KindRunDetail)
 	}
+	var detail RunDetail
+	if err := json.Unmarshal(envelope.Payload, &detail); err != nil {
+		t.Fatalf("detail payload: %v", err)
+	}
+	if len(detail.Timeline) == 0 || detail.Timeline[0].Label != TimelineCreated {
+		t.Errorf("detail timeline = %+v, want created entry", detail.Timeline)
+	}
+	// The wire shape carries the attribution the page renders: every entry names
+	// where it was recorded, and the payload states when this projection read
+	// the object.
+	for _, entry := range detail.Timeline {
+		if entry.Source == "" || entry.Authority == "" {
+			t.Errorf("served entry %s has no provenance: %+v", entry.Label, entry)
+		}
+	}
+	if detail.TimelineObservedAt == nil {
+		t.Error("served detail has no projection observation instant")
+	}
+	withoutTimes := courierv1alpha1.CoderRun{ObjectMeta: metav1.ObjectMeta{Name: "no-times", Namespace: "courier"}}
+	_, emptyHandler := serverFixture(t, &withoutTimes)
+	emptyEnvelope, _ := envelopeOf(t, get(emptyHandler, "/v1/runs/no-times"))
+	var emptyDetail RunDetail
+	if err := json.Unmarshal(emptyEnvelope.Payload, &emptyDetail); err != nil {
+		t.Fatalf("empty detail payload: %v", err)
+	}
+	if len(emptyDetail.Timeline) != 0 || emptyDetail.TimelineTruncated {
+		t.Errorf("empty timeline = %+v truncated=%v", emptyDetail.Timeline, emptyDetail.TimelineTruncated)
+	}
+}
+
+// TestServerRunDetailRetentionWindowServed pins that the retention truth the
+// operator acts on reaches the wire: the phase window, the expiry it implies,
+// and the window hold itself.
+func TestServerRunDetailRetentionWindowServed(t *testing.T) {
+	// The server reads its own clock, so the fixture stamps relative to now: the
+	// marker sits inside the window the projection must report.
+	markerAt := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
+	run := runFixture("retained", "github-label", "local", courierv1alpha1.PhaseFailed, markerAt.Add(-time.Hour))
+	run.Annotations = map[string]string{AnnotationFailedAt: markerAt.Format(time.RFC3339)}
+	run.Status.Conditions = []metav1.Condition{{
+		Type: courierv1alpha1.ConditionLifecycleReported, Status: metav1.ConditionTrue, Reason: "Published",
+		LastTransitionTime: metav1.NewTime(markerAt),
+	}}
+	_, handler := serverFixture(t, &run)
+	envelope, _ := envelopeOf(t, get(handler, "/v1/runs/retained"))
+	var detail RunDetail
+	if err := json.Unmarshal(envelope.Payload, &detail); err != nil {
+		t.Fatalf("detail payload: %v", err)
+	}
+	if fmt.Sprint(detail.Reap.Holds) != "[retention window still open]" {
+		t.Errorf("served holds = %v", detail.Reap.Holds)
+	}
+	if detail.Reap.RetentionWindowSeconds == nil || *detail.Reap.RetentionWindowSeconds != int64(DefaultFailedRetention/time.Second) {
+		t.Errorf("served window = %v, want %ds", detail.Reap.RetentionWindowSeconds, int64(DefaultFailedRetention/time.Second))
+	}
+	if detail.Reap.RetentionExpiresAt == nil || !detail.Reap.RetentionExpiresAt.Time.Equal(markerAt.Add(DefaultFailedRetention)) {
+		t.Fatalf("served expiry = %v, want %s", detail.Reap.RetentionExpiresAt, markerAt.Add(DefaultFailedRetention))
+	}
+	for _, entry := range detail.Timeline {
+		if entry.Label != TimelineRetentionMarked {
+			continue
+		}
+		if entry.Source != TimelineSourceRetention+"/"+AnnotationFailedAt {
+			t.Errorf("retention entry source = %q", entry.Source)
+		}
+	}
+}
+
+// TestServerRunDetailUsesConfiguredRetentionWindows pins the wiring the projected
+// expiry depends on: the read API must state the retention windows its caller
+// configured, not the mirrored defaults. A deployment that runs
+// --done-retention=1h while the page shows a 5-minute window would send an
+// operator away from a run the reaper is still holding for an hour.
+func TestServerRunDetailUsesConfiguredRetentionWindows(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := courierv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add scheme: %v", err)
+	}
+	markerAt := time.Now().Add(-30 * time.Minute).UTC().Truncate(time.Second)
+	run := runFixture("configured", "github-label", "local", courierv1alpha1.PhaseDone, markerAt.Add(-time.Hour))
+	run.Annotations = map[string]string{AnnotationDoneAt: markerAt.Format(time.RFC3339)}
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&run).Build()
+	server, err := NewServer(ServerConfig{
+		Reader:        reader,
+		Token:         testToken,
+		Bind:          ":0",
+		Namespace:     "courier",
+		DoneRetention: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	handler := server.Handler()
+
+	envelope, _ := envelopeOf(t, get(handler, "/v1/runs/configured"))
+	var detail RunDetail
+	if err := json.Unmarshal(envelope.Payload, &detail); err != nil {
+		t.Fatalf("detail payload: %v", err)
+	}
+	if detail.Reap.RetentionWindowSeconds == nil || *detail.Reap.RetentionWindowSeconds != 3600 {
+		t.Fatalf("served window = %v, want the configured 3600s", detail.Reap.RetentionWindowSeconds)
+	}
+	wantExpiry := markerAt.Add(time.Hour)
+	if detail.Reap.RetentionExpiresAt == nil || !detail.Reap.RetentionExpiresAt.Time.Equal(wantExpiry) {
+		t.Fatalf("served expiry = %v, want %s", detail.Reap.RetentionExpiresAt, wantExpiry)
+	}
+	// Thirty minutes into an hour-long window the run is still held; under the
+	// mirrored 5-minute default it would read as expired and unheld.
+	if fmt.Sprint(detail.Reap.Holds) != "[retention window still open]" {
+		t.Errorf("served holds = %v, want the window hold", detail.Reap.Holds)
+	}
 }
 
 // TestServerRedactionEndToEnd pushes a fully populated run through the HTTP

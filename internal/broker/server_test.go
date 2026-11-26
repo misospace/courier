@@ -631,6 +631,75 @@ func TestAPIStalledBodyCannotOutliveWriteDeadline(t *testing.T) {
 	}
 }
 
+// TestForgeCallStalledBodyCannotOutliveWriteDeadline: the forge-read route
+// authenticates inside its own context budget, but the body is still read
+// under the socket bound the shared handler installs. A client that sends its
+// headers, passes authentication, and then stalls its body must still receive
+// the whole retryable 408 while the write deadline is ahead — the budget
+// context never replaces the socket bound that keeps this phase answerable.
+func TestForgeCallStalledBodyCannotOutliveWriteDeadline(t *testing.T) {
+	s, _ := serverForTest(t)
+	cert, key := testTLSFiles(t)
+	// Compress the bound so the regression does not wait a production window.
+	s.bodyReadBudget = 200 * time.Millisecond
+	srv := s.newHTTPServer("127.0.0.1:0")
+	srv.WriteTimeout = s.bodyReadBudget + 100*time.Millisecond
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.ServeTLS(ln, cert, key) }()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("ServeTLS() = %v", err)
+		}
+	})
+	certPEM, err := os.ReadFile(cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(certPEM) {
+		t.Fatal("test certificate is not PEM")
+	}
+	conn, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{RootCAs: pool, ServerName: "broker.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	// The headers arrive and pass authentication; the body never does.
+	if _, err := conn.Write([]byte("POST " + PathForgeCall + " HTTP/1.1\r\nHost: broker.test\r\nAuthorization: Bearer valid-token\r\nContent-Length: 64\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	// The generous read deadline is the failure margin: against the bug the
+	// answer is truncated and the connection hangs until this deadline, so
+	// the test must not wait forever on the defect it pins.
+	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodPost, "https://broker.test"+PathForgeCall, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(conn), request)
+	if err != nil {
+		t.Fatalf("stalled forge-read body did not receive a whole answer: %v", err)
+	}
+	defer response.Body.Close()
+	payload, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if response.StatusCode != http.StatusRequestTimeout {
+		t.Fatalf("status = %d, want 408; a body that could not be read in time is an incomplete request, not a denial", response.StatusCode)
+	}
+	if string(payload) != "request timed out\n" {
+		t.Fatalf("body = %q, want the whole retryable answer", payload)
+	}
+}
+
 // stalledBodyReader sends a prefix of the declared body and then blocks until
 // the test ends, standing in for a client that stalls its body mid-upload.
 type stalledBodyReader struct {

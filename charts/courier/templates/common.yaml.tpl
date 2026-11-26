@@ -25,6 +25,7 @@
 {{- $hasDispatchLane := false }}
 {{- $hasDispatchLaneBinding := false }}
 {{- $hasDispatchRebaseExecutor := false }}
+{{- $hasDispatchRebaseCapable := false }}
 {{- $hasDispatchRebaseLane := false }}
 {{- $hasDispatchPollInterval := false }}
 {{- $hasDispatchHTTPTimeout := false }}
@@ -70,6 +71,9 @@
 {{- end }}
 {{- if hasPrefix "--dispatch-rebase-executor=" $arg }}
 {{- $hasDispatchRebaseExecutor = true }}
+{{- end }}
+{{- if hasPrefix "--dispatch-rebase-capable=" $arg }}
+{{- $hasDispatchRebaseCapable = true }}
 {{- end }}
 {{- if hasPrefix "--dispatch-rebase-lane=" $arg }}
 {{- $hasDispatchRebaseLane = true }}
@@ -119,11 +123,16 @@
 {{- $dispatch := .Values.dispatch }}
 {{- $lanes := $dispatch.lanes | default (list) }}
 {{- $rebaseExecutorLanes := 0 }}
+{{- $rebaseCapableLanes := 0 }}
 {{- range $binding := $lanes }}
 {{- if $binding.rebaseExecutor }}{{- $rebaseExecutorLanes = add $rebaseExecutorLanes 1 }}{{- end }}
+{{- if $binding.rebaseCapable }}{{- $rebaseCapableLanes = add $rebaseCapableLanes 1 }}{{- end }}
 {{- end }}
 {{- if and (not $dispatch.enabled) (gt $rebaseExecutorLanes 0) }}
 {{- fail "dispatch.lanes[].rebaseExecutor requires dispatch.enabled" }}
+{{- end }}
+{{- if and (not $dispatch.enabled) (gt $rebaseCapableLanes 0) }}
+{{- fail "dispatch.lanes[].rebaseCapable requires dispatch.enabled" }}
 {{- end }}
 {{- if $dispatch.enabled }}
 {{- if or (not $dispatch.baseURL) (not $dispatch.agentName) (not $dispatch.tokenSecret.name) (not $dispatch.tokenSecret.key) }}
@@ -158,12 +167,21 @@
 {{- if and (gt (index $queueCounts $binding.queueLane) 1) (not $binding.agentName) }}
 {{- fail (printf "repeated queueLane %q requires explicit distinct agentName values" $binding.queueLane) }}
 {{- end }}
+{{- if and $binding.rebaseExecutor $binding.rebaseCapable }}
+{{- fail "dispatch.lanes entry cannot set both rebaseExecutor and rebaseCapable" }}
+{{- end }}
 {{- if and $binding.rebaseExecutor (not $binding.agentName) }}
 {{- fail (printf "dispatch.lanes entry with rebaseExecutor true requires an explicit agentName (queueLane %q)" $binding.queueLane) }}
+{{- end }}
+{{- if and $binding.rebaseCapable (not $binding.agentName) }}
+{{- fail (printf "dispatch.lanes entry with rebaseCapable true requires an explicit agentName (queueLane %q)" $binding.queueLane) }}
 {{- end }}
 {{- end }}
 {{- if and $hasDispatchLaneBinding (gt $rebaseExecutorLanes 0) }}
 {{- fail "dispatch.lanes[].rebaseExecutor cannot be combined with operator-supplied --dispatch-lane-binding args; declare the rebase executor with an operator-supplied --dispatch-rebase-executor arg" }}
+{{- end }}
+{{- if and $hasDispatchLaneBinding (gt $rebaseCapableLanes 0) }}
+{{- fail "dispatch.lanes[].rebaseCapable cannot be combined with operator-supplied --dispatch-lane-binding args; declare the rebase-capable binding with an operator-supplied --dispatch-rebase-capable arg" }}
 {{- end }}
 {{- else if or (not $dispatch.queueLane) (not $dispatch.laneProfile) }}
 {{- fail "dispatch.enabled requires dispatch.lanes or both dispatch.queueLane and dispatch.laneProfile" }}
@@ -180,6 +198,9 @@
 {{- $args = append $args (printf "--dispatch-lane-binding=%s" $bindingArg) }}
 {{- if and $binding.rebaseExecutor (not $hasDispatchRebaseExecutor) (not $hasDispatchRebaseLane) }}
 {{- $args = append $args (printf "--dispatch-rebase-executor=%s" $binding.agentName) }}
+{{- end }}
+{{- if and $binding.rebaseCapable (not $hasDispatchRebaseCapable) }}
+{{- $args = append $args (printf "--dispatch-rebase-capable=%s" $binding.agentName) }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -610,6 +631,15 @@ the pair guards below rather than an opaque template error. */}}
 {{- $effectiveContributeURL := $consoleContributeValues.url }}
 {{- $hasConsoleContributeTokenFile := false }}
 {{- $effectiveContributeToken := not (empty $consoleContributeValues.tokenSecret) }}
+{{- $hasConsoleContributeStatusURL := false }}
+{{- /* default dict keeps a values override that omits the contributeStatus
+block an empty map instead of nil, so field access fails closed through
+the pair guard below rather than an opaque template error. */}}
+{{- $consoleContributeStatusValues := $operatorConsole.contributeStatus | default (dict) }}
+{{- $effectiveContributeStatusURL := $consoleContributeStatusValues.url }}
+{{- $hasConsoleContributeStatusTokenFile := false }}
+{{- $effectiveContributeStatusTokenFilePath := "" }}
+{{- $effectiveContributeStatusToken := not (empty $consoleContributeStatusValues.tokenSecret) }}
 {{- $hasConsoleReadAPITokenFile := false }}
 {{- $hasConsoleBind := false }}
 {{- $hasConsoleCookieSecure := false }}
@@ -634,6 +664,20 @@ own parser also accepts, so the pair guard below sees what it will run. */}}
 {{- if and (eq $arg "--contribute-token-file") (lt (add1 $i) $consoleArgCount) (not (hasPrefix "-" (index $consoleArgs (add1 $i)))) }}
 {{- $hasConsoleContributeTokenFile = true }}
 {{- $effectiveContributeToken = true }}
+{{- end }}
+{{- /* the contribute-status flags count in both spellings: --flag=value and a
+bare --flag whose value is the next argument, the spelling the binary's
+own parser also accepts, so the pair guard below sees what it will run. */}}
+{{- if hasPrefix "--contribute-status-url=" $arg }}{{- $hasConsoleContributeStatusURL = true }}{{- $effectiveContributeStatusURL = trimPrefix "--contribute-status-url=" $arg }}{{- end }}
+{{- if and (eq $arg "--contribute-status-url") (lt (add1 $i) $consoleArgCount) (not (hasPrefix "-" (index $consoleArgs (add1 $i)))) }}
+{{- $hasConsoleContributeStatusURL = true }}
+{{- $effectiveContributeStatusURL = index $consoleArgs (add1 $i) }}
+{{- end }}
+{{- if hasPrefix "--contribute-status-token-file=" $arg }}{{- $hasConsoleContributeStatusTokenFile = true }}{{- $effectiveContributeStatusToken = true }}{{- $effectiveContributeStatusTokenFilePath = trimPrefix "--contribute-status-token-file=" $arg }}{{- end }}
+{{- if and (eq $arg "--contribute-status-token-file") (lt (add1 $i) $consoleArgCount) (not (hasPrefix "-" (index $consoleArgs (add1 $i)))) }}
+{{- $hasConsoleContributeStatusTokenFile = true }}
+{{- $effectiveContributeStatusToken = true }}
+{{- $effectiveContributeStatusTokenFilePath = index $consoleArgs (add1 $i) }}
 {{- end }}
 {{- if hasPrefix "--readapi-token-file=" $arg }}{{- $hasConsoleReadAPITokenFile = true }}{{- end }}
 {{- if hasPrefix "--bind=" $arg }}{{- $hasConsoleBind = true }}{{- end }}
@@ -686,6 +730,33 @@ instead of crash-looping the console. */}}
 {{- end }}
 {{- if and $consoleContributeValues.url (not $hasConsoleContributeURL) }}{{- $consoleArgs = append $consoleArgs (printf "--contribute-url=%s" $consoleContributeValues.url) }}{{- end }}
 {{- if and $consoleContributeValues.tokenSecret (not $hasConsoleContributeTokenFile) }}{{- $consoleArgs = append $consoleArgs "--contribute-token-file=/etc/courier/console/contribute-token" }}{{- end }}
+{{- /* The effective contribution-status pair mirrors the binary's own startup
+rule: values and raw args both count, and half a pair fails the render
+instead of crash-looping the console. */}}
+{{- if ne (empty $effectiveContributeStatusURL) (empty $effectiveContributeStatusToken) }}
+{{- fail "operatorConsole.contributeStatus.url and operatorConsole.contributeStatus.tokenSecret must be set together (a raw --contribute-status-url or --contribute-status-token-file arg counts)" }}
+{{- end }}
+{{- /* A raw token-file arg completes the flag pair but the chart mounts the
+token content only from tokenSecret, so without it the binary would start
+paired and exit reading a file that was never mounted. Fail the render for
+that half-supplied pair too. */}}
+{{- if and $hasConsoleContributeStatusTokenFile (empty $consoleContributeStatusValues.tokenSecret) }}
+{{- fail "operatorConsole.contributeStatus.tokenSecret must be set with a raw --contribute-status-token-file arg: the chart mounts the contribution status token only from that Secret" }}
+{{- end }}
+{{- /* The chart mounts the contribution status token Secret at exactly one
+path, so a raw token-file arg is only usable when it names that path: any
+other value completes the flag pair but points the binary at a file that is
+never mounted, and the console would exit at startup. Force the canonical
+path instead of rendering an unstartable pairing. */}}
+{{- $contributeStatusTokenPath := "/etc/courier/console/contribute-status-token" }}
+{{- if and $hasConsoleContributeStatusTokenFile (ne $effectiveContributeStatusTokenFilePath $contributeStatusTokenPath) }}
+{{- fail (printf "operatorConsole.contributeStatus: a raw --contribute-status-token-file arg must name the canonical path %s, the only path the chart mounts the token Secret at" $contributeStatusTokenPath) }}
+{{- end }}
+{{- if and $consoleContributeStatusValues.tokenSecret (hasKey $consoleContributeStatusValues "tokenSecretKey") (empty $consoleContributeStatusValues.tokenSecretKey) }}
+{{- fail "operatorConsole.contributeStatus.tokenSecretKey must name a Secret entry when tokenSecret is set" }}
+{{- end }}
+{{- if and $consoleContributeStatusValues.url (not $hasConsoleContributeStatusURL) }}{{- $consoleArgs = append $consoleArgs (printf "--contribute-status-url=%s" $consoleContributeStatusValues.url) }}{{- end }}
+{{- if and $consoleContributeStatusValues.tokenSecret (not $hasConsoleContributeStatusTokenFile) }}{{- $consoleArgs = append $consoleArgs "--contribute-status-token-file=/etc/courier/console/contribute-status-token" }}{{- end }}
 {{- if and $operatorConsole.readAPITokenSecret (not $hasConsoleReadAPITokenFile) }}
 {{- $consoleArgs = append $consoleArgs "--readapi-token-file=/etc/courier/console/readapi-token" }}
 {{- end }}
@@ -705,6 +776,7 @@ Secure-cookie setting without reading defaults. */}}
 {{- if eq $effectiveMode "token" }}{{- $needsConsolePersistence = true }}{{- end }}
 {{- if $operatorConsole.readAPITokenSecret }}{{- $needsConsolePersistence = true }}{{- end }}
 {{- if and $effectiveContribute (eq $effectiveMode "token") $consoleContributeValues.tokenSecret }}{{- $needsConsolePersistence = true }}{{- end }}
+{{- if $consoleContributeStatusValues.tokenSecret }}{{- $needsConsolePersistence = true }}{{- end }}
 {{- if $needsConsolePersistence }}
 {{- $persistence := deepCopy (.Values.persistence | default dict) }}
 {{- if and $effectiveContribute (eq $effectiveMode "token") $consoleContributeValues.tokenSecret }}
@@ -732,6 +804,13 @@ Secure-cookie setting without reading defaults. */}}
   "name" $operatorConsole.readAPITokenSecret
   "items" (list (dict "key" $operatorConsole.readAPITokenSecretKey "path" "readapi-token"))
   "advancedMounts" (dict "console" (dict "console" (list (dict "path" "/etc/courier/console/readapi-token" "subPath" "readapi-token" "readOnly" true))))) }}
+{{- end }}
+{{- if $consoleContributeStatusValues.tokenSecret }}
+{{- $_ := set $persistence "console-contribute-status-token" (dict
+  "type" "secret"
+  "name" $consoleContributeStatusValues.tokenSecret
+  "items" (list (dict "key" ($consoleContributeStatusValues.tokenSecretKey | default "token") "path" "contribute-status-token"))
+  "advancedMounts" (dict "console" (dict "console" (list (dict "path" "/etc/courier/console/contribute-status-token" "subPath" "contribute-status-token" "readOnly" true))))) }}
 {{- end }}
 {{- $_ := set .Values "persistence" $persistence }}
 {{- end }}

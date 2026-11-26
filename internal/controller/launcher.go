@@ -6,12 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"reflect"
 	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -22,6 +25,7 @@ import (
 	"github.com/misospace/courier/internal/broker"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/forge"
+	"github.com/misospace/courier/internal/topology"
 )
 
 var (
@@ -72,6 +76,12 @@ var (
 	// charge as before.
 	ErrProvisioningInFlight = errors.New("coordinator launcher: provisioning in flight; slot could not be verified as a live run-owned pod")
 )
+
+// ErrGuardTeardownPending reports a terminal run's guard teardown that has
+// requested the guard pod's deletion but has not yet observed its absence:
+// the caller must requeue and retry, because an accepted delete is not a
+// termination and the guard pod can still serve until the object is gone.
+var ErrGuardTeardownPending = errors.New("legacy git guard teardown is unfinished: the guard pod is still present")
 
 // ProvisioningCollisionError reports that Launch collided with a run-owned
 // coordinator pod whose deletion is already in flight (DeletionTimestamp
@@ -144,6 +154,14 @@ type CoordinatorLauncher struct {
 	// Secret, no identity, and the static COURIER_GIT_* pair exactly as
 	// before.
 	InstallationGit *InstallationGitOptions
+	// GitGuardEgressCIDRs enables the per-run git-guard egress policy for
+	// legacy App-mode runs (#919): the guard pod may reach these
+	// operator-provided forge CIDRs, while the coordinator policy explicitly
+	// refuses them and preserves other TCP 443 destinations. The API endpoint
+	// is admitted separately for credential reads; non-443 coordinator egress
+	// remains refused. Nil leaves static and secure launches unchanged.
+	GitGuardEgressCIDRs     []string
+	GitGuardKubernetesAPIIP string
 }
 
 // baseUnverifiedReason marks the permanent launch rejection of a fix-pr run
@@ -280,12 +298,11 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 		}
 		podConfig.BaseBranch = base
 	}
-	// App-mode git credentials for legacy coordinator pods (#871): the mint
+	// App-mode git credentials for legacy guard pods (#871, #919): the mint
 	// identity is proven and the run's installation-token document is on the
-	// API server before the pod that reads it is even rendered, so a
-	// coordinator never starts against a credential its launch refused to
-	// mint. Identity and ownership refusals are permanent; mint and write
-	// failures stay ordinary errors on the claim-safe retry path.
+	// API server before either pod is rendered, so git cannot start against a
+	// credential its launch refused to mint. Identity and ownership refusals
+	// are permanent; mint and write failures stay ordinary retryable errors.
 	if l.InstallationGit != nil {
 		if l.InstallationGit.Minter == nil {
 			return secureNeedsHuman("InstallationTokenOwner",
@@ -306,6 +323,7 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 	if err != nil {
 		return err
 	}
+
 	// The isolated legacy observer's run-scoped identity — ServiceAccount,
 	// Role, RoleBinding — is provisioned and ownership-verified BEFORE the
 	// coordinator pod can begin execution (#327 single-writer guarantee).
@@ -333,6 +351,58 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 		if err := l.ensureLegacyGitCredentialsResources(ctx, run, pod); err != nil {
 			return l.provisioningFailure(ctx, pod, err)
 		}
+	}
+	// The per-run git guard (#919) is provisioned for every App-mode launch:
+	// the guard Pod and its Service replace the #902 sidecar as the credential
+	// boundary, so they must exist before the coordinator pod — the same
+	// no-moment argument #908 recorded for its policy — and both survive
+	// coordinator relaunches, garbage-collected with the run. The two network
+	// policies render only when the deployment opted in with CIDRs, and the
+	// coordinator policy is provisioned first so no coordinator container can
+	// run while a direct forge path is still open. A deployment that
+	// configured CIDRs against a non-App-mode run still fails closed before
+	// any pod exists: a policy set that does not match the credential
+	// boundary would be a silent half-enforcement.
+	if podConfig.InstallationGit != nil {
+		if len(l.GitGuardEgressCIDRs) > 0 {
+			if strings.TrimSpace(l.GitGuardKubernetesAPIIP) == "" || parseGitGuardAPIIP(l.GitGuardKubernetesAPIIP) == nil {
+				return secureNeedsHuman("GitGuardPolicyAPI", "legacy git-guard egress requires a valid Kubernetes API endpoint IP")
+			}
+			if err := l.ensureGitGuardEgressPolicy(ctx, run); err != nil {
+				return l.provisioningFailure(ctx, pod, err)
+			}
+		}
+		if err := l.ensureGitGuardPodPolicy(ctx, run); err != nil {
+			return l.provisioningFailure(ctx, pod, err)
+		}
+		if err := l.ensureGitGuardService(ctx, run); err != nil {
+			return l.provisioningFailure(ctx, pod, err)
+		}
+		podConfig.GitGuardServiceAccountName = legacyGitCredentialsResourceName(run.Name)
+		guard, err := executor.BuildGitGuardPod(run, &lane, podConfig)
+		if err != nil {
+			return err
+		}
+		if err := l.ensureGitGuardPod(ctx, run, guard); err != nil {
+			if apierrors.IsInvalid(err) {
+				if !l.slotEmpty(ctx, pod) {
+					return ErrProvisioningInFlight
+				}
+				return secureNeedsHuman("GitGuardPodAdmission", "the API server rejected the git-guard pod %s: %v", guard.Name, err)
+			}
+			// Claim-safety is judged against the coordinator slot, never the
+			// guard pod: a guard-ensure failure left the coordinator slot
+			// untouched, so a permanent guard refusal (a foreign same-named
+			// pod) must still surface as its NeedsHuman class instead of
+			// wedging the claim against a guard pod that will never be
+			// adopted.
+			return l.provisioningFailure(ctx, pod, err)
+		}
+		if err := l.requireGitGuardRunning(ctx, run, guard.Name); err != nil {
+			return err
+		}
+	} else if len(l.GitGuardEgressCIDRs) > 0 {
+		return secureNeedsHuman("GitGuardPolicyApp", "legacy git-guard egress CIDRs require an App-mode coordinator pod")
 	}
 	err = l.Client.Create(ctx, pod)
 	if err == nil {
@@ -496,6 +566,77 @@ func (l *CoordinatorLauncher) collisionReader() client.Reader {
 		return l.APIReader
 	}
 	return l.Client
+}
+
+// ensureGitGuardEgressPolicy provisions the run's opt-in git-guard egress
+// policy before the coordinator pod exists. A create is the normal path. On
+// an AlreadyExists collision the existing policy is verified against the run:
+// a policy this run does not own is refused — a same-named foreign policy
+// must never be adopted or overwritten, because that would enforce an egress
+// boundary the deployment did not configure; an owned policy whose spec
+// equals the rendered one is accepted as idempotently live; and an owned
+// policy whose spec drifted is converged in place to the rendered spec,
+// mirroring the secure path's policy convergence, so a rendering change
+// reaches runs provisioned before it and no requeue loop wedges the launch.
+func parseGitGuardAPIIP(value string) *net.IPNet {
+	ip := net.ParseIP(strings.TrimSpace(value))
+	if ip == nil {
+		return nil
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return &net.IPNet{IP: v4, Mask: net.CIDRMask(32, 32)}
+	}
+	return &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
+}
+
+func (l *CoordinatorLauncher) ensureGitGuardPodPolicy(ctx context.Context, run *courierv1alpha1.CoderRun) error {
+	cidrs, err := topology.ParseGitGuardCIDRs(l.GitGuardEgressCIDRs)
+	if err != nil {
+		return secureNeedsHuman("GitGuardPolicyCIDRs", "legacy git-guard egress policy CIDRs are invalid: %v", err)
+	}
+	return l.ensureGitGuardPolicyObject(ctx, run, topology.GitGuardPodNetworkPolicy(run, cidrs, parseGitGuardAPIIP(l.GitGuardKubernetesAPIIP)))
+}
+
+func (l *CoordinatorLauncher) ensureGitGuardPolicyObject(ctx context.Context, run *courierv1alpha1.CoderRun, desired *networkingv1.NetworkPolicy) error {
+	if desired == nil {
+		return secureNeedsHuman("GitGuardPolicyCIDRs", "legacy git-guard egress policy requires CIDRs and a valid Kubernetes API IP")
+	}
+	if err := l.Client.Create(ctx, desired); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+		actual := &networkingv1.NetworkPolicy{}
+		if err := l.collisionReader().Get(ctx, client.ObjectKeyFromObject(desired), actual); err != nil {
+			return err
+		}
+		if !resourceOwnedByUID(actual, run.UID) {
+			return secureNeedsHuman("GitGuardPolicyOwnership", "NetworkPolicy %q is not owned by this run", desired.Name)
+		}
+		if !apiequality.Semantic.DeepEqual(desired.Spec, actual.Spec) {
+			updated := actual.DeepCopy()
+			updated.Spec = *desired.Spec.DeepCopy()
+			if err := l.Client.Update(ctx, updated); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (l *CoordinatorLauncher) ensureGitGuardEgressPolicy(ctx context.Context, run *courierv1alpha1.CoderRun) error {
+	if len(l.GitGuardEgressCIDRs) == 0 {
+		return secureNeedsHuman("GitGuardPolicyCIDRs", "legacy git-guard egress policy requires at least one CIDR")
+	}
+	cidrs, err := topology.ParseGitGuardCIDRs(l.GitGuardEgressCIDRs)
+	if err != nil {
+		return secureNeedsHuman("GitGuardPolicyCIDRs", "legacy git-guard egress policy CIDRs are invalid: %v", err)
+	}
+	apiIP := parseGitGuardAPIIP(l.GitGuardKubernetesAPIIP)
+	if apiIP == nil {
+		return secureNeedsHuman("GitGuardPolicyAPI", "legacy git-guard egress requires a valid Kubernetes API endpoint IP")
+	}
+	desired := topology.GitGuardEgressPolicy(run, cidrs, apiIP)
+	return l.ensureGitGuardPolicyObject(ctx, run, desired)
 }
 
 func (l *CoordinatorLauncher) ensureLegacyObserverResources(ctx context.Context, run *courierv1alpha1.CoderRun, pod *corev1.Pod) error {

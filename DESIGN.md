@@ -52,7 +52,11 @@ judgment, instead of boxing it in with gates, caps, and one-shot pods.
   any mix. Courier is **local-capable, not local-constrained**. Its author runs
   it local-only; nothing in the design requires that of anyone else.
 - **No wall-clock deadlines.** Consumer hardware is slow; an 18-hour run that is
-  making progress is fine. Courier bounds *stuck*, not *duration*.
+  making progress is fine. Courier bounds *stuck*, not *duration*. The one
+  declared exception is opt-in and lane-scoped: an operator may bound a lane's
+  coordination on `LaneProfile.spec.budget` (#901), which the harness — never
+  the controller — enforces as a coordination budget ending `budget_exhausted`.
+  Nothing may bound a run's duration that its lane did not declare.
 
 ## Architecture
 
@@ -510,7 +514,8 @@ The native harness ends with an explicit, structured terminal result, not a
 bare exit code (#127; the full contract is HARNESS.md §8). Trusted control
 classifies every ending into a `status.nativeResult` kind — `published`,
 `no_change`, `needs_human`, `blocked_external`, `capacity_exhausted`,
-`workload_failed`, or `infrastructure_failed` — and persists it through the
+`budget_exhausted`, `workload_failed`, or `infrastructure_failed` — and
+persists it through the
 run's broker status path before the control process exits. The broker fences
 the write to the authenticated control incarnation, so a stale pod cannot
 record a result, and one incarnation's recorded result is final: an identical
@@ -864,7 +869,12 @@ added later.
 
 ## Liveness and stuck detection
 
-No wall-clock. Courier bounds *stuck*, never *duration*.
+No wall-clock deadlines imposed by the control plane. Courier bounds *stuck*,
+never *duration*. The only duration bound that exists is the one a lane opts
+into on `LaneProfile.spec.budget` (#901): the harness checks the coordinator
+session loop's wall clock at its step boundaries and ends an exhausted run
+`budget_exhausted`; a lane that declares no budget is bounded by liveness
+alone.
 
 The only safe progress signal is **successful model streaming or a completed
 tool call** — real activity. Commits are unsafe (opencode-style runs commit
@@ -1970,16 +1980,22 @@ matching applies. The claimant stays the only ownership evidence — it is never
 inferred from the recipient, author, branch, or fix type — and the fix type
 only selects the shape of the lane arm. The lane comparison is dropped for one
 case (#787): on a connector that negotiated the rebase-executor intake
-contract, the verdict for a REBASE-marked item is known-claimant membership
-alone. REBASE exclusivity is the `DISPATCH_REBASE_AGENTS` local-only pool, not
-the queue-lane column (misospace/dispatch#1327): the claimant is the original
+contract as a dedicated rebase-only executor, the verdict for a REBASE-marked
+item is known-claimant membership alone. REBASE exclusivity is the
+`DISPATCH_REBASE_AGENTS` local-only pool, not the queue-lane column
+(misospace/dispatch#1327): the claimant is the original
 fixer on its own lane while the rebase connector polls on its own, so lane
 equality could never hold there, and enforcing it declined every pool-routed
 rebase handout and drove the fail-closed waiting-external park loop (#786).
+A rebase-capable connector (#886) — one that declares the `rebase-executor:1`
+capability without the rebase-only work scope, so the owning lane can execute
+the mechanical rebase alongside its ordinary work — is not that exception:
+REBASE-marked work keeps full lane equality there, so the handout is admitted
+only by the connector whose queue lane owns the claimant.
 Evidence stays required on that path — a REBASE-marked offer whose claimant is
 absent or outside the bindings is still declined by ownership — and every
 other attempt keeps full lane equality: a REBASE-marked offer reaching a
-connector that never negotiated the capability keeps the full verdict, so a
+connector that never declared the capability keeps the full verdict, so a
 cross-lane or evidence-less claimant is declined by ownership first and a
 same-lane one passes ownership only to meet the rebase classification's
 unsupported decline.
@@ -2646,6 +2662,9 @@ spec:
     roles:
       coordinator: {maxInputTokens: 128000}
       coder: {maxInputTokens: 32000}
+  budget:                          # optional coordination budgets the harness enforces (#901)
+    maxToolCalls: 200              # total tool calls across the coordinator and every delegate session
+    wallClockSeconds: 3600         # coordinator-loop wall clock, checked at step boundaries
   resources:                       # optional CPU/memory sizing for this lane's pods
     requests: {cpu: 500m, memory: 1Gi}
     limits: {cpu: "4", memory: 8Gi}
@@ -2700,9 +2719,11 @@ limit, and the probe image's real usage (a shell doing DNS and network
 checks) peaks in the tens of MiB, far under the limit, so the limit cannot
 OOM-kill the probe and falsify the isolation result it exists to produce.
 Likewise the workspace-observer sidecar and its seed init container on the
-coordinator pod always carry the fixed small `DefaultObserverResources`
+coordinator pod, and the per-run git-guard pod's container, always carry the
+fixed small `DefaultObserverResources`
 (25m/64Mi requested, 1 CPU/512Mi limited) whatever the lane says: they are
-Courier-internal helpers — baseline capture and workspace observation — and
+Courier-internal helpers — baseline capture, workspace observation, and the
+git transport guard — and
 the lane sizes the work a model does, not the helper that hashes the
 workspace, so sizing them from the lane would multiply the pod's scheduler
 reservation for processes that never grow with it. Unsized, they were the one
@@ -3070,7 +3091,7 @@ The operator console (`internal/console`, served by the standalone
 chart) is a server-rendered interface for authenticated operators. It is
 deliberately independent of the manager and of the Kubernetes API: it imports
 only the standard library, never talks to a cluster, and reaches the operator
-read API only over a fixed allowlist of GET paths. The run explorer reads the
+read API over fixed GET paths plus one composed run-detail path. The run explorer reads the
 read API's paginated run projection (`/v1/runs`, issue #825) and renders it
 server-side, with no client-side JavaScript, so filters and pagination are GET
 query state and every view is a shareable URL. The overview page (#824)
@@ -3084,9 +3105,28 @@ projection cannot supply reads Unknown, Unsupported, or an explicit
 "no … recorded", and a failed projection states itself as an outage instead
 of an empty namespace. The page reloads on a bounded meta-refresh interval —
 never through JavaScript or a Kubernetes watch — and stops polling when the
-backend is unconfigured. The run-detail page stays scaffold; the console
-still probes the read API's `/healthz` path for the page backend note when
-`--backend-url` is configured. The console additionally carries a bounded
+backend is unconfigured. The run-detail page (#826) reads the single-run
+projection (`/v1/runs/{name}`, still one named Get behind the read API) and
+renders the run's identity, the allowlisted status blocks (heartbeat,
+admission, checkpoint, publication, CI park, lifecycle report, coordinator
+diagnostic, reap, workspace safety), and a bounded event timeline derived
+only from recorded status timestamps (at most the newest
+`readapi.MaxTimelineEntries` entries, omission explicit, truncation stated).
+Every entry carries its own source of truth — the run-object field path that
+holds the stamp and which authority writes it — and the payload states the
+projection's own observation instant separately, so "the event happened at X" is
+never read as "the read model observed the run at Y". A 404 is a not-found state
+with a link back, never an error box, and the reap block lists the single-object
+hold reasons a terminal run cannot be reaped yet, mirroring the controller's
+gates: phase eligibility, the retention marker, the phase retention window and
+the expiry it implies, report settlement, outstanding CI settlement or park
+release, an outstanding retry, and the capacity-recovery ownership hold whose
+unsafe-workspace case the controller itself records. The per-repository audit
+floor compares other runs and is never derivable per run; the payload states
+whether the run's phase is governed by it, and the page names it only for those
+phases rather than implying a hold that cannot apply. The console still probes the read API's
+`/healthz` path for the page backend note when `--backend-url` is configured.
+The console additionally carries a bounded
 contribution form, a mutating, credentialed
 outbound-HTTP surface that submits server-side through the operator's
 contribution admission API under a file-mounted bearer token. The form is
@@ -3128,16 +3168,20 @@ request (DNS or dial phase); timeouts and server errors stay "may have been
 admitted".
 
 The console decodes each projection into its own view types rather than
-importing `internal/readapi`, so the standard-library-only boundary holds and
-a projected field reaches a browser only through that decode. The read API
+importing `internal/readapi` — production code never imports that package;
+only tests pin the mirrored path and kind constants against it — so the
+standard-library-only boundary holds and a projected field reaches a browser
+only through that decode. The read API
 bearer token (`operatorConsole.readAPITokenSecret`, mounted as a file and
 passed as `--readapi-token-file`) is optional: with no token the console still
 serves its pages and the unauthenticated health probe, and the explorer states
 that it is not configured rather than sending an unauthenticated projection
-request. The backend path is a constant allowlist entry and only its query
-string varies, so a filter value can never redirect the request to another
-path or host. Secrets, including the contribution and read API tokens, travel
-as file paths read from mounted Secrets, never environment values.
+request. The list paths are constant allowlist entries and only the run-list
+query string varies; the run-detail path is composed only after the requested
+name passes DNS-subdomain validation, so no browser-controlled value can
+redirect a request to another path or host. Secrets, including the contribution
+and read API tokens, travel as file paths read from mounted Secrets, never
+environment values.
 
 One authorization model: every authenticated identity is an operator, and
 `IsOperator` in `internal/console/auth.go` is the single seam where a
@@ -3173,6 +3217,25 @@ read-header/read/write/idle timeouts. With the chart's default values
 (`operatorConsole.enabled=false` and no `controllers.console` block) the
 chart renders exactly what a headless release rendered before: no second
 controller, no console Service, no new flags, and no policy.
+
+The console adds a contribution status view that reads
+`GET /v1/contributions/<run>` on the contribution listener. It sends the
+separate status-read bearer token — the same token the Secret named by
+`contributeAPI.readKeySecret` holds — as `--contribute-status-token-file`
+beside `--contribute-status-url`, not the operator read API token or the
+admission token. A status-read token cannot
+admit a contribution, and an admission token cannot read status. The page
+renders recorded state only: each phase maps to one honest word, `unknown`
+stays unknown, and an unrecognized phase shows its raw word marked unknown. It
+never calls a published pull request or a `Done` run merged or successful,
+because Courier opens pull requests and does not track merges. It links a pull
+request only for a credential-free `https` URL and renders every other value,
+and every user or model string, as escaped text. A successful read stores a
+bounded history of namespace-and-run pairs in an HMAC-signed, `HttpOnly`,
+`SameSite=Lax` cookie of links only, and header mode has no session key so it
+keeps no history. A meta-refresh tag reloads the view: fast when active, slow
+when parked, off when terminal or static, and a slow backoff after a failed
+read.
 
 ## Reconcile loop
 
@@ -3691,6 +3754,30 @@ resolves a queue lane only when that lane carries exactly one binding, and the
 two forms cannot be combined. A binding that reads like a rebase executor but
 was not declared as one produces a startup warning, because it declines every
 REBASE handout and the lane looks idle.
+
+A lane can also own its rebase work (#886): `--dispatch-rebase-capable` names
+a binding whose lane may execute mechanical rebase work alongside its ordinary
+queue. That binding declares `rebase-executor:1` without the rebase-only work
+scope, so Dispatch treats the poll as a capable REBASE recipient (for pool
+members) while its ordinary queue is unchanged; a REBASE offer is accepted
+only on a v1 acknowledgment granting the capability, and only when the
+claimant is bound to that connector's own queue lane — full lane equality,
+not the dedicated executor's membership-only verdict. The server-side pool
+form decides whether a dual-role lane survives: every bare name in
+`DISPATCH_REBASE_AGENTS` is also a dedicated-executor claimant exclusion
+for non-REBASE work (misospace/dispatch#1615), so a pool-named identity —
+the lane's own agent, or a separate same-lane identity, since the unscoped
+poll serves it ordinary work too — strands its own newly authored PR-fix
+claims. The bare `*` opt-in avoids the exclusion but deletes the
+fail-closed local-only allowlist, so it stays a debugging/backcompat
+choice, never a normal rollout. No pool form is a safe normal enablement
+until misospace/dispatch#1701 separates lane eligibility from the
+claimant exclusion; the client capability ships dark and
+`docs/rebase-lane.md` carries the rule.
+A designation that
+resolves to nothing fails startup like the executor form; one agent cannot
+carry both designations. Concurrency one per rebase is Dispatch's serialized
+lane admission plus the generation-pinned claim, not the connector count.
 
 Model-assisted conflict resolution (#732) is an explicit operator-selected
 capability, off by default. When enabled, the engine hands the episode's first
@@ -4346,7 +4433,7 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   registration and to the operator's own identity — instead of duplicating it
   into two, and the chart's label-source guard accepts the seam as a
   credential argument, mirroring the Go rule.
-   GitHub App authentication can replace the static identity for operator observation and admission reads, and can supply secure brokers' forge and git credentials. The operator retains the private key, refreshes its own read-only tokens, and mints and rotates short-lived tokens into that run's credentials Secret — one token per pinned repository, each carrying only the permissions the run needs against that repository, because GitHub applies an installation token's permissions to every repository the token names: the base repository's token carries the publication writes (issues, pull requests) and the reads that gate them but no contents write, and the work repository's token carries contents write for fetch and push plus administration read so the broker can establish the pinned work ref's effective protection before serving, but no publication write; a same-repository run is the one case whose single token legitimately carries both profiles. An existing credentials Secret is only trusted or updated once it is proven controlled by this exact run UID, its document owner and endpoint match the run's pinned identity, and a create that loses a race re-reads and re-validates the winner; a foreign or stale-owner object fails closed rather than being read or overwritten. The broker reads the Secret through the API server and never sees the private key or a pod-environment credential, and it asks for a token by full owner/name identity, so a fetch, push, or API request against one repository is never accompanied by a token minted for another. App mode never falls back to a static token, and a run whose pinned repositories have different owners cannot launch. The broker's git credential provider serves the token only for the run's pinned base and work repositories, and the broker refuses a token document whose shape it does not fully recognize. Rotation runs at launch and from the running-phase observer: a run that no observer supervises simply lets its tokens expire, and its broker then refuses every App-mode operation — fail-closed, never a silent fallback — until relaunch or the next supervised pass re-mints. See [HARNESS.md](./HARNESS.md) for setup and limits. Label discovery and settlement still use the static credential chain.
+   GitHub App authentication can replace the static identity for operator observation and admission reads, and can supply secure brokers' forge and git credentials. The operator retains the private key, refreshes its own read-only tokens, and mints and rotates short-lived tokens into that run's credentials Secret — one token per pinned repository, each carrying only the permissions the run needs against that repository, because GitHub applies an installation token's permissions to every repository the token names: the base repository's token carries the publication writes (issues, pull requests) and the reads that gate them but no contents write, and the work repository's token carries contents write for fetch and push plus administration read so the broker can establish the pinned work ref's effective protection before serving, but no publication write; a same-repository run is the one case whose single token legitimately carries both profiles. Every secure App-mode run also mints a second, read-scoped token per pinned repository: it carries only the read permissions the model-facing `/v1/forge/call` vocabulary needs and never a write scope, and the broker serves that route through a client bound to this profile whose transport refuses a write method before any token is spent, so a regression in the route vocabulary cannot reach a write-capable credential. The read profile is a credential of its own, never a copy of the write token: an entry whose read token aliases its write token is malformed — the operator refuses it when rendering the document, and the broker's per-read validation and the launcher's freshness and create-race checks re-establish the same distinctness, so a drifted Secret can never hand the write credential to the model-facing reader. The document shape carries both profiles per entry; legacy git-transport documents omit the read profile. A document-shape version bump refuses across image generations in both directions, so an operator upgrade that moves the version breaks in-flight App-mode runs' credentials until their topology relaunches — drained like a static↔App switch, never served half-recognized. An existing credentials Secret is only trusted or updated once it is proven controlled by this exact run UID, its document owner and endpoint match the run's pinned identity, and a create that loses a race re-reads and re-validates the winner; a foreign or stale-owner object fails closed rather than being read or overwritten. The broker reads the Secret through the API server and never sees the private key or a pod-environment credential, and it asks for a token by full owner/name identity, so a fetch, push, or API request against one repository is never accompanied by a token minted for another. App mode never falls back to a static token, and a run whose pinned repositories have different owners cannot launch. The broker's git credential provider serves the token only for the run's pinned base and work repositories, and the broker refuses a token document whose shape it does not fully recognize. Rotation runs at launch and from the running-phase observer: a run that no observer supervises simply lets its tokens expire, and its broker then refuses every App-mode operation — fail-closed, never a silent fallback — until relaunch or the next supervised pass re-mints. See [HARNESS.md](./HARNESS.md) for setup and limits. Label discovery and settlement still use the static credential chain.
 - With the App configured, the legacy coordinator path (#871) gets the same
   refreshable credential shape for its git checkout, fetch, push, and rebase:
   the launcher mints the run's installation-token document with the
@@ -4356,8 +4443,8 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   legacy git path performs no forge API writes with this credential — writes
   it to the run's credentials Secret under the same document the secure broker
   reads, and provisions a run-scoped identity whose only grant is one named
-  `get` on that Secret, bound to the coordinator pod's effective ServiceAccount
-  (the observer identity when the observer contract is on). Before any token
+  `get` on that Secret, bound to the per-run guard pod's ServiceAccount.
+  Before any token
   exists the launcher proves the mint identity: the base and head repositories
   must name one owner and the installation must sign for exactly that owner,
   so a cross-owner fork run is refused permanently at launch — a condition a
@@ -4369,14 +4456,48 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   the executor's forge-API reads are not the git transport this mode governs,
   so an App-mode pod receives it solely from an explicitly configured
   `GitHubCredentialSecret`. Every git operation the coordinator performs
-  goes through the run's loopback git egress guard (#902): the pod builder
-  rewrites both remotes to the guard's loopback origin, and the guard
-  container — the executor binary's `git-egress` mode, rendered as a native
-  sidecar the kubelet starts before every app container and stops once they
-  have all terminated, so the credential surface can never outlive the
-  coordinator it serves — re-reads the document through the API on every
+  goes through the run's git egress guard (#902, moved to a dedicated pod by
+  #919): the pod builder rewrites the coordinator's and the observer's remotes
+  to the run's guard Service DNS
+  name and port, and the guard pod — the executor binary's `git-egress` mode
+  in its own pod, provisioned by the launcher before the coordinator pod and
+  owned by the run — re-reads the document through the API on every
   operation, so a rotation or an expiry takes effect on the next
-  operation rather than at restart. The guard is
+  operation rather than at restart. The launcher creates the coordinator pod
+  only after the guard container is running, so the coordinator's first git
+  operation and the observer seed find a serving guard; a guard that never
+  runs holds the run in its claim, where the crashing pod is visible, instead
+  of failing runs one launch at a time. The guard survives coordinator
+  relaunches,
+  so a replacement coordinator attaches to a guard that is already serving.
+  Terminal teardown is staged, because an accepted Pod delete is not a
+  termination: both the terminal reconcile and the Done settle request the
+  guard pod's and the guard Service's deletion with UID preconditions, keep
+  the guard pod's ingress policy until an authoritative read proves no pod
+  carries the guard's run-and-component labels — the exact set the policy
+  bounds, so a terminating guard can still hold the boundary while it serves,
+  and that policy is the unauthenticated listener's only client bound — and
+  never delete the coordinator's forge-refusal policy themselves. A terminal
+  run can
+  still carry a live or deliberately preserved coordinator pod, so the
+  coordinator policy stays owned by the run and garbage collection removes it
+  with the run after retention: the refusal holds for the coordinator pod's
+  whole retained life, and the one residual window is the reap cascade
+  itself, where the run object's deletion removes the policy and a still
+  terminating coordinator pod in unspecified order — the same accepted
+  owner-reference cascade that already removes the pod. A teardown that has
+  not yet observed the guard pod absent — or whose writes failed outright —
+  holds the reap and requeues while the dispatch's other terminal duties keep
+  running, and the reaper holds the run object until the guard topology is
+  conclusively gone, so the delete cascade never removes the ingress policy
+  before the pod it bounds. The same staged teardown and absence gate guard
+  the two internal stale-work deletes — the outright claim refusal and the
+  pre-launch stale rejection — because a retryable launch rollback returns the
+  run to Pending with a live guard under its ownerRef, and a stale delete
+  issued then would cascade with no ordering between the policy and the pod it
+  bounds; while the guard survives, the refusal re-drives on the ordinary
+  workqueue path and the source-settlement semantics of stale work are
+  unchanged. The guard is
   the boundary a prompt could never be: git tells an askpass helper nothing
   about the ref a push is about to update, but the guard sees the push
   request itself. It serves only the smart-HTTP service endpoints of the two
@@ -4386,15 +4507,15 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   ref deletion, the base repository as a push destination, and any non-git
   endpoint are refused before any credential is resolved or any byte leaves
   the guard. The guard injects the credential into the upstream request
-  itself, so the token never enters the model container's environment,
+  itself and serves no client authentication, so the token never enters the
+  model container's environment,
   mounts, or files: the coordinator container carries neither the static
-  pair nor the installation contract nor the projected token, and the only
-  readable credential source in the pod is a projected token the model
-  container cannot mount and a Secret the pod's single `get` grants only
-  through it. The isolated legacy
-  observer and its seed resolve the same document through their own projected
-  token, so workspace observation keeps working when no static git credential
-  exists. Rotation reuses the same refresh lead and mint-lifetime guard and runs
+  pair nor the installation contract, and the observer containers carry no
+  credential at all, because their git rides the same guard and the observer
+  keeps only its projected pod identity for its own API read. The
+  credential-read identity lives only on the guard pod. Workspace observation
+  keeps working when no static git credential
+  exists: the seed and the observer fetch through the guard. Rotation reuses the same refresh lead and mint-lifetime guard and runs
   at launch and from the legacy run's steady settle, gated on the coordinator
   pod actually rendering the App-mode marker — a static run never gains a
   Secret behind its pod's back, and an App run whose Secret is gone re-mints.
@@ -4410,14 +4531,54 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   credentials, the rebase force-push keeps its head-SHA compare-and-set lease
   unchanged under the new credential, and no merge capability is added
   anywhere. The residual trust model is stated rather than wished away. The
-  guard shares the pod's network namespace, so a compromised model can still
-  bypass it and open its own connection to the forge — and be refused
-  unauthenticated, because the credential lives only inside the guard and
-  the projected token the model container cannot reach; bypassing the guard
-  loses the operation, not merely the policy. Making bypass impossible
-  instead of useless needs deployment-level egress control that a
-  pod-scoped NetworkPolicy cannot express (a policy cannot distinguish
-  containers inside one pod), which remains deployment work, not core work.
+  guard runs in its own per-run pod, so the coordinator pod's egress policy
+  can refuse the forge outright. The guard pod's ingress policy is not opt-in:
+  every App-mode run renders it, and it admits only the run's own pods on the
+  guard port, because the guard Service fronts a plain-HTTP listener that
+  serves the run's git authority and the client set is the boundary. On a
+  fabric that does not enforce NetworkPolicy that boundary is advisory, and a
+  deployment that cannot accept the run's git authority being namespace-local
+  keeps the App-mode deployment shape it had before the guard pod. The guard
+  Service peer is a pod selector, the same shape the secure control's broker
+  path uses; a datapath that masquerades cross-node service traffic strips
+  the run-pod identity at the guard and needs the same datapath care the
+  secure topology's CNI notes describe. With
+  `--git-guard-forge-cidrs` set,
+  the launcher also provisions the coordinator policy. It selects the
+  coordinator pod and admits DNS, ingress from the run's own pods (the reply
+  path of a pod-originated connection), the run's guard Service on the guard
+  port, and TCP 443 to the Kubernetes API endpoint the observer reads its pod
+  through. The operator's forge CIDRs appear
+  only in the except lists of broad TCP-443 rules, so every other 443
+  destination (the model-provider endpoint, any other HTTPS endpoint the
+  deployment configures, MCP servers among them) stays admitted, mirroring
+  the secure broker's own 443 posture, and every non-443 path stays refused,
+  notably the evidence-intake POST, whose bundle is lost (logged, not
+  fatal) because the intake is plain HTTP on a port no rule admits. The
+  guard policy's egress renders with the same flag: DNS, the
+  forge CIDRs, and the Kubernetes API endpoint the guard reads the credentials
+  document
+  through. The launcher derives the API endpoint from the operator pod's own
+  service environment, so the operator pins only the forge CIDRs. The flag
+  replaces `--legacy-git-guard-egress-cidrs`, whose value once listed every
+  443 destination a sidecar guard needed — forge, model provider, MCP
+  servers, and the Kubernetes API. The per-run guard inverted that meaning
+  into a forge refusal, so a carried-over list would deny the coordinator its
+  own model provider; the old flag is therefore refused at startup, and the
+  deployment migrates by naming only the forge CIDRs. Under
+  identity-based CNIs such as Cilium the API server carries a reserved
+  identity that vanilla ipBlock rules cannot match (the secure broker's
+  CNI note), so there the guard's credential read and the observer's pod read
+  need a companion CNI policy in the run namespace. The boundary claims
+  exactly the forge, not the whole internet: the coordinator container can
+  still open a non-forge HTTPS connection, and the forge CIDRs are operator
+  configuration because the operator, not the coordinator, decides which
+  hosts are the forge. Egress rules of
+  policies selecting the same pod are unioned, so the deny is exact only
+  where the coordinator policy is the only policy selecting the pod. A
+  deployment that leaves the flag unset keeps the coordinator pod
+  policy-free exactly as before; the guard pod carries only its ingress
+  boundary.
   An explicitly configured forge-API token (`GitHubCredentialSecret`) stays
   outside this boundary by design: it never served the git transport the
   guard governs, the guard neither mints nor relays it, and its scope is the
@@ -4425,8 +4586,9 @@ control code — registration grants no shell, forge, or Kubernetes authority.
   exactly the git surface.
   The guard enforces the operator-pinned work ref and the run's two pinned
   repositories; it does not re-adjudicate the plan. The isolated observer
-  and its seed keep their own projected token and document read because
-  they are trusted containers that host no model process. Static-mode
+  and its seed keep their own projected token for their pod read because
+  they are trusted containers that host no model process, and their git
+  rides the same guard the coordinator uses. Static-mode
   pods, askpass semantics, and every render stay byte-identical; the
   askpass installation path survives only to serve pods launched before
   the guard, and steady-state rotation recognizes both pod shapes.

@@ -13,9 +13,9 @@ require (
 	golang.org/x/mod v0.43.0
 	golang.org/x/sys v0.50.0
 	golang.org/x/time v0.16.0
-	k8s.io/api v0.37.2
-	k8s.io/apimachinery v0.37.2
-	k8s.io/client-go v0.37.2
+	k8s.io/api v0.37.3
+	k8s.io/apimachinery v0.37.3
+	k8s.io/client-go v0.37.3
 	sigs.k8s.io/controller-runtime v0.25.3
 	sigs.k8s.io/yaml v1.6.0
 )

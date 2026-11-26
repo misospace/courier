@@ -1014,6 +1014,179 @@ func TestChartRejectsRebaseExecutorWithoutDispatchEnabled(t *testing.T) {
 	}
 }
 
+func TestChartRendersRebaseCapableBinding(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	out := runHelm(t, chartDir, "template", "courier", ".",
+		"--set", "dispatch.enabled=true",
+		"--set", "dispatch.baseURL=https://dispatch.example.test",
+		"--set", "dispatch.agentName=example-agent",
+		"--set", "dispatch.tokenSecret.name=dispatch-token-secret",
+		"--set", "dispatch.lanes[0].queueLane=normal",
+		"--set", "dispatch.lanes[0].laneProfile=default",
+		"--set", "dispatch.lanes[0].agentName=courier-local",
+		"--set", "dispatch.lanes[1].queueLane=normal",
+		"--set", "dispatch.lanes[1].laneProfile=courier-escalation",
+		"--set", "dispatch.lanes[1].agentName=courier-escalation",
+		"--set", "dispatch.lanes[1].rebaseCapable=true",
+	)
+	for _, want := range []string{
+		"--dispatch-lane-binding=normal:default:courier-local",
+		"--dispatch-lane-binding=normal:courier-escalation:courier-escalation",
+		"--dispatch-rebase-capable=courier-escalation",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("rebase-capable chart output is missing %q", want)
+		}
+	}
+	if strings.Contains(out, "--dispatch-rebase-executor") {
+		t.Fatal("rebase-capable chart output renders a rebase executor")
+	}
+	if strings.Contains(out, "--dispatch-rebase-capable=courier-local") {
+		t.Fatal("rebase-capable chart output names a binding that is not rebase capable")
+	}
+}
+
+func TestChartOperatorSuppliedRebaseCapableWins(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	out := runHelm(t, chartDir, "template", "courier", ".",
+		"--set", "dispatch.enabled=true",
+		"--set", "dispatch.baseURL=https://dispatch.example.test",
+		"--set", "dispatch.agentName=example-agent",
+		"--set", "dispatch.tokenSecret.name=dispatch-token-secret",
+		"--set", "dispatch.lanes[0].queueLane=normal",
+		"--set", "dispatch.lanes[0].laneProfile=courier-escalation",
+		"--set", "dispatch.lanes[0].agentName=courier-escalation",
+		"--set", "dispatch.lanes[0].rebaseCapable=true",
+		"--set-string", "controllers.main.containers.main.args[0]=--dispatch-rebase-capable=courier-other",
+	)
+	if !strings.Contains(out, "--dispatch-rebase-capable=courier-other") {
+		t.Fatalf("chart output is missing the operator-supplied rebase-capable binding")
+	}
+	if strings.Contains(out, "--dispatch-rebase-capable=courier-escalation") {
+		t.Fatal("chart output renders a values-derived rebase-capable binding next to an operator-supplied one")
+	}
+}
+
+func TestChartRejectsRebaseCapableWithoutAgentName(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	out, err := runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "dispatch.enabled=true",
+		"--set", "dispatch.baseURL=https://dispatch.example.test",
+		"--set", "dispatch.agentName=example-agent",
+		"--set", "dispatch.tokenSecret.name=dispatch-token-secret",
+		"--set", "dispatch.lanes[0].queueLane=normal",
+		"--set", "dispatch.lanes[0].laneProfile=default",
+		"--set", "dispatch.lanes[0].rebaseCapable=true",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template to fail for a rebase-capable binding without an agentName, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "rebaseCapable true requires an explicit agentName") {
+		t.Fatalf("helm template failed without the expected rebaseCapable message:\n%s", out)
+	}
+}
+
+func TestChartRejectsRebaseCapableWithRebaseExecutor(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	out, err := runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "dispatch.enabled=true",
+		"--set", "dispatch.baseURL=https://dispatch.example.test",
+		"--set", "dispatch.agentName=example-agent",
+		"--set", "dispatch.tokenSecret.name=dispatch-token-secret",
+		"--set", "dispatch.lanes[0].queueLane=rebase-lane",
+		"--set", "dispatch.lanes[0].laneProfile=courier-rebase",
+		"--set", "dispatch.lanes[0].agentName=courier-rebase",
+		"--set", "dispatch.lanes[0].rebaseExecutor=true",
+		"--set", "dispatch.lanes[0].rebaseCapable=true",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template to fail for a binding set both rebaseExecutor and rebaseCapable, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "cannot set both rebaseExecutor and rebaseCapable") {
+		t.Fatalf("helm template failed without the expected rebaseCapable message:\n%s", out)
+	}
+}
+
+func TestChartRejectsRebaseCapableWithOperatorSuppliedLaneBindings(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	out, err := runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "dispatch.enabled=true",
+		"--set", "dispatch.baseURL=https://dispatch.example.test",
+		"--set", "dispatch.agentName=example-agent",
+		"--set", "dispatch.tokenSecret.name=dispatch-token-secret",
+		"--set", "dispatch.lanes[0].queueLane=normal",
+		"--set", "dispatch.lanes[0].laneProfile=default",
+		"--set", "dispatch.lanes[0].agentName=courier-local",
+		"--set", "dispatch.lanes[0].rebaseCapable=true",
+		"--set-string", "controllers.main.containers.main.args[0]=--dispatch-lane-binding=other-lane:other-profile:other-agent",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template to fail for a rebase-capable binding with operator-supplied lane bindings, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "rebaseCapable cannot be combined with operator-supplied --dispatch-lane-binding args") {
+		t.Fatalf("helm template failed without the expected rebaseCapable message:\n%s", out)
+	}
+}
+
+func TestChartRejectsRebaseCapableWithoutDispatchEnabled(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	out, err := runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "dispatch.enabled=false",
+		"--set", "dispatch.lanes[0].queueLane=normal",
+		"--set", "dispatch.lanes[0].laneProfile=default",
+		"--set", "dispatch.lanes[0].agentName=courier-local",
+		"--set", "dispatch.lanes[0].rebaseCapable=true",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template to fail for a rebase-capable binding without Dispatch, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "rebaseCapable requires dispatch.enabled") {
+		t.Fatalf("helm template failed without the expected rebaseCapable message:\n%s", out)
+	}
+}
+
 func TestChartRendersSecureTopologyConfiguration(t *testing.T) {
 	if _, err := exec.LookPath("helm"); err != nil {
 		t.Skip("helm is not installed")
@@ -3449,6 +3622,205 @@ func TestChartRendersConsoleContributeForm(t *testing.T) {
 	plain := runHelm(t, chartDir, operatorConsoleRenderArgs()...)
 	if strings.Contains(plain, "--contribute-url") || strings.Contains(plain, "contribute-token") {
 		t.Fatal("console without the contribute block unexpectedly rendered contribution configuration")
+	}
+}
+
+// TestChartOperatorConsoleContributeStatus covers the contribution status
+// wiring: operatorConsole.contributeStatus.url and tokenSecret inject
+// --contribute-status-url and --contribute-status-token-file and mount the
+// Secret in BOTH auth modes — the status view is mode-independent — while
+// half a pair fails the render, raw args win over the values-derived flags
+// and still count toward the pair guard in both spellings.
+func TestChartOperatorConsoleContributeStatus(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	configureChartRepository(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	disabled := runHelm(t, chartDir, "template", "courier", ".")
+	for _, unwanted := range []string{"--contribute-status-url", "--contribute-status-token-file"} {
+		if strings.Contains(disabled, unwanted) {
+			t.Fatalf("default chart output unexpectedly contains %q", unwanted)
+		}
+	}
+
+	configured := []string{
+		"--set", "operatorConsole.contributeStatus.url=http://courier-contribute-api",
+		"--set", "operatorConsole.contributeStatus.tokenSecret=contribute-status-token",
+	}
+	enabled := runHelm(t, chartDir, operatorConsoleRenderArgs(configured...)...)
+	for _, want := range []string{
+		"--contribute-status-url=http://courier-contribute-api",
+		"--contribute-status-token-file=/etc/courier/console/contribute-status-token",
+		"mountPath: /etc/courier/console/contribute-status-token",
+		"secretName: contribute-status-token",
+	} {
+		if !strings.Contains(enabled, want) {
+			t.Fatalf("contribution status chart output is missing %q:\n%s", want, enabled)
+		}
+	}
+	deployment := findDocument(t, enabled, "kind: Deployment", "name: courier-console")
+	if !strings.Contains(deployment, "secretName: contribute-status-token") || !strings.Contains(deployment, "subPath: contribute-status-token") {
+		t.Fatalf("console Deployment did not mount the contribution status token Secret:\n%s", deployment)
+	}
+
+	// The status view is mode-independent: header mode renders the same
+	// flag pair and Secret mount.
+	headerMode := runHelm(t, chartDir, operatorConsoleHeaderRenderArgs(configured...)...)
+	for _, want := range []string{
+		"--contribute-status-url=http://courier-contribute-api",
+		"--contribute-status-token-file=/etc/courier/console/contribute-status-token",
+		"secretName: contribute-status-token",
+	} {
+		if !strings.Contains(headerMode, want) {
+			t.Fatalf("header-mode contribution status render is missing %q:\n%s", want, headerMode)
+		}
+	}
+
+	overridden := runHelm(t, chartDir, operatorConsoleRenderArgs(append(configured,
+		"--set-string", "controllers.console.containers.console.args[0]=--contribute-status-url=http://operator-override")...)...)
+	if !strings.Contains(overridden, "--contribute-status-url=http://operator-override") {
+		t.Fatal("console output is missing the operator-supplied contribution status URL")
+	}
+	if strings.Contains(overridden, "--contribute-status-url=http://courier-contribute-api") {
+		t.Fatal("operator-supplied contribution status URL did not override the values-derived flag")
+	}
+	if !strings.Contains(overridden, "--contribute-status-token-file=/etc/courier/console/contribute-status-token") {
+		t.Fatal("raw contribution status URL override dropped the values-derived token-file flag")
+	}
+
+	rawURLWithValuesToken := runHelm(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.contributeStatus.tokenSecret=contribute-status-token",
+		"--set-string", "controllers.console.containers.console.args[0]=--contribute-status-url=http://operator-override",
+	)...)
+	if !strings.Contains(rawURLWithValuesToken, "--contribute-status-url=http://operator-override") || strings.Contains(rawURLWithValuesToken, "--contribute-status-url=http://courier-contribute-api") {
+		t.Fatal("raw contribution status URL plus values token did not render as a complete effective pair")
+	}
+	if !strings.Contains(findDocument(t, rawURLWithValuesToken, "kind: Deployment", "name: courier-console"), "mountPath: /etc/courier/console/contribute-status-token") {
+		t.Fatal("raw URL plus values token omitted the values-derived token mount")
+	}
+
+	out, err := runHelmOutput(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.contributeStatus.url=http://courier-contribute-api",
+	)...)
+	if err == nil {
+		t.Fatalf("expected helm template to fail without operatorConsole.contributeStatus.tokenSecret, but it succeeded:\n%s", out)
+	}
+	for _, want := range []string{"operatorConsole.contributeStatus.url", "operatorConsole.contributeStatus.tokenSecret", "raw --contribute-status-url"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("contribution status guard message is missing %q:\n%s", want, out)
+		}
+	}
+
+	out, err = runHelmOutput(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.contributeStatus.tokenSecret=contribute-status-token",
+	)...)
+	if err == nil || !strings.Contains(out, "must be set together") || !strings.Contains(out, "operatorConsole.contributeStatus.url") || !strings.Contains(out, "operatorConsole.contributeStatus.tokenSecret") {
+		t.Fatalf("tokenSecret-without-url render error = %v, want the effective-pair message naming both value paths:\n%s", err, out)
+	}
+
+	out, err = runHelmOutput(t, chartDir, operatorConsoleRenderArgs(
+		"--set-string", "controllers.console.containers.console.args[0]=--contribute-status-url=http://operator-override",
+	)...)
+	if err == nil || !strings.Contains(out, "operatorConsole.contributeStatus.url") || !strings.Contains(out, "raw --contribute-status-url") {
+		t.Fatalf("raw URL without effective token error = %v, want effective-pair message:\n%s", err, out)
+	}
+
+	// A bare --contribute-status-url whose value is the next argument is the
+	// spelling the binary's parser accepts, and it must count toward the
+	// pair guard the same as the = form.
+	out, err = runHelmOutput(t, chartDir, operatorConsoleRenderArgs(
+		"--set-string", "controllers.console.containers.console.args[0]=--contribute-status-url",
+		"--set-string", "controllers.console.containers.console.args[1]=http://operator-override",
+	)...)
+	if err == nil || !strings.Contains(out, "must be set together") {
+		t.Fatalf("bare raw URL without token error = %v, want effective-pair message:\n%s", err, out)
+	}
+
+	bareWithValue := runHelm(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.contributeStatus.tokenSecret=contribute-status-token",
+		"--set-string", "controllers.console.containers.console.args[0]=--contribute-status-url",
+		"--set-string", "controllers.console.containers.console.args[1]=http://operator-override",
+	)...)
+	if !strings.Contains(bareWithValue, "--contribute-status-token-file=/etc/courier/console/contribute-status-token") {
+		t.Fatal("bare raw URL with a values token did not render the canonical token-file flag")
+	}
+
+	// A raw token-file arg completes the binary's flag pair but only
+	// tokenSecret mounts the file, so without it the console would start
+	// paired and exit reading a file that was never mounted. Both arg
+	// spellings must fail the render even when a URL is set.
+	for _, spellings := range [][]string{
+		{"--set-string", "controllers.console.containers.console.args[0]=--contribute-status-token-file=/custom/path"},
+		{"--set-string", "controllers.console.containers.console.args[0]=--contribute-status-token-file",
+			"--set-string", "controllers.console.containers.console.args[1]=/custom/path"},
+	} {
+		out, err = runHelmOutput(t, chartDir, operatorConsoleRenderArgs(append(
+			[]string{"--set", "operatorConsole.contributeStatus.url=http://courier-contribute-api"},
+			spellings...)...)...)
+
+		if err == nil || !strings.Contains(out, "operatorConsole.contributeStatus.tokenSecret") || !strings.Contains(out, "mounts the contribution status token only") {
+			t.Fatalf("raw token-file arg without tokenSecret render error = %v, want the mount-availability guard:\n%s", err, out)
+		}
+	}
+
+	// With tokenSecret set, the Secret mount is the single canonical path,
+	// so a raw token-file arg naming any other path would point the binary
+	// at a file that is never mounted: the chart supports only the
+	// canonical path and fails the render otherwise, in both spellings.
+	for _, spellings := range [][]string{
+		{"--set-string", "controllers.console.containers.console.args[0]=--contribute-status-token-file=/custom/path"},
+		{"--set-string", "controllers.console.containers.console.args[0]=--contribute-status-token-file",
+			"--set-string", "controllers.console.containers.console.args[1]=/custom/path"},
+	} {
+		out, err = runHelmOutput(t, chartDir, operatorConsoleRenderArgs(append(
+			[]string{
+				"--set", "operatorConsole.contributeStatus.url=http://courier-contribute-api",
+				"--set", "operatorConsole.contributeStatus.tokenSecret=contribute-status-token",
+			},
+			spellings...)...)...)
+		if err == nil || !strings.Contains(out, "canonical path /etc/courier/console/contribute-status-token") {
+			t.Fatalf("non-canonical raw token-file arg with tokenSecret render error = %v, want the canonical-path guard:\n%s", err, out)
+		}
+	}
+
+	// A raw token-file arg naming the canonical path survives alongside
+	// tokenSecret without a duplicated flag, and the rendered Deployment and
+	// argv agree: the arg's path is exactly the mount path.
+	rawArgWithSecret := runHelm(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.contributeStatus.url=http://courier-contribute-api",
+		"--set", "operatorConsole.contributeStatus.tokenSecret=contribute-status-token",
+		"--set-string", "controllers.console.containers.console.args[0]=--contribute-status-token-file=/etc/courier/console/contribute-status-token",
+	)...)
+	rawArgDeployment := findDocument(t, rawArgWithSecret, "kind: Deployment", "name: courier-console")
+	if strings.Count(rawArgDeployment, "--contribute-status-token-file=") != 1 {
+		t.Fatalf("raw canonical token-file arg did not suppress the values-derived flag:\n%s", rawArgDeployment)
+	}
+	if !strings.Contains(rawArgDeployment, "mountPath: /etc/courier/console/contribute-status-token") ||
+		!strings.Contains(rawArgDeployment, "secretName: contribute-status-token") {
+		t.Fatalf("canonical raw token-file arg with tokenSecret did not mount the Secret at the arg's path:\n%s", rawArgDeployment)
+	}
+
+	// A values override that omits the contributeStatus block entirely must
+	// render a contribution-status-free console, not an opaque template
+	// error.
+	plain := runHelm(t, chartDir, operatorConsoleRenderArgs()...)
+	if strings.Contains(plain, "--contribute-status") || strings.Contains(plain, "contribute-status-token") {
+		t.Fatal("console without the contributeStatus block unexpectedly rendered contribution status configuration")
+	}
+
+	// An explicitly empty tokenSecretKey would project a Secret entry with
+	// no key; fail the render instead of shipping an unmountable volume.
+	out, err = runHelmOutput(t, chartDir, operatorConsoleRenderArgs(
+		"--set", "operatorConsole.contributeStatus.url=http://courier-contribute-api",
+		"--set", "operatorConsole.contributeStatus.tokenSecret=contribute-status-token",
+		"--set-string", "operatorConsole.contributeStatus.tokenSecretKey=",
+	)...)
+	if err == nil || !strings.Contains(out, "operatorConsole.contributeStatus.tokenSecretKey must name a Secret entry") {
+		t.Fatalf("empty tokenSecretKey render error = %v, want the empty-entry guard:\n%s", err, out)
 	}
 }
 
