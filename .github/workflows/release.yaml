@@ -1,8 +1,8 @@
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -35,7 +35,12 @@ jobs:
         id: version
         env:
           TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
         run: |
+          if [[ "$REF_TYPE" != tag ]]; then
+            echo "dispatch this workflow against a published release tag" >&2
+            exit 1
+          fi
           version="${TAG#v}"
           if [[ "$TAG" != v* || ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "expected a v-prefixed semver tag, got $TAG"
@@ -73,13 +78,10 @@ jobs:
           revision=$(git rev-parse HEAD)
           asset="courier-source-$revision.tar.gz"
           bash hack/package-corresponding-source.sh "$RUNNER_TEMP/$asset"
-          for attempt in {1..12}; do
-            if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-              break
-            fi
-            sleep 5
-          done
-          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null
+          if [[ "$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" != false ]]; then
+            echo "source must be uploaded to a published release" >&2
+            exit 1
+          fi
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -Fxq "$asset"; then
             mkdir -p "$RUNNER_TEMP/existing-source"
             gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir "$RUNNER_TEMP/existing-source"

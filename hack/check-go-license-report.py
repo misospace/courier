@@ -5,8 +5,14 @@ import sys
 ALLOWED = {"Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "MIT", "ISC"}
 PROJECT = "github.com/misospace/courier"
 
-with open(sys.argv[1], newline="", encoding="utf-8") as report:
-    rows = list(csv.reader(report))
+if len(sys.argv) != 2:
+    sys.exit("Usage: check-go-license-report.py REPORT.csv")
+
+try:
+    with open(sys.argv[1], newline="", encoding="utf-8") as report:
+        rows = list(csv.reader(report, strict=True))
+except (OSError, UnicodeError, csv.Error) as exc:
+    sys.exit(f"Cannot read Go license report: {exc}")
 
 if not rows or not any(len(row) == 3 and row[0] == PROJECT for row in rows):
     sys.exit("Missing Courier license record in Go license report")

@@ -582,6 +582,8 @@ jobs:
           cache: true
       - name: Package and verify corresponding source
         run: bash hack/package-corresponding-source.sh "$RUNNER_TEMP/courier-source.tar.gz"
+      - name: Test linked-license gate
+        run: python3 hack/test-go-license-report.py
       - name: Inventory linked Go licenses
         run: |
           GOBIN="$RUNNER_TEMP" go install github.com/google/go-licenses/v2@v2.0.1

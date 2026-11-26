@@ -3088,7 +3088,13 @@ mirroring the lane-profiles transport.
 
 The operator console (`internal/console`, served by the standalone
 `courier-console` binary and enabled by `operatorConsole.enabled` in the
-chart) is a server-rendered interface for authenticated operators. It is
+chart) is a server-rendered interface for authenticated operators. The shared
+layout offers the deployed build's corresponding source at public GET /source;
+read, contribution and metrics MCP HTTP responses advertise the same source
+via a Link header (rel="source"). Official release manager and console binaries
+embed the revision-specific source archive URL; custom builds configure
+COURIER_SOURCE_URL. The endpoint exposes no operator state or credentials.
+See [licensing](docs/licensing.md). The console is
 deliberately independent of the manager and of the Kubernetes API: it imports
 only the standard library, never talks to a cluster, and reaches the operator
 read API over fixed GET paths plus one composed run-detail path. The run explorer reads the
