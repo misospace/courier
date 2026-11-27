@@ -69,7 +69,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # availability probe resolves ssh remotes through the ssh binary git
 # invokes), and opencode in one image.
 # Debian (not alpine) because the opencode npm package ships glibc binaries.
-FROM node:26-bookworm-slim@sha256:3fcc4609776fc12c0079831ca6020e250ca109b8d46243d504625d0af7efda93 AS coordinator
+FROM node:26-bookworm-slim@sha256:0042e17d232a87a2cd485be1da7900fca4d10a4ad11b29e9285da1d2e54798c9 AS coordinator
 LABEL org.opencontainers.image.licenses="AGPL-3.0-only" \
       org.opencontainers.image.source="https://github.com/misospace/courier"
 COPY LICENSE NOTICE /usr/share/doc/courier/
