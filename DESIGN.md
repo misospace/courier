@@ -195,9 +195,13 @@ rewriting another branch. A replay that lands continues the normal fix-pr
 lifecycle on the rebased branch; a semantic conflict ends the run NeedsHuman
 with the conflicting files named and the remote branch untouched; a writer
 that moved the branch makes the leased replay decline and the run continues on
-the ordinary path, whose pushes never force. A clean or unreported merge state
-changes nothing, and a transiently unreadable pull request parks the run for
-the operator's bounded retry rather than replaying on an unobserved world.
+the ordinary path, whose pushes never force. The forge's machine-readable
+merge state, never the mergeable boolean alone, decides the replay: GitHub's
+boolean can also answer no for a request merely blocked by required checks or
+reviews, so only its explicit conflict state opens the path. A clean, blocked,
+or unreported state changes nothing, and a transiently unreadable pull request
+parks the run for the operator's bounded retry rather than replaying on an
+unobserved world.
 
 Goals stay short — a goal plus tools — but each carries one non-negotiable
 contract: delegation covers bounded work, never the coordinator's ownership

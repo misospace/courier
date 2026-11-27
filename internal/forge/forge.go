@@ -212,10 +212,19 @@ type PullRequest struct {
 	// can merge into its base ref. Nil means the forge gave no answer — the
 	// computation is still pending, or the provider does not report
 	// mergeability — and a caller must treat it as unverifiable, never as
-	// satisfied (#513). False is the forge's authoritative no: the head
-	// cannot merge into the base as it stands, which for GitHub is a merge
-	// conflict with the base branch.
+	// satisfied (#513). False is the forge's authoritative no, and it names
+	// no reason: GitHub answers false for a merge conflict and has been
+	// observed answering false for requests merely blocked by required
+	// checks or reviews. A caller that needs the conflict itself must
+	// require MergeableState to name it.
 	Mergeable *bool
+	// MergeableState is the forge's machine-readable merge verdict when the
+	// forge reports one, empty when it does not. The values are forge
+	// vocabulary — GitHub reports clean, dirty, blocked, behind, unstable,
+	// has_hooks, draft, and unknown — so a consumer may only decide from a
+	// value its provider defines, and a conflict decision requires the
+	// provider's explicit conflict value, never the Mergeable boolean alone.
+	MergeableState string
 }
 
 // Review is a provider-neutral review on a pull request.

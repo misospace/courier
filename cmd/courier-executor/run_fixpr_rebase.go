@@ -20,8 +20,10 @@ import (
 // so a conflict a trusted rule can resynchronize never reaches the coordinator
 // as a mid-merge workspace. The merge state rides the same forge
 // read-pull-request capability the launch guards use — never a forge-specific
-// CLI — and a clean or still-unverified answer changes nothing: no replay, no
-// push, today's path.
+// CLI — and the replay opens only on the forge's machine-readable conflict
+// verdict, because a bare mergeable no also answers requests merely blocked by
+// required checks or reviews. Anything else — clean, pending, blocked, or
+// otherwise unverified — changes nothing: no replay, no push, today's path.
 //
 // The replay is the rebase lane's engine (#715) with its closed mechanical
 // rules, its bounded checks, and its publication leased to the head admission
@@ -84,7 +86,7 @@ func rebaseConflictingFixPRBranch(ctx context.Context, report reporter, cfg conf
 		report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: reason, Category: terminalCategoryUnknown})
 		return exitNeedsHuman, true
 	}
-	if pr.Mergeable == nil || *pr.Mergeable {
+	if !fixPRBranchConflictsWithBase(pr) {
 		return 0, false
 	}
 	if reason := conflictingFixPRHeadReason(pr, cfg); reason != "" {
@@ -198,6 +200,21 @@ func preflightEventPayload(result rebase.Result) map[string]any {
 		payload["files"] = result.Conflict.Files
 	}
 	return payload
+}
+
+// githubMergeStateConflict is GitHub's mergeable_state value for a real
+// merge conflict against the base branch.
+const githubMergeStateConflict = "dirty"
+
+// fixPRBranchConflictsWithBase reports only the forge's unambiguous conflict
+// answer: the authoritative mergeable no whose reported state names the
+// conflict. A bare mergeable=false also answers requests blocked by required
+// checks or reviews, GitHub has been observed pairing it with such answers,
+// and a replay would rewrite a branch that needs no rewrite; a missing,
+// pending, or non-conflict state gives the pre-flight no license to
+// force-push, and the run continues on the ordinary path.
+func fixPRBranchConflictsWithBase(pr forge.PullRequest) bool {
+	return pr.Mergeable != nil && !*pr.Mergeable && pr.MergeableState == githubMergeStateConflict
 }
 
 // conflictingFixPRHeadReason names why the conflicting pull request's head is

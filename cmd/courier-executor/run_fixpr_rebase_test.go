@@ -278,6 +278,144 @@ func TestRunFixPRCleanBranchProducesNoRebaseAndNoPush(t *testing.T) {
 	}
 }
 
+// TestRunFixPRBlockedAnswerProducesNoRebaseAndNoPush pins the #945 review
+// fix: a forge mergeable no whose state names a blockage by required checks
+// or reviews is not a conflict report. Even though the boolean says the
+// branch cannot merge, the pre-flight replays nothing — no event, no push —
+// and the run takes the ordinary path.
+func TestRunFixPRBlockedAnswerProducesNoRebaseAndNoPush(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	preRunHead := remoteHeadSHA(t, remote, rebasePreflightBranch)
+
+	source := filepath.Join(root, "source")
+	write(t, filepath.Join(source, "docs.txt"), "main moved on\n")
+	commit(t, source, "base: unrelated docs")
+	runGit(t, source, "push", "origin", "main")
+
+	prServer, prState := fakeForgePullRequestServer(t)
+	write(t, prState, fixPRMergeStateFixtureJSON(preRunHead, false, "blocked"))
+
+	fakeOpenCode := writeFixPRNoChangeCoordinator(t, root, prState,
+		fixPRMergeStateFixtureJSON(preRunHead, true, "clean"))
+	setFixPREnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNoChangeNeeded {
+		t.Fatalf("run exit code = %d, want %d; stdout=%q stderr=%q", code, exitNoChangeNeeded, output.String(), errorsOut.String())
+	}
+	if strings.Contains(output.String(), `"event":"rebase.preflight"`) {
+		t.Fatalf("a blocked answer triggered a replay: %q", output.String())
+	}
+	if head := remoteHeadSHA(t, remote, rebasePreflightBranch); head != preRunHead {
+		t.Fatalf("remote branch head = %q, want the untouched %q: a blocked answer must never be force-pushed", head, preRunHead)
+	}
+	if _, err := os.Stat(filepath.Join(root, "scratch", "coordinator-ran")); err != nil {
+		t.Fatalf("coordinator did not run on the ordinary path: marker missing (stat error %v)", err)
+	}
+}
+
+// TestRunFixPRBlockedAnswerOnConflictingBranchNeverReplays pins the same
+// invariant where a mechanical replay would have succeeded: the git history
+// conflicts, but the forge answer names blockage rather than conflict, so
+// the pre-flight keeps its hands off the branch and the run falls through to
+// the ordinary mid-merge handoff with the remote untouched.
+func TestRunFixPRBlockedAnswerOnConflictingBranchNeverReplays(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithMechanicallyConflictingBranch(t, root)
+	preRunHead := remoteHeadSHA(t, remote, rebasePreflightBranch)
+
+	prServer, prState := fakeForgePullRequestServer(t)
+	write(t, prState, fixPRMergeStateFixtureJSON(preRunHead, false, "blocked"))
+
+	fakeOpenCode := writeFixPRNoChangeCoordinator(t, root, "", "")
+	setFixPREnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stdout=%q stderr=%q", code, exitNeedsHuman, output.String(), errorsOut.String())
+	}
+	stdout := output.String()
+	if strings.Contains(stdout, `"event":"rebase.preflight"`) {
+		t.Fatalf("a blocked answer triggered a replay even though the branch conflicts: %q", stdout)
+	}
+	if !strings.Contains(stdout, "still unresolved; conflicts remain in notes.md") {
+		t.Fatalf("the run must fall through to the ordinary mid-merge handoff: %q", stdout)
+	}
+	if head := remoteHeadSHA(t, remote, rebasePreflightBranch); head != preRunHead {
+		t.Fatalf("remote branch head = %q, want the untouched %q: a blocked answer must never be force-pushed", head, preRunHead)
+	}
+	if _, err := os.Stat(filepath.Join(root, "scratch", "coordinator-ran")); err != nil {
+		t.Fatalf("coordinator did not run on the ordinary mid-merge path: marker missing (stat error %v)", err)
+	}
+}
+
+// TestRunFixPRConflictingBranchWithoutLeasableHeadSkipsReplay pins the
+// no-lease ending: a dirty answer whose head commit neither the admission
+// pin nor the forge answer names cannot carry a force-with-lease, so the
+// pre-flight reports the replay skipped with its reason and the run
+// continues on the ordinary path without publishing.
+func TestRunFixPRConflictingBranchWithoutLeasableHeadSkipsReplay(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithMechanicallyConflictingBranch(t, root)
+	preRunHead := remoteHeadSHA(t, remote, rebasePreflightBranch)
+
+	prServer, prState := fakeForgePullRequestServer(t)
+	write(t, prState, fixPRMergeStateFixtureJSON("", false, "dirty"))
+
+	fakeOpenCode := writeFixPRNoChangeCoordinator(t, root, "", "")
+	setFixPREnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stdout=%q stderr=%q", code, exitNeedsHuman, output.String(), errorsOut.String())
+	}
+	stdout := output.String()
+	if !strings.Contains(stdout, `"event":"rebase.preflight"`) || !strings.Contains(stdout, `"status":"skipped"`) {
+		t.Fatalf("output missing the skipped-replay pre-flight event: %q", stdout)
+	}
+	if !strings.Contains(stdout, "named a head commit to lease the replay to") {
+		t.Fatalf("the skipped event must carry its reason: %q", stdout)
+	}
+	if head := remoteHeadSHA(t, remote, rebasePreflightBranch); head != preRunHead {
+		t.Fatalf("remote branch head = %q, want the untouched %q: an unleased replay must never publish", head, preRunHead)
+	}
+	if _, err := os.Stat(filepath.Join(root, "scratch", "coordinator-ran")); err != nil {
+		t.Fatalf("coordinator did not run on the ordinary path: marker missing (stat error %v)", err)
+	}
+}
+
+// TestFixPRBranchConflictsWithBase pins which forge answers open the
+// force-push pre-flight: only the authoritative mergeable no whose state
+// names GitHub's conflict value. A nil or positive answer, and any state
+// that names another reason — blockage, drift, a still-computing or absent
+// answer — closes it.
+func TestFixPRBranchConflictsWithBase(t *testing.T) {
+	yes, no := true, false
+	for _, test := range []struct {
+		name string
+		pr   forge.PullRequest
+		want bool
+	}{
+		{"dirty false conflicts", forge.PullRequest{Mergeable: &no, MergeableState: "dirty"}, true},
+		{"blocked false is not a conflict", forge.PullRequest{Mergeable: &no, MergeableState: "blocked"}, false},
+		{"behind false is not a conflict", forge.PullRequest{Mergeable: &no, MergeableState: "behind"}, false},
+		{"contradictory clean false is not a conflict", forge.PullRequest{Mergeable: &no, MergeableState: "clean"}, false},
+		{"false without a state is not a conflict", forge.PullRequest{Mergeable: &no}, false},
+		{"pending answer is not a conflict", forge.PullRequest{MergeableState: "dirty"}, false},
+		{"mergeable true is not a conflict", forge.PullRequest{Mergeable: &yes, MergeableState: "clean"}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := fixPRBranchConflictsWithBase(test.pr); got != test.want {
+				t.Fatalf("fixPRBranchConflictsWithBase() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 // TestConflictingFixPRHeadReason pins which forge head identity a leased
 // force-with-lease replay may target: only the exact head ref and repository
 // the run was admitted against.
