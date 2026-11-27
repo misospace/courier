@@ -172,9 +172,9 @@ const (
 	// published head when the replay landed, and the files a semantic
 	// conflict stopped on. A clean or unverified merge state emits no event:
 	// no replay was attempted. A conflicting request whose head neither the
-	// admission pin nor the forge answer names carries status "skipped" and
-	// the reason: the replay needs a head to lease to, so it is declined and
-	// the ordinary path continues without publishing.
+	// admission pin nor the forge answer names carries detail status
+	// "skipped" and the reason: the replay needs a head to lease to, so it
+	// is declined and the ordinary path continues without publishing.
 	EventRebasePreflight = "rebase.preflight"
 	// EventRunSurface reports the run's model-surface provenance (#730):
 	// the schema version, the digest, and the canonical encoding that
