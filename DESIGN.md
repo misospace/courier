@@ -188,7 +188,8 @@ a conflict a trusted rule can resynchronize. The merge state rides the
 configured forge read-pull-request capability, never a forge-specific CLI, and
 the replay is the rebase lane's engine: the same closed mechanical rules, the
 same bounded repository checks gating publication, and a force-with-lease tied
-to the head admission pinned — targeting only the head the pull request
+to the head admission pinned, or to the head that read observed when the run
+pinned none — targeting only the head the pull request
 itself names and failing closed on a head-identity mismatch rather than
 rewriting another branch. A replay that lands continues the normal fix-pr
 lifecycle on the rebased branch; a semantic conflict ends the run NeedsHuman

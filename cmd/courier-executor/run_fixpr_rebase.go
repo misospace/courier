@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/misospace/courier/internal/forge"
@@ -46,6 +48,15 @@ func rebaseConflictingFixPRBranch(ctx context.Context, report reporter, cfg conf
 			// the launch guards do, and never replay on an unobserved world.
 			reason := fmt.Sprintf("pull request #%d of %q could not be read to check its merge state before the fix: %s; the forge was temporarily unavailable, so the run is parked for bounded retry by the operator", cfg.Ref, cfg.Repo, err.Error())
 			report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: reason, Outcome: outcomeBlockedExternal, Category: terminalCategoryForgeUnavailable})
+			return exitNeedsHuman, true
+		}
+		var apiErr *github.APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+			// The pinned request vanished between the guard's read and this
+			// one: the assignment is gone, which a human settles. The run
+			// neither opens a replacement nor replays anything else.
+			reason := fmt.Sprintf("pull request #%d of %q does not exist, so the pinned pull request is unverified; the executor neither opens a replacement nor adopts another pull request; the run needs a human", cfg.Ref, cfg.Repo)
+			report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: reason, Category: terminalCategoryUnknown})
 			return exitNeedsHuman, true
 		}
 		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: exitFailed, Reason: err.Error(), Category: terminalCategoryExecutorCrash})
