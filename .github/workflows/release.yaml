@@ -1,12 +1,12 @@
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 concurrency:
@@ -35,7 +35,12 @@ jobs:
         id: version
         env:
           TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
         run: |
+          if [[ "$REF_TYPE" != tag ]]; then
+            echo "dispatch this workflow against a published release tag" >&2
+            exit 1
+          fi
           version="${TAG#v}"
           if [[ "$TAG" != v* || ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "expected a v-prefixed semver tag, got $TAG"
@@ -60,16 +65,43 @@ jobs:
           go-version: "1.27.4"
           cache: true
 
+      - name: Check linked Go dependency licenses
+        run: |
+          GOBIN="$RUNNER_TEMP" go install github.com/google/go-licenses/v2@v2.0.1
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$RUNNER_TEMP/go-licenses" report ./cmd/... > "$RUNNER_TEMP/go-licenses.csv"
+          python3 hack/check-go-license-report.py "$RUNNER_TEMP/go-licenses.csv"
+
+      - name: Publish exact corresponding source before images
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          revision=$(git rev-parse HEAD)
+          asset="courier-source-$revision.tar.gz"
+          bash hack/package-corresponding-source.sh "$RUNNER_TEMP/$asset"
+          if [[ "$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" != false ]]; then
+            echo "source must be uploaded to a published release" >&2
+            exit 1
+          fi
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -Fxq "$asset"; then
+            mkdir -p "$RUNNER_TEMP/existing-source"
+            gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir "$RUNNER_TEMP/existing-source"
+            cmp "$RUNNER_TEMP/$asset" "$RUNNER_TEMP/existing-source/$asset"
+          else
+            gh release upload "$GITHUB_REF_NAME" "$RUNNER_TEMP/$asset" --repo "$GITHUB_REPOSITORY"
+          fi
+          echo "COURIER_RELEASE_SOURCE_URL=https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/$asset" >> "$GITHUB_ENV"
+
       - name: Build release binaries
         run: |
           mkdir -p dist
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/manager cmd/main.go
+          source_flags="-X github.com/misospace/courier/internal/sourceoffer.ReleaseURL=$COURIER_RELEASE_SOURCE_URL"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "$source_flags" -o dist/manager cmd/main.go
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/courier-executor ./cmd/courier-executor
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/courier-control ./cmd/courier-control
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/courier-worker ./cmd/courier-worker
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/courier-broker ./cmd/courier-broker
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/courier-dependency-cache ./cmd/courier-dependency-cache
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/courier-console ./cmd/courier-console
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "$source_flags" -o dist/courier-console ./cmd/courier-console
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4.4.1
@@ -194,6 +226,15 @@ jobs:
           docker pull ${{ env.HARNESS_IMAGE }}:${{ steps.version.outputs.version }}
           docker pull ${{ env.HARNESS_GO_IMAGE }}:${{ steps.version.outputs.version }}
 
+      - name: Verify published license files
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          bash hack/verify-image-licenses.sh "$MANAGER_IMAGE:$VERSION" manager
+          for image in "$COORDINATOR_IMAGE" "$TOOLCHAIN_IMAGE" "$HARNESS_IMAGE" "$HARNESS_GO_IMAGE"; do
+            bash hack/verify-image-licenses.sh "$image:$VERSION" toolchain
+          done
+
       - name: Validate manager image
         run: docker run --rm ${{ env.MANAGER_IMAGE }}:${{ steps.version.outputs.version }} --help
 
@@ -239,7 +280,9 @@ jobs:
 
       - name: Package chart
         run: |
-          mkdir -p .release
+          mkdir -p .release charts/courier/LICENSES
+          cp LICENSE NOTICE charts/courier/
+          cp LICENSES/Apache-2.0.txt charts/courier/LICENSES/
           helm package charts/courier --destination .release
 
       - name: Log in to GHCR for Helm

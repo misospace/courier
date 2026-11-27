@@ -1,0 +1,8 @@
+Courier
+Copyright 2026 The Courier Authors.
+
+The Courier project is distributed under AGPL-3.0-only from the licensing transition onward. See LICENSE.
+
+Earlier versions were released under Apache-2.0. Existing grants for those versions and applicable Apache-2.0-covered material are not revoked. The original license and attribution are preserved verbatim in LICENSES/Apache-2.0.txt. The pre-transition source snapshot is https://github.com/misospace/courier/tree/b0f64c1f79b079488c60deab5443783ff16686bd.
+
+Independently licensed third-party dependencies, generated or imported material, and software packaged alongside Courier retain their applicable licenses and notices. This notice is not an exhaustive third-party inventory.

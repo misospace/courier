@@ -14,6 +14,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/misospace/courier/internal/sourceoffer"
 )
 
 // PathContributions is the admission route the server serves; per-run
@@ -207,7 +209,7 @@ func (s *AdmissionServer) Start(ctx context.Context) error {
 // every request, with all authentication, negotiation, bounding, and
 // error mapping inside it.
 func (s *AdmissionServer) Handler() http.Handler {
-	return http.HandlerFunc(s.handle)
+	return sourceoffer.Wrap(http.HandlerFunc(s.handle))
 }
 
 // handle routes the two surfaces before any request touches a pipeline:

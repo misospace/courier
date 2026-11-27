@@ -9,6 +9,8 @@ appVersion: 0.1.26
 home: https://github.com/misospace/courier
 sources:
   - https://github.com/misospace/courier
+annotations:
+  artifacthub.io/license: AGPL-3.0-only
 keywords:
   - ai
   - agents

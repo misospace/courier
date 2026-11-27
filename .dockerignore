@@ -2,9 +2,8 @@
 # file is the only place non-build inputs can be trimmed before the checkout is
 # uploaded to the builder and captured in the type=gha build cache.
 #
-# The Dockerfile reads exactly six context paths: go.mod, go.sum, cmd/, api/,
-# and internal/ in the builder stage, and dist/ in the binaries-prebuilt stage.
-# Everything below is excluded because no stage reads it.
+# Keep every Dockerfile context input available, including source, prebuilt
+# binaries, toolchain pins and the license/notice files copied into images.
 #
 # dist/ is deliberately absent: `BINARIES=prebuilt` copies it, so CI builds
 # depend on it reaching the builder. hack/ is excluded for the same reason it is

@@ -1,11 +1,10 @@
 // Package console implements the Courier operator console: a small,
 // server-rendered interface for authenticated operators. It is deliberately
-// independent of the operator binary and of the Kubernetes API — it imports
-// only the standard library and never talks to a cluster. Its pages render
+// independent of the operator binary and Kubernetes API, using only the standard library and the stdlib-only sourceoffer helper. Its pages render
 // the operator read API's allowlisted projections over fixed or validated
 // GET paths; the read API client lives in backend.go and decodes
 // projection JSON into its own view types rather than importing the read
-// API package, so the standard-library-only invariant holds. Contributions
+// API package, so the no-external-dependencies invariant holds. Contributions
 // submit through the operator's HTTP admission API (#829), and the
 // contribution pages read one run's lifecycle status from a second
 // backend — the contribution listener's status route — over a separate
@@ -22,6 +21,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/misospace/courier/internal/sourceoffer"
 )
 
 //go:embed templates static
@@ -155,6 +156,7 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealth)
+	mux.HandleFunc("GET /source", sourceoffer.Serve)
 	mux.HandleFunc("GET /static/{path}", s.handleStatic)
 	mux.HandleFunc("GET /login", s.handleLogin)
 	mux.HandleFunc("POST /login", s.handleLoginSubmit)

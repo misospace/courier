@@ -434,8 +434,9 @@ history list, and its detail page still works.
 
 The run explorer links an ad-hoc run's row, source `adhoc`, to its
 contribution status page, pinned to the namespace the row names. The console's
-other boundaries still hold: it imports
-only the standard library, never talks to Kubernetes, renders no client-side
+other boundaries still hold: it uses the standard library and the shared
+standard-library-only `internal/sourceoffer` helper, never talks to Kubernetes,
+renders no client-side
 JavaScript, and reads tokens only from mounted files.
 
 ## Headless Courier is preserved

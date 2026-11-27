@@ -17,6 +17,7 @@ import (
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/sourceoffer"
 )
 
 // The routes the read API serves. The /v1 routes are the projections, all
@@ -247,7 +248,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET "+PathHealthz, s.handleHealthz)
 	mux.Handle("/", authed)
-	return mux
+	return sourceoffer.Wrap(mux)
 }
 
 // handleHealthz serves GET /healthz: unauthenticated liveness. It carries no

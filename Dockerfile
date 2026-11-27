@@ -9,7 +9,7 @@
 ARG BINARIES=builder
 
 # Build the manager and executor binaries.
-FROM golang:1.27.4@sha256:205c7636d74e0ffbe3d007162df7d74f859f5a8c8322dfb9f907977686c126cf AS builder
+FROM golang:1.27.4@sha256:205c7636d74e0ffbe3d007162df7d74f859f5a8c8322dfb9f907977686c126cf AS source-tree
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -23,6 +23,17 @@ COPY cmd/ cmd/
 COPY api/ api/
 COPY internal/ internal/
 
+FROM source-tree AS go-notices
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod vendor && \
+    mkdir -p /notices/modules /notices/go && \
+    cd vendor && \
+    find . -type f \( -iname 'license*' -o -iname 'copying*' -o -iname 'copyright*' -o -iname 'notice*' -o -iname 'patents*' -o -iname 'authors*' -o -iname 'contributors*' -o -iname 'legal*' \) \
+      -exec cp --parents {} /notices/modules/ \; && \
+    cp /usr/local/go/LICENSE /usr/local/go/PATENTS /notices/go/ && \
+    test -n "$(find /notices/modules -type f -print -quit)"
+
+FROM source-tree AS builder
 RUN --mount=type=cache,target=/go/pkg/mod \
 	--mount=type=cache,target=/root/.cache/go-build \
 	CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
@@ -59,6 +70,12 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # invokes), and opencode in one image.
 # Debian (not alpine) because the opencode npm package ships glibc binaries.
 FROM node:26-bookworm-slim@sha256:3fcc4609776fc12c0079831ca6020e250ca109b8d46243d504625d0af7efda93 AS coordinator
+LABEL org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.source="https://github.com/misospace/courier"
+COPY LICENSE NOTICE /usr/share/doc/courier/
+COPY LICENSES/Apache-2.0.txt /usr/share/doc/courier/LICENSES/Apache-2.0.txt
+COPY --from=go-notices /notices/ /usr/share/doc/courier/third-party/go/
+
 ARG OPENCODE_VERSION=1.18.31
 # mise is pinned because the repository development bootstrap contract (#414)
 # dispatches `mise run bootstrap` in the secure worker; the binary downloads at
@@ -84,6 +101,9 @@ RUN set -eux; \
 	echo 'f61ffa245b9a353a8d32b1c6c22d92ccf9a888419edb850260ceb4ce1b2b3cae  /tmp/git.tar.gz' | sha256sum -c - && \
 	mkdir -p /tmp/git-src && \
 	tar -xzf /tmp/git.tar.gz -C /tmp/git-src --strip-components=1 && \
+	install -d /usr/share/doc/courier/third-party/git && \
+	install -m 0644 /tmp/git.tar.gz /usr/share/doc/courier/third-party/git/git-v2.47.3.tar.gz && \
+	install -m 0644 /tmp/git-src/COPYING /usr/share/doc/courier/third-party/git/COPYING && \
 	rm /tmp/git.tar.gz && \
 	make -j"$(nproc)" -C /tmp/git-src prefix=/usr/local NO_GETTEXT=YesPlease NO_TCLTK=YesPlease all && \
 	make -C /tmp/git-src prefix=/usr/local NO_GETTEXT=YesPlease NO_TCLTK=YesPlease install && \
@@ -92,6 +112,9 @@ RUN set -eux; \
 	wget -qO /tmp/mise "$mise_url" && \
 	echo 'fe6dd17e68e09682b31d2e7bb7bb755d22636ac1af5d94621e300f2ca9e9fe8a  /tmp/mise' | sha256sum -c - && \
 	install -m 0755 /tmp/mise /usr/local/bin/mise && \
+	install -d /usr/share/doc/courier/third-party/mise && \
+	wget -qO /usr/share/doc/courier/third-party/mise/LICENSE "https://raw.githubusercontent.com/jdx/mise/${MISE_VERSION}/LICENSE" && \
+	test -s /usr/share/doc/courier/third-party/mise/LICENSE && \
 	rm /tmp/mise && \
 	apt-get purge -y --auto-remove \
 		build-essential \
@@ -107,6 +130,9 @@ RUN set -eux; \
 		exit 1; \
 	fi && \
 	npm install -g opencode-ai@${OPENCODE_VERSION} && \
+	install -d /usr/share/doc/courier/third-party/opencode && \
+	node -e 'const fs=require("fs");const path=require("path");const root=process.argv[1];for(const name of ["opencode-ai","opencode-linux-x64","opencode-linux-x64-baseline"]){const p=path.join(root,name);if(fs.existsSync(p)){for(const f of fs.readdirSync(p)){if(/^(license|notice|copying)(\.|$)/i.test(f)){fs.copyFileSync(path.join(p,f),path.join("/usr/share/doc/courier/third-party/opencode",name+"-"+f))}}}}' "$(npm root -g)" && \
+	node -e 'const fs=require("fs");fetch("https://raw.githubusercontent.com/anomalyco/opencode/v"+process.argv[1]+"/LICENSE").then(async r=>{if(!r.ok)throw Error("OpenCode license HTTP "+r.status);fs.writeFileSync("/usr/share/doc/courier/third-party/opencode/LICENSE",await r.text())}).catch(e=>{console.error(e);process.exitCode=1})' "${OPENCODE_VERSION}" && \
 	groupadd --gid 65532 courier && \
 	useradd --create-home --uid 65532 --gid 65532 courier && \
 	mkdir -p /workspace && chown courier:courier /workspace
@@ -208,6 +234,12 @@ USER 65532:65532
 # infrastructure binaries. Kept last so a bare `docker build .`
 # produces the operator image; build paths still pass --target explicitly.
 FROM gcr.io/distroless/static:nonroot@sha256:8ce6dd87e9823c5b48dcfb2c8604714ccb351ce59607327bcc4957448da279b5 AS manager
+LABEL org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.source="https://github.com/misospace/courier"
+COPY LICENSE NOTICE /usr/share/doc/courier/
+COPY LICENSES/Apache-2.0.txt /usr/share/doc/courier/LICENSES/Apache-2.0.txt
+COPY --from=go-notices /notices/ /usr/share/doc/courier/third-party/go/
+
 WORKDIR /
 COPY --from=binaries /workspace/manager .
 COPY --from=binaries /workspace/courier-dependency-cache /usr/local/bin/courier-dependency-cache
