@@ -181,6 +181,23 @@ body for this head, or a failed read — launches the pre-handoff goal unchanged
 structured fix input improves the coordinator's own feedback inspection and is
 never a launch precondition.
 
+A fix-pr run whose pinned pull request the forge reports conflicting with its
+live base replays the branch onto that base mechanically before any workspace
+preparation (#887), so the coordinator never receives a mid-merge workspace for
+a conflict a trusted rule can resynchronize. The merge state rides the
+configured forge read-pull-request capability, never a forge-specific CLI, and
+the replay is the rebase lane's engine: the same closed mechanical rules, the
+same bounded repository checks gating publication, and a force-with-lease tied
+to the head admission pinned — targeting only the head the pull request
+itself names and failing closed on a head-identity mismatch rather than
+rewriting another branch. A replay that lands continues the normal fix-pr
+lifecycle on the rebased branch; a semantic conflict ends the run NeedsHuman
+with the conflicting files named and the remote branch untouched; a writer
+that moved the branch makes the leased replay decline and the run continues on
+the ordinary path, whose pushes never force. A clean or unreported merge state
+changes nothing, and a transiently unreadable pull request parks the run for
+the operator's bounded retry rather than replaying on an unobserved world.
+
 Goals stay short — a goal plus tools — but each carries one non-negotiable
 contract: delegation covers bounded work, never the coordinator's ownership
 of completion and forge publication. The publication hint names the run branch
@@ -2371,7 +2388,12 @@ dead 12-hour run straight to Tier 3.
   the forge capability and pinned into the coordinator pod at launch; a base
   that cannot be verified fails that launch closed rather than substituting the
   default. The executor re-reads the live base before it prepares anything and
-  fails closed when it no longer matches the pinned one.
+  fails closed when it no longer matches the pinned one. A fix-pr takeover also
+  reads the forge's merge state first and replays a pull request reported
+  conflicting with its live base mechanically before preparation runs, so the
+  mid-merge handoff above remains only for what that pre-flight leaves alone: a
+  clean or unreported state whose sync still stops, and a replay a concurrent
+  writer's move declined.
 
 Scope: **resolve-issue** adopts an orphaned branch only when a branch exists but
 no pull request points at it. When the deterministic branch already carries an
@@ -3748,6 +3770,16 @@ existing PR branch plus bounded repository checks — regardless of who resolved
 a conflict. The versioned rebase-only intake contract with Dispatch and the
 supported release combinations are documented in
 [docs/rebase-lane.md](./docs/rebase-lane.md).
+
+The same engine also serves fix-pr runs (#887): when the forge's
+read-pull-request capability reports a fix-pr run's pinned pull request
+conflicting with its live base, the executor replays the branch onto that base
+before workspace preparation under the identical mechanical rules, bounded
+checks, and head-lease force-push, and the run then continues its ordinary
+lifecycle on the rebased branch. This is why the standalone lane remains the
+path for a conflicting pull request without review feedback: fix-pr runs are
+issued for review feedback, and review feedback supersedes rebase work because
+the replay happens inside the fix run.
 
 The rebase executor is a configured binding, not a queue lane. The manager
 settles the designation at startup and stops when the designation does not name

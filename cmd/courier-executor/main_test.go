@@ -907,8 +907,18 @@ func runFixPRDeclaredNoChange(t *testing.T, pull func(w http.ResponseWriter, r *
 // conflict — so the run fails with a reason that stands on the forge state,
 // never on the model-authored evidence, and publishes no comment.
 func TestRunFixPRDeclaredNoChangeNeededRejectedWhenConflicting(t *testing.T) {
+	// The launch base guard (#514) and the merge-state pre-flight (#887) read
+	// the same pull request before the session runs, so the first two reads
+	// answer clean and only the claim verification sees the conflict: this
+	// case exercises the verification, not the pre-flight's replay.
+	reads := 0
 	code, output, comments := runFixPRDeclaredNoChange(t, func(w http.ResponseWriter, r *http.Request) bool {
-		_, _ = io.WriteString(w, `{"number":7,"state":"open","mergeable":false,"mergeable_state":"dirty","base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":"feature","repo":{"full_name":"acme/widgets"}}}`)
+		reads++
+		mergeable, state := "false", "dirty"
+		if reads <= 2 {
+			mergeable, state = "true", "clean"
+		}
+		_, _ = io.WriteString(w, `{"number":7,"state":"open","mergeable":`+mergeable+`,"mergeable_state":"`+state+`","base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":"feature","repo":{"full_name":"acme/widgets"}}}`)
 		return true
 	})
 	if code != exitFailed {
@@ -958,15 +968,16 @@ func TestRunFixPRDeclaredNoChangeNeededRejectedWhenMergeabilityUnknown(t *testin
 // happen proves nothing, so the run may not exit 3 on a claim it could not
 // check.
 //
-// The startup guard (#514) reads the same pull request before the run
-// reaches the claim verification, so the fixture answers the guard's read
-// with an open request on the pinned base and fails the verification's own
-// read: the claim verification, not the guard, is what this case exercises.
+// The startup guard (#514) and the merge-state pre-flight (#887) read the
+// same pull request before the run reaches the claim verification, so the
+// fixture answers both of those reads with an open, mergeable request on the
+// pinned base and fails the verification's own read: the claim verification,
+// not the guard or the pre-flight, is what this case exercises.
 func TestRunFixPRDeclaredNoChangeNeededRejectedWhenForgeReadFails(t *testing.T) {
 	reads := 0
 	code, output, comments := runFixPRDeclaredNoChange(t, func(w http.ResponseWriter, r *http.Request) bool {
 		reads++
-		if reads == 1 {
+		if reads <= 2 {
 			_, _ = io.WriteString(w, `{"number":7,"state":"open","mergeable":true,"mergeable_state":"clean","base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":"feature","repo":{"full_name":"acme/widgets"}}}`)
 			return true
 		}

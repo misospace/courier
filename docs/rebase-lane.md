@@ -10,6 +10,13 @@ combinations, and the operator configuration that enables the lane. It pairs
 with misospace/dispatch#1327 (queue support) and misospace/dispatch#1532
 (strict rebase-only intake and negotiated handout eligibility).
 
+The engine also serves fix-pr runs (#887): a fix-pr run whose pull request the
+forge reports conflicting with its live base replays the branch before any
+workspace preparation, under the same lease and the same mechanical rules
+described below. This is why a conflicting pull request that carries review
+feedback is not handed to the rebase queue — the replay happens inside the fix
+run.
+
 ## What a rebase run is
 
 A `REBASE` PR-fix item materializes as a CoderRun with `spec.mode: rebase` and
@@ -385,6 +392,9 @@ conflict, so the source's failure policy, not a human queue, governs it.
 The episode's model-assisted attempt is reported on the
 `rebase.model.assist` run event (model, turns, files, token usage), for
 published and unresolved endings alike.
+
+Because these variables are rendered only on rebase-mode pods, a fix-pr run's
+pre-flight replay always runs the closed mechanical rules alone.
 
 The cross-repository capability negotiation that would let Dispatch route
 model-backed rebase work is not settled yet (misospace/dispatch#1540). The
