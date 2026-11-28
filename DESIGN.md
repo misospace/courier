@@ -426,10 +426,12 @@ on the run branch; the declaration never substitutes for that check (#169):
   `3`. Before a fix-pr claim may exit `3`, the executor verifies it against
   the assigned repair condition using current authoritative forge state: the
   pinned pull request is read through the forge `read-pull-request`
-  capability, and a request the forge reports still conflicting with its
-  base fails the run, while an unknown mergeability answer or an unreadable
-  forge fails closed — review approval and an unchanged head prove nothing,
-  and a claim the forge cannot verify never publishes the success (#513). A
+  capability, and a request the forge reports not mergeable into its base
+  fails the run — the rejection names the forge merge state instead of
+  assuming a conflict, because GitHub answers false for blocked requests
+  too (#513, #946) — while an unknown mergeability answer or an unreadable
+  forge fails closed: review approval and an unchanged head prove nothing,
+  and a claim the forge cannot verify never publishes the success. A
   merged, closed, or mergeable request lets the claim stand, so a satisfied
   no-change ending remains possible without manufacturing commits; a
   resolve-issue claim pins no pull request and is not verified this way.
