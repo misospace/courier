@@ -10,6 +10,13 @@ combinations, and the operator configuration that enables the lane. It pairs
 with misospace/dispatch#1327 (queue support) and misospace/dispatch#1532
 (strict rebase-only intake and negotiated handout eligibility).
 
+The engine also serves fix-pr runs (#887): a fix-pr run whose pull request the
+forge reports conflicting with its live base replays the branch before any
+workspace preparation, under the same lease and the same mechanical rules
+described below. This is why a conflicting pull request that carries review
+feedback is not handed to the rebase queue — the replay happens inside the fix
+run.
+
 ## What a rebase run is
 
 A `REBASE` PR-fix item materializes as a CoderRun with `spec.mode: rebase` and
@@ -55,6 +62,15 @@ binary takes an explicit branch before workspace preparation:
    to the existing PR branch and nothing else. The branch must still carry the
    leased head at push time; a concurrent writer's push is refused, never
    overwritten, and never silently recreated if the branch vanished.
+6. **Pre-publication authorization** (fix-pr pre-flight only): a non-fast-forward
+   rewrite rides a live pull request, and a retarget or close leaves the leased
+   head OID unchanged, so the engine's publication seam re-reads the pinned
+   request through the forge capability and publishes nothing unless it is still
+   open and still names this head and base. This narrows the window between
+   reading the forge and pushing git but cannot close it — there is no atomic
+   API-plus-git transaction — so the residual race stays open by design and the
+   head lease is the backstop. A declined publication ends the fix-pr run for a
+   human; it does not fall through to the ordinary path.
 
 ### Outcomes
 
@@ -385,6 +401,9 @@ conflict, so the source's failure policy, not a human queue, governs it.
 The episode's model-assisted attempt is reported on the
 `rebase.model.assist` run event (model, turns, files, token usage), for
 published and unresolved endings alike.
+
+Because these variables are rendered only on rebase-mode pods, a fix-pr run's
+pre-flight replay always runs the closed mechanical rules alone.
 
 The cross-repository capability negotiation that would let Dispatch route
 model-backed rebase work is not settled yet (misospace/dispatch#1540). The

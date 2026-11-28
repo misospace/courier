@@ -457,3 +457,105 @@ func TestValidateOptionsRequiresLeaseInputs(t *testing.T) {
 		t.Fatal("unreachable")
 	}
 }
+
+// A mechanically sound replay that the injected publication authorization
+// declines ends not-authorized with the head lease intact and nothing pushed —
+// the fix-pr boundary case where the live pull request was retargeted while the
+// bounded checks ran, leaving the head OID the lease proves unchanged.
+func TestPublicationAuthorizationDeclinesWithoutPush(t *testing.T) {
+	f := newFixture(t,
+		map[string]string{"notes.md": "intro\n# header (main)\nbody\n"},
+		map[string]string{"notes.md": "intro\n# header (main)\n# pr addition\nbody\n"},
+	)
+	calls := 0
+	result, err := Execute(context.Background(), Options{
+		Repo:         "acme/widgets",
+		Base:         f.base,
+		Branch:       f.branch,
+		ExpectedHead: f.head,
+		Workspace:    f.workspace,
+		RemoteURL:    f.origin,
+		CheckTimeout: 30 * time.Second,
+		Authorize: func(context.Context) string {
+			calls++
+			return `it now targets base "release", not the replayed base "main"`
+		},
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if result.Outcome != OutcomeNotAuthorized {
+		t.Fatalf("outcome = %q (%s), want not-authorized", result.Outcome, result.Reason)
+	}
+	if calls != 1 {
+		t.Fatalf("authorize consulted %d times, want exactly once at the publication seam", calls)
+	}
+	if result.LeaseHead != f.head {
+		t.Fatalf("lease head = %q, want the admission head preserved", result.LeaseHead)
+	}
+	if got := remoteHead(t, f); got != f.head {
+		t.Fatalf("remote head = %q, want the untouched admission head: a declined authorization publishes nothing", got)
+	}
+}
+
+// A granted authorization publishes normally: the seam declines only on a
+// non-empty reason, never by default.
+func TestPublicationAuthorizationAllowsPublicationWhenGranted(t *testing.T) {
+	f := newFixture(t,
+		map[string]string{"other.txt": "main content\n"},
+		map[string]string{"pr.txt": "pr content\n"},
+	)
+	calls := 0
+	result, err := Execute(context.Background(), Options{
+		Repo:         "acme/widgets",
+		Base:         f.base,
+		Branch:       f.branch,
+		ExpectedHead: f.head,
+		Workspace:    f.workspace,
+		RemoteURL:    f.origin,
+		CheckTimeout: 30 * time.Second,
+		Authorize:    func(context.Context) string { calls++; return "" },
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if result.Outcome != OutcomePublished {
+		t.Fatalf("outcome = %q (%s), want published", result.Outcome, result.Reason)
+	}
+	if calls != 1 {
+		t.Fatalf("authorize consulted %d times, want exactly once", calls)
+	}
+	if got := remoteHead(t, f); got != result.Head {
+		t.Fatalf("remote head = %q, want the published head", got)
+	}
+}
+
+// A moved remote head is declined by the lease before the publication seam is
+// consulted: an authorization can never resurrect a replay the lease refused.
+func TestPublicationAuthorizationNotConsultedWhenHeadMoved(t *testing.T) {
+	f := newFixture(t,
+		map[string]string{"other.txt": "main content\n"},
+		map[string]string{"pr.txt": "pr content\n"},
+	)
+	runGit(t, f.origin, "update-ref", "refs/heads/pr-branch", runGit(t, f.origin, "rev-parse", "main"))
+	calls := 0
+	result, err := Execute(context.Background(), Options{
+		Repo:         "acme/widgets",
+		Base:         f.base,
+		Branch:       f.branch,
+		ExpectedHead: f.head,
+		Workspace:    f.workspace,
+		RemoteURL:    f.origin,
+		CheckTimeout: 30 * time.Second,
+		Authorize:    func(context.Context) string { calls++; return "" },
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if result.Outcome != OutcomeRemoteHeadMoved {
+		t.Fatalf("outcome = %q (%s), want remote-head-moved", result.Outcome, result.Reason)
+	}
+	if calls != 0 {
+		t.Fatalf("authorize consulted %d times, want zero: a lease refusal precedes the seam", calls)
+	}
+}

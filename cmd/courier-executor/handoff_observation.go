@@ -288,10 +288,12 @@ func (r reporter) observeRunBranchPullRequest(ctx context.Context) (runBranchPRO
 // and an unknown answer is not proof, because review approval and an
 // unchanged head prove nothing about mergeability. The read goes through the
 // configured forge read-pull-request capability, never a forge-specific CLI.
-// The method returns "" when the claim may stand and otherwise a rejection
-// reason for a failed ending; a claim the forge cannot verify fails closed
-// and never publishes the success, and the rejection reason stands on the
-// forge state, never on the coordinator's model-authored evidence.
+// A false answer names no reason by itself, so the rejection names the forge
+// merge state alongside its verdict (#946). The method returns "" when the
+// claim may stand and otherwise a rejection reason for a failed ending; a
+// claim the forge cannot verify fails closed and never publishes the success,
+// and the rejection reason stands on the forge state, never on the
+// coordinator's model-authored evidence.
 func (r reporter) verifyNoChangeClaim(ctx context.Context) string {
 	// A resolve-issue run pins no pull request: its repair condition is the
 	// issue itself, and the controller settles that ending against the world
@@ -322,9 +324,31 @@ func (r reporter) verifyNoChangeClaim(ctx context.Context) string {
 		return fmt.Sprintf("opencode declared no change needed but pull request %s#%d mergeability against base %s is unknown; an unverified mergeability cannot settle the assignment", r.cfg.Repo, r.cfg.Ref, pull.BaseRef)
 	}
 	if !*pull.Mergeable {
-		return fmt.Sprintf("opencode declared no change needed but pull request %s#%d still conflicts with base %s; the assignment is not satisfied", r.cfg.Repo, r.cfg.Ref, pull.BaseRef)
+		return noChangeMergeStateRejection(r.cfg.Repo, r.cfg.Ref, pull.BaseRef, pull.MergeableState)
 	}
 	return ""
+}
+
+// noChangeMergeStateRejection words a false mergeability rejection from the
+// forge merge state, because GitHub answers false both for a real conflict
+// and for a request merely blocked by required checks or reviews. Only the
+// provider's conflict value ("dirty") may be reported as a conflict; other
+// known states name themselves, and an unknown or empty state is reported as
+// not mergeable with its state quoted rather than invented as a conflict
+// (#946).
+func noChangeMergeStateRejection(repo string, ref int, baseRef, mergeableState string) string {
+	verdict := ""
+	switch state := strings.TrimSpace(mergeableState); state {
+	case githubMergeStateConflict:
+		verdict = "still conflicts with"
+	case "blocked":
+		verdict = "is blocked against"
+	case "":
+		verdict = "is not mergeable into"
+	default:
+		return fmt.Sprintf("opencode declared no change needed but pull request %s#%d is not mergeable into base %s (merge state %q); the assignment is not satisfied", repo, ref, baseRef, state)
+	}
+	return fmt.Sprintf("opencode declared no change needed but pull request %s#%d %s base %s; the assignment is not satisfied", repo, ref, verdict, baseRef)
 }
 
 // confirmRemotePublication proves the run's current commit is published on

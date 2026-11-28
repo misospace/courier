@@ -264,19 +264,24 @@ func boolPtr(b bool) *bool { return &b }
 // mergeability mapping (#513): GitHub's mergeable_state "dirty" is the
 // authoritative conflict signal and wins over the boolean, a pending or
 // absent answer maps to nil (unverifiable, never satisfied), and a computed
-// answer passes through unchanged.
+// answer passes through unchanged. The state string also passes through
+// verbatim, so a conflict consumer can require "dirty" rather than trust the
+// boolean alone — a mergeable false paired with a non-conflict state like
+// "blocked" must stay readable as one.
 func TestProviderReadPullRequestMergeability(t *testing.T) {
 	cases := []struct {
-		name string
-		body string
-		want *bool
+		name      string
+		body      string
+		want      *bool
+		wantState string
 	}{
-		{"dirty wins over mergeable true", `{"number":7,"state":"open","mergeable":true,"mergeable_state":"dirty","head":{"ref":"work","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}`, boolPtr(false)},
-		{"unknown state wins over stale mergeable true", `{"number":7,"state":"open","mergeable":true,"mergeable_state":"unknown","head":{"ref":"work","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}`, nil},
-		{"mergeable true stays true", `{"number":7,"state":"open","mergeable":true,"mergeable_state":"clean","head":{"ref":"work","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}`, boolPtr(true)},
-		{"mergeable false stays false", `{"number":7,"state":"open","mergeable":false,"mergeable_state":"clean","head":{"ref":"work","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}`, boolPtr(false)},
-		{"pending answer stays nil", `{"number":7,"state":"open","mergeable":null,"mergeable_state":"unknown","head":{"ref":"work","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}`, nil},
-		{"absent answer stays nil", `{"number":7,"state":"open","head":{"ref":"work","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}`, nil},
+		{"dirty wins over mergeable true", `{"number":7,"state":"open","mergeable":true,"mergeable_state":"dirty","head":{"ref":"work","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}`, boolPtr(false), "dirty"},
+		{"unknown state wins over stale mergeable true", `{"number":7,"state":"open","mergeable":true,"mergeable_state":"unknown","head":{"ref":"work","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}`, nil, "unknown"},
+		{"mergeable true stays true", `{"number":7,"state":"open","mergeable":true,"mergeable_state":"clean","head":{"ref":"work","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}`, boolPtr(true), "clean"},
+		{"mergeable false stays false", `{"number":7,"state":"open","mergeable":false,"mergeable_state":"clean","head":{"ref":"work","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}`, boolPtr(false), "clean"},
+		{"blocked false keeps its state", `{"number":7,"state":"open","mergeable":false,"mergeable_state":"blocked","head":{"ref":"work","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}`, boolPtr(false), "blocked"},
+		{"pending answer stays nil", `{"number":7,"state":"open","mergeable":null,"mergeable_state":"unknown","head":{"ref":"work","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}`, nil, "unknown"},
+		{"absent answer stays nil", `{"number":7,"state":"open","head":{"ref":"work","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}`, nil, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -304,6 +309,8 @@ func TestProviderReadPullRequestMergeability(t *testing.T) {
 				t.Fatalf("Mergeable = nil, want %v", *tc.want)
 			case tc.want != nil && *got.Mergeable != *tc.want:
 				t.Fatalf("Mergeable = %v, want %v", *got.Mergeable, *tc.want)
+			case got.MergeableState != tc.wantState:
+				t.Fatalf("MergeableState = %q, want %q", got.MergeableState, tc.wantState)
 			}
 		})
 	}

@@ -1,0 +1,708 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/misospace/courier/internal/forge"
+)
+
+const rebasePreflightBranch = "courier/resolve-issue/acme-widgets/7"
+
+// fixPRMergeStateFixtureJSON is the single-pull-request fixture the #887
+// pre-flight reads: the pinned open request on the run branch whose live head
+// SHA is the remote head the replay leases to, with the merge answer the test
+// is scripting.
+func fixPRMergeStateFixtureJSON(headSHA string, mergeable bool, mergeableState string) string {
+	return fmt.Sprintf(`[{"number":7,"state":"open","mergeable":%t,"mergeable_state":%q,"title":"Work","base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":%q,"sha":%q,"repo":{"full_name":"acme/widgets"}}}]`,
+		mergeable, mergeableState, rebasePreflightBranch, headSHA)
+}
+
+// writeFixPRNoChangeCoordinator writes the fake coordinator that records its
+// own run and declares no_change_needed. When prState names the fake forge
+// state file it first lets the forge recompute the pull request clean, so the
+// final no-change verification passes. It returns the fake binary path.
+func writeFixPRNoChangeCoordinator(t *testing.T, root, prState, cleanFixture string) string {
+	t.Helper()
+	binary := filepath.Join(root, "opencode")
+	script := "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf 'coordinator ran\\n' > \"$COURIER_SCRATCH_DIR/coordinator-ran\"\n"
+	if prState != "" {
+		script += writePullRequestScript(prState, cleanFixture)
+	}
+	script += "printf '{\"outcome\":\"no_change_needed\",\"evidence\":\"the branch already carries the review work\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n"
+	writeExecutable(t, binary, script)
+	return binary
+}
+
+// writePushedCleanPullRequestScript is the fake-coordinator shell lines that
+// let the forge recompute the pinned pull request clean at the head the
+// coordinator just pushed, so the Verifying handoff observes the world the
+// run published.
+func writePushedCleanPullRequestScript(statePath string) string {
+	return fmt.Sprintf("sha=$(git rev-parse HEAD)\nprintf '[{\"number\":7,\"state\":\"open\",\"draft\":false,\"title\":\"Work\",\"base\":{\"ref\":\"main\",\"repo\":{\"full_name\":\"acme/widgets\"}},\"head\":{\"ref\":%q,\"sha\":\"%%s\",\"repo\":{\"full_name\":\"acme/widgets\"}}}]' \"$sha\" > '%s'\n", rebasePreflightBranch, statePath)
+}
+
+// setFixPREnv points a fix-pr run at remote for pull request #7 of
+// acme/widgets and returns the workspace directory the run will use.
+func setFixPREnv(t *testing.T, root, remote, githubBase, openCodeBinary string) string {
+	t.Helper()
+	workspace := setResolveIssueEnv(t, root, remote, githubBase, openCodeBinary)
+	t.Setenv("COURIER_MODE", "fix-pr")
+	t.Setenv("COURIER_HEAD_REPO", "acme/widgets")
+	t.Setenv("COURIER_BASE", "main")
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+	t.Setenv("GITHUB_TOKEN", "test-token")
+	return workspace
+}
+
+// remoteWithMechanicallyConflictingBranch is a bare remote whose PR branch and
+// a later main commit edit notes.md in the comment-subset shape the rebase
+// engine's mechanical rules resolve.
+func remoteWithMechanicallyConflictingBranch(t *testing.T, root string) string {
+	t.Helper()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "init", source)
+	configureGit(t, source)
+	write(t, filepath.Join(source, "notes.md"), "intro\n# header\nbody\n")
+	commit(t, source, "base: shared notes")
+	runGit(t, source, "branch", "-M", "main")
+	runGit(t, source, "remote", "add", "origin", remote)
+	runGit(t, source, "push", "-u", "origin", "main")
+	runGit(t, source, "checkout", "-b", rebasePreflightBranch)
+	write(t, filepath.Join(source, "notes.md"), "intro\n# header (main)\n# pr addition\nbody\n")
+	commit(t, source, "work: pr notes")
+	runGit(t, source, "push", "origin", rebasePreflightBranch)
+	runGit(t, source, "checkout", "main")
+	write(t, filepath.Join(source, "notes.md"), "intro\n# header (main)\nbody\n")
+	commit(t, source, "base: main notes")
+	runGit(t, source, "push", "origin", "main")
+	return remote
+}
+
+// TestRunFixPRConflictingBranchRebasesMechanicallyBeforeCoordinator pins the
+// #887 pre-flight: a fix-pr run whose pull request the forge reports dirty
+// replays the branch onto the live base with the mechanical engine and
+// publishes it under the lease before the coordinator starts, keeping both
+// comment edits and never producing a merge commit.
+func TestRunFixPRConflictingBranchRebasesMechanicallyBeforeCoordinator(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithMechanicallyConflictingBranch(t, root)
+	preRunHead := remoteHeadSHA(t, remote, rebasePreflightBranch)
+	mainHead := remoteHeadSHA(t, remote, "main")
+
+	prServer, prState := fakeForgePullRequestServer(t)
+	write(t, prState, fixPRMergeStateFixtureJSON(preRunHead, false, "dirty"))
+
+	fakeOpenCode := writeFixPRNoChangeCoordinator(t, root, prState,
+		fixPRMergeStateFixtureJSON(preRunHead, true, "clean"))
+	setFixPREnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNoChangeNeeded {
+		t.Fatalf("run exit code = %d, want %d; stdout=%q stderr=%q", code, exitNoChangeNeeded, output.String(), errorsOut.String())
+	}
+	stdout := output.String()
+	if !strings.Contains(stdout, `"event":"rebase.preflight"`) {
+		t.Fatalf("pre-flight event missing: %q", stdout)
+	}
+	if !strings.Contains(stdout, `"status":"published"`) {
+		t.Fatalf("pre-flight event must report a published replay: %q", stdout)
+	}
+
+	newHead := remoteHeadSHA(t, remote, rebasePreflightBranch)
+	if newHead == preRunHead {
+		t.Fatalf("remote branch head = %q, want the replayed head: the conflicting branch was never published", newHead)
+	}
+	if _, code := gitResult(t, remote, "merge-base", "--is-ancestor", mainHead, newHead); code != 0 {
+		t.Fatalf("main tip %q is not an ancestor of the rebased head %q: the replay did not land on the live base", mainHead, newHead)
+	}
+	merges, code := gitResult(t, remote, "log", "--merges", "--oneline", newHead)
+	if code != 0 {
+		t.Fatalf("git log --merges on %q exited %d, want 0: %q", newHead, code, merges)
+	}
+	if merges != "" {
+		t.Fatalf("rebased branch history holds merge commits %q, want none: the pre-flight replays and never merges", merges)
+	}
+	notes, _ := gitResult(t, remote, "show", newHead+":notes.md")
+	if !strings.Contains(notes, "# header (main)") || !strings.Contains(notes, "# pr addition") {
+		t.Fatalf("rebased notes.md lost an edit: %q", notes)
+	}
+	if strings.Contains(notes, "<<<<<<<") {
+		t.Fatalf("rebased notes.md still carries conflict markers: %q", notes)
+	}
+	if _, err := os.Stat(filepath.Join(root, "scratch", "coordinator-ran")); err != nil {
+		t.Fatalf("coordinator did not run after the replay: marker missing (stat error %v)", err)
+	}
+}
+
+// TestRunFixPRConflictingBranchRepairsFastForwardAfterReplayPublication pins
+// the #887 acceptance the no-change replay test leaves open: once the
+// pre-flight publishes the replay, the ordinary repair continues from that
+// replayed head, and the coordinator's review-fix commit rides on top of it
+// through an ordinary (never forced) push, handing off as Verifying. The
+// replayed head is recorded from the coordinator's own workspace, so a run
+// that prepared the stale pre-replay branch could not pass: its unforced push
+// would be refused and the handoff would never observe a published fix.
+func TestRunFixPRConflictingBranchRepairsFastForwardAfterReplayPublication(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithMechanicallyConflictingBranch(t, root)
+	preRunHead := remoteHeadSHA(t, remote, rebasePreflightBranch)
+	mainHead := remoteHeadSHA(t, remote, "main")
+
+	prServer, prState := fakeForgePullRequestServer(t)
+	write(t, prState, fixPRMergeStateFixtureJSON(preRunHead, false, "dirty"))
+
+	binary := filepath.Join(root, "opencode")
+	script := "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nmkdir -p \"$COURIER_SCRATCH_DIR\"\ngit rev-parse HEAD > \"$COURIER_SCRATCH_DIR/replayed-head\"\nprintf 'review fix\\n' > fixwork.txt\ngit add --all -- .\ngit commit -m 'fix: apply review feedback' >/dev/null\ngit push origin \"$COURIER_BRANCH\" >/dev/null 2>&1\n" +
+		writePushedCleanPullRequestScript(prState) +
+		"printf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n"
+	writeExecutable(t, binary, script)
+	setFixPREnv(t, root, remote, prServer.URL, binary)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitSuccess {
+		t.Fatalf("run exit code = %d, want %d; stdout=%q stderr=%q", code, exitSuccess, output.String(), errorsOut.String())
+	}
+	stdout := output.String()
+	for _, fragment := range []string{`"event":"rebase.preflight"`, `"status":"published"`, `"phase":"Verifying"`} {
+		if !strings.Contains(stdout, fragment) {
+			t.Fatalf("output missing %q: %q", fragment, stdout)
+		}
+	}
+
+	replayed, err := os.ReadFile(filepath.Join(root, "scratch", "replayed-head"))
+	if err != nil {
+		t.Fatalf("coordinator never recorded its starting head (stat error %v)", err)
+	}
+	replayedHead := strings.TrimSpace(string(replayed))
+	if replayedHead == "" || replayedHead == preRunHead {
+		t.Fatalf("repair started on head %q, want the published replay distinct from the pre-run head %q", replayedHead, preRunHead)
+	}
+	notes, code := gitResult(t, remote, "show", replayedHead+":notes.md")
+	if code != 0 || !strings.Contains(notes, "# header (main)") || !strings.Contains(notes, "# pr addition") {
+		t.Fatalf("starting head %q is not the mechanically rebased branch (code %d): notes.md = %q", replayedHead, code, notes)
+	}
+
+	finalHead := remoteHeadSHA(t, remote, rebasePreflightBranch)
+	if finalHead == replayedHead {
+		t.Fatalf("remote head = %q: the review fix was never published", finalHead)
+	}
+	parent, code := gitResult(t, remote, "rev-parse", finalHead+"^")
+	if code != 0 || strings.TrimSpace(parent) != replayedHead {
+		t.Fatalf("published fix parent = %q (code %d), want the replayed head %q: the fix must ride the replay as a fast-forward", parent, code, replayedHead)
+	}
+	fixwork, code := gitResult(t, remote, "show", finalHead+":fixwork.txt")
+	if code != 0 || !strings.Contains(fixwork, "review fix") {
+		t.Fatalf("published fix missing fixwork.txt (code %d): %q", code, fixwork)
+	}
+	if _, code := gitResult(t, remote, "merge-base", "--is-ancestor", mainHead, finalHead); code != 0 {
+		t.Fatalf("main tip %q is not an ancestor of the published fix %q", mainHead, finalHead)
+	}
+}
+
+// TestRunFixPRConflictingBranchSemanticConflictStopsForHuman pins the #887
+// decline: a conflict the mechanical rules reject ends the run for a human
+// with the file named, publishes nothing, and never starts the coordinator.
+func TestRunFixPRConflictingBranchSemanticConflictStopsForHuman(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithConflictingBranch(t, root)
+	preRunHead := remoteHeadSHA(t, remote, rebasePreflightBranch)
+
+	prServer, prState := fakeForgePullRequestServer(t)
+	write(t, prState, fixPRMergeStateFixtureJSON(preRunHead, false, "dirty"))
+
+	fakeOpenCode := writeFixPRNoChangeCoordinator(t, root, "", "")
+	setFixPREnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stdout=%q stderr=%q", code, exitNeedsHuman, output.String(), errorsOut.String())
+	}
+	stdout := output.String()
+	for _, fragment := range []string{`"phase":"NeedsHuman"`, `"outcome":"needs_decision"`, `"category":"needs-decision"`, "README.md"} {
+		if !strings.Contains(stdout, fragment) {
+			t.Fatalf("output missing %q: %q", fragment, stdout)
+		}
+	}
+	if head := remoteHeadSHA(t, remote, rebasePreflightBranch); head != preRunHead {
+		t.Fatalf("remote branch head = %q, want the untouched %q: a declined replay must leave no half-rebased branch", head, preRunHead)
+	}
+	if _, err := os.Stat(filepath.Join(root, "scratch", "coordinator-ran")); !os.IsNotExist(err) {
+		t.Fatalf("coordinator ran after a semantic conflict: marker exists (stat error %v)", err)
+	}
+}
+
+// TestRunFixPRConflictingBranchHeadMismatchRefusesReplay pins the #887 head
+// guard on the run's own forge read: a dirty answer whose head ref is not the
+// run's branch ends the run for a human before any replay, push, or
+// coordinator start, because a force-with-lease may rewrite only the head the
+// request itself names.
+func TestRunFixPRConflictingBranchHeadMismatchRefusesReplay(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithConflictingBranch(t, root)
+	preRunHead := remoteHeadSHA(t, remote, rebasePreflightBranch)
+
+	prServer, prState := fakeForgePullRequestServer(t)
+	write(t, prState, fmt.Sprintf(`[{"number":7,"state":"open","mergeable":false,"mergeable_state":"dirty","title":"Work","base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":"feature","sha":%q,"repo":{"full_name":"acme/widgets"}}}]`, preRunHead))
+
+	fakeOpenCode := writeFixPRNoChangeCoordinator(t, root, "", "")
+	setFixPREnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stdout=%q stderr=%q", code, exitNeedsHuman, output.String(), errorsOut.String())
+	}
+	stdout := output.String()
+	for _, fragment := range []string{`"phase":"NeedsHuman"`, "refuses to replay or publish another head", rebasePreflightBranch} {
+		if !strings.Contains(stdout, fragment) {
+			t.Fatalf("output missing %q: %q", fragment, stdout)
+		}
+	}
+	if head := remoteHeadSHA(t, remote, rebasePreflightBranch); head != preRunHead {
+		t.Fatalf("remote branch head = %q, want the untouched %q: a refused replay must publish nothing", head, preRunHead)
+	}
+	if _, err := os.Stat(filepath.Join(root, "scratch", "coordinator-ran")); !os.IsNotExist(err) {
+		t.Fatalf("coordinator ran after a head-identity refusal: marker exists (stat error %v)", err)
+	}
+}
+
+// TestRunFixPRConflictingBranchWriterMovedHeadDeclinesReplayToMidMerge pins
+// the #887 declined-replay ending: when the branch no longer sits at the head
+// the lease names, the replay declines before touching anything and publishes
+// nothing, and the run continues the ordinary lifecycle — which hands the
+// still-conflicting branch to the coordinator mid-merge rather than letting
+// the declined replay decide the run's ending.
+func TestRunFixPRConflictingBranchWriterMovedHeadDeclinesReplayToMidMerge(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithConflictingBranch(t, root)
+	prHead := remoteHeadSHA(t, remote, rebasePreflightBranch)
+	staleHead := remoteHeadSHA(t, remote, "main")
+
+	prServer, prState := fakeForgePullRequestServer(t)
+	write(t, prState, fixPRMergeStateFixtureJSON(staleHead, false, "dirty"))
+
+	fakeOpenCode := writeFixPRNoChangeCoordinator(t, root, "", "")
+	setFixPREnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stdout=%q stderr=%q", code, exitNeedsHuman, output.String(), errorsOut.String())
+	}
+	stdout := output.String()
+	if !strings.Contains(stdout, `"event":"rebase.preflight"`) || !strings.Contains(stdout, `"status":"remote-head-moved"`) {
+		t.Fatalf("output missing the declined-replay pre-flight event: %q", stdout)
+	}
+	if !strings.Contains(stdout, "still unresolved; conflicts remain in README.md") {
+		t.Fatalf("the declined replay must leave the run to the ordinary mid-merge handoff: %q", stdout)
+	}
+	if head := remoteHeadSHA(t, remote, rebasePreflightBranch); head != prHead {
+		t.Fatalf("remote branch head = %q, want the untouched %q: a declined replay publishes nothing", head, prHead)
+	}
+	if _, err := os.Stat(filepath.Join(root, "scratch", "coordinator-ran")); err != nil {
+		t.Fatalf("coordinator did not run after the declined replay: marker missing (stat error %v)", err)
+	}
+}
+
+// TestRunFixPRCleanBranchProducesNoRebaseAndNoPush pins the #887 no-op: a
+// forge answer that is not a conflict leaves the branch alone — no pre-flight
+// event, no extra push, and the run branch commits unrewritten in the
+// workspace.
+func TestRunFixPRCleanBranchProducesNoRebaseAndNoPush(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	preRunHead := remoteHeadSHA(t, remote, rebasePreflightBranch)
+
+	source := filepath.Join(root, "source")
+	write(t, filepath.Join(source, "docs.txt"), "main moved on\n")
+	commit(t, source, "base: unrelated docs")
+	runGit(t, source, "push", "origin", "main")
+
+	prServer, prState := fakeForgePullRequestServer(t)
+	write(t, prState, fixPRMergeStateFixtureJSON(preRunHead, true, "clean"))
+
+	fakeOpenCode := writeFixPRNoChangeCoordinator(t, root, "", "")
+	workspace := setFixPREnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNoChangeNeeded {
+		t.Fatalf("run exit code = %d, want %d; stdout=%q stderr=%q", code, exitNoChangeNeeded, output.String(), errorsOut.String())
+	}
+	if strings.Contains(output.String(), `"event":"rebase.preflight"`) {
+		t.Fatalf("clean pull request triggered a replay: %q", output.String())
+	}
+	if head := remoteHeadSHA(t, remote, rebasePreflightBranch); head != preRunHead {
+		t.Fatalf("remote branch head = %q, want the untouched %q: a clean branch must not be pushed", head, preRunHead)
+	}
+	if _, code := gitResult(t, workspace, "merge-base", "--is-ancestor", preRunHead, "HEAD"); code != 0 {
+		t.Fatalf("pre-run head %q is not an ancestor of the workspace HEAD: a clean run rewrote the branch commits", preRunHead)
+	}
+}
+
+// TestRunFixPRBlockedAnswerProducesNoRebaseAndNoPush pins the #945 review
+// fix: a forge mergeable no whose state names a blockage by required checks
+// or reviews is not a conflict report. Even though the boolean says the
+// branch cannot merge, the pre-flight replays nothing — no event, no push —
+// and the run takes the ordinary path.
+func TestRunFixPRBlockedAnswerProducesNoRebaseAndNoPush(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	preRunHead := remoteHeadSHA(t, remote, rebasePreflightBranch)
+
+	source := filepath.Join(root, "source")
+	write(t, filepath.Join(source, "docs.txt"), "main moved on\n")
+	commit(t, source, "base: unrelated docs")
+	runGit(t, source, "push", "origin", "main")
+
+	prServer, prState := fakeForgePullRequestServer(t)
+	write(t, prState, fixPRMergeStateFixtureJSON(preRunHead, false, "blocked"))
+
+	fakeOpenCode := writeFixPRNoChangeCoordinator(t, root, prState,
+		fixPRMergeStateFixtureJSON(preRunHead, true, "clean"))
+	setFixPREnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNoChangeNeeded {
+		t.Fatalf("run exit code = %d, want %d; stdout=%q stderr=%q", code, exitNoChangeNeeded, output.String(), errorsOut.String())
+	}
+	if strings.Contains(output.String(), `"event":"rebase.preflight"`) {
+		t.Fatalf("a blocked answer triggered a replay: %q", output.String())
+	}
+	if head := remoteHeadSHA(t, remote, rebasePreflightBranch); head != preRunHead {
+		t.Fatalf("remote branch head = %q, want the untouched %q: a blocked answer must never be force-pushed", head, preRunHead)
+	}
+	if _, err := os.Stat(filepath.Join(root, "scratch", "coordinator-ran")); err != nil {
+		t.Fatalf("coordinator did not run on the ordinary path: marker missing (stat error %v)", err)
+	}
+}
+
+// TestRunFixPRBlockedAnswerOnConflictingBranchNeverReplays pins the same
+// invariant where a mechanical replay would have succeeded: the git history
+// conflicts, but the forge answer names blockage rather than conflict, so
+// the pre-flight keeps its hands off the branch and the run falls through to
+// the ordinary mid-merge handoff with the remote untouched.
+func TestRunFixPRBlockedAnswerOnConflictingBranchNeverReplays(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithMechanicallyConflictingBranch(t, root)
+	preRunHead := remoteHeadSHA(t, remote, rebasePreflightBranch)
+
+	prServer, prState := fakeForgePullRequestServer(t)
+	write(t, prState, fixPRMergeStateFixtureJSON(preRunHead, false, "blocked"))
+
+	fakeOpenCode := writeFixPRNoChangeCoordinator(t, root, "", "")
+	setFixPREnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stdout=%q stderr=%q", code, exitNeedsHuman, output.String(), errorsOut.String())
+	}
+	stdout := output.String()
+	if strings.Contains(stdout, `"event":"rebase.preflight"`) {
+		t.Fatalf("a blocked answer triggered a replay even though the branch conflicts: %q", stdout)
+	}
+	if !strings.Contains(stdout, "still unresolved; conflicts remain in notes.md") {
+		t.Fatalf("the run must fall through to the ordinary mid-merge handoff: %q", stdout)
+	}
+	if head := remoteHeadSHA(t, remote, rebasePreflightBranch); head != preRunHead {
+		t.Fatalf("remote branch head = %q, want the untouched %q: a blocked answer must never be force-pushed", head, preRunHead)
+	}
+	if _, err := os.Stat(filepath.Join(root, "scratch", "coordinator-ran")); err != nil {
+		t.Fatalf("coordinator did not run on the ordinary mid-merge path: marker missing (stat error %v)", err)
+	}
+}
+
+// TestRunFixPRConflictingBranchWithoutLeasableHeadSkipsReplay pins the
+// no-lease ending: a dirty answer whose head commit neither the admission
+// pin nor the forge answer names cannot carry a force-with-lease, so the
+// pre-flight reports the replay skipped with its reason and the run
+// continues on the ordinary path without publishing.
+func TestRunFixPRConflictingBranchWithoutLeasableHeadSkipsReplay(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithMechanicallyConflictingBranch(t, root)
+	preRunHead := remoteHeadSHA(t, remote, rebasePreflightBranch)
+
+	prServer, prState := fakeForgePullRequestServer(t)
+	write(t, prState, fixPRMergeStateFixtureJSON("", false, "dirty"))
+
+	fakeOpenCode := writeFixPRNoChangeCoordinator(t, root, "", "")
+	setFixPREnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stdout=%q stderr=%q", code, exitNeedsHuman, output.String(), errorsOut.String())
+	}
+	stdout := output.String()
+	if !strings.Contains(stdout, `"event":"rebase.preflight"`) || !strings.Contains(stdout, `"status":"skipped"`) {
+		t.Fatalf("output missing the skipped-replay pre-flight event: %q", stdout)
+	}
+	if !strings.Contains(stdout, "named a head commit to lease the replay to") {
+		t.Fatalf("the skipped event must carry its reason: %q", stdout)
+	}
+	if head := remoteHeadSHA(t, remote, rebasePreflightBranch); head != preRunHead {
+		t.Fatalf("remote branch head = %q, want the untouched %q: an unleased replay must never publish", head, preRunHead)
+	}
+	if _, err := os.Stat(filepath.Join(root, "scratch", "coordinator-ran")); err != nil {
+		t.Fatalf("coordinator did not run on the ordinary path: marker missing (stat error %v)", err)
+	}
+}
+
+// TestFixPRBranchConflictsWithBase pins which forge answers open the
+// force-push pre-flight: only the authoritative mergeable no whose state
+// names GitHub's conflict value. A nil or positive answer, and any state
+// that names another reason — blockage, drift, a still-computing or absent
+// answer — closes it.
+func TestFixPRBranchConflictsWithBase(t *testing.T) {
+	yes, no := true, false
+	for _, test := range []struct {
+		name string
+		pr   forge.PullRequest
+		want bool
+	}{
+		{"dirty false conflicts", forge.PullRequest{Mergeable: &no, MergeableState: "dirty"}, true},
+		{"blocked false is not a conflict", forge.PullRequest{Mergeable: &no, MergeableState: "blocked"}, false},
+		{"behind false is not a conflict", forge.PullRequest{Mergeable: &no, MergeableState: "behind"}, false},
+		{"contradictory clean false is not a conflict", forge.PullRequest{Mergeable: &no, MergeableState: "clean"}, false},
+		{"false without a state is not a conflict", forge.PullRequest{Mergeable: &no}, false},
+		{"pending answer is not a conflict", forge.PullRequest{MergeableState: "dirty"}, false},
+		{"mergeable true is not a conflict", forge.PullRequest{Mergeable: &yes, MergeableState: "clean"}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := fixPRBranchConflictsWithBase(test.pr); got != test.want {
+				t.Fatalf("fixPRBranchConflictsWithBase() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+// TestConflictingFixPRHeadReason pins which forge head identity a leased
+// force-with-lease replay may target: only the exact head ref and repository
+// the run was admitted against.
+func TestConflictingFixPRHeadReason(t *testing.T) {
+	const branch = "courier/resolve-issue/acme-widgets/7"
+	for _, test := range []struct {
+		name string
+		pr   forge.PullRequest
+		cfg  config
+		want string
+	}{
+		{
+			name: "matching same-repository head replays",
+			pr:   forge.PullRequest{HeadRef: branch, HeadRepo: "acme/widgets"},
+			cfg:  config{Repo: "acme/widgets", Branch: branch},
+			want: "",
+		},
+		{
+			name: "missing head ref has no lease target",
+			pr:   forge.PullRequest{HeadRef: "", HeadRepo: "acme/widgets"},
+			cfg:  config{Repo: "acme/widgets", Branch: branch},
+			want: "the forge answer carries no head repository or ref",
+		},
+		{
+			name: "missing head repository has no lease target",
+			pr:   forge.PullRequest{HeadRef: branch, HeadRepo: ""},
+			cfg:  config{Repo: "acme/widgets", Branch: branch},
+			want: "the forge answer carries no head repository or ref",
+		},
+		{
+			name: "head ref is not the run branch",
+			pr:   forge.PullRequest{HeadRef: "courier/resolve-issue/acme-widgets/8", HeadRepo: "acme/widgets"},
+			cfg:  config{Repo: "acme/widgets", Branch: branch},
+			want: `its head ref "courier/resolve-issue/acme-widgets/8" is not the run's branch "courier/resolve-issue/acme-widgets/7"`,
+		},
+		{
+			name: "head repository is not the run repository",
+			pr:   forge.PullRequest{HeadRef: branch, HeadRepo: "acme/fork"},
+			cfg:  config{Repo: "acme/widgets", Branch: branch},
+			want: `its head repository "acme/fork" is not the run's "acme/widgets"`,
+		},
+		{
+			name: "fork head repository matches the pinned head repo",
+			pr:   forge.PullRequest{HeadRef: branch, HeadRepo: "acme/fork"},
+			cfg:  config{Repo: "acme/widgets", HeadRepo: "acme/fork", Branch: branch},
+			want: "",
+		},
+		{
+			name: "fork head repository differs from the pinned head repo",
+			pr:   forge.PullRequest{HeadRef: branch, HeadRepo: "acme/other"},
+			cfg:  config{Repo: "acme/widgets", HeadRepo: "acme/fork", Branch: branch},
+			want: `its head repository "acme/other" is not the run's "acme/fork"`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := conflictingFixPRHeadReason(test.pr, test.cfg); got != test.want {
+				t.Fatalf("conflictingFixPRHeadReason() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+// TestFixPRPublicationDriftReason pins the publication-boundary re-check: the
+// request must still be open and still name the replayed base and the leased
+// head, and only those facts decline the rewrite. A retarget or close does not
+// move the head OID the git lease proves, so this is the only read that catches
+// it.
+func TestFixPRPublicationDriftReason(t *testing.T) {
+	const branch = "courier/resolve-issue/acme-widgets/7"
+	const lease = "abc123"
+	cfg := config{Repo: "acme/widgets", Branch: branch, Base: "main"}
+	authorized := func(mut func(*forge.PullRequest)) forge.PullRequest {
+		pr := forge.PullRequest{State: "open", BaseRepo: "acme/widgets", BaseRef: "main", HeadRepo: "acme/widgets", HeadRef: branch, HeadSHA: lease}
+		if mut != nil {
+			mut(&pr)
+		}
+		return pr
+	}
+	for _, test := range []struct {
+		name string
+		pr   forge.PullRequest
+		want string
+	}{
+		{"still open and named", authorized(nil), ""},
+		{"closed request", authorized(func(p *forge.PullRequest) { p.State = "closed" }), "it is closed, not open"},
+		{"merged request", authorized(func(p *forge.PullRequest) { p.State = "closed"; p.Merged = true }), "it is merged, not open"},
+		{"retargeted base", authorized(func(p *forge.PullRequest) { p.BaseRef = "release" }), `it now targets base "release", not the replayed base "main"`},
+		{"base moved to a fork", authorized(func(p *forge.PullRequest) { p.BaseRepo = "acme/other" }), "its base repository identity is incomplete or no longer the run's repository"},
+		{"head commit moved", authorized(func(p *forge.PullRequest) { p.HeadSHA = "def456" }), `its head "def456" is no longer the leased head "abc123"`},
+		{"head commit unnamed", authorized(func(p *forge.PullRequest) { p.HeadSHA = "" }), `its head "" is no longer the leased head "abc123"`},
+		{"head ref retargeted", authorized(func(p *forge.PullRequest) { p.HeadRef = "someone-elses-branch" }), `its head ref "someone-elses-branch" is not the run's branch "courier/resolve-issue/acme-widgets/7"`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := fixPRPublicationDriftReason(test.pr, cfg, lease); got != test.want {
+				t.Fatalf("fixPRPublicationDriftReason() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+// fakeForgePullRequestServerFlippingOnClone answers every read with the
+// conflicting fixture until the run has cloned its workspace — the pre-flight's
+// git clone lands a .git directory under *workspaceDir — and the drift fixture
+// thereafter. It models a maintainer who retargets or closes the pull request
+// during the replay and bounded checks, after the pre-flight's single read and
+// before its publication: exactly the boundary race #945 must decline. The run
+// terminates before the coordinator runs, so only single-pull-request reads and
+// best-effort comment posts reach it.
+func fakeForgePullRequestServerFlippingOnClone(t *testing.T, workspaceDir *string, conflictFixture, driftFixture string) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/comments") {
+			_, _ = io.Copy(io.Discard, r.Body)
+			_, _ = io.WriteString(w, `{"id":1}`)
+			return
+		}
+		fixture := conflictFixture
+		if *workspaceDir != "" {
+			if _, err := os.Stat(filepath.Join(*workspaceDir, ".git")); err == nil {
+				fixture = driftFixture
+			}
+		}
+		number, single := pullRequestReadNumber(r.URL.Path)
+		if single {
+			serveSinglePullRequest(w, []byte(fixture), number)
+			return
+		}
+		_, _ = io.WriteString(w, fixture)
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// retargetedFixPRFixtureJSON renders the same open, still-conflicting pull
+// request #945 on the run branch and head, but repointed at base "release":
+// the head OID is unchanged, so the git lease alone would still succeed.
+func retargetedFixPRFixtureJSON(headSHA string) string {
+	return fmt.Sprintf(`[{"number":7,"state":"open","mergeable":false,"mergeable_state":"dirty","title":"Work","base":{"ref":"release","repo":{"full_name":"acme/widgets"}},"head":{"ref":%q,"sha":%q,"repo":{"full_name":"acme/widgets"}}}]`,
+		rebasePreflightBranch, headSHA)
+}
+
+// TestRunFixPRConflictingBranchRetargetedAtPublicationBoundaryDeclines pins the
+// #945 review fix: a fix-pr run that replays a conflicting branch, publishes
+// nothing yet, and then finds at the engine's publication seam that the pull
+// request was retargeted (head unchanged) ends for a human with the lease
+// intact — it neither force-pushes the main-rebased branch onto the new target
+// nor falls through to the ordinary repair.
+func TestRunFixPRConflictingBranchRetargetedAtPublicationBoundaryDeclines(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithMechanicallyConflictingBranch(t, root)
+	preRunHead := remoteHeadSHA(t, remote, rebasePreflightBranch)
+
+	var workspace string
+	prServer := fakeForgePullRequestServerFlippingOnClone(t, &workspace,
+		fixPRMergeStateFixtureJSON(preRunHead, false, "dirty"),
+		retargetedFixPRFixtureJSON(preRunHead))
+
+	fakeOpenCode := writeFixPRNoChangeCoordinator(t, root, "", "")
+	workspace = setFixPREnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stdout=%q stderr=%q", code, exitNeedsHuman, output.String(), errorsOut.String())
+	}
+	stdout := output.String()
+	for _, fragment := range []string{`"event":"rebase.preflight"`, `"status":"not-authorized"`, "publication boundary", `"phase":"NeedsHuman"`} {
+		if !strings.Contains(stdout, fragment) {
+			t.Fatalf("output missing %q: %q", fragment, stdout)
+		}
+	}
+	if head := remoteHeadSHA(t, remote, rebasePreflightBranch); head != preRunHead {
+		t.Fatalf("remote branch head = %q, want the untouched %q: a boundary retarget must publish nothing onto the old base", head, preRunHead)
+	}
+	if _, err := os.Stat(filepath.Join(root, "scratch", "coordinator-ran")); !os.IsNotExist(err) {
+		t.Fatalf("coordinator ran after a boundary retarget: marker exists (stat error %v)", err)
+	}
+}
+
+// TestRunFixPRConflictingBranchClosedAtPublicationBoundaryDeclines covers the
+// other unchanged-head drift: the request is closed while the checks run, so
+// the same seam declines the rewrite with nothing published.
+func TestRunFixPRConflictingBranchClosedAtPublicationBoundaryDeclines(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithMechanicallyConflictingBranch(t, root)
+	preRunHead := remoteHeadSHA(t, remote, rebasePreflightBranch)
+
+	var workspace string
+	closedFixture := fmt.Sprintf(`[{"number":7,"state":"closed","mergeable":false,"mergeable_state":"dirty","title":"Work","base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":%q,"sha":%q,"repo":{"full_name":"acme/widgets"}}}]`,
+		rebasePreflightBranch, preRunHead)
+	prServer := fakeForgePullRequestServerFlippingOnClone(t, &workspace,
+		fixPRMergeStateFixtureJSON(preRunHead, false, "dirty"),
+		closedFixture)
+
+	fakeOpenCode := writeFixPRNoChangeCoordinator(t, root, "", "")
+	workspace = setFixPREnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stdout=%q stderr=%q", code, exitNeedsHuman, output.String(), errorsOut.String())
+	}
+	stdout := output.String()
+	for _, fragment := range []string{`"status":"not-authorized"`, "it is closed, not open"} {
+		if !strings.Contains(stdout, fragment) {
+			t.Fatalf("output missing %q: %q", fragment, stdout)
+		}
+	}
+	if head := remoteHeadSHA(t, remote, rebasePreflightBranch); head != preRunHead {
+		t.Fatalf("remote branch head = %q, want the untouched %q: a boundary close must publish nothing", head, preRunHead)
+	}
+}

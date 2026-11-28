@@ -496,7 +496,9 @@ func (p *Provider) RemoveWorkItemLabel(ctx context.Context, ref forge.WorkItemRe
 // authoritative conflict signal and wins over the boolean, the "unknown"
 // state means the answer is still being computed and maps to nil even when a
 // stale boolean is present, and a pending or absent answer maps to nil —
-// callers must treat nil as unverifiable rather than satisfied (#513).
+// callers must treat nil as unverifiable rather than satisfied (#513). The
+// state string travels verbatim so a caller that needs the conflict itself
+// can require "dirty" rather than trust the boolean alone.
 func toForgePR(pr PullRequest) (forge.PullRequest, error) {
 	baseRepo := pr.Base.Repo.FullName
 	if baseRepo == "" {
@@ -515,20 +517,21 @@ func toForgePR(pr PullRequest) (forge.PullRequest, error) {
 		mergeable = nil
 	}
 	return forge.PullRequest{
-		Number:    pr.Number,
-		Repo:      baseRepo,
-		BaseRepo:  baseRepo,
-		BaseRef:   pr.Base.Ref,
-		BaseSHA:   pr.Base.SHA,
-		HeadRepo:  headRepo,
-		HeadRef:   pr.Head.Ref,
-		HeadSHA:   pr.Head.SHA,
-		Title:     pr.Title,
-		Body:      pr.Body,
-		State:     pr.State,
-		Draft:     pr.Draft,
-		URL:       pr.HTMLURL,
-		Merged:    pr.MergedAt != "",
-		Mergeable: mergeable,
+		Number:         pr.Number,
+		Repo:           baseRepo,
+		BaseRepo:       baseRepo,
+		BaseRef:        pr.Base.Ref,
+		BaseSHA:        pr.Base.SHA,
+		HeadRepo:       headRepo,
+		HeadRef:        pr.Head.Ref,
+		HeadSHA:        pr.Head.SHA,
+		Title:          pr.Title,
+		Body:           pr.Body,
+		State:          pr.State,
+		Draft:          pr.Draft,
+		URL:            pr.HTMLURL,
+		Merged:         pr.MergedAt != "",
+		Mergeable:      mergeable,
+		MergeableState: pr.MergeableState,
 	}, nil
 }

@@ -166,6 +166,20 @@ const (
 	// names a binding, never an invocation. It is Verbose so the evidence
 	// reaches the log store on every run that ran the assist.
 	EventRebaseModelAssist = "rebase.model.assist"
+	// EventRebasePreflight reports the mechanical replay a fix-pr run ran
+	// before its session because the forge reported the pull request
+	// conflicting with its live base (#887): the engine's verdict, the
+	// published head when the replay landed, and the files a semantic
+	// conflict stopped on. A clean or unverified merge state emits no event:
+	// no replay was attempted. A conflicting request whose head neither the
+	// admission pin nor the forge answer names carries detail status
+	// "skipped" and the reason: the replay needs a head to lease to, so it
+	// is declined and the ordinary path continues without publishing. A
+	// replay the engine declines at its publication boundary — the pinned
+	// request was retargeted, closed, or unreadable while the bounded checks
+	// ran — carries detail status "not-authorized" and stops the run without
+	// publishing.
+	EventRebasePreflight = "rebase.preflight"
 	// EventRunSurface reports the run's model-surface provenance (#730):
 	// the schema version, the digest, and the canonical encoding that
 	// produced it — the input identities (role bindings, section and tool

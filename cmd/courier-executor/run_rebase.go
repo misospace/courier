@@ -66,20 +66,7 @@ func runRebaseMode(ctx context.Context, report reporter, cfg config) int {
 		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: exitFailed, Reason: err.Error(), Category: terminalCategoryExecutorCrash})
 		return exitFailed
 	}
-	if outcome.Assist != nil && outcome.Assist.Attempted {
-		// The per-turn evidence that the configured model actually ran on
-		// this task: distinct from run.start's configured model field, and
-		// emitted for published and unresolved endings alike, because the
-		// attempt's spend is real whatever the outcome was. Verbose so the
-		// evidence reaches the log store on every run that ran the assist.
-		report.eventVerbose(courierlog.EventRebaseModelAssist, courierlog.StatusOK, map[string]any{
-			"model":          outcome.Assist.Model,
-			"turns":          outcome.Assist.Turns,
-			"files_resolved": outcome.Assist.FilesResolved,
-			"input_tokens":   outcome.Assist.InputTokens,
-			"output_tokens":  outcome.Assist.OutputTokens,
-		})
-	}
+	reportRebaseAssist(report, outcome)
 	switch outcome.Outcome {
 	case rebase.OutcomePublished:
 		report.event(courierlog.EventRunSummary, courierlog.StatusOK, map[string]any{
@@ -109,4 +96,22 @@ func runRebaseMode(ctx context.Context, report reporter, cfg config) int {
 		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: exitFailed, Reason: outcome.Reason, Category: terminalCategoryUnknown})
 		return exitFailed
 	}
+}
+
+// reportRebaseAssist emits the per-turn evidence that a configured model
+// resolver ran on one rebase attempt (#732): distinct from run.start's
+// configured model field, and emitted for published and unresolved endings
+// alike, because the attempt's spend is real whatever the outcome was.
+// Verbose so the evidence reaches the log store on every run that assisted.
+func reportRebaseAssist(report reporter, outcome rebase.Result) {
+	if outcome.Assist == nil || !outcome.Assist.Attempted {
+		return
+	}
+	report.eventVerbose(courierlog.EventRebaseModelAssist, courierlog.StatusOK, map[string]any{
+		"model":          outcome.Assist.Model,
+		"turns":          outcome.Assist.Turns,
+		"files_resolved": outcome.Assist.FilesResolved,
+		"input_tokens":   outcome.Assist.InputTokens,
+		"output_tokens":  outcome.Assist.OutputTokens,
+	})
 }

@@ -19,6 +19,15 @@
 //     and never retries itself. Reissue policy belongs to the source.
 //   - Publication goes only to the existing PR branch. The engine never
 //     creates a ref, never merges, and never edits code semantics.
+//   - A non-fast-forward rewrite rides the live pull request, whose target and
+//     open state the head OID cannot prove: a retarget or close leaves the head
+//     OID unchanged. A caller that carries a pull request therefore injects an
+//     Authorize seam that re-confirms the request is still open and still names
+//     this head and base immediately before the leased push, and the engine
+//     publishes nothing when it declines. The re-check narrows the window
+//     between reading the forge and pushing git but cannot close it — no atomic
+//     GitHub-API-plus-git transaction exists — so the lease still carries the
+//     residual race and the head lease is never relaxed to compensate.
 package rebase
 
 import (
@@ -57,6 +66,12 @@ const (
 	// moved before this attempt's leased push could land. The attempt ends
 	// without publishing; the source's own attempt policy governs any reissue.
 	OutcomeRemoteHeadMoved Outcome = "remote-head-moved"
+	// OutcomeNotAuthorized: the replay was mechanically sound and the remote
+	// head still sat at the lease head, but the injected Authorize seam (see
+	// Options.Authorize) declined the publication — the live pull request the
+	// rewrite rides is no longer open or no longer names this head and base.
+	// Nothing was pushed and the head lease is preserved.
+	OutcomeNotAuthorized Outcome = "not-authorized"
 	// OutcomeFailed: the attempt failed for a reason that is neither a
 	// semantic conflict nor writer contention (git or check infrastructure).
 	OutcomeFailed Outcome = "failed"
@@ -121,6 +136,18 @@ type Options struct {
 	// CheckTimeout bounds each bounded repository check invocation; zero uses
 	// DefaultCheckTimeout.
 	CheckTimeout time.Duration
+	// Authorize is consulted once immediately before the leased force-push,
+	// after the remote head has been re-confirmed to still sit at the lease
+	// head. It re-checks the external state a non-fast-forward rewrite depends
+	// on but the head OID cannot prove — for a fix-pr pre-flight, that the
+	// pinned pull request is still open and still names this head and base. A
+	// non-empty return declines publication with that reason and pushes
+	// nothing; the head lease is preserved. The re-check narrows but cannot
+	// close the race between reading the forge and pushing git (no atomic
+	// API+git transaction exists), so the residual window stays documented and
+	// the lease stays intact. A nil Authorizer publishes whenever the head
+	// lease holds, which is the standalone rebase lane's unchanged behavior.
+	Authorize func(ctx context.Context) (decline string)
 }
 
 // ConflictReport is the human decision evidence a semantic-conflict outcome
@@ -329,6 +356,19 @@ func executeAttempt(ctx context.Context, opts Options, assist *AssistReport) (Re
 		return Result{Outcome: OutcomeRemoteHeadMoved,
 			Reason: fmt.Sprintf("PR branch %q moved to %s after this attempt read it at %s; the leased publication declines rather than discarding the writer", opts.Branch, short(live), short(result.LeaseHead)),
 		}, nil
+	}
+	// Last look at the world the head OID cannot prove: the live pull request
+	// this rewrite rides. A retarget or close does not move the leased head, so
+	// only a fresh read tells us the target still authorizes a non-fast-forward
+	// publication. Declining here pushes nothing and keeps the lease intact; the
+	// residual race against the push below is documented, never papered over by
+	// loosening the lease.
+	if opts.Authorize != nil {
+		if decline := opts.Authorize(ctx); decline != "" {
+			result.Outcome = OutcomeNotAuthorized
+			result.Reason = decline
+			return result, nil
+		}
 	}
 	if err := w.PushForceWithLease(ctx, result.LeaseHead); err != nil {
 		// A lease refusal is writer contention, not an infrastructure fault.

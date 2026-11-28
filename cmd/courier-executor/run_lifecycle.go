@@ -66,6 +66,13 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		return runRebaseMode(ctx, report, cfg)
 	}
 
+	// A fix-pr run whose pull request the forge reports conflicting with its
+	// live base replays the branch mechanically here, before any workspace
+	// preparation could leave it mid-merge (#887). A clean run is untouched.
+	if code, stop := rebaseConflictingFixPRBranch(ctx, report, cfg); stop {
+		return code
+	}
+
 	workspace, startCommit, code := prepareWorkspace(ctx, report, cfg)
 	if code != 0 {
 		return code
