@@ -1,5 +1,65 @@
 # Changelog
 
+## [0.1.27](https://github.com/misospace/courier/compare/v0.1.26...v0.1.27) (2026-11-28)
+
+
+### Features
+
+* bound coordinator tool calls and wall clock so lanes cannot stall ([#904](https://github.com/misospace/courier/issues/904)) ([84ade2b](https://github.com/misospace/courier/commit/84ade2b8fdac4d3c65ddef06786e1b214ebc1ddf))
+* **contribute-ui:** authenticated new-contribution form over existing admission ([#878](https://github.com/misospace/courier/issues/878)) ([cd08678](https://github.com/misospace/courier/commit/cd086785d0473f8515e3e8b99dae0cb99983e38b))
+* **contribute-ui:** contribution status/history and published PR drilldown ([#899](https://github.com/misospace/courier/issues/899)) ([ddcaef6](https://github.com/misospace/courier/commit/ddcaef6f8d7d331580acc27bd10843326eec42c4))
+* **dispatch:** let the owning lane claim rebase work behind a capability-only declaration ([#913](https://github.com/misospace/courier/issues/913)) ([2777499](https://github.com/misospace/courier/commit/2777499446a1f423ddd54ffcd1da324b3e80f0c7))
+* **executor:** rebase a conflicting PR branch before fix-pr fixes ([#945](https://github.com/misospace/courier/issues/945)) ([24d30a8](https://github.com/misospace/courier/commit/24d30a8e4317b047f29871ca870dbc571656d382))
+* **git-guard:** dedicated per-run guard pod so the coordinator pod's egress refuses the forge ([#923](https://github.com/misospace/courier/issues/923)) ([0a190aa](https://github.com/misospace/courier/commit/0a190aa5227c32dfe4a652b6a05f5c06c5eee930))
+* **github-app:** enforce the run ref and operation on legacy-pod git writes behind a trusted boundary ([#909](https://github.com/misospace/courier/issues/909)) ([f794cfb](https://github.com/misospace/courier/commit/f794cfb4b1ff47822d536d365ce50c389215ccd2))
+* **github-app:** opt-in per-run egress allowlist reducing legacy coordinator blast radius (part of [#908](https://github.com/misospace/courier/issues/908)) ([#916](https://github.com/misospace/courier/issues/916)) ([3d640e6](https://github.com/misospace/courier/commit/3d640e6b01ba38557899e1a20d219a1eeefb8a20))
+* **github-app:** read-scoped installation token for model-facing forge reads ([#912](https://github.com/misospace/courier/issues/912)) ([42dc5e8](https://github.com/misospace/courier/commit/42dc5e8d6afd90a54bb3aa4c75b2a96fb8207a15))
+* **github-app:** refreshable PAT-free credentials for legacy git checkout, push, and rebase ([#897](https://github.com/misospace/courier/issues/897)) ([b1d7112](https://github.com/misospace/courier/commit/b1d711273a5cc0089b2ef492a3fe7bf7f1df3681))
+* **github-app:** repository-scoped installation credentials for trusted broker forge access ([#879](https://github.com/misospace/courier/issues/879)) ([4e7be31](https://github.com/misospace/courier/commit/4e7be31f6225b28878c2f9f9976d1bbc6716029c))
+* **github-app:** trusted model-facing forge read path through the broker ([#872](https://github.com/misospace/courier/issues/872)) ([#895](https://github.com/misospace/courier/issues/895)) ([6d0bf11](https://github.com/misospace/courier/commit/6d0bf11493405fc6e75faba33a52e865046a3567))
+* **operator-ui:** authenticated console shell and independent deployment scaffold ([#832](https://github.com/misospace/courier/issues/832)) ([3f9b859](https://github.com/misospace/courier/commit/3f9b8597988271bb61c976496c3a2f9ba403d27e))
+* **operator-ui:** namespace-scoped safe read model for lanes, sources, and runs ([#834](https://github.com/misospace/courier/issues/834)) ([f81b20f](https://github.com/misospace/courier/commit/f81b20fa179befbc5686c33d46c780e6caa98802))
+* **operator-ui:** per-run state page and bounded event timeline ([#826](https://github.com/misospace/courier/issues/826)) ([#907](https://github.com/misospace/courier/issues/907)) ([d81d26a](https://github.com/misospace/courier/commit/d81d26a8162070c3aab1a62301ce80b0a2924231))
+* **operator-ui:** read-only overview of source health, capacity and admission wedges ([#891](https://github.com/misospace/courier/issues/891)) ([39a6a78](https://github.com/misospace/courier/commit/39a6a78b085b80054ed23293444197b0d81f4c10))
+* **operator-ui:** searchable, paginated CoderRun explorer ([#882](https://github.com/misospace/courier/issues/882)) ([1ddb863](https://github.com/misospace/courier/commit/1ddb8638c8930f6c9119f6350938ea2ef955e17d))
+* **readapi:** surface configured idle sources as Empty on GET /v1/sources ([#883](https://github.com/misospace/courier/issues/883)) ([f9b35f9](https://github.com/misospace/courier/commit/f9b35f9d996c098ffaceb6e53c4f73d4b1b3ac23))
+* support GitHub App authentication for operator reads ([#868](https://github.com/misospace/courier/issues/868)) ([f83bc16](https://github.com/misospace/courier/commit/f83bc16034962787df3f6c29fb55b4dbfa123fe4))
+
+
+### Bug Fixes
+
+* **broker:** bound the forge-read route to a response budget and classify over-bound reads non-retryable ([#914](https://github.com/misospace/courier/issues/914)) ([d5d4731](https://github.com/misospace/courier/commit/d5d47315dda3ac94cb23a2ecc27be41685e95b3d))
+* **console:** ship only validatable status links and pin the handler shape gate ([#926](https://github.com/misospace/courier/issues/926)) ([4686320](https://github.com/misospace/courier/commit/46863208c98ac6f9ab20b3deb4c51d2e910ae235))
+* **deps:** update dependency astro (7.4.12 → 7.4.13) ([#864](https://github.com/misospace/courier/issues/864)) ([fe0de25](https://github.com/misospace/courier/commit/fe0de252afb88cd342cf5353f86b508f4aa18328))
+* **deps:** update kubernetes monorepo (v0.37.2 → v0.37.3) ([#928](https://github.com/misospace/courier/issues/928)) ([39b0bf0](https://github.com/misospace/courier/commit/39b0bf07f8af6741d8823a9e438e52ebe71a9d8c))
+* **devenv:** redirect mise state off the root-owned home the bake leaves ([#859](https://github.com/misospace/courier/issues/859)) ([e46d458](https://github.com/misospace/courier/commit/e46d458a69127999b37b68260c59b7b8a3fa3a60))
+* honor provider quota reset times across capacity handoffs ([#869](https://github.com/misospace/courier/issues/869)) ([168afef](https://github.com/misospace/courier/commit/168afefc131b291a0eabbe234e50e9fbf0b25e97))
+* pin the govulncheck version used by CI ([#857](https://github.com/misospace/courier/issues/857)) ([ff2d9fd](https://github.com/misospace/courier/commit/ff2d9fd5591e6837dc35923a5f6708ec779391fe))
+
+
+### Chores
+
+* add LiteLLM review session affinity ([#874](https://github.com/misospace/courier/issues/874)) ([7ec9563](https://github.com/misospace/courier/commit/7ec95637ef413592a9de35eda5a568abfcbf0010))
+* adopt AGPL-3.0-only for Courier ([#936](https://github.com/misospace/courier/issues/936)) ([f02fcbb](https://github.com/misospace/courier/commit/f02fcbb87a0f38906a1be61dd42008385c492d5d))
+* **container:** update image gcr.io/distroless/static (aafe993 → 8ce6dd8) ([#900](https://github.com/misospace/courier/issues/900)) ([23450d6](https://github.com/misospace/courier/commit/23450d60ab887576f0a5c75d9faa7590732c4fec))
+* **container:** update image golang (205c763 → 5f1b98f) ([#944](https://github.com/misospace/courier/issues/944)) ([b5067a8](https://github.com/misospace/courier/commit/b5067a8b421b2c11fda564df3e3cddab40d05c9c))
+* **container:** update image golang (5e8afd4 → 205c763) ([#867](https://github.com/misospace/courier/issues/867)) ([5ecd11a](https://github.com/misospace/courier/commit/5ecd11ab01b0df7b8585d9ebcc51dda7fe4363a5))
+* **container:** update image node (3fcc460 → 0042e17) ([#938](https://github.com/misospace/courier/issues/938)) ([26f753f](https://github.com/misospace/courier/commit/26f753f5cee6d49ba1937ed4a5296a352831df18))
+* **container:** update image node (5df7998 → 3fcc460) ([#910](https://github.com/misospace/courier/issues/910)) ([b0f64c1](https://github.com/misospace/courier/commit/b0f64c1f79b079488c60deab5443783ff16686bd))
+* **deps:** lock file maintenance ([#903](https://github.com/misospace/courier/issues/903)) ([3da0f32](https://github.com/misospace/courier/commit/3da0f32d1f4aa2862e8451dd9a50969134c2ab56))
+
+
+### Documentation
+
+* codify repository independence from Dispatch ([#925](https://github.com/misospace/courier/issues/925)) ([e35be65](https://github.com/misospace/courier/commit/e35be65490837f84271fdf1696ff7a7f576ebfc3))
+* require concise source comments ([#931](https://github.com/misospace/courier/issues/931)) ([8cf2cba](https://github.com/misospace/courier/commit/8cf2cba384c5dc18e9e31415d2947e45f00fa52d))
+
+
+### Refactors
+
+* **labels:** hold the run-label scheme once and delegate from topology ([#927](https://github.com/misospace/courier/issues/927)) ([21ce027](https://github.com/misospace/courier/commit/21ce027b265b3f16b4476f5524740c8c4d4dea79))
+* **metrics:** serve terminal age and backlog gauges from one scoped CoderRun list ([#856](https://github.com/misospace/courier/issues/856)) ([f9a17bb](https://github.com/misospace/courier/commit/f9a17bbdf2020011b5ab50c3c5971493a3fdffef))
+
 ## [0.1.26](https://github.com/misospace/courier/compare/v0.1.25...v0.1.26) (2026-11-17)
 
 
