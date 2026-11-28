@@ -42,6 +42,14 @@ func writeFixPRNoChangeCoordinator(t *testing.T, root, prState, cleanFixture str
 	return binary
 }
 
+// writePushedCleanPullRequestScript is the fake-coordinator shell lines that
+// let the forge recompute the pinned pull request clean at the head the
+// coordinator just pushed, so the Verifying handoff observes the world the
+// run published.
+func writePushedCleanPullRequestScript(statePath string) string {
+	return fmt.Sprintf("sha=$(git rev-parse HEAD)\nprintf '[{\"number\":7,\"state\":\"open\",\"draft\":false,\"title\":\"Work\",\"base\":{\"ref\":\"main\",\"repo\":{\"full_name\":\"acme/widgets\"}},\"head\":{\"ref\":%q,\"sha\":\"%%s\",\"repo\":{\"full_name\":\"acme/widgets\"}}}]' \"$sha\" > '%s'\n", rebasePreflightBranch, statePath)
+}
+
 // setFixPREnv points a fix-pr run at remote for pull request #7 of
 // acme/widgets and returns the workspace directory the run will use.
 func setFixPREnv(t *testing.T, root, remote, githubBase, openCodeBinary string) string {
@@ -136,6 +144,72 @@ func TestRunFixPRConflictingBranchRebasesMechanicallyBeforeCoordinator(t *testin
 	}
 	if _, err := os.Stat(filepath.Join(root, "scratch", "coordinator-ran")); err != nil {
 		t.Fatalf("coordinator did not run after the replay: marker missing (stat error %v)", err)
+	}
+}
+
+// TestRunFixPRConflictingBranchRepairsFastForwardAfterReplayPublication pins
+// the #887 acceptance the no-change replay test leaves open: once the
+// pre-flight publishes the replay, the ordinary repair continues from that
+// replayed head, and the coordinator's review-fix commit rides on top of it
+// through an ordinary (never forced) push, handing off as Verifying. The
+// replayed head is recorded from the coordinator's own workspace, so a run
+// that prepared the stale pre-replay branch could not pass: its unforced push
+// would be refused and the handoff would never observe a published fix.
+func TestRunFixPRConflictingBranchRepairsFastForwardAfterReplayPublication(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithMechanicallyConflictingBranch(t, root)
+	preRunHead := remoteHeadSHA(t, remote, rebasePreflightBranch)
+	mainHead := remoteHeadSHA(t, remote, "main")
+
+	prServer, prState := fakeForgePullRequestServer(t)
+	write(t, prState, fixPRMergeStateFixtureJSON(preRunHead, false, "dirty"))
+
+	binary := filepath.Join(root, "opencode")
+	script := "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nmkdir -p \"$COURIER_SCRATCH_DIR\"\ngit rev-parse HEAD > \"$COURIER_SCRATCH_DIR/replayed-head\"\nprintf 'review fix\\n' > fixwork.txt\ngit add --all -- .\ngit commit -m 'fix: apply review feedback' >/dev/null\ngit push origin \"$COURIER_BRANCH\" >/dev/null 2>&1\n" +
+		writePushedCleanPullRequestScript(prState) +
+		"printf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n"
+	writeExecutable(t, binary, script)
+	setFixPREnv(t, root, remote, prServer.URL, binary)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitSuccess {
+		t.Fatalf("run exit code = %d, want %d; stdout=%q stderr=%q", code, exitSuccess, output.String(), errorsOut.String())
+	}
+	stdout := output.String()
+	for _, fragment := range []string{`"event":"rebase.preflight"`, `"status":"published"`, `"phase":"Verifying"`} {
+		if !strings.Contains(stdout, fragment) {
+			t.Fatalf("output missing %q: %q", fragment, stdout)
+		}
+	}
+
+	replayed, err := os.ReadFile(filepath.Join(root, "scratch", "replayed-head"))
+	if err != nil {
+		t.Fatalf("coordinator never recorded its starting head (stat error %v)", err)
+	}
+	replayedHead := strings.TrimSpace(string(replayed))
+	if replayedHead == "" || replayedHead == preRunHead {
+		t.Fatalf("repair started on head %q, want the published replay distinct from the pre-run head %q", replayedHead, preRunHead)
+	}
+	notes, code := gitResult(t, remote, "show", replayedHead+":notes.md")
+	if code != 0 || !strings.Contains(notes, "# header (main)") || !strings.Contains(notes, "# pr addition") {
+		t.Fatalf("starting head %q is not the mechanically rebased branch (code %d): notes.md = %q", replayedHead, code, notes)
+	}
+
+	finalHead := remoteHeadSHA(t, remote, rebasePreflightBranch)
+	if finalHead == replayedHead {
+		t.Fatalf("remote head = %q: the review fix was never published", finalHead)
+	}
+	parent, code := gitResult(t, remote, "rev-parse", finalHead+"^")
+	if code != 0 || strings.TrimSpace(parent) != replayedHead {
+		t.Fatalf("published fix parent = %q (code %d), want the replayed head %q: the fix must ride the replay as a fast-forward", parent, code, replayedHead)
+	}
+	fixwork, code := gitResult(t, remote, "show", finalHead+":fixwork.txt")
+	if code != 0 || !strings.Contains(fixwork, "review fix") {
+		t.Fatalf("published fix missing fixwork.txt (code %d): %q", code, fixwork)
+	}
+	if _, code := gitResult(t, remote, "merge-base", "--is-ancestor", mainHead, finalHead); code != 0 {
+		t.Fatalf("main tip %q is not an ancestor of the published fix %q", mainHead, finalHead)
 	}
 }
 
