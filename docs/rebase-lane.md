@@ -62,6 +62,15 @@ binary takes an explicit branch before workspace preparation:
    to the existing PR branch and nothing else. The branch must still carry the
    leased head at push time; a concurrent writer's push is refused, never
    overwritten, and never silently recreated if the branch vanished.
+6. **Pre-publication authorization** (fix-pr pre-flight only): a non-fast-forward
+   rewrite rides a live pull request, and a retarget or close leaves the leased
+   head OID unchanged, so the engine's publication seam re-reads the pinned
+   request through the forge capability and publishes nothing unless it is still
+   open and still names this head and base. This narrows the window between
+   reading the forge and pushing git but cannot close it — there is no atomic
+   API-plus-git transaction — so the residual race stays open by design and the
+   head lease is the backstop. A declined publication ends the fix-pr run for a
+   human; it does not fall through to the ordinary path.
 
 ### Outcomes
 

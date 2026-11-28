@@ -195,8 +195,15 @@ rewriting another branch. A replay that lands continues the normal fix-pr
 lifecycle on the rebased branch; a semantic conflict ends the run NeedsHuman
 with the conflicting files named and the remote branch untouched; a writer
 that moved the branch makes the leased replay decline and the run continues on
-the ordinary path, whose pushes never force. The forge's machine-readable
-merge state, never the mergeable boolean alone, decides the replay: GitHub's
+the ordinary path, whose pushes never force. Because a retarget or a close
+leaves the head OID the lease proves unchanged, the engine re-reads the pull
+request through the forge capability at its publication seam and publishes
+nothing unless the request is still open and still names this head and base — a
+re-confirmation that narrows but cannot close the race against the git push,
+which the intact lease then backstops, ending the run NeedsHuman rather than
+falling through to an ordinary repair onto a stale target. The forge's
+machine-readable merge state, never the mergeable boolean alone, decides the
+replay: GitHub's
 boolean can also answer no for a request merely blocked by required checks or
 reviews, so only its explicit conflict state opens the path. A clean, blocked,
 or unreported state changes nothing, and a transiently unreadable pull request

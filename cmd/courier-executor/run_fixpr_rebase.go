@@ -30,8 +30,13 @@ import (
 // pinned: never a merge, never an unleased rewrite. A semantic conflict ends
 // the run for a human with the conflicting files named and the remote branch
 // untouched; a writer that moved the branch declines the replay, and the run
-// continues on the ordinary path, whose pushes are fast-forward only. It
-// returns (0, false) when the run may proceed to workspace preparation.
+// continues on the ordinary path, whose pushes are fast-forward only. Because a
+// retarget or a close leaves the head OID the lease checks unchanged, the engine
+// re-reads the pinned request at its publication seam and stops with nothing
+// published if it is no longer open or no longer names this head and base — a
+// re-confirmation that narrows but cannot close the race against the push, which
+// the intact lease then backstops. It returns (0, false) when the run may proceed
+// to workspace preparation.
 func rebaseConflictingFixPRBranch(ctx context.Context, report reporter, cfg config) (int, bool) {
 	if !strings.EqualFold(cfg.Mode, "fix-pr") || cfg.Ref < 1 {
 		return 0, false
@@ -145,6 +150,23 @@ func rebaseConflictingFixPRBranch(ctx context.Context, report reporter, cfg conf
 		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: exitFailed, Reason: reason, Category: terminalCategoryExecutorCrash})
 		return exitFailed, true
 	}
+	// The replay force-pushes, so the engine re-confirms the live pull request
+	// at its publication seam — the head OID cannot prove a retarget or close
+	// that lands after the single read above. The seam fails closed: a request
+	// it cannot re-read, or that no longer names this open head and base, stops
+	// the rewrite with nothing published. This narrows but cannot close the
+	// race against the git push; no atomic forge-read-plus-push transaction
+	// exists, so the head lease stays the backstop.
+	authorize := func(ctx context.Context) string {
+		current, err := provider.ReadPullRequest(ctx, forge.PullRequestRef{Repo: cfg.Repo, Number: cfg.Ref})
+		if err != nil {
+			return fmt.Sprintf("pull request #%d of %q could not be re-read at the publication boundary (%s); the run declines the rewrite rather than publish onto a target it cannot confirm", cfg.Ref, cfg.Repo, err.Error())
+		}
+		if reason := fixPRPublicationDriftReason(current, cfg, leaseHead); reason != "" {
+			return fmt.Sprintf("pull request #%d of %q no longer authorizes the replay at the publication boundary: %s; nothing was published", cfg.Ref, cfg.Repo, reason)
+		}
+		return ""
+	}
 	result, err := rebase.Execute(ctx, rebase.Options{
 		Repo:            cfg.Repo,
 		Base:            cfg.Base,
@@ -156,6 +178,7 @@ func rebaseConflictingFixPRBranch(ctx context.Context, report reporter, cfg conf
 		Goal:            cfg.Goal,
 		ModelResolver:   resolver,
 		LockfileTimeout: rebase.DefaultLockfileTimeout,
+		Authorize:       authorize,
 	})
 	if err != nil {
 		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: exitFailed, Reason: err.Error(), Category: terminalCategoryExecutorCrash})
@@ -186,6 +209,15 @@ func rebaseConflictingFixPRBranch(ctx context.Context, report reporter, cfg conf
 		// the run's ending.
 		report.eventVerbose(courierlog.EventRebasePreflight, courierlog.StatusOK, preflightEventPayload(result))
 		return 0, false
+	case rebase.OutcomeNotAuthorized:
+		// The target drifted after the single read: the request was retargeted,
+		// closed, or could not be re-read while the bounded checks ran. Nothing
+		// was published, and the ordinary path must not continue either — it
+		// would repair onto a base or a request the pull request no longer
+		// names. The run stops for a human with the lease still intact.
+		report.eventVerbose(courierlog.EventRebasePreflight, courierlog.StatusNeedsHuman, preflightEventPayload(result))
+		report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: result.Reason, Category: terminalCategoryUnknown})
+		return exitNeedsHuman, true
 	default:
 		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: exitFailed, Reason: result.Reason, Category: terminalCategoryUnknown})
 		return exitFailed, true
@@ -242,4 +274,33 @@ func conflictingFixPRHeadReason(pr forge.PullRequest, cfg config) string {
 		return fmt.Sprintf("its head repository %q is not the run's %q", pr.HeadRepo, headRepo)
 	}
 	return ""
+}
+
+// fixPRPublicationDriftReason names why the pull request no longer authorizes
+// the replay at the publication boundary, or "" while it still does. It is the
+// engine seam's view of the same open-and-identity facts the pre-flight checked
+// on its single read: a retarget or close does not move the head OID the git
+// lease proves, so only this fresh forge read catches it. Unlike the pre-read it
+// has one ending for every drift — the run stops and nothing is pushed — because
+// the rewrite has already been attempted and the only safe response to a moved
+// target is to leave the lease untouched.
+func fixPRPublicationDriftReason(pr forge.PullRequest, cfg config, leaseHead string) string {
+	switch {
+	case !strings.EqualFold(pr.State, "open"):
+		observed := pr.State
+		if pr.Merged {
+			observed = "merged"
+		}
+		return fmt.Sprintf("it is %s, not open", observed)
+	case pr.BaseRepo == "" || pr.BaseRef == "" || pr.BaseRepo != cfg.Repo:
+		return "its base repository identity is incomplete or no longer the run's repository"
+	case pr.BaseRef != cfg.Base:
+		return fmt.Sprintf("it now targets base %q, not the replayed base %q", pr.BaseRef, cfg.Base)
+	case leaseHead != "" && pr.HeadSHA != leaseHead:
+		// The rewrite is leased to a head the request named at admission; if the
+		// boundary read no longer names that exact head — including a now-empty
+		// answer — it does not authorize this force-push.
+		return fmt.Sprintf("its head %q is no longer the leased head %q", pr.HeadSHA, leaseHead)
+	}
+	return conflictingFixPRHeadReason(pr, cfg)
 }

@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -475,5 +478,157 @@ func TestConflictingFixPRHeadReason(t *testing.T) {
 				t.Fatalf("conflictingFixPRHeadReason() = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+// TestFixPRPublicationDriftReason pins the publication-boundary re-check: the
+// request must still be open and still name the replayed base and the leased
+// head, and only those facts decline the rewrite. A retarget or close does not
+// move the head OID the git lease proves, so this is the only read that catches
+// it.
+func TestFixPRPublicationDriftReason(t *testing.T) {
+	const branch = "courier/resolve-issue/acme-widgets/7"
+	const lease = "abc123"
+	cfg := config{Repo: "acme/widgets", Branch: branch, Base: "main"}
+	authorized := func(mut func(*forge.PullRequest)) forge.PullRequest {
+		pr := forge.PullRequest{State: "open", BaseRepo: "acme/widgets", BaseRef: "main", HeadRepo: "acme/widgets", HeadRef: branch, HeadSHA: lease}
+		if mut != nil {
+			mut(&pr)
+		}
+		return pr
+	}
+	for _, test := range []struct {
+		name string
+		pr   forge.PullRequest
+		want string
+	}{
+		{"still open and named", authorized(nil), ""},
+		{"closed request", authorized(func(p *forge.PullRequest) { p.State = "closed" }), "it is closed, not open"},
+		{"merged request", authorized(func(p *forge.PullRequest) { p.State = "closed"; p.Merged = true }), "it is merged, not open"},
+		{"retargeted base", authorized(func(p *forge.PullRequest) { p.BaseRef = "release" }), `it now targets base "release", not the replayed base "main"`},
+		{"base moved to a fork", authorized(func(p *forge.PullRequest) { p.BaseRepo = "acme/other" }), "its base repository identity is incomplete or no longer the run's repository"},
+		{"head commit moved", authorized(func(p *forge.PullRequest) { p.HeadSHA = "def456" }), `its head "def456" is no longer the leased head "abc123"`},
+		{"head commit unnamed", authorized(func(p *forge.PullRequest) { p.HeadSHA = "" }), `its head "" is no longer the leased head "abc123"`},
+		{"head ref retargeted", authorized(func(p *forge.PullRequest) { p.HeadRef = "someone-elses-branch" }), `its head ref "someone-elses-branch" is not the run's branch "courier/resolve-issue/acme-widgets/7"`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := fixPRPublicationDriftReason(test.pr, cfg, lease); got != test.want {
+				t.Fatalf("fixPRPublicationDriftReason() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+// fakeForgePullRequestServerFlippingOnClone answers every read with the
+// conflicting fixture until the run has cloned its workspace — the pre-flight's
+// git clone lands a .git directory under *workspaceDir — and the drift fixture
+// thereafter. It models a maintainer who retargets or closes the pull request
+// during the replay and bounded checks, after the pre-flight's single read and
+// before its publication: exactly the boundary race #945 must decline. The run
+// terminates before the coordinator runs, so only single-pull-request reads and
+// best-effort comment posts reach it.
+func fakeForgePullRequestServerFlippingOnClone(t *testing.T, workspaceDir *string, conflictFixture, driftFixture string) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/comments") {
+			_, _ = io.Copy(io.Discard, r.Body)
+			_, _ = io.WriteString(w, `{"id":1}`)
+			return
+		}
+		fixture := conflictFixture
+		if *workspaceDir != "" {
+			if _, err := os.Stat(filepath.Join(*workspaceDir, ".git")); err == nil {
+				fixture = driftFixture
+			}
+		}
+		number, single := pullRequestReadNumber(r.URL.Path)
+		if single {
+			serveSinglePullRequest(w, []byte(fixture), number)
+			return
+		}
+		_, _ = io.WriteString(w, fixture)
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// retargetedFixPRFixtureJSON renders the same open, still-conflicting pull
+// request #945 on the run branch and head, but repointed at base "release":
+// the head OID is unchanged, so the git lease alone would still succeed.
+func retargetedFixPRFixtureJSON(headSHA string) string {
+	return fmt.Sprintf(`[{"number":7,"state":"open","mergeable":false,"mergeable_state":"dirty","title":"Work","base":{"ref":"release","repo":{"full_name":"acme/widgets"}},"head":{"ref":%q,"sha":%q,"repo":{"full_name":"acme/widgets"}}}]`,
+		rebasePreflightBranch, headSHA)
+}
+
+// TestRunFixPRConflictingBranchRetargetedAtPublicationBoundaryDeclines pins the
+// #945 review fix: a fix-pr run that replays a conflicting branch, publishes
+// nothing yet, and then finds at the engine's publication seam that the pull
+// request was retargeted (head unchanged) ends for a human with the lease
+// intact — it neither force-pushes the main-rebased branch onto the new target
+// nor falls through to the ordinary repair.
+func TestRunFixPRConflictingBranchRetargetedAtPublicationBoundaryDeclines(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithMechanicallyConflictingBranch(t, root)
+	preRunHead := remoteHeadSHA(t, remote, rebasePreflightBranch)
+
+	var workspace string
+	prServer := fakeForgePullRequestServerFlippingOnClone(t, &workspace,
+		fixPRMergeStateFixtureJSON(preRunHead, false, "dirty"),
+		retargetedFixPRFixtureJSON(preRunHead))
+
+	fakeOpenCode := writeFixPRNoChangeCoordinator(t, root, "", "")
+	workspace = setFixPREnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stdout=%q stderr=%q", code, exitNeedsHuman, output.String(), errorsOut.String())
+	}
+	stdout := output.String()
+	for _, fragment := range []string{`"event":"rebase.preflight"`, `"status":"not-authorized"`, "publication boundary", `"phase":"NeedsHuman"`} {
+		if !strings.Contains(stdout, fragment) {
+			t.Fatalf("output missing %q: %q", fragment, stdout)
+		}
+	}
+	if head := remoteHeadSHA(t, remote, rebasePreflightBranch); head != preRunHead {
+		t.Fatalf("remote branch head = %q, want the untouched %q: a boundary retarget must publish nothing onto the old base", head, preRunHead)
+	}
+	if _, err := os.Stat(filepath.Join(root, "scratch", "coordinator-ran")); !os.IsNotExist(err) {
+		t.Fatalf("coordinator ran after a boundary retarget: marker exists (stat error %v)", err)
+	}
+}
+
+// TestRunFixPRConflictingBranchClosedAtPublicationBoundaryDeclines covers the
+// other unchanged-head drift: the request is closed while the checks run, so
+// the same seam declines the rewrite with nothing published.
+func TestRunFixPRConflictingBranchClosedAtPublicationBoundaryDeclines(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithMechanicallyConflictingBranch(t, root)
+	preRunHead := remoteHeadSHA(t, remote, rebasePreflightBranch)
+
+	var workspace string
+	closedFixture := fmt.Sprintf(`[{"number":7,"state":"closed","mergeable":false,"mergeable_state":"dirty","title":"Work","base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":%q,"sha":%q,"repo":{"full_name":"acme/widgets"}}}]`,
+		rebasePreflightBranch, preRunHead)
+	prServer := fakeForgePullRequestServerFlippingOnClone(t, &workspace,
+		fixPRMergeStateFixtureJSON(preRunHead, false, "dirty"),
+		closedFixture)
+
+	fakeOpenCode := writeFixPRNoChangeCoordinator(t, root, "", "")
+	workspace = setFixPREnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stdout=%q stderr=%q", code, exitNeedsHuman, output.String(), errorsOut.String())
+	}
+	stdout := output.String()
+	for _, fragment := range []string{`"status":"not-authorized"`, "it is closed, not open"} {
+		if !strings.Contains(stdout, fragment) {
+			t.Fatalf("output missing %q: %q", fragment, stdout)
+		}
+	}
+	if head := remoteHeadSHA(t, remote, rebasePreflightBranch); head != preRunHead {
+		t.Fatalf("remote branch head = %q, want the untouched %q: a boundary close must publish nothing", head, preRunHead)
 	}
 }
