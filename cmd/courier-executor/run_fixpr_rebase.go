@@ -42,6 +42,13 @@ func rebaseConflictingFixPRBranch(ctx context.Context, report reporter, cfg conf
 		return exitFailed, true
 	}
 	provider := github.NewProvider(forge.ProviderConfig{Name: "github", Endpoint: cfg.GitHubAPIBase}, client)
+	// Fail closed before reading: an unoffered read-pull-request capability
+	// means the conflict was never observed, and the pre-flight never replays blind.
+	if !provider.Capabilities().Available(forge.CapabilityReadPullRequest).Available {
+		reason := fmt.Sprintf("pull request #%d of %q could not be read to check its merge state before the fix: the forge read-pull-request capability is unavailable; the run refuses to replay on a world it cannot observe", cfg.Ref, cfg.Repo)
+		report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: reason, Outcome: outcomeBlockedExternal, Category: terminalCategoryForgeUnavailable})
+		return exitNeedsHuman, true
+	}
 	pr, err := provider.ReadPullRequest(ctx, forge.PullRequestRef{Repo: cfg.Repo, Number: cfg.Ref})
 	if err != nil {
 		if forge.IsTransientAvailability(err) {
